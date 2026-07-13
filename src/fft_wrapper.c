@@ -1,0 +1,218 @@
+/**
+ * fft_wrapper.c — fft_wrapper.h implementation using KISS FFT.
+ *
+ * Vendored from the NR repo (SE/NR/c_impl/src/fft_wrapper.c) so AEC and NR share
+ * one portable FFT layer. Real-to-complex FFT via KISS FFT's complex FFT
+ * (kiss_fft_scalar = float). For the ARM NEON build see fft_wrapper_ne10.c.
+ *
+ * Convention (matches the retired pocketfft backend's callers):
+ *     fft_forward(x)  == rfft(x), unnormalised
+ *     fft_inverse(X)  == irfft(X), normalised by 1/N
+ * KISS computes in float32, so results match numpy's fp64 np.fft to ~float32
+ * precision (~1e-5 e2e, a documented tolerance — NOT 0/0 bit-exact). The
+ * non-FFT C logic remains bit-exact to Python.
+ *
+ * AEC addition over the NR original: the static-memory API (fft_get_mem_size /
+ * fft_init). KISS supports cfg placement into a caller buffer, so the static
+ * path is FULLY heap-free (the FftHandle, work buffers, and both kiss configs
+ * all live in the caller pool).
+ */
+#include "fft_wrapper.h"
+#include "kiss_fft.h"
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+/* Internal FFT handle structure */
+struct FftHandle {
+    int fft_size;
+    int n_freqs;            /* fft_size/2 + 1 */
+
+    kiss_fft_cfg fft_cfg;   /* Forward FFT config */
+    kiss_fft_cfg ifft_cfg;  /* Inverse FFT config */
+
+    kiss_fft_cpx* fft_in;   /* Complex input buffer [fft_size]  */
+    kiss_fft_cpx* fft_out;  /* Complex output buffer [fft_size] */
+
+    int pool_owned;         /* 1 if placed via fft_init (no free in destroy) */
+};
+
+/* --- construction (heap) -------------------------------------------------- */
+
+FftHandle* fft_create(int fft_size) {
+    if (fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) {
+        return NULL;  /* fft_size must be power of 2 */
+    }
+
+    FftHandle* h = (FftHandle*)calloc(1, sizeof(FftHandle));
+    if (!h) return NULL;
+
+    h->fft_size   = fft_size;
+    h->n_freqs    = fft_size / 2 + 1;
+    h->pool_owned = 0;
+
+    h->fft_cfg  = kiss_fft_alloc(fft_size, 0, NULL, NULL);  /* Forward */
+    h->ifft_cfg = kiss_fft_alloc(fft_size, 1, NULL, NULL);  /* Inverse */
+    if (!h->fft_cfg || !h->ifft_cfg) { fft_destroy(h); return NULL; }
+
+    h->fft_in  = (kiss_fft_cpx*)calloc(fft_size, sizeof(kiss_fft_cpx));
+    h->fft_out = (kiss_fft_cpx*)calloc(fft_size, sizeof(kiss_fft_cpx));
+    if (!h->fft_in || !h->fft_out) { fft_destroy(h); return NULL; }
+
+    return h;
+}
+
+/* --- construction (static pool, heap-free) -------------------------------- */
+
+size_t fft_get_mem_size(int fft_size) {
+    if (fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return 0;
+    size_t lf = 0, li = 0;
+    kiss_fft_alloc(fft_size, 0, NULL, &lf);   /* query forward cfg size */
+    kiss_fft_alloc(fft_size, 1, NULL, &li);   /* query inverse cfg size */
+    size_t total = 0;
+    total += ALIGN16(sizeof(FftHandle));
+    total += ALIGN16((size_t)fft_size * sizeof(kiss_fft_cpx));  /* fft_in  */
+    total += ALIGN16((size_t)fft_size * sizeof(kiss_fft_cpx));  /* fft_out */
+    total += ALIGN16(lf);                                       /* fft_cfg  */
+    total += ALIGN16(li);                                       /* ifft_cfg */
+    return total;
+}
+
+FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
+    if (!mem || fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return NULL;
+    if (mem_size < fft_get_mem_size(fft_size)) return NULL;
+
+    uint8_t* ptr = (uint8_t*)mem;
+    FftHandle* h = (FftHandle*)ptr;
+    ptr += ALIGN16(sizeof(FftHandle));
+    memset(h, 0, sizeof(FftHandle));
+
+    h->fft_size   = fft_size;
+    h->n_freqs    = fft_size / 2 + 1;
+    h->pool_owned = 1;
+
+    h->fft_in = (kiss_fft_cpx*)ptr;
+    ptr += ALIGN16((size_t)fft_size * sizeof(kiss_fft_cpx));
+    h->fft_out = (kiss_fft_cpx*)ptr;
+    ptr += ALIGN16((size_t)fft_size * sizeof(kiss_fft_cpx));
+    memset(h->fft_in,  0, (size_t)fft_size * sizeof(kiss_fft_cpx));
+    memset(h->fft_out, 0, (size_t)fft_size * sizeof(kiss_fft_cpx));
+
+    size_t lf = 0;
+    kiss_fft_alloc(fft_size, 0, NULL, &lf);
+    h->fft_cfg = kiss_fft_alloc(fft_size, 0, ptr, &lf);
+    ptr += ALIGN16(lf);
+
+    size_t li = 0;
+    kiss_fft_alloc(fft_size, 1, NULL, &li);
+    h->ifft_cfg = kiss_fft_alloc(fft_size, 1, ptr, &li);
+    ptr += ALIGN16(li);
+
+    if (!h->fft_cfg || !h->ifft_cfg) return NULL;
+    return h;
+}
+
+void fft_destroy(FftHandle* h) {
+    if (!h) return;
+    if (h->pool_owned) return;   /* pool path: caller owns the whole buffer */
+
+    if (h->fft_cfg)  kiss_fft_free(h->fft_cfg);
+    if (h->ifft_cfg) kiss_fft_free(h->ifft_cfg);
+    if (h->fft_in)   free(h->fft_in);
+    if (h->fft_out)  free(h->fft_out);
+    free(h);
+}
+
+int fft_get_size(const FftHandle* h)    { return h ? h->fft_size : 0; }
+int fft_get_n_freqs(const FftHandle* h) { return h ? h->n_freqs  : 0; }
+
+/* --- forward: rfft -------------------------------------------------------- */
+
+void fft_forward(FftHandle* h, const float* real_in, Complex* complex_out) {
+    if (!h || !real_in || !complex_out) return;
+
+    int n = h->fft_size;
+
+    /* Copy real input to complex buffer (imaginary = 0) */
+    for (int i = 0; i < n; i++) {
+        h->fft_in[i].r = real_in[i];
+        h->fft_in[i].i = 0.0f;
+    }
+
+    kiss_fft(h->fft_cfg, h->fft_in, h->fft_out);
+
+    /* Copy first n_freqs bins to output */
+    for (int k = 0; k < h->n_freqs; k++) {
+        complex_out[k].r = h->fft_out[k].r;
+        complex_out[k].i = h->fft_out[k].i;
+    }
+}
+
+/* --- inverse: irfft (1/N normalised) -------------------------------------- */
+
+void fft_inverse(FftHandle* h, const Complex* complex_in, float* real_out) {
+    if (!h || !complex_in || !real_out) return;
+
+    int n = h->fft_size;
+    int n_freqs = h->n_freqs;
+
+    /* Reconstruct full spectrum with conjugate symmetry: X[k] = conj(X[N-k]) */
+    for (int k = 0; k < n_freqs; k++) {
+        h->fft_in[k].r = complex_in[k].r;
+        h->fft_in[k].i = complex_in[k].i;
+    }
+    for (int k = 1; k < n_freqs - 1; k++) {
+        h->fft_in[n - k].r =  complex_in[k].r;
+        h->fft_in[n - k].i = -complex_in[k].i;  /* Conjugate */
+    }
+
+    kiss_fft(h->ifft_cfg, h->fft_in, h->fft_out);
+
+    /* KISS FFT doesn't scale, so divide by N (numpy irfft convention) */
+    float scale = 1.0f / (float)n;
+    for (int i = 0; i < n; i++) {
+        real_out[i] = h->fft_out[i].r * scale;
+    }
+}
+
+/* --- spectral helpers ----------------------------------------------------- */
+
+void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
+    if (!spectrum || !magnitude) return;
+    for (int k = 0; k < n_freqs; k++) {
+        float re = spectrum[k].r, im = spectrum[k].i;
+        magnitude[k] = sqrtf(re * re + im * im);
+    }
+}
+
+void fft_power(const Complex* spectrum, float* power, int n_freqs) {
+    if (!spectrum || !power) return;
+    for (int k = 0; k < n_freqs; k++) {
+        float re = spectrum[k].r, im = spectrum[k].i;
+        power[k] = re * re + im * im;
+    }
+}
+
+void fft_phase(const Complex* spectrum, float* phase, int n_freqs) {
+    if (!spectrum || !phase) return;
+    for (int k = 0; k < n_freqs; k++) {
+        phase[k] = atan2f(spectrum[k].i, spectrum[k].r);
+    }
+}
+
+void fft_from_mag_phase(const float* magnitude, const float* phase,
+                        Complex* spectrum, int n_freqs) {
+    if (!magnitude || !phase || !spectrum) return;
+    for (int k = 0; k < n_freqs; k++) {
+        spectrum[k].r = magnitude[k] * cosf(phase[k]);
+        spectrum[k].i = magnitude[k] * sinf(phase[k]);
+    }
+}
+
+void fft_apply_gain(Complex* spectrum, const float* gain, int n_freqs) {
+    if (!spectrum || !gain) return;
+    for (int k = 0; k < n_freqs; k++) {
+        spectrum[k].r *= gain[k];
+        spectrum[k].i *= gain[k];
+    }
+}
