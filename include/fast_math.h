@@ -5,8 +5,6 @@
  * - exp() using LUT + Taylor
  * - log() using IEEE 754 + Taylor
  * - sqrt() using Newton-Raphson
- * - reciprocal/division (fast_recip/fast_div) using Newton-Raphson (opt-in,
- *   see USE_FAST_RECIPROCAL in consumers' Makefiles — off by default)
  * - E1(v) exponential integral approximation
  *
  * Define USE_STANDARD_MATH to use standard library functions instead
@@ -84,8 +82,6 @@ static inline float fast_exp_neg(float x) { return expf(-x); }
 static inline float fast_log(float x) { return logf(x); }
 static inline float fast_log10(float x) { return log10f(x); }
 static inline float fast_sqrt(float v) { return sqrtf(v); }
-static inline float fast_recip(float x) { return 1.0f / x; }
-static inline float fast_div(float a, float b) { return a / b; }
 
 // E1(v) using standard math
 static inline float exp1_approx(float v) {
@@ -209,43 +205,6 @@ static inline float fast_sqrt(float v) {
     x = 0.5f * (x + v / x);  // Iteration 2
 
     return x;
-}
-
-// ============================================================================
-// Fast reciprocal / division - Newton-Raphson iteration
-// ============================================================================
-
-/**
- * Fast 1/x using Newton-Raphson with IEEE 754 initial estimate.
- * y(n+1) = y(n) * (2 - x*y(n))
- *
- * Accuracy (measured, 2 NR iterations, positive x over a wide dynamic range
- * ~1e-12..1e12 as seen by the PSD/SNR ratios this is used for): typical
- * relative error ~1e-6 (e.g. 4.05e-6 at x=1.0), worst case observed ~1.2e-5
- * near the extreme low end of the sweep. Callers here always feed x = value + eps
- * (eps in {1e-10f}), so x is never <= 0 in practice; the x<=0 branch below is a
- * defensive fallback only (mirrors fast_sqrt's v<=0 guard).
- */
-static inline float fast_recip(float x) {
-    if (x <= 0.0f) return 0.0f;
-
-    FloatBits fb;
-    fb.f = x;
-    fb.i = 0x7EF477D5 - fb.i;  // Initial reciprocal estimate
-
-    // Newton-Raphson iterations (2 iterations, same as fast_sqrt)
-    float y = fb.f;
-    y = y * (2.0f - x * y);  // Iteration 1
-    y = y * (2.0f - x * y);  // Iteration 2
-
-    return y;
-}
-
-/**
- * Fast a/b using fast_recip(b). Same accuracy characteristics as fast_recip.
- */
-static inline float fast_div(float a, float b) {
-    return a * fast_recip(b);
 }
 
 // ============================================================================
