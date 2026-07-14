@@ -8,6 +8,7 @@ One copy of the shared DSP code for every consumer repo (AEC, NR, Audio_ALG):
 | KISS FFT | `lib/kiss_fft/` | portable reference backend |
 | NE10 | `lib/ne10/` | whole, **unmodified** NE10 DSP module (C + NEON kernels) |
 | fast_math | `include/fast_math.h` | header-only LUT/Taylor approximations |
+| simd_kernels | `include/simd_kernels.h` | header-only **bit-exact** NEON/scalar per-bin kernels (complex magnitude, complex MAC / filter W-updates, EMA, gain apply, min/clip, pairwise sums, fast_sqrt). Every kernel has an always-compiled scalar twin; the AArch64 NEON body replicates the scalar op sequence lane-for-lane (strict FMA discipline, no estimate instructions). `SIMD_KERNELS_FORCE_SCALAR` forces the fallback; consumer TUs must build with `-ffp-contract=off` (see the header's doc comment). `make selftest` runs the bitwise NEON-vs-scalar check |
 | HPF | `include/hpf.h`, `src/hpf.c` | biquad high-pass (f32, DF2-transposed), `hpf_create`/`hpf_get_mem_size`+`hpf_init` API — shared by platform code AND AEC's mic path |
 
 ## Build
