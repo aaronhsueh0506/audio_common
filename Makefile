@@ -201,7 +201,7 @@ endif
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test_pool test_wav test_zero_heap clean
+.PHONY: all lib selftest test_pool test_wav test_zero_heap test_ne10_force_c _ne10_parity_bin clean
 all: lib
 
 lib: $(LIB)
@@ -307,6 +307,50 @@ else
 endif
 	@echo "--- audio_common allocator-hook zero-heap test [$(BACKEND)] ---"
 	@$(BIN_DIR)/test_fft_zero_heap
+
+# test_ne10_force_c (F11): builds test/test_ne10_c_parity.c TWICE -- once
+# against the normal NE10 backend (calls the `_neon`-suffixed kernels) and
+# once with EXTRA_CFLAGS=-DFFT_NE10_FORCE_C (fft_wrapper_ne10.c routes every
+# FFT call through NE10's `_c` scalar kernels instead -- see that file's
+# FFT_NE10_FORCE_C block) -- then diffs the two runs' dumped outputs.
+# NE10-specific (the FFT_NE10_FORCE_C knob only exists in
+# src/fft_wrapper_ne10.c): BACKEND=ne10 is forced in both sub-makes below
+# regardless of how this invocation of `make` itself resolved BACKEND, and
+# nothing here touches a BACKEND=kiss build.
+#
+# Two full sub-`make`s (via $(MAKE) BACKEND=ne10 ...) rebuild the archive
+# for each EXTRA_CFLAGS value rather than trying to build both variants in
+# one invocation: EXTRA_CFLAGS is baked into every .o in $(OBJ_DIR) (see the
+# CFG_SIG build-configuration stamp above), so switching it means a real
+# rebuild either way -- routing that rebuild through the same top-level
+# Makefile logic (instead of duplicating the CFG_SIG dance here) is exactly
+# what makes the flag switch safe: CFG_SIG wipes obj/ne10 between the two
+# configs instead of silently mixing .o's built under different flags.
+#
+# The renamed binaries and dump files all live under bin/ne10/, which the
+# CFG_SIG mechanism never wipes (only obj/$(BACKEND) is wiped on a config
+# change -- see the stamp comment above), so the first (NEON) build's
+# artifacts survive the second (forced-C) sub-make's rebuild.
+test_ne10_force_c:
+	@$(MAKE) BACKEND=ne10 _ne10_parity_bin
+	@cp bin/ne10/test_ne10_c_parity bin/ne10/test_ne10_c_parity_neon
+	@$(MAKE) BACKEND=ne10 EXTRA_CFLAGS=-DFFT_NE10_FORCE_C _ne10_parity_bin
+	@cp bin/ne10/test_ne10_c_parity bin/ne10/test_ne10_c_parity_c
+	@echo "--- audio_common NE10 NEON-vs-C parity [test_ne10_force_c] ---"
+	@bin/ne10/test_ne10_c_parity_neon bin/ne10/test_ne10_c_parity_neon.dump
+	@bin/ne10/test_ne10_c_parity_c    bin/ne10/test_ne10_c_parity_c.dump
+	@$(CC) -O2 -Wall -Wextra -o bin/ne10/ne10_parity_compare test/ne10_parity_compare.c -lm
+	@bin/ne10/ne10_parity_compare bin/ne10/test_ne10_c_parity_neon.dump bin/ne10/test_ne10_c_parity_c.dump
+
+# _ne10_parity_bin: internal plumbing target invoked (via $(MAKE) BACKEND=ne10
+# [EXTRA_CFLAGS=...] _ne10_parity_bin) by test_ne10_force_c above; same shape
+# as test_pool/test_wav/etc. but not meant to be run directly since it always
+# overwrites the SAME $(BIN_DIR)/test_ne10_c_parity path on each of the two
+# sub-make calls (that's why test_ne10_force_c cp's it to a variant-specific
+# name immediately after each sub-make returns).
+_ne10_parity_bin: $(LIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -c -o $(OBJ_DIR)/test_ne10_c_parity.o test/test_ne10_c_parity.c
+	$(LINK) -o $(BIN_DIR)/test_ne10_c_parity $(OBJ_DIR)/test_ne10_c_parity.o $(LIB) $(LDFLAGS)
 
 $(OBJ_DIR) $(BIN_DIR):
 	@mkdir -p $@

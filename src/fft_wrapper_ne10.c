@@ -12,9 +12,79 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stddef.h>   /* offsetof — F11 layout proof below */
 
 #if defined(__ARM_NEON) && defined(__aarch64__)
 #include <arm_neon.h>
+#endif
+
+/* --- F11: compile-time proof that Complex and ne10_fft_cpx_float32_t are
+ * layout-compatible ------------------------------------------------------
+ *
+ * fft_forward/fft_inverse (and the _scratch variants below) cast a
+ * `Complex*` (fft_wrapper.h: struct {float r, i;}) straight to a
+ * `ne10_fft_cpx_float32_t*` (NE10_types.h: struct {ne10_float32_t r, i;},
+ * ne10_float32_t == float) and hand it to the NE10 kernel as its
+ * output/input buffer, with no element-by-element copy. That is only safe
+ * if the two struct types agree on size, alignment, and per-member offset.
+ * These asserts make that a build-time guarantee instead of a comment: if a
+ * future NE10 update (or a change to Complex) ever breaks the match, the
+ * build fails here instead of silently corrupting spectra.
+ *
+ * -std=gnu99 (not c11) is in effect for this TU (see the top-level
+ * Makefile) but both clang and gcc accept `_Static_assert` as a portable
+ * extension in gnu99 mode (verified), so this needs no negative-array-size
+ * fallback.
+ *
+ * Residual strict-aliasing caveat: Complex and ne10_fft_cpx_float32_t are
+ * still DISTINCT struct types, so this is layout compatibility, not type
+ * compatibility -- the C standard does not guarantee that reading through
+ * one struct type after writing through the other is defined behavior
+ * (a "distinct types" strict-aliasing violation) even when the layouts
+ * match byte-for-byte. In practice this is mitigated because: (1) every
+ * live pointer of either type used to reach a given byte range in these
+ * functions comes from a single cast expression evaluated immediately
+ * before the call, never a stored/aliased pointer of one type accessed
+ * again later as the other type in the same scope; and (2) this TU is
+ * compiled at -O2 without LTO, so the compiler cannot presently see far
+ * enough across the NE10 call boundary to apply a type-based-alias
+ * optimization that would reorder around this cast. A future LTO or
+ * whole-program-optimization build of this archive should re-verify this
+ * assumption (e.g. re-run the roundtrip/selftest targets under
+ * -flto) rather than assume it still holds. */
+_Static_assert(sizeof(Complex) == sizeof(ne10_fft_cpx_float32_t),
+               "Complex/ne10_fft_cpx_float32_t size mismatch -- fft_forward/"
+               "fft_inverse cast between them without copying");
+_Static_assert(_Alignof(Complex) == _Alignof(ne10_fft_cpx_float32_t),
+               "Complex/ne10_fft_cpx_float32_t alignment mismatch -- cast "
+               "between them is unsafe");
+_Static_assert(offsetof(Complex, r) == offsetof(ne10_fft_cpx_float32_t, r),
+               "Complex/ne10_fft_cpx_float32_t .r offset mismatch");
+_Static_assert(offsetof(Complex, i) == offsetof(ne10_fft_cpx_float32_t, i),
+               "Complex/ne10_fft_cpx_float32_t .i offset mismatch");
+
+/* --- F11: FFT_NE10_FORCE_C build knob -------------------------------------
+ * SIMD_KERNELS_FORCE_SCALAR (simd_kernels.h) forces the header-only SIMD
+ * kernels to their scalar reference path, but it has no effect on NE10's
+ * FFT: this TU calls the `_neon`-suffixed kernels directly (see the header
+ * comment above), so there was previously no way to get an NE10-backend
+ * build (correct twiddle/config layout, correct archive, etc.) that still
+ * runs the FFT itself through NE10's plain-C scalar kernels for an
+ * apples-to-apples NEON-vs-C comparison. Define -DFFT_NE10_FORCE_C (e.g.
+ * `make BACKEND=ne10 selftest EXTRA_CFLAGS=-DFFT_NE10_FORCE_C`) to route
+ * every call site below through ne10_fft_r2c_1d_float32_c /
+ * ne10_fft_c2r_1d_float32_c instead. Both variants are always compiled into
+ * the archive (NE10_rfft_float32.c, which defines the _c versions, is
+ * already in the NE10 source list -- see the Makefile's NE10_C_SRCS -- and
+ * is NOT gated out when this macro is undefined), so this is a pure
+ * dispatch switch with zero effect on the archive's file list or on the
+ * BACKEND=kiss build (this macro only exists in this NE10-only TU). */
+#if defined(FFT_NE10_FORCE_C)
+#define NE10_R2C_1D_FLOAT32 ne10_fft_r2c_1d_float32_c
+#define NE10_C2R_1D_FLOAT32 ne10_fft_c2r_1d_float32_c
+#else
+#define NE10_R2C_1D_FLOAT32 ne10_fft_r2c_1d_float32_neon
+#define NE10_C2R_1D_FLOAT32 ne10_fft_c2r_1d_float32_neon
 #endif
 
 /* This TU calls the _neon-suffixed NE10 kernels (ne10_fft_r2c_1d_float32_neon /
@@ -173,7 +243,7 @@ void fft_forward(FftHandle* h, const float* real_in, Complex* complex_out) {
     // the output-side staging copy through h->cpx_buf was pure overhead and
     // is elided here (h->cpx_buf is still used as the fft_inverse input
     // staging buffer below).
-    ne10_fft_r2c_1d_float32_neon((ne10_fft_cpx_float32_t*)complex_out, h->real_buf, h->r2c_cfg);
+    NE10_R2C_1D_FLOAT32((ne10_fft_cpx_float32_t*)complex_out, h->real_buf, h->r2c_cfg);
 }
 
 void fft_inverse(FftHandle* h, const Complex* complex_in, float* real_out) {
@@ -188,7 +258,7 @@ void fft_inverse(FftHandle* h, const Complex* complex_in, float* real_out) {
     // through h->real_buf was pure overhead and is elided here (NE10 C2R
     // IFFT auto-scales by 1/N, official doc confirmed; h->real_buf is still
     // used as the fft_forward input staging buffer above).
-    ne10_fft_c2r_1d_float32_neon(real_out, h->cpx_buf, h->r2c_cfg);
+    NE10_C2R_1D_FLOAT32(real_out, h->cpx_buf, h->r2c_cfg);
 }
 
 /* --- scratch variants (caller's input buffer contents left undefined) -----
@@ -216,12 +286,12 @@ void fft_inverse(FftHandle* h, const Complex* complex_in, float* real_out) {
 
 void fft_forward_scratch(FftHandle* h, float* time_in_clobbered, Complex* complex_out) {
     if (!h || !time_in_clobbered || !complex_out) return;
-    ne10_fft_r2c_1d_float32_neon((ne10_fft_cpx_float32_t*)complex_out, time_in_clobbered, h->r2c_cfg);
+    NE10_R2C_1D_FLOAT32((ne10_fft_cpx_float32_t*)complex_out, time_in_clobbered, h->r2c_cfg);
 }
 
 void fft_inverse_scratch(FftHandle* h, Complex* freq_in_clobbered, float* real_out) {
     if (!h || !freq_in_clobbered || !real_out) return;
-    ne10_fft_c2r_1d_float32_neon(real_out, (ne10_fft_cpx_float32_t*)freq_in_clobbered, h->r2c_cfg);
+    NE10_C2R_1D_FLOAT32(real_out, (ne10_fft_cpx_float32_t*)freq_in_clobbered, h->r2c_cfg);
 }
 
 void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
