@@ -80,7 +80,7 @@ VPATH    = src lib/kiss_fft lib/ne10/modules lib/ne10/modules/dsp
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest clean
+.PHONY: all lib selftest test_pool clean
 all: lib
 
 lib: $(LIB)
@@ -114,6 +114,15 @@ selftest: $(LIB) | $(BIN_DIR)
 	$(CC) -o $(BIN_DIR)/simd_selftest $(OBJ_DIR)/simd_selftest.o -lm
 	@echo "--- audio_common SIMD kernel selftest [$(BACKEND)] ---"
 	@$(BIN_DIR)/simd_selftest
+
+# test_pool: pool-contract negative tests (F07 alignment guards, F14 HPF
+# domain validation). Same shape as selftest -- links against the same $(LIB)
+# archive so it exercises whichever backend (kiss/ne10) was built.
+test_pool: $(LIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -c -o $(OBJ_DIR)/test_pool_contract.o test/test_pool_contract.c
+	$(LINK) -o $(BIN_DIR)/test_pool_contract $(OBJ_DIR)/test_pool_contract.o $(LIB) $(LDFLAGS)
+	@echo "--- audio_common pool-contract test [$(BACKEND)] ---"
+	@$(BIN_DIR)/test_pool_contract
 
 $(OBJ_DIR) $(BIN_DIR):
 	@mkdir -p $@

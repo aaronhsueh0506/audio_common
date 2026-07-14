@@ -71,20 +71,27 @@ FftHandle* fft_create(int fft_size) {
 size_t fft_get_mem_size(int fft_size) {
     if (fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return 0;
     size_t lf = 0, li = 0;
+    if (fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return 0;
     kiss_fft_alloc(fft_size, 0, NULL, &lf);   /* query forward cfg size */
     kiss_fft_alloc(fft_size, 1, NULL, &li);   /* query inverse cfg size */
     size_t total = 0;
-    total += ALIGN16(sizeof(FftHandle));
-    total += ALIGN16((size_t)fft_size * sizeof(kiss_fft_cpx));  /* fft_in  */
-    total += ALIGN16((size_t)fft_size * sizeof(kiss_fft_cpx));  /* fft_out */
-    total += ALIGN16(lf);                                       /* fft_cfg  */
-    total += ALIGN16(li);                                       /* ifft_cfg */
-    return total;
+    total = ck_field_size(total, 1, sizeof(FftHandle));
+    total = ck_field_size(total, (size_t)fft_size, sizeof(kiss_fft_cpx));  /* fft_in  */
+    total = ck_field_size(total, (size_t)fft_size, sizeof(kiss_fft_cpx));  /* fft_out */
+    total = ck_field_size(total, 1, lf);                                   /* fft_cfg  */
+    total = ck_field_size(total, 1, li);                                   /* ifft_cfg */
+    return MEM_SIZE_INVALID(total) ? 0 : total;
 }
 
 FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
     if (!mem || fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return NULL;
-    if (mem_size < fft_get_mem_size(fft_size)) return NULL;
+    if (!MEM_IS_ALIGNED16(mem)) return NULL;  /* F07: reject a misaligned base before any write */
+    if (mem_size == 0) return NULL;
+    size_t need = fft_get_mem_size(fft_size);
+    /* need==0 means fft_get_mem_size's own arithmetic overflowed -- no mem_size
+     * can ever satisfy that (mem_size < 0 is never true for a size_t), so it
+     * must be rejected explicitly rather than falling through the compare. */
+    if (need == 0 || mem_size < need) return NULL;
 
     uint8_t* ptr = (uint8_t*)mem;
     FftHandle* h = (FftHandle*)ptr;

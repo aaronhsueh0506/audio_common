@@ -85,16 +85,22 @@ size_t fft_get_mem_size(int fft_size) {
     if (fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return 0;
     int n_freqs = fft_size / 2 + 1;
     size_t total = 0;
-    total += ALIGN16(sizeof(FftHandle));
-    total += ALIGN16((size_t)fft_size * sizeof(ne10_float32_t));        /* real_buf */
-    total += ALIGN16((size_t)n_freqs * sizeof(ne10_fft_cpx_float32_t)); /* cpx_buf  */
+    total = ck_field_size(total, 1, sizeof(FftHandle));
+    total = ck_field_size(total, (size_t)fft_size, sizeof(ne10_float32_t));        /* real_buf */
+    total = ck_field_size(total, (size_t)n_freqs, sizeof(ne10_fft_cpx_float32_t)); /* cpx_buf  */
     /* NE10 twiddle cfg uses NE10-internal malloc — deliberately NOT counted. */
-    return total;
+    return MEM_SIZE_INVALID(total) ? 0 : total;
 }
 
 FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
     if (!mem || fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return NULL;
-    if (mem_size < fft_get_mem_size(fft_size)) return NULL;
+    if (!MEM_IS_ALIGNED16(mem)) return NULL;  /* F07: reject a misaligned base before any write */
+    if (mem_size == 0) return NULL;
+    size_t need = fft_get_mem_size(fft_size);
+    /* need==0 means fft_get_mem_size's own arithmetic overflowed -- no mem_size
+     * can ever satisfy that (mem_size < 0 is never true for a size_t), so it
+     * must be rejected explicitly rather than falling through the compare. */
+    if (need == 0 || mem_size < need) return NULL;
 
     // One-time NE10 initialization
     if (!ne10_initialized) {
@@ -102,7 +108,7 @@ FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
         ne10_initialized = 1;
     }
 
-    memset(mem, 0, fft_get_mem_size(fft_size));  /* calloc-equivalent */
+    memset(mem, 0, need);  /* calloc-equivalent */
     uint8_t* cursor = (uint8_t*)mem;
 
     FftHandle* h = (FftHandle*)cursor;

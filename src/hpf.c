@@ -40,8 +40,20 @@ static void hpf_compute_coeffs(Hpf* h, float cutoff_hz, int sample_rate) {
     h->z2 = 0.0f;
 }
 
+/* F14: shared cutoff/sample_rate domain check for hpf_create and hpf_init.
+ * cutoff_hz must be finite and > 0; sample_rate (already an int -- always
+ * "finite" -- is range-checked instead) must be > 0; and cutoff_hz is kept a
+ * fixed margin below Nyquist (0.45*sample_rate, not 0.5) so wc/2 in
+ * hpf_compute_coeffs stays well clear of tanf's pi/2 singularity. */
+static int hpf_params_valid(float cutoff_hz, int sample_rate) {
+    if (!isfinite(cutoff_hz) || cutoff_hz <= 0.0f) return 0;
+    if (sample_rate <= 0) return 0;
+    if ((double)cutoff_hz >= 0.45 * (double)sample_rate) return 0;
+    return 1;
+}
+
 Hpf* hpf_create(float cutoff_hz, int sample_rate) {
-    if (cutoff_hz <= 0 || sample_rate <= 0) return NULL;
+    if (!hpf_params_valid(cutoff_hz, sample_rate)) return NULL;
 
     Hpf* h = (Hpf*)calloc(1, sizeof(Hpf));
     if (!h) return NULL;
@@ -53,12 +65,20 @@ Hpf* hpf_create(float cutoff_hz, int sample_rate) {
 /* --- Static memory API --- */
 
 size_t hpf_get_mem_size(void) {
-    return ALIGN16(sizeof(Hpf));
+    size_t total = ck_field_size(0, 1, sizeof(Hpf));
+    return MEM_SIZE_INVALID(total) ? 0 : total;
 }
 
 Hpf* hpf_init(void* mem, size_t mem_size, float cutoff_hz, int sample_rate) {
-    if (!mem || cutoff_hz <= 0 || sample_rate <= 0) return NULL;
-    if (mem_size < hpf_get_mem_size()) return NULL;
+    if (!mem) return NULL;
+    if (!MEM_IS_ALIGNED16(mem)) return NULL;  /* F07: reject a misaligned base before any write */
+    if (!hpf_params_valid(cutoff_hz, sample_rate)) return NULL;  /* F14 */
+    if (mem_size == 0) return NULL;
+    size_t need = hpf_get_mem_size();
+    /* need==0 would mean hpf_get_mem_size's arithmetic overflowed -- no
+     * mem_size could ever satisfy that via mem_size < need, so reject it
+     * explicitly (see the identical note in fft_wrapper.c's fft_init). */
+    if (need == 0 || mem_size < need) return NULL;
 
     Hpf* h = (Hpf*)mem;
     memset(h, 0, sizeof(Hpf));

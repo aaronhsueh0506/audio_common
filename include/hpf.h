@@ -16,10 +16,25 @@ extern "C" {
 
 typedef struct Hpf Hpf;
 
-/** Create high-pass filter (malloc version) */
+/**
+ * Accepted parameter domain (both hpf_create and hpf_init):
+ *   - cutoff_hz must be finite and > 0
+ *   - sample_rate must be > 0
+ *   - cutoff_hz must stay below 0.45 * sample_rate (a fixed margin under
+ *     Nyquist, not 0.5) so the bilinear-transform prewarp tan(pi*cutoff/sr)
+ *     stays well-conditioned. Values outside this domain (including NaN/Inf
+ *     cutoff_hz) are rejected -- both functions return NULL rather than
+ *     computing undefined/degenerate coefficients.
+ */
+
+/** Create high-pass filter (malloc version). Returns NULL if the params are
+ * outside the domain above or on allocation failure. */
 Hpf* hpf_create(float cutoff_hz, int sample_rate);
 
-/** Initialize HPF in pre-allocated memory (static version) */
+/** Initialize HPF in pre-allocated memory (static version). `mem` must be
+ * 16-byte aligned and at least hpf_get_mem_size() bytes; returns NULL
+ * (without writing to `mem`) if the base is misaligned, mem_size is too
+ * small, or cutoff_hz/sample_rate are outside the domain above. */
 Hpf* hpf_init(void* mem, size_t mem_size, float cutoff_hz, int sample_rate);
 
 /** Get memory required for hpf_init() */
