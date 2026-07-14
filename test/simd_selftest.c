@@ -146,75 +146,10 @@ static void check_bits_or_die(const char *kernel, int n, int trial,
     }
 }
 
-static void check_scalar_bits_or_die(const char *kernel, int n, int trial,
-                                      float simd_val, float scalar_val) {
-    uint32_t gb, wb;
-    memcpy(&gb, &simd_val, sizeof gb);
-    memcpy(&wb, &scalar_val, sizeof wb);
-    if (gb != wb) {
-        fprintf(stderr,
-            "MISMATCH kernel=%s n=%d trial=%d idx=0 simd=0x%08x (%.9g) scalar=0x%08x (%.9g)\n",
-            kernel, n, trial, (unsigned)gb, (double)simd_val, (unsigned)wb, (double)scalar_val);
-        exit(1);
-    }
-}
-
-/* ═══════════════════════════ correctness: kernel 1 ═══════════════════════ */
-
-static void test_cabs_np(void) {
-    Complex z[SK_TEST_MAX_N];
-    float out_scalar[SK_TEST_MAX_N], out_simd[SK_TEST_MAX_N];
-    int ni, t;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_complex(z, n);
-            sk_cabs_np_f32_scalar(z, out_scalar, n);
-            sk_cabs_np_f32(z, out_simd, n);
-            check_bits_or_die("cabs_np_f32", n, t, out_simd, out_scalar, n);
-        }
-    }
-    printf("PASS cabs_np_f32\n");
-}
-
-/* ═══════════════════════════ correctness: kernel 2 ═══════════════════════ */
-
-static void test_cmag2_np(void) {
-    Complex z[SK_TEST_MAX_N];
-    float out_scalar[SK_TEST_MAX_N], out_simd[SK_TEST_MAX_N];
-    int ni, t;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_complex(z, n);
-            sk_cmag2_np_f32_scalar(z, out_scalar, n);
-            sk_cmag2_np_f32(z, out_simd, n);
-            check_bits_or_die("cmag2_np_f32", n, t, out_simd, out_scalar, n);
-        }
-    }
-    printf("PASS cmag2_np_f32\n");
-}
-
-/* ═══════════════════════════ correctness: kernel 3 ═══════════════════════ */
-
-static void test_cmag2_np_acc(void) {
-    Complex z[SK_TEST_MAX_N];
-    float acc_init[SK_TEST_MAX_N], acc_scalar[SK_TEST_MAX_N], acc_simd[SK_TEST_MAX_N];
-    int ni, t;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_complex(z, n);
-            fill_floats(acc_init, n);
-            memcpy(acc_scalar, acc_init, (size_t)n * sizeof(float));
-            memcpy(acc_simd, acc_init, (size_t)n * sizeof(float));
-            sk_cmag2_np_acc_f32_scalar(z, acc_scalar, n);
-            sk_cmag2_np_acc_f32(z, acc_simd, n);
-            check_bits_or_die("cmag2_np_acc_f32", n, t, acc_simd, acc_scalar, n);
-        }
-    }
-    printf("PASS cmag2_np_acc_f32\n");
-}
+/* NOTE: check_scalar_bits_or_die (the single-float-return sibling of
+ * check_bits_or_die) is not needed here -- it was only ever called by the
+ * pairwise-sum-family kernels' tests, all of which moved to
+ * AEC/c_impl/test/simd_selftest_aec.c along with their kernels. */
 
 /* ═══════════════════════════ correctness: kernel 4 ═══════════════════════ */
 
@@ -238,98 +173,6 @@ static void test_ema(void) {
     printf("PASS ema_f32\n");
 }
 
-/* ═══════════════════════════ correctness: kernel 5 ═══════════════════════ */
-
-static void test_ema_cmag2(void) {
-    Complex z[SK_TEST_MAX_N];
-    float state_init[SK_TEST_MAX_N], state_scalar[SK_TEST_MAX_N], state_simd[SK_TEST_MAX_N];
-    int ni, t;
-    const float alpha = 0.9f, beta = 0.1f;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_complex(z, n);
-            fill_floats(state_init, n);
-            memcpy(state_scalar, state_init, (size_t)n * sizeof(float));
-            memcpy(state_simd, state_init, (size_t)n * sizeof(float));
-            sk_ema_cmag2_f32_scalar(state_scalar, z, alpha, beta, n);
-            sk_ema_cmag2_f32(state_simd, z, alpha, beta, n);
-            check_bits_or_die("ema_cmag2_f32", n, t, state_simd, state_scalar, n);
-        }
-    }
-    printf("PASS ema_cmag2_f32\n");
-}
-
-/* ═══════════════════════════ correctness: kernel 6 ═══════════════════════ */
-
-static void test_cmac_np(void) {
-    Complex w[SK_TEST_MAX_N], x[SK_TEST_MAX_N];
-    Complex acc_init[SK_TEST_MAX_N], acc_scalar[SK_TEST_MAX_N], acc_simd[SK_TEST_MAX_N];
-    int ni, t;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_complex(w, n);
-            fill_complex(x, n);
-            fill_complex(acc_init, n);
-            memcpy(acc_scalar, acc_init, (size_t)n * sizeof(Complex));
-            memcpy(acc_simd, acc_init, (size_t)n * sizeof(Complex));
-            sk_cmac_np_f32_scalar(acc_scalar, w, x, n);
-            sk_cmac_np_f32(acc_simd, w, x, n);
-            check_bits_or_die("cmac_np_f32", n, t, (const float *)acc_simd, (const float *)acc_scalar, 2 * n);
-        }
-    }
-    printf("PASS cmac_np_f32\n");
-}
-
-/* ═══════════════════════════ correctness: kernel 7 ═══════════════════════ */
-
-static void test_wupdate_nlms(void) {
-    Complex X[SK_TEST_MAX_N], err[SK_TEST_MAX_N];
-    Complex W_init[SK_TEST_MAX_N], W_scalar[SK_TEST_MAX_N], W_simd[SK_TEST_MAX_N];
-    float mu_eff[SK_TEST_MAX_N];
-    int ni, t;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_complex(X, n);
-            fill_complex(err, n);
-            fill_complex(W_init, n);
-            fill_floats(mu_eff, n);
-            memcpy(W_scalar, W_init, (size_t)n * sizeof(Complex));
-            memcpy(W_simd, W_init, (size_t)n * sizeof(Complex));
-            sk_wupdate_nlms_f32_scalar(W_scalar, X, err, mu_eff, n);
-            sk_wupdate_nlms_f32(W_simd, X, err, mu_eff, n);
-            check_bits_or_die("wupdate_nlms_f32", n, t, (const float *)W_simd, (const float *)W_scalar, 2 * n);
-        }
-    }
-    printf("PASS wupdate_nlms_f32\n");
-}
-
-/* ═══════════════════════════ correctness: kernel 8 ═══════════════════════ */
-
-static void test_wupdate_kf(void) {
-    Complex X[SK_TEST_MAX_N], err[SK_TEST_MAX_N];
-    Complex W_init[SK_TEST_MAX_N], W_scalar[SK_TEST_MAX_N], W_simd[SK_TEST_MAX_N];
-    float mu[SK_TEST_MAX_N], mu_scale[SK_TEST_MAX_N];
-    int ni, t;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_complex(X, n);
-            fill_complex(err, n);
-            fill_complex(W_init, n);
-            fill_floats(mu, n);
-            fill_floats(mu_scale, n);
-            memcpy(W_scalar, W_init, (size_t)n * sizeof(Complex));
-            memcpy(W_simd, W_init, (size_t)n * sizeof(Complex));
-            sk_wupdate_kf_f32_scalar(W_scalar, X, err, mu, mu_scale, n);
-            sk_wupdate_kf_f32(W_simd, X, err, mu, mu_scale, n);
-            check_bits_or_die("wupdate_kf_f32", n, t, (const float *)W_simd, (const float *)W_scalar, 2 * n);
-        }
-    }
-    printf("PASS wupdate_kf_f32\n");
-}
 
 /* ═══════════════════════════ correctness: kernel 9 ═══════════════════════ */
 
@@ -364,6 +207,7 @@ static void test_capply_gain(void) {
     printf("PASS capply_gain_f32\n");
 }
 
+
 /* ═══════════════════════════ correctness: kernel 10 ══════════════════════ */
 
 static void test_cadd(void) {
@@ -383,6 +227,7 @@ static void test_cadd(void) {
     printf("PASS cadd_f32\n");
 }
 
+
 /* ═══════════════════════════ correctness: kernel 11 ══════════════════════ */
 
 static void test_sq_scale(void) {
@@ -400,6 +245,7 @@ static void test_sq_scale(void) {
     }
     printf("PASS sq_scale_f32\n");
 }
+
 
 /* ═══════════════════════════ correctness: kernel 12 ══════════════════════ */
 
@@ -433,6 +279,7 @@ static void test_min(void) {
     printf("PASS min_f32\n");
 }
 
+
 static void test_clip(void) {
     float x_scalar[SK_TEST_MAX_N], x_simd[SK_TEST_MAX_N], x_init[SK_TEST_MAX_N];
     int ni, t;
@@ -459,126 +306,6 @@ static void test_clip(void) {
     printf("PASS clip_f32\n");
 }
 
-/* ═══════════════════════════ correctness: kernel 13 ══════════════════════ */
-
-static void test_pairwise_sum(void) {
-    float a[SK_TEST_MAX_N];
-    int ni, t;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_floats(a, n);
-            {
-                float rs = sk_pairwise_sum_f32_scalar(a, (size_t)n);
-                float rn = sk_pairwise_sum_f32(a, (size_t)n);
-                check_scalar_bits_or_die("pairwise_sum_f32", n, t, rn, rs);
-            }
-        }
-    }
-    printf("PASS pairwise_sum_f32\n");
-}
-
-/* ═══════════════════════════ correctness: kernel 14 ══════════════════════ */
-
-static void test_sum_sq_pairwise(void) {
-    float a[SK_TEST_MAX_N];
-    int ni, t;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_floats(a, n);
-            {
-                float rs = sk_sum_sq_pairwise_f32_scalar(a, (size_t)n);
-                float rn = sk_sum_sq_pairwise_f32(a, (size_t)n);
-                check_scalar_bits_or_die("sum_sq_pairwise_f32", n, t, rn, rs);
-            }
-        }
-    }
-    printf("PASS sum_sq_pairwise_f32\n");
-}
-
-/* ═══════════════════ correctness: kernels 21/22 (tail-fold pairwise) ══════
- * Dedicated n-list covering the leaf/split boundaries specific to these two
- * kernels' recursion (127/128/129 straddle the n<=128 leaf cutover; 960
- * exercises >=2 levels of the half-rounded-to-a-multiple-of-8 split; 7/8/9
- * straddle the small-n vs. leaf cutover that differs between kernel 21 and
- * kernel 13 -- see kernel 21's header comment). Separate, larger backing
- * buffer (960) since this exceeds SK_TEST_MAX_N (512), used only here. */
-
-#define PW_TAILFOLD_MAX_N 960
-static const int PW_TAILFOLD_N_LIST[] = {1, 7, 8, 9, 127, 128, 129, 160, 255, 256, 257, 512, 960};
-#define PW_TAILFOLD_N_LIST_COUNT ((int)(sizeof(PW_TAILFOLD_N_LIST) / sizeof(PW_TAILFOLD_N_LIST[0])))
-
-static void test_pairwise_sum_tailfold(void) {
-    static float a[PW_TAILFOLD_MAX_N];
-    int ni, t;
-    for (ni = 0; ni < PW_TAILFOLD_N_LIST_COUNT; ++ni) {
-        int n = PW_TAILFOLD_N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_floats(a, n);
-            {
-                float rs = sk_pairwise_sum_tailfold_f32_scalar(a, (size_t)n);
-                float rn = sk_pairwise_sum_tailfold_f32(a, (size_t)n);
-                check_scalar_bits_or_die("pairwise_sum_tailfold_f32", n, t, rn, rs);
-            }
-        }
-    }
-    /* dedicated signed-zero small-n checks (see header comment: this
-     * kernel's 0.0f-seeded small-n accumulator normalizes -0.0f to +0.0f,
-     * a bit pattern that must still round-trip scalar==NEON identically). */
-    {
-        float az1[1] = { -0.0f };
-        float rs = sk_pairwise_sum_tailfold_f32_scalar(az1, 1);
-        float rn = sk_pairwise_sum_tailfold_f32(az1, 1);
-        check_scalar_bits_or_die("pairwise_sum_tailfold_f32_negzero_n1", 1, 0, rn, rs);
-    }
-    {
-        float az5[5] = { -0.0f, -0.0f, -0.0f, -0.0f, -0.0f };
-        float rs = sk_pairwise_sum_tailfold_f32_scalar(az5, 5);
-        float rn = sk_pairwise_sum_tailfold_f32(az5, 5);
-        check_scalar_bits_or_die("pairwise_sum_tailfold_f32_negzero_n5", 5, 0, rn, rs);
-    }
-    printf("PASS pairwise_sum_tailfold_f32\n");
-}
-
-static void test_pairwise_sum_tailfold_b(void) {
-    static float a[PW_TAILFOLD_MAX_N];
-    int ni, t;
-    for (ni = 0; ni < PW_TAILFOLD_N_LIST_COUNT; ++ni) {
-        int n = PW_TAILFOLD_N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_floats(a, n);
-            {
-                float rs = sk_pairwise_sum_tailfold_b_f32_scalar(a, (size_t)n);
-                float rn = sk_pairwise_sum_tailfold_b_f32(a, (size_t)n);
-                check_scalar_bits_or_die("pairwise_sum_tailfold_b_f32", n, t, rn, rs);
-            }
-        }
-    }
-    /* n==0 explicit-return path. */
-    {
-        float dummy[1] = { 1.0f };
-        float rs = sk_pairwise_sum_tailfold_b_f32_scalar(dummy, 0);
-        float rn = sk_pairwise_sum_tailfold_b_f32(dummy, 0);
-        check_scalar_bits_or_die("pairwise_sum_tailfold_b_f32_n0", 0, 0, rn, rs);
-    }
-    /* dedicated signed-zero small-n checks (see header comment: this
-     * kernel's a[0]-seeded small-n accumulator preserves -0.0f as-is,
-     * unlike kernel 21 -- both must still be scalar==NEON internally). */
-    {
-        float az1[1] = { -0.0f };
-        float rs = sk_pairwise_sum_tailfold_b_f32_scalar(az1, 1);
-        float rn = sk_pairwise_sum_tailfold_b_f32(az1, 1);
-        check_scalar_bits_or_die("pairwise_sum_tailfold_b_f32_negzero_n1", 1, 0, rn, rs);
-    }
-    {
-        float az5[5] = { -0.0f, -0.0f, -0.0f, -0.0f, -0.0f };
-        float rs = sk_pairwise_sum_tailfold_b_f32_scalar(az5, 5);
-        float rn = sk_pairwise_sum_tailfold_b_f32(az5, 5);
-        check_scalar_bits_or_die("pairwise_sum_tailfold_b_f32_negzero_n5", 5, 0, rn, rs);
-    }
-    printf("PASS pairwise_sum_tailfold_b_f32\n");
-}
 
 /* ═══════════════════════════ correctness: kernel 15 ══════════════════════ */
 
@@ -616,67 +343,6 @@ static void report_bench(const char *name, double ns_scalar, double ns_simd) {
            ns_simd > 0.0 ? ns_scalar / ns_simd : 0.0);
 }
 
-static void bench_cabs_np(void) {
-    Complex z[BENCH_N]; float out[BENCH_N];
-    fill_bench_complex(z, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) { sk_cabs_np_f32_scalar(z, out, BENCH_N); g_bench_sink += out[0]; }
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) { sk_cabs_np_f32(z, out, BENCH_N); g_bench_sink += out[0]; }
-            {
-                double t3 = now_ns();
-                report_bench("cabs_np_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
-static void bench_cmag2_np(void) {
-    Complex z[BENCH_N]; float out[BENCH_N];
-    fill_bench_complex(z, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) { sk_cmag2_np_f32_scalar(z, out, BENCH_N); g_bench_sink += out[0]; }
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) { sk_cmag2_np_f32(z, out, BENCH_N); g_bench_sink += out[0]; }
-            {
-                double t3 = now_ns();
-                report_bench("cmag2_np_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
-static void bench_cmag2_np_acc(void) {
-    Complex z[BENCH_N]; float acc[BENCH_N];
-    fill_bench_complex(z, BENCH_N);
-    fill_bench_floats(acc, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) { sk_cmag2_np_acc_f32_scalar(z, acc, BENCH_N); g_bench_sink += acc[0]; }
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) { sk_cmag2_np_acc_f32(z, acc, BENCH_N); g_bench_sink += acc[0]; }
-            {
-                double t3 = now_ns();
-                report_bench("cmag2_np_acc_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
 static void bench_ema(void) {
     float state[BENCH_N], x[BENCH_N];
     fill_bench_floats(state, BENCH_N);
@@ -698,97 +364,6 @@ static void bench_ema(void) {
     }
 }
 
-static void bench_ema_cmag2(void) {
-    Complex z[BENCH_N]; float state[BENCH_N];
-    fill_bench_complex(z, BENCH_N);
-    fill_bench_floats(state, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) { sk_ema_cmag2_f32_scalar(state, z, 0.9f, 0.1f, BENCH_N); g_bench_sink += state[0]; }
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) { sk_ema_cmag2_f32(state, z, 0.9f, 0.1f, BENCH_N); g_bench_sink += state[0]; }
-            {
-                double t3 = now_ns();
-                report_bench("ema_cmag2_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
-static void bench_cmac_np(void) {
-    Complex w[BENCH_N], x[BENCH_N], acc[BENCH_N];
-    fill_bench_complex(w, BENCH_N);
-    fill_bench_complex(x, BENCH_N);
-    fill_bench_complex(acc, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) { sk_cmac_np_f32_scalar(acc, w, x, BENCH_N); g_bench_sink += acc[0].r; }
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) { sk_cmac_np_f32(acc, w, x, BENCH_N); g_bench_sink += acc[0].r; }
-            {
-                double t3 = now_ns();
-                report_bench("cmac_np_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
-static void bench_wupdate_nlms(void) {
-    Complex X[BENCH_N], err[BENCH_N], W[BENCH_N];
-    float mu_eff[BENCH_N];
-    fill_bench_complex(X, BENCH_N);
-    fill_bench_complex(err, BENCH_N);
-    fill_bench_complex(W, BENCH_N);
-    fill_bench_floats(mu_eff, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) { sk_wupdate_nlms_f32_scalar(W, X, err, mu_eff, BENCH_N); g_bench_sink += W[0].r; }
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) { sk_wupdate_nlms_f32(W, X, err, mu_eff, BENCH_N); g_bench_sink += W[0].r; }
-            {
-                double t3 = now_ns();
-                report_bench("wupdate_nlms_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
-static void bench_wupdate_kf(void) {
-    Complex X[BENCH_N], err[BENCH_N], W[BENCH_N];
-    float mu[BENCH_N], mu_scale[BENCH_N];
-    fill_bench_complex(X, BENCH_N);
-    fill_bench_complex(err, BENCH_N);
-    fill_bench_complex(W, BENCH_N);
-    fill_bench_floats(mu, BENCH_N);
-    fill_bench_floats(mu_scale, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) { sk_wupdate_kf_f32_scalar(W, X, err, mu, mu_scale, BENCH_N); g_bench_sink += W[0].r; }
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) { sk_wupdate_kf_f32(W, X, err, mu, mu_scale, BENCH_N); g_bench_sink += W[0].r; }
-            {
-                double t3 = now_ns();
-                report_bench("wupdate_kf_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
 
 static void bench_capply_gain(void) {
     Complex z[BENCH_N], out[BENCH_N];
@@ -812,6 +387,7 @@ static void bench_capply_gain(void) {
     }
 }
 
+
 static void bench_cadd(void) {
     Complex a[BENCH_N], b[BENCH_N], out[BENCH_N];
     fill_bench_complex(a, BENCH_N);
@@ -833,6 +409,7 @@ static void bench_cadd(void) {
     }
 }
 
+
 static void bench_sq_scale(void) {
     float x[BENCH_N], out[BENCH_N];
     fill_bench_floats(x, BENCH_N);
@@ -852,6 +429,7 @@ static void bench_sq_scale(void) {
         }
     }
 }
+
 
 static void bench_min(void) {
     float a[BENCH_N], b[BENCH_N], out[BENCH_N];
@@ -874,6 +452,7 @@ static void bench_min(void) {
     }
 }
 
+
 static void bench_clip(void) {
     float x[BENCH_N];
     fill_bench_floats(x, BENCH_N);
@@ -894,85 +473,6 @@ static void bench_clip(void) {
     }
 }
 
-static void bench_pairwise_sum(void) {
-    float a[BENCH_N];
-    fill_bench_floats(a, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) g_bench_sink += sk_pairwise_sum_f32_scalar(a, (size_t)BENCH_N);
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) g_bench_sink += sk_pairwise_sum_f32(a, (size_t)BENCH_N);
-            {
-                double t3 = now_ns();
-                report_bench("pairwise_sum_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
-static void bench_sum_sq_pairwise(void) {
-    float a[BENCH_N];
-    fill_bench_floats(a, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) g_bench_sink += sk_sum_sq_pairwise_f32_scalar(a, (size_t)BENCH_N);
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) g_bench_sink += sk_sum_sq_pairwise_f32(a, (size_t)BENCH_N);
-            {
-                double t3 = now_ns();
-                report_bench("sum_sq_pairwise_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
-static void bench_pairwise_sum_tailfold(void) {
-    float a[BENCH_N];
-    fill_bench_floats(a, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) g_bench_sink += sk_pairwise_sum_tailfold_f32_scalar(a, (size_t)BENCH_N);
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) g_bench_sink += sk_pairwise_sum_tailfold_f32(a, (size_t)BENCH_N);
-            {
-                double t3 = now_ns();
-                report_bench("pairwise_sum_tailfold_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
-static void bench_pairwise_sum_tailfold_b(void) {
-    float a[BENCH_N];
-    fill_bench_floats(a, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) g_bench_sink += sk_pairwise_sum_tailfold_b_f32_scalar(a, (size_t)BENCH_N);
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) g_bench_sink += sk_pairwise_sum_tailfold_b_f32(a, (size_t)BENCH_N);
-            {
-                double t3 = now_ns();
-                report_bench("pairwise_sum_tailfold_b_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
 
 static void bench_fast_sqrt(void) {
     float x[BENCH_N], out[BENCH_N];
@@ -996,350 +496,28 @@ static void bench_fast_sqrt(void) {
     }
 }
 
-/* ═══════════════════════════ correctness: kernel 16 ══════════════════════ */
-
-static void test_coherence_ema_gate(void) {
-    Complex echo[SK_TEST_MAX_N], near_spec[SK_TEST_MAX_N];
-    float abs_echo[SK_TEST_MAX_N], abs_near[SK_TEST_MAX_N];
-    float sye_re_init[SK_TEST_MAX_N], sye_im_init[SK_TEST_MAX_N];
-    float syy_init[SK_TEST_MAX_N], see_init[SK_TEST_MAX_N];
-    float sye_re_s[SK_TEST_MAX_N], sye_im_s[SK_TEST_MAX_N];
-    float syy_s[SK_TEST_MAX_N], see_s[SK_TEST_MAX_N];
-    float sye_re_n[SK_TEST_MAX_N], sye_im_n[SK_TEST_MAX_N];
-    float syy_n[SK_TEST_MAX_N], see_n[SK_TEST_MAX_N];
-    unsigned char mask_s[SK_TEST_MAX_N], mask_n[SK_TEST_MAX_N];
-    int ni, t;
-    const float alpha = 0.05f, threshold = 0.5f;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_complex(echo, n);
-            fill_complex(near_spec, n);
-            fill_floats(abs_echo, n);
-            fill_floats(abs_near, n);
-            fill_floats(sye_re_init, n);
-            fill_floats(sye_im_init, n);
-            fill_floats(syy_init, n);
-            fill_floats(see_init, n);
-            memcpy(sye_re_s, sye_re_init, (size_t)n * sizeof(float));
-            memcpy(sye_im_s, sye_im_init, (size_t)n * sizeof(float));
-            memcpy(syy_s, syy_init, (size_t)n * sizeof(float));
-            memcpy(see_s, see_init, (size_t)n * sizeof(float));
-            memcpy(sye_re_n, sye_re_init, (size_t)n * sizeof(float));
-            memcpy(sye_im_n, sye_im_init, (size_t)n * sizeof(float));
-            memcpy(syy_n, syy_init, (size_t)n * sizeof(float));
-            memcpy(see_n, see_init, (size_t)n * sizeof(float));
-            sk_coherence_ema_gate_f32_scalar(sye_re_s, sye_im_s, syy_s, see_s,
-                                              echo, near_spec, abs_echo, abs_near,
-                                              alpha, threshold, mask_s, n);
-            sk_coherence_ema_gate_f32(sye_re_n, sye_im_n, syy_n, see_n,
-                                       echo, near_spec, abs_echo, abs_near,
-                                       alpha, threshold, mask_n, n);
-            check_bits_or_die("coherence_ema_gate_f32:sye_re", n, t, sye_re_n, sye_re_s, n);
-            check_bits_or_die("coherence_ema_gate_f32:sye_im", n, t, sye_im_n, sye_im_s, n);
-            check_bits_or_die("coherence_ema_gate_f32:syy", n, t, syy_n, syy_s, n);
-            check_bits_or_die("coherence_ema_gate_f32:see", n, t, see_n, see_s, n);
-            {
-                int idx;
-                for (idx = 0; idx < n; ++idx) {
-                    if (mask_s[idx] != mask_n[idx]) {
-                        fprintf(stderr,
-                            "MISMATCH kernel=coherence_ema_gate_f32:mask n=%d trial=%d idx=%d simd=%u scalar=%u\n",
-                            n, t, idx, (unsigned)mask_n[idx], (unsigned)mask_s[idx]);
-                        exit(1);
-                    }
-                }
-            }
-        }
-    }
-    printf("PASS coherence_ema_gate_f32\n");
-}
-
-/* ═══════════════════════════ correctness: kernel 17 ══════════════════════ */
-
-static void test_ema_delta(void) {
-    float state_init[SK_TEST_MAX_N], state_scalar[SK_TEST_MAX_N], state_simd[SK_TEST_MAX_N];
-    float x[SK_TEST_MAX_N];
-    int ni, t;
-    const float alpha = 0.23156652857908377f; /* cng_y2_alpha */
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_floats(state_init, n);
-            fill_floats(x, n);
-            memcpy(state_scalar, state_init, (size_t)n * sizeof(float));
-            memcpy(state_simd, state_init, (size_t)n * sizeof(float));
-            sk_ema_delta_f32_scalar(state_scalar, x, alpha, n);
-            sk_ema_delta_f32(state_simd, x, alpha, n);
-            check_bits_or_die("ema_delta_f32", n, t, state_simd, state_scalar, n);
-        }
-    }
-    printf("PASS ema_delta_f32\n");
-}
-
-/* ═══════════════════════════ correctness: kernel 18 ══════════════════════ */
-
-static void test_n2_track(void) {
-    float n2_init[SK_TEST_MAX_N], n2_scalar[SK_TEST_MAX_N], n2_simd[SK_TEST_MAX_N];
-    float y2s[SK_TEST_MAX_N];
-    int ni, t;
-    const float fresh = 0.9968377223398316f;
-    const float retain = 0.003162277660168411f;
-    const float g_up = 1.0005000750025f;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_floats(n2_init, n);
-            fill_floats(y2s, n);
-            memcpy(n2_scalar, n2_init, (size_t)n * sizeof(float));
-            memcpy(n2_simd, n2_init, (size_t)n * sizeof(float));
-            sk_n2_track_f32_scalar(n2_scalar, y2s, fresh, retain, g_up, n);
-            sk_n2_track_f32(n2_simd, y2s, fresh, retain, g_up, n);
-            check_bits_or_die("n2_track_f32", n, t, n2_simd, n2_scalar, n);
-        }
-    }
-    printf("PASS n2_track_f32\n");
-}
-
-/* ═══════════════════════════ correctness: kernel 19 ══════════════════════ */
-
-static void test_n2_initial_track(void) {
-    float n2i_init[SK_TEST_MAX_N], n2i_scalar[SK_TEST_MAX_N], n2i_simd[SK_TEST_MAX_N];
-    float n2[SK_TEST_MAX_N];
-    int ni, t;
-    const float alpha = 0.0024981253125391234f;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            fill_floats(n2i_init, n);
-            fill_floats(n2, n);
-            memcpy(n2i_scalar, n2i_init, (size_t)n * sizeof(float));
-            memcpy(n2i_simd, n2i_init, (size_t)n * sizeof(float));
-            sk_n2_initial_track_f32_scalar(n2i_scalar, n2, alpha, n);
-            sk_n2_initial_track_f32(n2i_simd, n2, alpha, n);
-            check_bits_or_die("n2_initial_track_f32", n, t, n2i_simd, n2i_scalar, n);
-        }
-    }
-    printf("PASS n2_initial_track_f32\n");
-}
-
-/* ═══════════════════════════ correctness: kernel 20 ══════════════════════ */
-
-static void test_mask_zero(void) {
-    float x_init[SK_TEST_MAX_N], x_scalar[SK_TEST_MAX_N], x_simd[SK_TEST_MAX_N];
-    unsigned char mask[SK_TEST_MAX_N];
-    int ni, t;
-    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
-        int n = N_LIST[ni];
-        for (t = 0; t < TRIALS; ++t) {
-            int i;
-            fill_floats(x_init, n);
-            for (i = 0; i < n; ++i) mask[i] = (unsigned char)(lcg_next() & 1u);
-            memcpy(x_scalar, x_init, (size_t)n * sizeof(float));
-            memcpy(x_simd, x_init, (size_t)n * sizeof(float));
-            sk_mask_zero_f32_scalar(x_scalar, mask, n);
-            sk_mask_zero_f32(x_simd, mask, n);
-            check_bits_or_die("mask_zero_f32", n, t, x_simd, x_scalar, n);
-        }
-    }
-    /* dedicated all-ones / all-zeros boundary check. */
-    {
-        float xa_init[8], xa_scalar[8], xa_simd[8];
-        unsigned char mall1[8], mall0[8];
-        int i;
-        fill_floats(xa_init, 8);
-        for (i = 0; i < 8; ++i) { mall1[i] = 1; mall0[i] = 0; }
-        memcpy(xa_scalar, xa_init, sizeof(xa_init));
-        memcpy(xa_simd, xa_init, sizeof(xa_init));
-        sk_mask_zero_f32_scalar(xa_scalar, mall1, 8);
-        sk_mask_zero_f32(xa_simd, mall1, 8);
-        check_bits_or_die("mask_zero_f32_all1", 8, 0, xa_simd, xa_scalar, 8);
-        memcpy(xa_scalar, xa_init, sizeof(xa_init));
-        memcpy(xa_simd, xa_init, sizeof(xa_init));
-        sk_mask_zero_f32_scalar(xa_scalar, mall0, 8);
-        sk_mask_zero_f32(xa_simd, mall0, 8);
-        check_bits_or_die("mask_zero_f32_all0", 8, 0, xa_simd, xa_scalar, 8);
-    }
-    printf("PASS mask_zero_f32\n");
-}
-
-static void bench_coherence_ema_gate(void) {
-    Complex echo[BENCH_N], near_spec[BENCH_N];
-    float abs_echo[BENCH_N], abs_near[BENCH_N];
-    float sye_re[BENCH_N], sye_im[BENCH_N], syy[BENCH_N], see[BENCH_N];
-    unsigned char mask[BENCH_N];
-    fill_bench_complex(echo, BENCH_N);
-    fill_bench_complex(near_spec, BENCH_N);
-    fill_bench_floats(abs_echo, BENCH_N);
-    fill_bench_floats(abs_near, BENCH_N);
-    fill_bench_floats(sye_re, BENCH_N);
-    fill_bench_floats(sye_im, BENCH_N);
-    fill_bench_floats(syy, BENCH_N);
-    fill_bench_floats(see, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) {
-            sk_coherence_ema_gate_f32_scalar(sye_re, sye_im, syy, see, echo, near_spec,
-                                              abs_echo, abs_near, 0.05f, 0.5f, mask, BENCH_N);
-            g_bench_sink += sye_re[0];
-        }
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) {
-                sk_coherence_ema_gate_f32(sye_re, sye_im, syy, see, echo, near_spec,
-                                           abs_echo, abs_near, 0.05f, 0.5f, mask, BENCH_N);
-                g_bench_sink += sye_re[0];
-            }
-            {
-                double t3 = now_ns();
-                report_bench("coherence_ema_gate_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
-static void bench_ema_delta(void) {
-    float state[BENCH_N], x[BENCH_N];
-    fill_bench_floats(state, BENCH_N);
-    fill_bench_floats(x, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) { sk_ema_delta_f32_scalar(state, x, 0.23f, BENCH_N); g_bench_sink += state[0]; }
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) { sk_ema_delta_f32(state, x, 0.23f, BENCH_N); g_bench_sink += state[0]; }
-            {
-                double t3 = now_ns();
-                report_bench("ema_delta_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
-static void bench_n2_track(void) {
-    float n2[BENCH_N], y2s[BENCH_N];
-    fill_bench_floats(n2, BENCH_N);
-    fill_bench_floats(y2s, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) { sk_n2_track_f32_scalar(n2, y2s, 0.99f, 0.003f, 1.0005f, BENCH_N); g_bench_sink += n2[0]; }
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) { sk_n2_track_f32(n2, y2s, 0.99f, 0.003f, 1.0005f, BENCH_N); g_bench_sink += n2[0]; }
-            {
-                double t3 = now_ns();
-                report_bench("n2_track_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
-static void bench_n2_initial_track(void) {
-    float n2i[BENCH_N], n2[BENCH_N];
-    fill_bench_floats(n2i, BENCH_N);
-    fill_bench_floats(n2, BENCH_N);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) { sk_n2_initial_track_f32_scalar(n2i, n2, 0.0025f, BENCH_N); g_bench_sink += n2i[0]; }
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) { sk_n2_initial_track_f32(n2i, n2, 0.0025f, BENCH_N); g_bench_sink += n2i[0]; }
-            {
-                double t3 = now_ns();
-                report_bench("n2_initial_track_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
-
-static void bench_mask_zero(void) {
-    float x[BENCH_N];
-    unsigned char mask[BENCH_N];
-    int i;
-    fill_bench_floats(x, BENCH_N);
-    for (i = 0; i < BENCH_N; ++i) mask[i] = (unsigned char)(i & 1);
-    {
-        double t0, t1; int r;
-        t0 = now_ns();
-        for (r = 0; r < BENCH_REPS; ++r) { sk_mask_zero_f32_scalar(x, mask, BENCH_N); g_bench_sink += x[0]; }
-        t1 = now_ns();
-        {
-            double ns_scalar = (t1 - t0) / BENCH_REPS;
-            double t2 = now_ns();
-            for (r = 0; r < BENCH_REPS; ++r) { sk_mask_zero_f32(x, mask, BENCH_N); g_bench_sink += x[0]; }
-            {
-                double t3 = now_ns();
-                report_bench("mask_zero_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
-            }
-        }
-    }
-}
 
 /* ═══════════════════════════════════ main ══════════════════════════════════ */
 
 int main(void) {
     init_special_pool();
 
-    test_cabs_np();
-    test_cmag2_np();
-    test_cmag2_np_acc();
     test_ema();
-    test_ema_cmag2();
-    test_cmac_np();
-    test_wupdate_nlms();
-    test_wupdate_kf();
     test_capply_gain();
     test_cadd();
     test_sq_scale();
     test_min();
     test_clip();
-    test_pairwise_sum();
-    test_sum_sq_pairwise();
-    test_pairwise_sum_tailfold();
-    test_pairwise_sum_tailfold_b();
     test_fast_sqrt();
-    test_coherence_ema_gate();
-    test_ema_delta();
-    test_n2_track();
-    test_n2_initial_track();
-    test_mask_zero();
 
     printf("\n--- microbenchmarks (n=%d, %d reps) ---\n", BENCH_N, BENCH_REPS);
-    bench_cabs_np();
-    bench_cmag2_np();
-    bench_cmag2_np_acc();
     bench_ema();
-    bench_ema_cmag2();
-    bench_cmac_np();
-    bench_wupdate_nlms();
-    bench_wupdate_kf();
     bench_capply_gain();
     bench_cadd();
     bench_sq_scale();
     bench_min();
     bench_clip();
-    bench_pairwise_sum();
-    bench_sum_sq_pairwise();
-    bench_pairwise_sum_tailfold();
-    bench_pairwise_sum_tailfold_b();
     bench_fast_sqrt();
-    bench_coherence_ema_gate();
-    bench_ema_delta();
-    bench_n2_track();
-    bench_n2_initial_track();
-    bench_mask_zero();
 
     printf("\nALL PASS (SK_HAVE_NEON=%d)\n", SK_HAVE_NEON);
     (void)g_bench_sink;
