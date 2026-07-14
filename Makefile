@@ -80,7 +80,7 @@ VPATH    = src lib/kiss_fft lib/ne10/modules lib/ne10/modules/dsp
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test_pool clean
+.PHONY: all lib selftest test_pool test_wav clean
 all: lib
 
 lib: $(LIB)
@@ -123,6 +123,16 @@ test_pool: $(LIB) | $(BIN_DIR)
 	$(LINK) -o $(BIN_DIR)/test_pool_contract $(OBJ_DIR)/test_pool_contract.o $(LIB) $(LDFLAGS)
 	@echo "--- audio_common pool-contract test [$(BACKEND)] ---"
 	@$(BIN_DIR)/test_pool_contract
+
+# test_wav: negative-corpus tests for the shared, hardened WAV parser (F06
+# remediation). Header-only like the simd_kernels.h half of `selftest` --
+# wav_io.h needs no FFT/archive objects, so this doesn't depend on $(LIB)
+# and links with a plain $(CC) (no NE10 C++ TU involved either way).
+test_wav: | $(OBJ_DIR) $(BIN_DIR)
+	$(CC) $(CFLAGS) -c -o $(OBJ_DIR)/test_wav_io.o test/test_wav_io.c
+	$(CC) -o $(BIN_DIR)/test_wav_io $(OBJ_DIR)/test_wav_io.o -lm
+	@echo "--- audio_common WAV I/O negative-corpus test [$(BACKEND)] ---"
+	@$(BIN_DIR)/test_wav_io
 
 $(OBJ_DIR) $(BIN_DIR):
 	@mkdir -p $@
