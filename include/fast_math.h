@@ -97,13 +97,51 @@ static inline float exp1_approx(float v) {
 
 #else  // Fast math implementations
 
+/* ────────────────────────── NaN / non-finite contract ─────────────────────
+ * fast_exp/fast_log/fast_sqrt below are finite-domain approximations: their
+ * Taylor/Newton-Raphson machinery is only ever validated against finite
+ * inputs in-range. Each function's leading domain guard is written as
+ * `if (!(x REL bound)) return EDGE;` rather than `if (x INVERSE_REL bound)
+ * return EDGE;` specifically so a NaN input -- which makes EVERY IEEE
+ * ordered comparison (<, <=, >, >=) false -- still takes the early-out: the
+ * negated form catches "not(finite AND in-range)" instead of only "finite
+ * AND out-of-range", so NaN maps to the same deterministic domain-edge
+ * constant a finite out-of-range input would get, rather than falling
+ * through into the fast-path bit tricks (fast_exp's `(int)floorf(x)` cast on
+ * NaN is undefined behaviour in C; fast_log/fast_sqrt's IEEE-754
+ * bit-reinterpret tricks are not UB on NaN but produce non-deterministic
+ * finite garbage or a propagated NaN instead of the documented edge value).
+ * For every FINITE input the two guard forms are logically identical
+ * (De Morgan's law over an already-ordered comparison), so this change is a
+ * pure NaN-safety fix with zero effect on finite (or already-handled
+ * +-Inf) behaviour -- see the per-function comments and the task's
+ * before/after truth tables for the exhaustive case analysis.
+ *
+ * USE_STANDARD_MATH (the `#ifdef` branch above) calls straight into libm
+ * (expf/logf/sqrtf), which instead propagates IEEE NaN/Inf per the C
+ * standard (e.g. sqrtf(NaN) == NaN, not 0.0f). That divergence between the
+ * two build modes on non-finite input is intentional and out-of-contract --
+ * USE_STANDARD_MATH exists for debugging/verification against a reference
+ * implementation, not for bit-identical behaviour with the fast path on
+ * every possible float bit pattern; only the finite-domain results need to
+ * match (and are what the parity/regression gates actually check).
+ */
+
 /**
  * Fast exp(x) using LUT + Taylor expansion
- * Range: [-16, 16], outside this range returns 0 or saturates
+ * Range: [-16, 16], outside this range returns 0 or saturates.
+ * NaN: fails `x >= -16.0f` (every IEEE comparison with NaN is false), so the
+ * negated guard below returns 0.0f for NaN as well as for finite x < -16 --
+ * this also closes a real out-of-bounds bug: without it, NaN falls through
+ * to `(int)floorf(x)`, and converting a NaN float to int is undefined
+ * behaviour in C (and could index exp_int_table out of bounds).
  */
 static inline float fast_exp(float x) {
-    // Handle boundaries
-    if (x < -16.0f) return 0.0f;
+    // Handle boundaries. Written as `!(x >= -16.0f)` (not `x < -16.0f`) so
+    // NaN -- for which every ordered comparison is false -- also takes this
+    // early-out instead of falling through to the (int) cast below (UB on
+    // NaN). Identical to `x < -16.0f` for all finite x.
+    if (!(x >= -16.0f)) return 0.0f;
     if (x > 16.0f) return 8.8861105e+06f;
 
     // Split into integer and fractional parts
@@ -153,9 +191,23 @@ typedef union {
 /**
  * Fast natural log using IEEE 754 float structure
  * log(x) = (E-127) * ln(2) + ln(1+m)
+ *
+ * NaN: fails `x > 0.0f`, so the negated guard below returns -1e10f
+ * (approximate -infinity) for NaN too, instead of falling through to the
+ * exponent/mantissa bit-extraction, which for a NaN input (biased exponent
+ * 255, same as +-Inf) is not UB but silently produces a large, non-obvious
+ * *finite* garbage value masquerading as a real log() result. +Inf is
+ * deliberately NOT special-cased here: it still falls through and gets the
+ * same finite garbage-but-plausible-looking value it always has (Inf > 0.0f
+ * is true, an ordered comparison) -- only NaN's behaviour changes. Ingress
+ * sanitization upstream is relied on to keep +Inf from reaching this
+ * function in practice; only the NaN early-out is this fix's contract.
  */
 static inline float fast_log(float x) {
-    if (x <= 0.0f) return -1e10f;  // Approximate -infinity
+    // Written as `!(x > 0.0f)` (not `x <= 0.0f`) so NaN -- for which every
+    // ordered comparison is false -- also takes this early-out. Identical to
+    // `x <= 0.0f` for all finite x.
+    if (!(x > 0.0f)) return -1e10f;  // Approximate -infinity
 
     FloatBits fb;
     fb.f = x;
@@ -190,9 +242,18 @@ static inline float fast_log10(float x) {
 /**
  * Fast sqrt using Newton-Raphson with IEEE 754 initial estimate
  * x(n+1) = 0.5 * (x(n) + v/x(n))
+ *
+ * NaN: fails `v > 0.0f`, so the negated guard below returns 0.0f for NaN
+ * too, instead of falling through to the bit-trick seed + Newton-Raphson
+ * iterations (not UB on NaN -- the seed is plain integer arithmetic on the
+ * bit pattern -- but `v/x` propagates the NaN through both iterations, so
+ * the old behaviour was "return NaN", not the documented domain-edge 0.0f).
  */
 static inline float fast_sqrt(float v) {
-    if (v <= 0.0f) return 0.0f;
+    // Written as `!(v > 0.0f)` (not `v <= 0.0f`) so NaN -- for which every
+    // ordered comparison is false -- also takes this early-out. Identical to
+    // `v <= 0.0f` for all finite v.
+    if (!(v > 0.0f)) return 0.0f;
 
     // Use IEEE 754 structure for initial estimate
     FloatBits fb;

@@ -276,6 +276,24 @@ static void test_min(void) {
         sk_min_f32(out_n, az, bz, 8);
         check_bits_or_die("min_f32_signed_zero", 8, 0, out_n, out_s, 8);
     }
+    /* dedicated NaN check (F10): sk_min_f32's scalar ternary `(a<b)?a:b` and
+     * the NEON `vcltq_f32(a,b)`-then-select both use an ORDERED '<' compare,
+     * which is false whenever either operand is NaN -- so both paths fall
+     * through to "return b" for every NaN case below, not just the ones
+     * where b happens to be the smaller value. Covers NaN-in-a, NaN-in-b,
+     * NaN-in-both, and NaN-vs-negative, all bitwise scalar-vs-NEON. */
+    {
+        float a[4], b[4], out_s[4], out_n[4];
+        float qnan = bits_to_float(0x7FC00000u);
+        float qnan_neg = bits_to_float(0xFFC00000u);
+        a[0] = qnan;     b[0] = 1.0f;
+        a[1] = 1.0f;     b[1] = qnan;
+        a[2] = qnan;     b[2] = qnan_neg;
+        a[3] = qnan;     b[3] = -1.0f;
+        sk_min_f32_scalar(out_s, a, b, 4);
+        sk_min_f32(out_n, a, b, 4);
+        check_bits_or_die("min_f32_nan", 4, 0, out_n, out_s, 4);
+    }
     printf("PASS min_f32\n");
 }
 
@@ -303,6 +321,22 @@ static void test_clip(void) {
         sk_clip_f32(x0_simd, 0.0f, 1.0f, 4);
         check_bits_or_die("clip_f32_signed_zero", 4, 0, x0_simd, x0_scalar, 4);
     }
+    /* dedicated NaN check (F10): sk_clip_f32's scalar `if(x<lo)...else if
+     * (x>hi)...` and the NEON vcltq_f32/vcgtq_f32-then-select both use
+     * ORDERED compares, which are false for a NaN input either way -- so
+     * neither branch fires and the original (NaN) bit pattern passes
+     * through unmodified in both paths. Verifies that "leave unchanged"
+     * agreement bitwise, including a NaN sitting exactly at a `lo`/`hi`
+     * bound value. */
+    {
+        float qnan = bits_to_float(0x7FC00000u);
+        float qnan_neg = bits_to_float(0xFFC00000u);
+        float x_scalar[4] = { qnan, qnan_neg, qnan, qnan };
+        float x_simd[4]   = { qnan, qnan_neg, qnan, qnan };
+        sk_clip_f32_scalar(x_scalar, lo, hi, 4);
+        sk_clip_f32(x_simd, lo, hi, 4);
+        check_bits_or_die("clip_f32_nan", 4, 0, x_simd, x_scalar, 4);
+    }
     printf("PASS clip_f32\n");
 }
 
@@ -319,6 +353,40 @@ static void test_fast_sqrt(void) {
             sk_fast_sqrt_f32_scalar(x, out_scalar, n);
             sk_fast_sqrt_f32(x, out_simd, n);
             check_bits_or_die("fast_sqrt_f32", n, t, out_simd, out_scalar, n);
+        }
+    }
+    /* dedicated NaN check (F10 fix): sk__fast_sqrt_elem's `!(v>0.0f)` guard
+     * and sk_fast_sqrt_f32's NEON `ispos = v>0` select both use an ORDERED
+     * '>' compare -- false for NaN -- so every NaN lane below must land on
+     * the 0.0f domain-edge branch in BOTH paths, matching fast_math.h's
+     * fast_sqrt() fix. Covers a quiet NaN, a negative-signed NaN, and a
+     * signaling-NaN-shaped bit pattern (exponent all-1s, nonzero mantissa,
+     * quiet bit clear) mixed with ordinary negative/positive/zero values so
+     * the NaN lanes sit next to non-NaN lanes within the same 4-wide vector. */
+    {
+        float nan_in[8], out_s[8], out_n[8];
+        int i;
+        nan_in[0] = bits_to_float(0x7FC00000u); /* quiet NaN */
+        nan_in[1] = bits_to_float(0xFFC00000u); /* quiet NaN, sign bit set */
+        nan_in[2] = bits_to_float(0x7F800001u); /* signaling NaN payload */
+        nan_in[3] = bits_to_float(0xFFA00000u); /* NaN, sign bit set, other payload */
+        nan_in[4] = -4.0f;                       /* ordinary negative, same vector */
+        nan_in[5] = 0.0f;
+        nan_in[6] = 4.0f;                        /* ordinary positive, same vector */
+        nan_in[7] = bits_to_float(0x7FC00001u); /* another quiet NaN payload */
+        sk_fast_sqrt_f32_scalar(nan_in, out_s, 8);
+        sk_fast_sqrt_f32(nan_in, out_n, 8);
+        check_bits_or_die("fast_sqrt_f32_nan", 8, 0, out_n, out_s, 8);
+        /* Also assert the NaN lanes are actually the documented 0.0f, not
+         * just "scalar and NEON happen to agree on some other garbage". */
+        for (i = 0; i < 4; ++i) {
+            if (out_s[i] != 0.0f || out_n[i] != 0.0f) {
+                fprintf(stderr,
+                    "fast_sqrt_f32 NaN guard FAILED: lane %d expected 0.0f, "
+                    "got scalar=%.9g simd=%.9g\n",
+                    i, (double)out_s[i], (double)out_n[i]);
+                exit(1);
+            }
         }
     }
     printf("PASS fast_sqrt_f32\n");

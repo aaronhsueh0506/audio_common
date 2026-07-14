@@ -12,6 +12,21 @@
  * requirement, not a tolerance: downstream regression gates `cmp` two WAV
  * files, so any drift anywhere breaks the gate.
  *
+ * NaN caveat, precisely: for the compare+select kernels (sk_min_f32,
+ * sk_clip_f32, sk_fast_sqrt_f32) NaN is actually deterministic and IS
+ * verified bit-exact scalar-vs-NEON (see simd_selftest.c's dedicated NaN
+ * blocks) — every IEEE ordered comparison (<, <=, >, >=) is false for NaN,
+ * on both the scalar FPU and NEON, so the "select" always lands on the same
+ * documented branch (fast_sqrt: the 0.0f domain-edge constant; min/clip:
+ * whichever operand the ternary/mask falls through to) in both paths.
+ * "NaN is out of scope" applies to the pure-arithmetic kernels (sk_ema_f32,
+ * sk_cadd_f32, sk_sq_scale_f32, sk_capply_gain_f32): a NaN operand
+ * propagates through +/- correctly-rounded arithmetic with no compare/select
+ * involved, and while AArch64 scalar and NEON FP units are architecturally
+ * the same IEEE-754 hardware (so payload propagation should in practice
+ * agree), this file does not assert or test that payload-bit equality for
+ * those kernels — only that NaN inputs don't corrupt unrelated lanes/output.
+ *
  * This is achievable because AArch64 NEON per-lane vaddq_f32/vmulq_f32/
  * vdivq_f32/vsqrtq_f32/vfmaq_f32 are IEEE-754 binary32 correctly-rounded
  * operations — the exact same rounding the scalar FPU ops use. Given that,
@@ -145,8 +160,12 @@ static inline float sk__fast_sqrt_elem(float v) {
     return sqrtf(v);
 }
 #else
+/* NaN: fails `v > 0.0f` (every ordered IEEE comparison with NaN is false),
+ * so the negated guard returns 0.0f for NaN too -- matching fast_math.h's
+ * fast_sqrt fix and this kernel's NEON twin below (sk_fast_sqrt_f32's NaN
+ * lane selects the same 0.0f). Identical to `v <= 0.0f` for all finite v. */
 static inline float sk__fast_sqrt_elem(float v) {
-    if (v <= 0.0f) return 0.0f;
+    if (!(v > 0.0f)) return 0.0f;
     {
         union { float f; uint32_t u; } fb;
         fb.f = v;
@@ -374,12 +393,23 @@ static inline void sk_clip_f32(float *x, float lo, float hi, int n) {
 
 /* ═══════════════════════════════ kernel 15 ═════════════════════════════════
  * sk_fast_sqrt_f32 — per-lane replica of fast_math.h fast_sqrt() (bit-trick
- * seed + 2 Newton iterations). The `v<=0` guard is applied as a final
- * vcleq_f32+vbslq_f32 select (matching cabs_np's "compute unconditionally,
+ * seed + 2 Newton iterations). The `v>0` guard is applied as a final
+ * vcgtq_f32+vbslq_f32 select (matching cabs_np's "compute unconditionally,
  * then select" pattern) rather than a branch: the bit-trick/Newton steps
- * are well-defined (finite, no trap) for non-positive/negative `v` too —
+ * are well-defined (finite, no trap) for non-positive/negative/NaN `v` too —
  * their result is simply discarded by the select for those lanes, same
- * final bits as the scalar early return. */
+ * final bits as the scalar early return.
+ *
+ * NaN lanes: the select predicate is deliberately `ispos = v > 0` (selecting
+ * the Newton-Raphson result `xk` when true, 0.0f otherwise) rather than
+ * `nonpos = v <= 0` (selecting 0.0f when true, `xk` otherwise). Both forms
+ * agree for every finite v (exactly one of `v>0`/`v<=0` is true), but they
+ * disagree on NaN: vcgtq_f32/vcleq_f32 are ordered compares, so BOTH
+ * `v>0` and `v<=0` are false for a NaN lane. With the nonpos form that
+ * false steers the select to the `xk` (garbage) branch; with the ispos form
+ * here, that same false steers it to the 0.0f branch -- matching the scalar
+ * sk__fast_sqrt_elem's `!(v>0.0f)` guard (and fast_math.h's fast_sqrt)
+ * bit-for-bit, including on NaN input. */
 
 static inline void sk_fast_sqrt_f32_scalar(const float *x, float *out, int n) {
     int i;
@@ -406,8 +436,12 @@ static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
         xk = vmulq_f32(vdupq_n_f32(0.5f), vaddq_f32(xk, vdivq_f32(v, xk)));
         xk = vmulq_f32(vdupq_n_f32(0.5f), vaddq_f32(xk, vdivq_f32(v, xk)));
         {
-            uint32x4_t nonpos = vcleq_f32(v, vdupq_n_f32(0.0f));
-            float32x4_t r = vbslq_f32(nonpos, vdupq_n_f32(0.0f), xk);
+            /* v > 0 (NOT v <= 0): an ordered compare, false for NaN lanes
+             * too, so NaN selects the 0.0f branch below -- see the
+             * kernel-15 header comment for why this must be the ">0"
+             * form and not the "<=0" form used before the NaN-safety fix. */
+            uint32x4_t ispos = vcgtq_f32(v, vdupq_n_f32(0.0f));
+            float32x4_t r = vbslq_f32(ispos, xk, vdupq_n_f32(0.0f));
             vst1q_f32(out + i, r);
         }
     }
