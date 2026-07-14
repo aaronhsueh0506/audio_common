@@ -14,8 +14,8 @@
 CC      ?= cc
 
 # FFT backend selection:
-#   - explicit `make BACKEND=kiss|ne10` always wins (consumers pin it per policy:
-#     main branch -> kiss, static-memory branch -> ne10).
+#   - explicit `make BACKEND=kiss|ne10` always wins (policy: host/reference
+#     builds -> kiss, embedded deliverable -> ne10; single main branch).
 #   - otherwise AUTO-DETECT from the (possibly cross-)compiler: NE10 when the
 #     target has ARM NEON (__ARM_NEON / __aarch64__ predefined), else KISS. Using
 #     the compiler (not uname) makes this correct under cross-compilation.
@@ -43,7 +43,7 @@ OBJ_DIR = obj/$(BACKEND)
 BIN_DIR = bin/$(BACKEND)
 
 # Backend-independent shared DSP sources (always in the archive).
-COMMON_SRCS = src/hpf.c src/hpf_f64.c
+COMMON_SRCS = src/hpf.c
 
 ifeq ($(BACKEND),ne10)
   # Whole, UNMODIFIED NE10 DSP module (C reference + NEON-intrinsic variants, all
