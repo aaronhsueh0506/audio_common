@@ -17,7 +17,16 @@
 #include <arm_neon.h>
 #endif
 
-static int ne10_initialized = 0;
+/* This TU calls the _neon-suffixed NE10 kernels (ne10_fft_r2c_1d_float32_neon /
+ * ne10_fft_c2r_1d_float32_neon) directly and unconditionally -- there is no _c
+ * (scalar) fallback path and no runtime dispatch through NE10's function
+ * pointers (that dispatch is set up by ne10_init(), which this TU no longer
+ * calls -- see fft_create/fft_init below). So compile-time NEON availability
+ * is a hard requirement, not a soft one; fail the build loudly instead of
+ * emitting calls to intrinsics the target can't execute. */
+#if !(defined(__ARM_NEON) && defined(__aarch64__))
+#error "NE10 backend requires compile-time NEON (__ARM_NEON && __aarch64__)"
+#endif
 
 // Internal FFT handle structure
 struct FftHandle {
@@ -37,14 +46,6 @@ FftHandle* fft_create(int fft_size) {
     if (fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) {
         // fft_size must be power of 2
         return NULL;
-    }
-
-    // One-time NE10 initialization
-    if (!ne10_initialized) {
-        if (ne10_init() != NE10_OK) {
-            return NULL;
-        }
-        ne10_initialized = 1;
     }
 
     FftHandle* h = (FftHandle*)calloc(1, sizeof(FftHandle));
@@ -73,13 +74,17 @@ FftHandle* fft_create(int fft_size) {
     return h;
 }
 
-/* --- construction (static pool, caller-owned buffer) -----------------------
- * The handle and work buffers (real_buf/cpx_buf) are bump-allocated from the
- * caller's block. The NE10 R2C twiddle config is NOT pool-able: standard NE10
- * has no external-memory API for it, so ne10_fft_alloc_r2c_float32() still
- * does its own one-time internal malloc here (fft_destroy still releases it
- * unconditionally). The per-frame audio path (fft_forward/fft_inverse) stays
- * malloc-free either way. */
+/* --- construction (static pool, heap-free) ---------------------------------
+ * The handle, work buffers (real_buf/cpx_buf), AND the NE10 R2C/C2R twiddle
+ * config are all bump-allocated from the caller's block. Standard NE10 has no
+ * external-memory API for the twiddle config, so this repo vendors one
+ * (lib/ne10/VENDORED.md patch P0001: ne10_fft_r2c_mem_size_float32 /
+ * ne10_fft_init_r2c_float32_ext in NE10_rfft_float32.c). The heap path
+ * (fft_create -> ne10_fft_alloc_r2c_float32) is now a thin malloc() wrapper
+ * around that same _ext function, so heap and pool configs are bit-identical
+ * by construction (one twiddle code path). fft_init is therefore fully
+ * heap-free end to end: no malloc anywhere from fft_init() through
+ * fft_destroy(), matching the KISS backend (fft_wrapper.c). */
 
 size_t fft_get_mem_size(int fft_size) {
     if (fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return 0;
@@ -88,7 +93,8 @@ size_t fft_get_mem_size(int fft_size) {
     total = ck_field_size(total, 1, sizeof(FftHandle));
     total = ck_field_size(total, (size_t)fft_size, sizeof(ne10_float32_t));        /* real_buf */
     total = ck_field_size(total, (size_t)n_freqs, sizeof(ne10_fft_cpx_float32_t)); /* cpx_buf  */
-    /* NE10 twiddle cfg uses NE10-internal malloc — deliberately NOT counted. */
+    /* NE10 R2C/C2R twiddle config (P0001 external-memory init) — LAST field. */
+    total = ck_add_size(total, ck_align16_size((size_t)ne10_fft_r2c_mem_size_float32(fft_size)));
     return MEM_SIZE_INVALID(total) ? 0 : total;
 }
 
@@ -102,12 +108,6 @@ FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
      * must be rejected explicitly rather than falling through the compare. */
     if (need == 0 || mem_size < need) return NULL;
 
-    // One-time NE10 initialization
-    if (!ne10_initialized) {
-        if (ne10_init() != NE10_OK) return NULL;
-        ne10_initialized = 1;
-    }
-
     memset(mem, 0, need);  /* calloc-equivalent */
     uint8_t* cursor = (uint8_t*)mem;
 
@@ -118,15 +118,17 @@ FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
     h->n_freqs = fft_size / 2 + 1;
     h->pool_owned = 1;
 
-    // R2C config — NE10 owns this allocation (one-time internal malloc).
-    h->r2c_cfg = ne10_fft_alloc_r2c_float32(fft_size);
-    if (!h->r2c_cfg) return NULL;
-
     // Work buffers from the caller's block.
     h->real_buf = (ne10_float32_t*)cursor;
     cursor += ALIGN16((size_t)fft_size * sizeof(ne10_float32_t));
     h->cpx_buf = (ne10_fft_cpx_float32_t*)cursor;
     cursor += ALIGN16((size_t)h->n_freqs * sizeof(ne10_fft_cpx_float32_t));
+
+    // R2C config — carved from the same caller block (P0001 external-memory
+    // init): no NE10-internal malloc on this path.
+    h->r2c_cfg = ne10_fft_init_r2c_float32_ext(cursor, fft_size);
+    cursor += ALIGN16((size_t)ne10_fft_r2c_mem_size_float32(fft_size));
+    if (!h->r2c_cfg) return NULL;
 
     return h;
 }
@@ -134,11 +136,15 @@ FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
 void fft_destroy(FftHandle* h) {
     if (!h) return;
 
-    // NE10 twiddle cfg is never pool-owned; always release it.
-    if (h->r2c_cfg) ne10_fft_destroy_r2c_float32(h->r2c_cfg);
+    // Pool path: handle, work buffers, AND the r2c cfg all live in the
+    // caller's block (P0001 external-memory init) -- nothing here was ever
+    // malloc'd, so there is nothing to release, ever. Checking this BEFORE
+    // touching h->r2c_cfg (unlike the old heap-cfg design) makes destroy a
+    // true unconditional no-op on this path: idempotent under any number of
+    // repeat calls, not just the first one (F08).
+    if (h->pool_owned) return;
 
-    if (h->pool_owned) return;  /* handle + work buffers live in caller's block */
-
+    if (h->r2c_cfg) { ne10_fft_destroy_r2c_float32(h->r2c_cfg); h->r2c_cfg = NULL; }
     if (h->real_buf) free(h->real_buf);
     if (h->cpx_buf) free(h->cpx_buf);
 

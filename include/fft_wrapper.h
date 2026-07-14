@@ -61,12 +61,30 @@ FftHandle* fft_create(int fft_size);
  *
  * The buffer must be at least `fft_get_mem_size(fft_size)` bytes and
  * 16-byte aligned. Returns NULL if `mem_size` is too small.
+ *
+ * Both backends' `fft_get_mem_size` includes every byte fft_init() touches,
+ * including backend-internal FFT twiddle/config storage — there is nothing
+ * left for either backend to allocate off the caller's pool. KISS's cfg size
+ * is queried from kiss_fft_alloc() itself; NE10's is
+ * `688 + 21*fft_size` bytes before 16-byte alignment (see
+ * ne10_fft_r2c_mem_size_float32() in lib/ne10/modules/dsp/NE10_rfft_float32.c,
+ * vendored patch P0001 in lib/ne10/VENDORED.md). Upstream NE10 has no
+ * external-memory API for this config, so both backends are fully heap-free
+ * on the fft_init() path.
  */
 size_t     fft_get_mem_size(int fft_size);
 FftHandle* fft_init(void* mem, size_t mem_size, int fft_size);
 
 /**
- * Destroy FFT handle. No-op when handle was created via fft_init().
+ * Destroy FFT handle.
+ *
+ * Genuinely a no-op — on BOTH backends — for a handle created via fft_init():
+ * the static-memory path never allocates anything beyond the caller's pool
+ * (see fft_get_mem_size above), so there is nothing to release, and calling
+ * fft_destroy() any number of times on an fft_init() handle is safe and
+ * idempotent. For an fft_create() (heap) handle, fft_destroy() frees it as
+ * usual and — like any free() — must not be called more than once on the
+ * same handle.
  */
 void fft_destroy(FftHandle* handle);
 
