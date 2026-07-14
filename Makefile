@@ -80,7 +80,7 @@ VPATH    = src lib/kiss_fft lib/ne10/modules lib/ne10/modules/dsp
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test_pool test_wav clean
+.PHONY: all lib selftest test_pool test_wav test_zero_heap clean
 all: lib
 
 lib: $(LIB)
@@ -133,6 +133,59 @@ test_wav: | $(OBJ_DIR) $(BIN_DIR)
 	$(CC) -o $(BIN_DIR)/test_wav_io $(OBJ_DIR)/test_wav_io.o -lm
 	@echo "--- audio_common WAV I/O negative-corpus test [$(BACKEND)] ---"
 	@$(BIN_DIR)/test_wav_io
+
+# test_zero_heap: allocator-hook acceptance test (review F02/F08) -- proves
+# fft_init()..fft_destroy() makes zero malloc/calloc/realloc/free calls, and
+# that fft_destroy() on a pool-owned handle is idempotent. Same shape as
+# test_pool -- links against the same $(LIB) archive so it exercises whichever
+# backend (kiss/ne10) was built (KISS was already zero-heap; NE10's twiddle
+# config is now carved from the caller pool too -- see lib/ne10/VENDORED.md
+# patch P0001).
+#
+# The allocator-hook mechanism (test/zero_heap_hook.c) is platform-specific
+# and, empirically (see that file's header comment), needs different
+# packaging per platform:
+#   - macOS: dyld __DATA,__interpose only takes effect from a Mach-O image
+#     OTHER than the main executable, so the hook is built as its own small
+#     .dylib and the test links against it (rpath'd to @loader_path so it
+#     resolves next to the test binary with no env var needed).
+#   - Linux: GNU ld --wrap=<symbol> works from a plain object linked directly
+#     into the test binary; -Wl,--wrap=... is scoped to this one target only,
+#     so it never affects the main $(LIB) archive or any other test.
+ifeq ($(shell uname -s),Darwin)
+  ZERO_HEAP_HOOK_LIB   = $(BIN_DIR)/libzero_heap_hook.dylib
+  ZERO_HEAP_LDFLAGS    = -L$(BIN_DIR) -lzero_heap_hook -Wl,-rpath,@loader_path
+  ZERO_HEAP_HOOK_DEPS  = $(ZERO_HEAP_HOOK_LIB)
+else
+  ZERO_HEAP_HOOK_LIB   = $(OBJ_DIR)/zero_heap_hook.o
+  ZERO_HEAP_LDFLAGS    = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free
+  ZERO_HEAP_HOOK_DEPS  = $(ZERO_HEAP_HOOK_LIB)
+endif
+
+$(BIN_DIR)/libzero_heap_hook.dylib: test/zero_heap_hook.c test/zero_heap_hook.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) -dynamiclib -o $@ test/zero_heap_hook.c
+
+$(OBJ_DIR)/zero_heap_hook.o: test/zero_heap_hook.c test/zero_heap_hook.h | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -c -o $@ test/zero_heap_hook.c
+
+test_zero_heap: $(LIB) $(ZERO_HEAP_HOOK_DEPS) | $(BIN_DIR)
+	# -fno-builtin is NOT optional here: without it, clang recognizes
+	# malloc/calloc/realloc/free as builtin allocation functions and, when a
+	# call's returned pointer never "escapes" (isn't dereferenced/printed,
+	# only null-checked and freed), silently deletes the whole
+	# alloc+free pair as dead code at -O2 -- verified empirically while
+	# building this test (the deliberate calloc()/realloc() sanity calls in
+	# test_hook_actually_counts() were compiled away entirely). That would
+	# make this test pass for the wrong reason (no calls to observe, rather
+	# than calls correctly observed at zero).
+	$(CC) $(CFLAGS) -fno-builtin -c -o $(OBJ_DIR)/test_fft_zero_heap.o test/test_fft_zero_heap.c
+ifeq ($(shell uname -s),Darwin)
+	$(LINK) -o $(BIN_DIR)/test_fft_zero_heap $(OBJ_DIR)/test_fft_zero_heap.o $(LIB) $(LDFLAGS) $(ZERO_HEAP_LDFLAGS)
+else
+	$(LINK) -o $(BIN_DIR)/test_fft_zero_heap $(OBJ_DIR)/test_fft_zero_heap.o $(ZERO_HEAP_HOOK_LIB) $(LIB) $(LDFLAGS) $(ZERO_HEAP_LDFLAGS)
+endif
+	@echo "--- audio_common allocator-hook zero-heap test [$(BACKEND)] ---"
+	@$(BIN_DIR)/test_fft_zero_heap
 
 $(OBJ_DIR) $(BIN_DIR):
 	@mkdir -p $@
