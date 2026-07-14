@@ -1263,6 +1263,209 @@ static inline void sk_mask_zero_f32(float *x, const unsigned char *mask, int n) 
 }
 #endif
 
+/* ═══════════════════════════════ kernel 21 ═════════════════════════════════
+ * sk_pairwise_sum_tailfold_f32 — numpy-style pairwise float32 sum, variant
+ * "A". Verbatim tree from AEC/c_impl/src/pbfdkf.c's pw_leaf_f32() +
+ * pairwise_sum_f32() (an exact, whitespace-only-diff twin also lives in
+ * AEC/c_impl/src/linear_filter_output.c — diff-verified byte-identical).
+ *
+ * Two structural differences from kernel 13's sk_pairwise_sum_f32 (so this
+ * is a genuinely different value-function, not a restyling):
+ *   1. There is no outer n<=8 gate ahead of the n<=128 leaf. The leaf is
+ *      entered directly for any n<=128 and branches internally on
+ *      `n < 8` (strict). Consequence: at n==8 this kernel takes the
+ *      8-accumulator tree-combine path, whereas kernel 13's OUTER n<=8
+ *      check (inclusive) diverts n==8 to a plain sequential sum instead —
+ *      different rounding, different bits.
+ *   2. In the n in (8,128] leaf, the n%8 remainder tail is folded ONE
+ *      ELEMENT AT A TIME straight into the already-combined `res` root
+ *      (`res += a[i]` per leftover element), not accumulated into a
+ *      separate running total and added once at the end the way kernel
+ *      13's leaf does (`return r + s;`). Whenever there is more than one
+ *      leftover element these two tail strategies round differently.
+ *
+ * The small-n (n<8) serial path here starts its accumulator at 0.0f and
+ * adds every element, `s = 0.0f; for (i=0;i<n;++i) s += a[i];` — see
+ * kernel 22 for the OTHER small-n convention (res = a[0], then fold from
+ * i=1) used by the four other pairwise-sum call sites, which is a third
+ * distinct value-function: it differs from this one only on signed-zero
+ * inputs (e.g. n=1 with a[0]=-0.0f: this kernel returns
+ * 0.0f + (-0.0f) = +0.0f; kernel 22 returns -0.0f unchanged) — confirmed by
+ * direct probe, see kernel 22's comment.
+ *
+ * NEON leaf: identical q0/q1 accumulation + vpaddq_f32×2 combine order to
+ * kernel 13's leaf (bit-identical group-of-8 sums), then the same
+ * one-at-a-time tail fold applied to the scalar `res` (not to q0/q1) to
+ * match the scalar tree above exactly. */
+
+static inline float sk__pairwise_sum_tailfold_leaf_scalar(const float *a, size_t n) {
+    if (n < 8) {
+        float s = 0.0f;
+        size_t i;
+        for (i = 0; i < n; ++i) s += a[i];
+        return s;
+    }
+    {
+        float acc[8];
+        size_t i, j;
+        float res;
+        for (j = 0; j < 8; ++j) acc[j] = a[j];
+        for (i = 8; i + 8 <= n; i += 8)
+            for (j = 0; j < 8; ++j) acc[j] += a[i + j];
+        res = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
+            + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+        for (; i < n; ++i) res += a[i];
+        return res;
+    }
+}
+
+static inline float sk_pairwise_sum_tailfold_f32_scalar(const float *a, size_t n) {
+    if (n <= 128) return sk__pairwise_sum_tailfold_leaf_scalar(a, n);
+    {
+        size_t half = n / 2;
+        half -= half % 8;
+        return sk_pairwise_sum_tailfold_f32_scalar(a, half)
+             + sk_pairwise_sum_tailfold_f32_scalar(a + half, n - half);
+    }
+}
+
+#if SK_HAVE_NEON
+static inline float sk__pairwise_sum_tailfold_leaf_neon(const float *a, size_t n) {
+    if (n < 8) {
+        float s = 0.0f;
+        size_t i;
+        for (i = 0; i < n; ++i) s += a[i];
+        return s;
+    }
+    {
+        float32x4_t q0 = vld1q_f32(a), q1 = vld1q_f32(a + 4);
+        size_t i;
+        float res;
+        for (i = 8; i + 8 <= n; i += 8) {
+            q0 = vaddq_f32(q0, vld1q_f32(a + i));
+            q1 = vaddq_f32(q1, vld1q_f32(a + i + 4));
+        }
+        {
+            float32x4_t t = vpaddq_f32(q0, q1);
+            float32x4_t u = vpaddq_f32(t, t);
+            res = vgetq_lane_f32(u, 0) + vgetq_lane_f32(u, 1);
+        }
+        for (; i < n; ++i) res += a[i];
+        return res;
+    }
+}
+
+static inline float sk_pairwise_sum_tailfold_f32(const float *a, size_t n) {
+    if (n <= 128) return sk__pairwise_sum_tailfold_leaf_neon(a, n);
+    {
+        size_t half = n / 2;
+        half -= half % 8;
+        return sk_pairwise_sum_tailfold_f32(a, half)
+             + sk_pairwise_sum_tailfold_f32(a + half, n - half);
+    }
+}
+#else
+static inline float sk_pairwise_sum_tailfold_f32(const float *a, size_t n) {
+    return sk_pairwise_sum_tailfold_f32_scalar(a, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 22 ═════════════════════════════════
+ * sk_pairwise_sum_tailfold_b_f32 — numpy-style pairwise float32 sum, variant
+ * "B". Verbatim tree from AEC/c_impl/src/filter_analyzer.c's
+ * fa_f32_pairwise_sum() (byte-identical, whitespace/line-wrap-only-diff
+ * twins also live in AEC/c_impl/src/reverb_frequency_response.c's
+ * f32_pairwise_sum(), AEC/c_impl/src/filter_state_bridge.c's
+ * fsb_f32_pairwise_sum(), and AEC/c_impl/src/fullband_erle.c's
+ * fb_erle_pairwise_sum() — all four diffed byte-for-byte identical modulo
+ * cosmetic renaming/line-wrapping).
+ *
+ * Same 8<=n<=128 leaf shape, tail-fold, and n/2-rounded-down-to-a-multiple-
+ * of-8 split as kernel 21 (sk_pairwise_sum_tailfold_f32) — differs ONLY in
+ * the small-n (n<8) path and the explicit n==0 case:
+ *   - n==0 returns 0.0f explicitly (kernel 21 also returns 0.0f for n==0,
+ *     via its 0.0f-initialized accumulator with a zero-iteration loop —
+ *     same result, different code path, no observable difference).
+ *   - n in [1,7]: `res = a[0]; for (i=1;i<n;++i) res = res + a[i];` — the
+ *     accumulator STARTS AT a[0] (a plain copy, no addition performed for
+ *     the first element), rather than starting at 0.0f and adding a[0] the
+ *     way kernel 21 does. These two conventions are bit-identical for
+ *     every finite/normal nonzero a[0], but diverge on signed zero: with
+ *     a[0] = -0.0f and n==1, this kernel returns -0.0f (copied through
+ *     untouched); kernel 21 returns 0.0f + (-0.0f) = +0.0f (IEEE-754
+ *     round-to-nearest: an unlike-signed zero sum rounds to +0). Verified
+ *     directly with a standalone probe for n=1 and for an all -0.0f array
+ *     of length 5: kernel 21 and kernel 22 disagree with each other on
+ *     those inputs (each stays internally bit-identical scalar-vs-NEON),
+ *     confirming two distinct kernels are required here, not one shared
+ *     implementation. */
+
+static inline float sk_pairwise_sum_tailfold_b_f32_scalar(const float *a, size_t n) {
+    if (n == 0) return 0.0f;
+    if (n < 8) {
+        float res = a[0];
+        size_t i;
+        for (i = 1; i < n; ++i) res = res + a[i];
+        return res;
+    }
+    if (n <= 128) {
+        float acc[8];
+        size_t i, j;
+        float res;
+        for (j = 0; j < 8; ++j) acc[j] = a[j];
+        for (i = 8; i + 8 <= n; i += 8)
+            for (j = 0; j < 8; ++j) acc[j] = acc[j] + a[i + j];
+        res = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
+            + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+        for (; i < n; ++i) res = res + a[i];
+        return res;
+    }
+    {
+        size_t n2 = n / 2;
+        n2 -= n2 % 8;
+        return sk_pairwise_sum_tailfold_b_f32_scalar(a, n2)
+             + sk_pairwise_sum_tailfold_b_f32_scalar(a + n2, n - n2);
+    }
+}
+
+#if SK_HAVE_NEON
+static inline float sk_pairwise_sum_tailfold_b_f32(const float *a, size_t n) {
+    if (n == 0) return 0.0f;
+    if (n < 8) {
+        float res = a[0];
+        size_t i;
+        for (i = 1; i < n; ++i) res = res + a[i];
+        return res;
+    }
+    if (n <= 128) {
+        float32x4_t q0 = vld1q_f32(a), q1 = vld1q_f32(a + 4);
+        size_t i;
+        float res;
+        for (i = 8; i + 8 <= n; i += 8) {
+            q0 = vaddq_f32(q0, vld1q_f32(a + i));
+            q1 = vaddq_f32(q1, vld1q_f32(a + i + 4));
+        }
+        {
+            float32x4_t t = vpaddq_f32(q0, q1);
+            float32x4_t u = vpaddq_f32(t, t);
+            res = vgetq_lane_f32(u, 0) + vgetq_lane_f32(u, 1);
+        }
+        for (; i < n; ++i) res = res + a[i];
+        return res;
+    }
+    {
+        size_t n2 = n / 2;
+        n2 -= n2 % 8;
+        return sk_pairwise_sum_tailfold_b_f32(a, n2)
+             + sk_pairwise_sum_tailfold_b_f32(a + n2, n - n2);
+    }
+}
+#else
+static inline float sk_pairwise_sum_tailfold_b_f32(const float *a, size_t n) {
+    return sk_pairwise_sum_tailfold_b_f32_scalar(a, n);
+}
+#endif
+
 #ifdef __cplusplus
 }
 #endif

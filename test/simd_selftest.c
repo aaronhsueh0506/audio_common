@@ -497,6 +497,89 @@ static void test_sum_sq_pairwise(void) {
     printf("PASS sum_sq_pairwise_f32\n");
 }
 
+/* ═══════════════════ correctness: kernels 21/22 (tail-fold pairwise) ══════
+ * Dedicated n-list covering the leaf/split boundaries specific to these two
+ * kernels' recursion (127/128/129 straddle the n<=128 leaf cutover; 960
+ * exercises >=2 levels of the half-rounded-to-a-multiple-of-8 split; 7/8/9
+ * straddle the small-n vs. leaf cutover that differs between kernel 21 and
+ * kernel 13 -- see kernel 21's header comment). Separate, larger backing
+ * buffer (960) since this exceeds SK_TEST_MAX_N (512), used only here. */
+
+#define PW_TAILFOLD_MAX_N 960
+static const int PW_TAILFOLD_N_LIST[] = {1, 7, 8, 9, 127, 128, 129, 160, 255, 256, 257, 512, 960};
+#define PW_TAILFOLD_N_LIST_COUNT ((int)(sizeof(PW_TAILFOLD_N_LIST) / sizeof(PW_TAILFOLD_N_LIST[0])))
+
+static void test_pairwise_sum_tailfold(void) {
+    static float a[PW_TAILFOLD_MAX_N];
+    int ni, t;
+    for (ni = 0; ni < PW_TAILFOLD_N_LIST_COUNT; ++ni) {
+        int n = PW_TAILFOLD_N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_floats(a, n);
+            {
+                float rs = sk_pairwise_sum_tailfold_f32_scalar(a, (size_t)n);
+                float rn = sk_pairwise_sum_tailfold_f32(a, (size_t)n);
+                check_scalar_bits_or_die("pairwise_sum_tailfold_f32", n, t, rn, rs);
+            }
+        }
+    }
+    /* dedicated signed-zero small-n checks (see header comment: this
+     * kernel's 0.0f-seeded small-n accumulator normalizes -0.0f to +0.0f,
+     * a bit pattern that must still round-trip scalar==NEON identically). */
+    {
+        float az1[1] = { -0.0f };
+        float rs = sk_pairwise_sum_tailfold_f32_scalar(az1, 1);
+        float rn = sk_pairwise_sum_tailfold_f32(az1, 1);
+        check_scalar_bits_or_die("pairwise_sum_tailfold_f32_negzero_n1", 1, 0, rn, rs);
+    }
+    {
+        float az5[5] = { -0.0f, -0.0f, -0.0f, -0.0f, -0.0f };
+        float rs = sk_pairwise_sum_tailfold_f32_scalar(az5, 5);
+        float rn = sk_pairwise_sum_tailfold_f32(az5, 5);
+        check_scalar_bits_or_die("pairwise_sum_tailfold_f32_negzero_n5", 5, 0, rn, rs);
+    }
+    printf("PASS pairwise_sum_tailfold_f32\n");
+}
+
+static void test_pairwise_sum_tailfold_b(void) {
+    static float a[PW_TAILFOLD_MAX_N];
+    int ni, t;
+    for (ni = 0; ni < PW_TAILFOLD_N_LIST_COUNT; ++ni) {
+        int n = PW_TAILFOLD_N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_floats(a, n);
+            {
+                float rs = sk_pairwise_sum_tailfold_b_f32_scalar(a, (size_t)n);
+                float rn = sk_pairwise_sum_tailfold_b_f32(a, (size_t)n);
+                check_scalar_bits_or_die("pairwise_sum_tailfold_b_f32", n, t, rn, rs);
+            }
+        }
+    }
+    /* n==0 explicit-return path. */
+    {
+        float dummy[1] = { 1.0f };
+        float rs = sk_pairwise_sum_tailfold_b_f32_scalar(dummy, 0);
+        float rn = sk_pairwise_sum_tailfold_b_f32(dummy, 0);
+        check_scalar_bits_or_die("pairwise_sum_tailfold_b_f32_n0", 0, 0, rn, rs);
+    }
+    /* dedicated signed-zero small-n checks (see header comment: this
+     * kernel's a[0]-seeded small-n accumulator preserves -0.0f as-is,
+     * unlike kernel 21 -- both must still be scalar==NEON internally). */
+    {
+        float az1[1] = { -0.0f };
+        float rs = sk_pairwise_sum_tailfold_b_f32_scalar(az1, 1);
+        float rn = sk_pairwise_sum_tailfold_b_f32(az1, 1);
+        check_scalar_bits_or_die("pairwise_sum_tailfold_b_f32_negzero_n1", 1, 0, rn, rs);
+    }
+    {
+        float az5[5] = { -0.0f, -0.0f, -0.0f, -0.0f, -0.0f };
+        float rs = sk_pairwise_sum_tailfold_b_f32_scalar(az5, 5);
+        float rn = sk_pairwise_sum_tailfold_b_f32(az5, 5);
+        check_scalar_bits_or_die("pairwise_sum_tailfold_b_f32_negzero_n5", 5, 0, rn, rs);
+    }
+    printf("PASS pairwise_sum_tailfold_b_f32\n");
+}
+
 /* ═══════════════════════════ correctness: kernel 15 ══════════════════════ */
 
 static void test_fast_sqrt(void) {
@@ -851,6 +934,46 @@ static void bench_sum_sq_pairwise(void) {
     }
 }
 
+static void bench_pairwise_sum_tailfold(void) {
+    float a[BENCH_N];
+    fill_bench_floats(a, BENCH_N);
+    {
+        double t0, t1; int r;
+        t0 = now_ns();
+        for (r = 0; r < BENCH_REPS; ++r) g_bench_sink += sk_pairwise_sum_tailfold_f32_scalar(a, (size_t)BENCH_N);
+        t1 = now_ns();
+        {
+            double ns_scalar = (t1 - t0) / BENCH_REPS;
+            double t2 = now_ns();
+            for (r = 0; r < BENCH_REPS; ++r) g_bench_sink += sk_pairwise_sum_tailfold_f32(a, (size_t)BENCH_N);
+            {
+                double t3 = now_ns();
+                report_bench("pairwise_sum_tailfold_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
+            }
+        }
+    }
+}
+
+static void bench_pairwise_sum_tailfold_b(void) {
+    float a[BENCH_N];
+    fill_bench_floats(a, BENCH_N);
+    {
+        double t0, t1; int r;
+        t0 = now_ns();
+        for (r = 0; r < BENCH_REPS; ++r) g_bench_sink += sk_pairwise_sum_tailfold_b_f32_scalar(a, (size_t)BENCH_N);
+        t1 = now_ns();
+        {
+            double ns_scalar = (t1 - t0) / BENCH_REPS;
+            double t2 = now_ns();
+            for (r = 0; r < BENCH_REPS; ++r) g_bench_sink += sk_pairwise_sum_tailfold_b_f32(a, (size_t)BENCH_N);
+            {
+                double t3 = now_ns();
+                report_bench("pairwise_sum_tailfold_b_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
+            }
+        }
+    }
+}
+
 static void bench_fast_sqrt(void) {
     float x[BENCH_N], out[BENCH_N];
     int i;
@@ -1184,6 +1307,8 @@ int main(void) {
     test_clip();
     test_pairwise_sum();
     test_sum_sq_pairwise();
+    test_pairwise_sum_tailfold();
+    test_pairwise_sum_tailfold_b();
     test_fast_sqrt();
     test_coherence_ema_gate();
     test_ema_delta();
@@ -1207,6 +1332,8 @@ int main(void) {
     bench_clip();
     bench_pairwise_sum();
     bench_sum_sq_pairwise();
+    bench_pairwise_sum_tailfold();
+    bench_pairwise_sum_tailfold_b();
     bench_fast_sqrt();
     bench_coherence_ema_gate();
     bench_ema_delta();
