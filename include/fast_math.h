@@ -285,29 +285,6 @@ static inline float min_f(float a, float b) {
     return (a < b) ? a : b;
 }
 
-/**
- * Convert dB to linear
- */
-static inline float db_to_linear(float db) {
-#ifdef USE_STANDARD_MATH
-    return powf(10.0f, db / 10.0f);
-#else
-    return fast_exp(db * 0.1f * FM_LN10);  // 10^(db/10)
-#endif
-}
-
-/**
- * Convert linear to dB
- */
-static inline float linear_to_db(float linear) {
-    if (linear <= FM_EPSILON) return -100.0f;
-#ifdef USE_STANDARD_MATH
-    return 10.0f * log10f(linear);
-#else
-    return 10.0f * fast_log10(linear);
-#endif
-}
-
 #ifdef __cplusplus
 }
 #endif
