@@ -873,6 +873,297 @@ static void bench_fast_sqrt(void) {
     }
 }
 
+/* ═══════════════════════════ correctness: kernel 16 ══════════════════════ */
+
+static void test_coherence_ema_gate(void) {
+    Complex echo[SK_TEST_MAX_N], near_spec[SK_TEST_MAX_N];
+    float abs_echo[SK_TEST_MAX_N], abs_near[SK_TEST_MAX_N];
+    float sye_re_init[SK_TEST_MAX_N], sye_im_init[SK_TEST_MAX_N];
+    float syy_init[SK_TEST_MAX_N], see_init[SK_TEST_MAX_N];
+    float sye_re_s[SK_TEST_MAX_N], sye_im_s[SK_TEST_MAX_N];
+    float syy_s[SK_TEST_MAX_N], see_s[SK_TEST_MAX_N];
+    float sye_re_n[SK_TEST_MAX_N], sye_im_n[SK_TEST_MAX_N];
+    float syy_n[SK_TEST_MAX_N], see_n[SK_TEST_MAX_N];
+    unsigned char mask_s[SK_TEST_MAX_N], mask_n[SK_TEST_MAX_N];
+    int ni, t;
+    const float alpha = 0.05f, threshold = 0.5f;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_complex(echo, n);
+            fill_complex(near_spec, n);
+            fill_floats(abs_echo, n);
+            fill_floats(abs_near, n);
+            fill_floats(sye_re_init, n);
+            fill_floats(sye_im_init, n);
+            fill_floats(syy_init, n);
+            fill_floats(see_init, n);
+            memcpy(sye_re_s, sye_re_init, (size_t)n * sizeof(float));
+            memcpy(sye_im_s, sye_im_init, (size_t)n * sizeof(float));
+            memcpy(syy_s, syy_init, (size_t)n * sizeof(float));
+            memcpy(see_s, see_init, (size_t)n * sizeof(float));
+            memcpy(sye_re_n, sye_re_init, (size_t)n * sizeof(float));
+            memcpy(sye_im_n, sye_im_init, (size_t)n * sizeof(float));
+            memcpy(syy_n, syy_init, (size_t)n * sizeof(float));
+            memcpy(see_n, see_init, (size_t)n * sizeof(float));
+            sk_coherence_ema_gate_f32_scalar(sye_re_s, sye_im_s, syy_s, see_s,
+                                              echo, near_spec, abs_echo, abs_near,
+                                              alpha, threshold, mask_s, n);
+            sk_coherence_ema_gate_f32(sye_re_n, sye_im_n, syy_n, see_n,
+                                       echo, near_spec, abs_echo, abs_near,
+                                       alpha, threshold, mask_n, n);
+            check_bits_or_die("coherence_ema_gate_f32:sye_re", n, t, sye_re_n, sye_re_s, n);
+            check_bits_or_die("coherence_ema_gate_f32:sye_im", n, t, sye_im_n, sye_im_s, n);
+            check_bits_or_die("coherence_ema_gate_f32:syy", n, t, syy_n, syy_s, n);
+            check_bits_or_die("coherence_ema_gate_f32:see", n, t, see_n, see_s, n);
+            {
+                int idx;
+                for (idx = 0; idx < n; ++idx) {
+                    if (mask_s[idx] != mask_n[idx]) {
+                        fprintf(stderr,
+                            "MISMATCH kernel=coherence_ema_gate_f32:mask n=%d trial=%d idx=%d simd=%u scalar=%u\n",
+                            n, t, idx, (unsigned)mask_n[idx], (unsigned)mask_s[idx]);
+                        exit(1);
+                    }
+                }
+            }
+        }
+    }
+    printf("PASS coherence_ema_gate_f32\n");
+}
+
+/* ═══════════════════════════ correctness: kernel 17 ══════════════════════ */
+
+static void test_ema_delta(void) {
+    float state_init[SK_TEST_MAX_N], state_scalar[SK_TEST_MAX_N], state_simd[SK_TEST_MAX_N];
+    float x[SK_TEST_MAX_N];
+    int ni, t;
+    const float alpha = 0.23156652857908377f; /* cng_y2_alpha */
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_floats(state_init, n);
+            fill_floats(x, n);
+            memcpy(state_scalar, state_init, (size_t)n * sizeof(float));
+            memcpy(state_simd, state_init, (size_t)n * sizeof(float));
+            sk_ema_delta_f32_scalar(state_scalar, x, alpha, n);
+            sk_ema_delta_f32(state_simd, x, alpha, n);
+            check_bits_or_die("ema_delta_f32", n, t, state_simd, state_scalar, n);
+        }
+    }
+    printf("PASS ema_delta_f32\n");
+}
+
+/* ═══════════════════════════ correctness: kernel 18 ══════════════════════ */
+
+static void test_n2_track(void) {
+    float n2_init[SK_TEST_MAX_N], n2_scalar[SK_TEST_MAX_N], n2_simd[SK_TEST_MAX_N];
+    float y2s[SK_TEST_MAX_N];
+    int ni, t;
+    const float fresh = 0.9968377223398316f;
+    const float retain = 0.003162277660168411f;
+    const float g_up = 1.0005000750025f;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_floats(n2_init, n);
+            fill_floats(y2s, n);
+            memcpy(n2_scalar, n2_init, (size_t)n * sizeof(float));
+            memcpy(n2_simd, n2_init, (size_t)n * sizeof(float));
+            sk_n2_track_f32_scalar(n2_scalar, y2s, fresh, retain, g_up, n);
+            sk_n2_track_f32(n2_simd, y2s, fresh, retain, g_up, n);
+            check_bits_or_die("n2_track_f32", n, t, n2_simd, n2_scalar, n);
+        }
+    }
+    printf("PASS n2_track_f32\n");
+}
+
+/* ═══════════════════════════ correctness: kernel 19 ══════════════════════ */
+
+static void test_n2_initial_track(void) {
+    float n2i_init[SK_TEST_MAX_N], n2i_scalar[SK_TEST_MAX_N], n2i_simd[SK_TEST_MAX_N];
+    float n2[SK_TEST_MAX_N];
+    int ni, t;
+    const float alpha = 0.0024981253125391234f;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_floats(n2i_init, n);
+            fill_floats(n2, n);
+            memcpy(n2i_scalar, n2i_init, (size_t)n * sizeof(float));
+            memcpy(n2i_simd, n2i_init, (size_t)n * sizeof(float));
+            sk_n2_initial_track_f32_scalar(n2i_scalar, n2, alpha, n);
+            sk_n2_initial_track_f32(n2i_simd, n2, alpha, n);
+            check_bits_or_die("n2_initial_track_f32", n, t, n2i_simd, n2i_scalar, n);
+        }
+    }
+    printf("PASS n2_initial_track_f32\n");
+}
+
+/* ═══════════════════════════ correctness: kernel 20 ══════════════════════ */
+
+static void test_mask_zero(void) {
+    float x_init[SK_TEST_MAX_N], x_scalar[SK_TEST_MAX_N], x_simd[SK_TEST_MAX_N];
+    unsigned char mask[SK_TEST_MAX_N];
+    int ni, t;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            int i;
+            fill_floats(x_init, n);
+            for (i = 0; i < n; ++i) mask[i] = (unsigned char)(lcg_next() & 1u);
+            memcpy(x_scalar, x_init, (size_t)n * sizeof(float));
+            memcpy(x_simd, x_init, (size_t)n * sizeof(float));
+            sk_mask_zero_f32_scalar(x_scalar, mask, n);
+            sk_mask_zero_f32(x_simd, mask, n);
+            check_bits_or_die("mask_zero_f32", n, t, x_simd, x_scalar, n);
+        }
+    }
+    /* dedicated all-ones / all-zeros boundary check. */
+    {
+        float xa_init[8], xa_scalar[8], xa_simd[8];
+        unsigned char mall1[8], mall0[8];
+        int i;
+        fill_floats(xa_init, 8);
+        for (i = 0; i < 8; ++i) { mall1[i] = 1; mall0[i] = 0; }
+        memcpy(xa_scalar, xa_init, sizeof(xa_init));
+        memcpy(xa_simd, xa_init, sizeof(xa_init));
+        sk_mask_zero_f32_scalar(xa_scalar, mall1, 8);
+        sk_mask_zero_f32(xa_simd, mall1, 8);
+        check_bits_or_die("mask_zero_f32_all1", 8, 0, xa_simd, xa_scalar, 8);
+        memcpy(xa_scalar, xa_init, sizeof(xa_init));
+        memcpy(xa_simd, xa_init, sizeof(xa_init));
+        sk_mask_zero_f32_scalar(xa_scalar, mall0, 8);
+        sk_mask_zero_f32(xa_simd, mall0, 8);
+        check_bits_or_die("mask_zero_f32_all0", 8, 0, xa_simd, xa_scalar, 8);
+    }
+    printf("PASS mask_zero_f32\n");
+}
+
+static void bench_coherence_ema_gate(void) {
+    Complex echo[BENCH_N], near_spec[BENCH_N];
+    float abs_echo[BENCH_N], abs_near[BENCH_N];
+    float sye_re[BENCH_N], sye_im[BENCH_N], syy[BENCH_N], see[BENCH_N];
+    unsigned char mask[BENCH_N];
+    fill_bench_complex(echo, BENCH_N);
+    fill_bench_complex(near_spec, BENCH_N);
+    fill_bench_floats(abs_echo, BENCH_N);
+    fill_bench_floats(abs_near, BENCH_N);
+    fill_bench_floats(sye_re, BENCH_N);
+    fill_bench_floats(sye_im, BENCH_N);
+    fill_bench_floats(syy, BENCH_N);
+    fill_bench_floats(see, BENCH_N);
+    {
+        double t0, t1; int r;
+        t0 = now_ns();
+        for (r = 0; r < BENCH_REPS; ++r) {
+            sk_coherence_ema_gate_f32_scalar(sye_re, sye_im, syy, see, echo, near_spec,
+                                              abs_echo, abs_near, 0.05f, 0.5f, mask, BENCH_N);
+            g_bench_sink += sye_re[0];
+        }
+        t1 = now_ns();
+        {
+            double ns_scalar = (t1 - t0) / BENCH_REPS;
+            double t2 = now_ns();
+            for (r = 0; r < BENCH_REPS; ++r) {
+                sk_coherence_ema_gate_f32(sye_re, sye_im, syy, see, echo, near_spec,
+                                           abs_echo, abs_near, 0.05f, 0.5f, mask, BENCH_N);
+                g_bench_sink += sye_re[0];
+            }
+            {
+                double t3 = now_ns();
+                report_bench("coherence_ema_gate_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
+            }
+        }
+    }
+}
+
+static void bench_ema_delta(void) {
+    float state[BENCH_N], x[BENCH_N];
+    fill_bench_floats(state, BENCH_N);
+    fill_bench_floats(x, BENCH_N);
+    {
+        double t0, t1; int r;
+        t0 = now_ns();
+        for (r = 0; r < BENCH_REPS; ++r) { sk_ema_delta_f32_scalar(state, x, 0.23f, BENCH_N); g_bench_sink += state[0]; }
+        t1 = now_ns();
+        {
+            double ns_scalar = (t1 - t0) / BENCH_REPS;
+            double t2 = now_ns();
+            for (r = 0; r < BENCH_REPS; ++r) { sk_ema_delta_f32(state, x, 0.23f, BENCH_N); g_bench_sink += state[0]; }
+            {
+                double t3 = now_ns();
+                report_bench("ema_delta_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
+            }
+        }
+    }
+}
+
+static void bench_n2_track(void) {
+    float n2[BENCH_N], y2s[BENCH_N];
+    fill_bench_floats(n2, BENCH_N);
+    fill_bench_floats(y2s, BENCH_N);
+    {
+        double t0, t1; int r;
+        t0 = now_ns();
+        for (r = 0; r < BENCH_REPS; ++r) { sk_n2_track_f32_scalar(n2, y2s, 0.99f, 0.003f, 1.0005f, BENCH_N); g_bench_sink += n2[0]; }
+        t1 = now_ns();
+        {
+            double ns_scalar = (t1 - t0) / BENCH_REPS;
+            double t2 = now_ns();
+            for (r = 0; r < BENCH_REPS; ++r) { sk_n2_track_f32(n2, y2s, 0.99f, 0.003f, 1.0005f, BENCH_N); g_bench_sink += n2[0]; }
+            {
+                double t3 = now_ns();
+                report_bench("n2_track_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
+            }
+        }
+    }
+}
+
+static void bench_n2_initial_track(void) {
+    float n2i[BENCH_N], n2[BENCH_N];
+    fill_bench_floats(n2i, BENCH_N);
+    fill_bench_floats(n2, BENCH_N);
+    {
+        double t0, t1; int r;
+        t0 = now_ns();
+        for (r = 0; r < BENCH_REPS; ++r) { sk_n2_initial_track_f32_scalar(n2i, n2, 0.0025f, BENCH_N); g_bench_sink += n2i[0]; }
+        t1 = now_ns();
+        {
+            double ns_scalar = (t1 - t0) / BENCH_REPS;
+            double t2 = now_ns();
+            for (r = 0; r < BENCH_REPS; ++r) { sk_n2_initial_track_f32(n2i, n2, 0.0025f, BENCH_N); g_bench_sink += n2i[0]; }
+            {
+                double t3 = now_ns();
+                report_bench("n2_initial_track_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
+            }
+        }
+    }
+}
+
+static void bench_mask_zero(void) {
+    float x[BENCH_N];
+    unsigned char mask[BENCH_N];
+    int i;
+    fill_bench_floats(x, BENCH_N);
+    for (i = 0; i < BENCH_N; ++i) mask[i] = (unsigned char)(i & 1);
+    {
+        double t0, t1; int r;
+        t0 = now_ns();
+        for (r = 0; r < BENCH_REPS; ++r) { sk_mask_zero_f32_scalar(x, mask, BENCH_N); g_bench_sink += x[0]; }
+        t1 = now_ns();
+        {
+            double ns_scalar = (t1 - t0) / BENCH_REPS;
+            double t2 = now_ns();
+            for (r = 0; r < BENCH_REPS; ++r) { sk_mask_zero_f32(x, mask, BENCH_N); g_bench_sink += x[0]; }
+            {
+                double t3 = now_ns();
+                report_bench("mask_zero_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
+            }
+        }
+    }
+}
+
 /* ═══════════════════════════════════ main ══════════════════════════════════ */
 
 int main(void) {
@@ -894,6 +1185,11 @@ int main(void) {
     test_pairwise_sum();
     test_sum_sq_pairwise();
     test_fast_sqrt();
+    test_coherence_ema_gate();
+    test_ema_delta();
+    test_n2_track();
+    test_n2_initial_track();
+    test_mask_zero();
 
     printf("\n--- microbenchmarks (n=%d, %d reps) ---\n", BENCH_N, BENCH_REPS);
     bench_cabs_np();
@@ -912,6 +1208,11 @@ int main(void) {
     bench_pairwise_sum();
     bench_sum_sq_pairwise();
     bench_fast_sqrt();
+    bench_coherence_ema_gate();
+    bench_ema_delta();
+    bench_n2_track();
+    bench_n2_initial_track();
+    bench_mask_zero();
 
     printf("\nALL PASS (SK_HAVE_NEON=%d)\n", SK_HAVE_NEON);
     (void)g_bench_sink;

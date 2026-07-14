@@ -937,6 +937,332 @@ static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
 }
 #endif
 
+/* ═══════════════════════════════ kernel 16 ═════════════════════════════════
+ * sk_coherence_ema_gate_f32 — AEC3-post coherence Γ²(Ŷ,Y) EMA update + the
+ * ERLE coh-gate threshold, FUSED into one per-bin pass. Verbatim from
+ * AEC/c_impl/src/aec3_post.c aec3_post_compute_coherence(): originally 2
+ * separate per-bin loops over the same [0,nb) range —
+ *
+ *   loop 1 (per k): pr = er*nr + ei*ni;  pi = ei*nr - er*ni;   // echo *
+ *                     conj(near), plain mul/add — source does NOT call
+ *                     fmaf for this cross-product.
+ *                   sye_re[k] = omaf*sye_re[k] + af*pr;         // plain
+ *                   sye_im[k] = omaf*sye_im[k] + af*pi;         // mul/mul/add,
+ *                                                                NOT fmaf
+ *                   syy[k] = (1.0f-a)*syy[k] + af*abs_echo[k]^2;  // source
+ *                   see[k] = (1.0f-a)*see[k] + af*abs_near[k]^2;  // recomputes
+ *                     "(1.0f-a)" inline here instead of reusing the `omaf`
+ *                     local — bit-identical to omaf regardless (same `a`,
+ *                     same deterministic IEEE subtract), so this kernel
+ *                     computes omaf once and reuses it for all four EMAs.
+ *   loop 2 (per k): sye2 = sye_re[k]^2 + sye_im[k]^2;           // plain
+ *                                                                mul/mul/add
+ *                   denom = syy[k]*see[k];
+ *                   if (denom<1e-30f) denom=1e-30f;             // compare+
+ *                     select, not vmaxq (signed-zero risk per header note)
+ *                   g2 = sye2/denom;
+ *                   mask[k] = (g2 >= threshold) ? 1u : 0u;
+ *
+ * FUSION SAFETY: loop 2 at index k reads ONLY sye_re[k]/sye_im[k]/syy[k]/
+ * see[k] — the values loop 1 just wrote at that SAME index k, never a
+ * different index (no cross-bin term anywhere in either loop). So merging
+ * into one per-k pass (update-then-gate) is order-preserving: loop 1's
+ * write at k happens-before loop 2's read at k in both the original 2-loop
+ * form and this fused form. */
+
+static inline void sk__coherence_ema_gate_elem(
+    float *sye_re, float *sye_im, float *syy, float *see,
+    float er, float ei, float nr, float ni,
+    float abs_echo, float abs_near,
+    float alpha, float omaf, float threshold,
+    unsigned char *mask_out) {
+    float pr = er * nr + ei * ni;
+    float pi = ei * nr - er * ni;
+    float echo_abs2 = abs_echo * abs_echo;
+    float near_abs2 = abs_near * abs_near;
+    float sye2, denom, g2;
+    *sye_re = omaf * (*sye_re) + alpha * pr;
+    *sye_im = omaf * (*sye_im) + alpha * pi;
+    *syy    = omaf * (*syy)    + alpha * echo_abs2;
+    *see    = omaf * (*see)    + alpha * near_abs2;
+    sye2 = (*sye_re) * (*sye_re) + (*sye_im) * (*sye_im);
+    denom = (*syy) * (*see);
+    if (denom < 1.0e-30f) denom = 1.0e-30f;
+    g2 = sye2 / denom;
+    *mask_out = (g2 >= threshold) ? (unsigned char)1 : (unsigned char)0;
+}
+
+static inline void sk_coherence_ema_gate_f32_scalar(
+    float *sye_re, float *sye_im, float *syy, float *see,
+    const Complex *echo, const Complex *near_spec,
+    const float *abs_echo, const float *abs_near,
+    float alpha, float threshold,
+    unsigned char *mask, int n) {
+    int i;
+    float omaf = 1.0f - alpha;
+    for (i = 0; i < n; ++i) {
+        sk__coherence_ema_gate_elem(&sye_re[i], &sye_im[i], &syy[i], &see[i],
+                                     echo[i].r, echo[i].i,
+                                     near_spec[i].r, near_spec[i].i,
+                                     abs_echo[i], abs_near[i],
+                                     alpha, omaf, threshold, &mask[i]);
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_coherence_ema_gate_f32(
+    float *sye_re, float *sye_im, float *syy, float *see,
+    const Complex *echo, const Complex *near_spec,
+    const float *abs_echo, const float *abs_near,
+    float alpha, float threshold,
+    unsigned char *mask, int n) {
+    int i = 0;
+    float omaf = 1.0f - alpha;
+    float32x4_t va = vdupq_n_f32(alpha), vomaf = vdupq_n_f32(omaf);
+    float32x4_t vfloor = vdupq_n_f32(1.0e-30f);
+    for (; i + 4 <= n; i += 4) {
+        float32x4x2_t ev = vld2q_f32((const float *)(echo + i));
+        float32x4_t er = ev.val[0], ei = ev.val[1];
+        float32x4x2_t nv = vld2q_f32((const float *)(near_spec + i));
+        float32x4_t nr = nv.val[0], ni = nv.val[1];
+        float32x4_t pr = vaddq_f32(vmulq_f32(er, nr), vmulq_f32(ei, ni));
+        float32x4_t pi = vsubq_f32(vmulq_f32(ei, nr), vmulq_f32(er, ni));
+
+        float32x4_t abs_echo_v = vld1q_f32(abs_echo + i);
+        float32x4_t abs_near_v = vld1q_f32(abs_near + i);
+        float32x4_t echo_abs2 = vmulq_f32(abs_echo_v, abs_echo_v);
+        float32x4_t near_abs2 = vmulq_f32(abs_near_v, abs_near_v);
+
+        float32x4_t sye_re_v = vld1q_f32(sye_re + i);
+        float32x4_t sye_im_v = vld1q_f32(sye_im + i);
+        float32x4_t syy_v = vld1q_f32(syy + i);
+        float32x4_t see_v = vld1q_f32(see + i);
+
+        sye_re_v = vaddq_f32(vmulq_f32(vomaf, sye_re_v), vmulq_f32(va, pr));
+        sye_im_v = vaddq_f32(vmulq_f32(vomaf, sye_im_v), vmulq_f32(va, pi));
+        syy_v    = vaddq_f32(vmulq_f32(vomaf, syy_v), vmulq_f32(va, echo_abs2));
+        see_v    = vaddq_f32(vmulq_f32(vomaf, see_v), vmulq_f32(va, near_abs2));
+
+        vst1q_f32(sye_re + i, sye_re_v);
+        vst1q_f32(sye_im + i, sye_im_v);
+        vst1q_f32(syy + i, syy_v);
+        vst1q_f32(see + i, see_v);
+
+        {
+            float32x4_t sye2 = vaddq_f32(vmulq_f32(sye_re_v, sye_re_v),
+                                          vmulq_f32(sye_im_v, sye_im_v));
+            float32x4_t denom = vmulq_f32(syy_v, see_v);
+            uint32x4_t lt = vcltq_f32(denom, vfloor);
+            float32x4_t g2;
+            float g2_arr[4];
+            int j;
+            denom = vbslq_f32(lt, vfloor, denom);
+            g2 = vdivq_f32(sye2, denom);
+            vst1q_f32(g2_arr, g2);
+            for (j = 0; j < 4; ++j)
+                mask[i + j] = (g2_arr[j] >= threshold) ? (unsigned char)1
+                                                        : (unsigned char)0;
+        }
+    }
+    for (; i < n; ++i) {
+        sk__coherence_ema_gate_elem(&sye_re[i], &sye_im[i], &syy[i], &see[i],
+                                     echo[i].r, echo[i].i,
+                                     near_spec[i].r, near_spec[i].i,
+                                     abs_echo[i], abs_near[i],
+                                     alpha, omaf, threshold, &mask[i]);
+    }
+}
+#else
+static inline void sk_coherence_ema_gate_f32(
+    float *sye_re, float *sye_im, float *syy, float *see,
+    const Complex *echo, const Complex *near_spec,
+    const float *abs_echo, const float *abs_near,
+    float alpha, float threshold,
+    unsigned char *mask, int n) {
+    sk_coherence_ema_gate_f32_scalar(sye_re, sye_im, syy, see, echo, near_spec,
+                                      abs_echo, abs_near, alpha, threshold,
+                                      mask, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 17 ═════════════════════════════════
+ * sk_ema_delta_f32 — state[i] = state[i] + alpha*(x[i]-state[i]) (the
+ * "delta-form" EMA — distinct from kernel 4's alpha*state+beta*x shape:
+ * different rounding path, NOT interchangeable bit-for-bit). Verbatim from
+ * AEC/c_impl/src/aec3_post.c aec3_post_compute_comfort_noise()'s
+ * y2_smoothed update:
+ *   p->y2_smoothed[k] = p->y2_smoothed[k]
+ *                     + y2a * (p->near_psd[k] - p->y2_smoothed[k]);
+ * Source computes this as a separate subtract, a separate multiply, then a
+ * separate add — no fmaf call at this line — so NOT fused here either (needs
+ * -ffp-contract=off to stay that way, same discipline as kernel 4). */
+
+static inline void sk_ema_delta_f32_scalar(float *state, const float *x,
+                                            float alpha, int n) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        float diff = x[i] - state[i];
+        state[i] = state[i] + alpha * diff;
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_ema_delta_f32(float *state, const float *x,
+                                     float alpha, int n) {
+    int i = 0;
+    float32x4_t va = vdupq_n_f32(alpha);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t sv = vld1q_f32(state + i);
+        float32x4_t xv = vld1q_f32(x + i);
+        float32x4_t diff = vsubq_f32(xv, sv);
+        float32x4_t r = vaddq_f32(sv, vmulq_f32(va, diff));
+        vst1q_f32(state + i, r);
+    }
+    for (; i < n; ++i) {
+        float diff = x[i] - state[i];
+        state[i] = state[i] + alpha * diff;
+    }
+}
+#else
+static inline void sk_ema_delta_f32(float *state, const float *x,
+                                     float alpha, int n) {
+    sk_ema_delta_f32_scalar(state, x, alpha, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 18 ═════════════════════════════════
+ * sk_n2_track_f32 — the CNG N2-tracking data-dependent update. Verbatim from
+ * AEC/c_impl/src/aec3_post.c aec3_post_compute_comfort_noise():
+ *   track = (fresh*y2s[k] + retain*n2[k]) * g_up;  // mul, mul, add, mul —
+ *                                                     all plain, no fmaf
+ *   up    = n2[k] * g_up;
+ *   n2[k] = (y2s[k] < n2[k]) ? track : up;          // exact IEEE '<'
+ *                                                       compare+select
+ */
+
+static inline void sk_n2_track_f32_scalar(float *n2, const float *y2s,
+                                           float fresh, float retain,
+                                           float g_up, int n) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        float track = (fresh * y2s[i] + retain * n2[i]) * g_up;
+        float up = n2[i] * g_up;
+        n2[i] = (y2s[i] < n2[i]) ? track : up;
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_n2_track_f32(float *n2, const float *y2s,
+                                    float fresh, float retain,
+                                    float g_up, int n) {
+    int i = 0;
+    float32x4_t vfresh = vdupq_n_f32(fresh), vretain = vdupq_n_f32(retain);
+    float32x4_t vgup = vdupq_n_f32(g_up);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t y2v = vld1q_f32(y2s + i);
+        float32x4_t n2v = vld1q_f32(n2 + i);
+        float32x4_t track = vmulq_f32(
+            vaddq_f32(vmulq_f32(vfresh, y2v), vmulq_f32(vretain, n2v)), vgup);
+        float32x4_t up = vmulq_f32(n2v, vgup);
+        uint32x4_t lt = vcltq_f32(y2v, n2v);
+        float32x4_t r = vbslq_f32(lt, track, up);
+        vst1q_f32(n2 + i, r);
+    }
+    for (; i < n; ++i) {
+        float track = (fresh * y2s[i] + retain * n2[i]) * g_up;
+        float up = n2[i] * g_up;
+        n2[i] = (y2s[i] < n2[i]) ? track : up;
+    }
+}
+#else
+static inline void sk_n2_track_f32(float *n2, const float *y2s,
+                                    float fresh, float retain,
+                                    float g_up, int n) {
+    sk_n2_track_f32_scalar(n2, y2s, fresh, retain, g_up, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 19 ═════════════════════════════════
+ * sk_n2_initial_track_f32 — the CNG N2-initial slow-tracking data-dependent
+ * update. Verbatim from AEC/c_impl/src/aec3_post.c
+ * aec3_post_compute_comfort_noise():
+ *   slow = n2i[k] + ia*(n2[k]-n2i[k]);        // plain sub/mul/add, no fmaf
+ *   n2i[k] = (n2[k] > n2i[k]) ? slow : n2[k];  // exact IEEE '>' compare+select,
+ *                                                 comparing against the
+ *                                                 ORIGINAL n2i[k] (captured
+ *                                                 before the overwrite)
+ */
+
+static inline void sk_n2_initial_track_f32_scalar(float *n2i, const float *n2,
+                                                    float alpha, int n) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        float old = n2i[i];
+        float slow = old + alpha * (n2[i] - old);
+        n2i[i] = (n2[i] > old) ? slow : n2[i];
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_n2_initial_track_f32(float *n2i, const float *n2,
+                                            float alpha, int n) {
+    int i = 0;
+    float32x4_t va = vdupq_n_f32(alpha);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t oldv = vld1q_f32(n2i + i);
+        float32x4_t n2v = vld1q_f32(n2 + i);
+        float32x4_t diff = vsubq_f32(n2v, oldv);
+        float32x4_t slow = vaddq_f32(oldv, vmulq_f32(va, diff));
+        uint32x4_t gt = vcgtq_f32(n2v, oldv);
+        float32x4_t r = vbslq_f32(gt, slow, n2v);
+        vst1q_f32(n2i + i, r);
+    }
+    for (; i < n; ++i) {
+        float old = n2i[i];
+        float slow = old + alpha * (n2[i] - old);
+        n2i[i] = (n2[i] > old) ? slow : n2[i];
+    }
+}
+#else
+static inline void sk_n2_initial_track_f32(float *n2i, const float *n2,
+                                            float alpha, int n) {
+    sk_n2_initial_track_f32_scalar(n2i, n2, alpha, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 20 ═════════════════════════════════
+ * sk_mask_zero_f32 — out[i] = mask[i] ? 0.0f : out[i] (in-place, byte mask,
+ * C truthiness: any nonzero byte triggers the zero — matches a plain
+ * `if (mask[k]) x[k] = 0.0f;` source loop verbatim, e.g.
+ * AEC/c_impl/src/aec3_post.c's stationarity R²-zeroing step). */
+
+static inline void sk_mask_zero_f32_scalar(float *x, const unsigned char *mask,
+                                            int n) {
+    int i;
+    for (i = 0; i < n; ++i) if (mask[i]) x[i] = 0.0f;
+}
+
+#if SK_HAVE_NEON
+static inline void sk_mask_zero_f32(float *x, const unsigned char *mask, int n) {
+    int i = 0;
+    float32x4_t zero = vdupq_n_f32(0.0f);
+    for (; i + 4 <= n; i += 4) {
+        uint32_t m[4];
+        int j;
+        float32x4_t xv = vld1q_f32(x + i);
+        uint32x4_t mv;
+        for (j = 0; j < 4; ++j) m[j] = mask[i + j] ? 0xFFFFFFFFu : 0u;
+        mv = vld1q_u32(m);
+        vst1q_f32(x + i, vbslq_f32(mv, zero, xv));
+    }
+    for (; i < n; ++i) if (mask[i]) x[i] = 0.0f;
+}
+#else
+static inline void sk_mask_zero_f32(float *x, const unsigned char *mask, int n) {
+    sk_mask_zero_f32_scalar(x, mask, n);
+}
+#endif
+
 #ifdef __cplusplus
 }
 #endif
