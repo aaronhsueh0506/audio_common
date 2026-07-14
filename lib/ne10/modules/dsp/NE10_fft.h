@@ -73,7 +73,17 @@
 #define NE10_FACTOR_EIGHT               2
 
 // Comment when do not want to scale output result
+// P0002 (see ../../VENDORED.md): guarded against redefinition -- callers
+// (audio_common/Makefile) pass -DNE10_DSP_RFFT_SCALING on the command line
+// explicitly so no build can silently drop it; without the guard, this
+// #define unconditionally clashes with that command-line macro and produces
+// -Wmacro-redefined noise on every TU that includes this header. Guarding
+// (rather than deleting) keeps the header self-sufficient for any caller
+// that does NOT pass the macro on the command line -- behavior is identical
+// either way (verified: NE10 c2r auto-scales by 1/N in both cases).
+#ifndef NE10_DSP_RFFT_SCALING
 #define NE10_DSP_RFFT_SCALING
+#endif
 #define NE10_DSP_CFFT_SCALING
 
 #define NE10_FFT_PARA_LEVEL 4
