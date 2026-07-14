@@ -41,6 +41,26 @@ consumer repo is single-branch (`main`).
   bit-exactness / parity-vs-Python guarantees are KISS-only; NE10-heap vs
   NE10-static must still be byte-equal (allocation is numerically transparent).
 
+## Precision policy (f32 vs f64) — adjudicated 2026-07-15, don't reopen without new evidence
+
+Everything hot is already float32: both FFT backends (`kiss_fft_scalar` = float;
+NE10 is f32-only), every per-bin loop in AEC/NR, and the AEC matched-filter dot
+products (f32 + NEON). A full four-repo audit found **zero** `double` on any
+per-sample or per-bin production hot path in NR / audio_common / the Audio_ALG
+pipelines (sole exception: `hpf_f64`, ~1.4e5 flops/s, parity-mandated), and in
+AEC only (a) per-hop scalar bookkeeping that textually mirrors numpy fp64
+promotion rules — converting it breaks the documented bit-exact Python↔C
+contract — and (b) the delay-estimator decimator biquads (~1.15M flops/s).
+Measured on an out-of-order arm64 core, a 4-stage biquad cascade in fp64 runs
+within 1.08× of f32 (IIR recurrences don't vectorise), so converting (b) would
+recover on the order of 0.001% of a core while forcing a delay-chain golden
+regen + AECMOS re-sample and risking f32 state-quantisation drift in the
+highest-Q anti-alias section (pole radius ≈ 0.985). Rule of thumb: new code
+uses f32 in loops over samples/bins; scalar fp64 is fine where it mirrors a
+Python reference or costs O(per-hop); any f32 conversion of existing fp64 needs
+a measured hotspot first, then the same gate discipline as the matched-filter
+conversion.
+
 ## Why two HPFs (collision resolved)
 
 AEC's mic-path HPF is a **bit-exact fp64 port** of its Python reference — its state
