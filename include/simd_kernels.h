@@ -153,7 +153,18 @@ static inline float sk__cmag2_np_elem(float re, float im) {
 
 /* fast_math.h fast_sqrt(), replicated verbatim (bit-trick seed + 2 Newton
  * iterations) rather than #include-d, per the header-comment rationale
- * above. Keep in sync with fast_math.h if that implementation ever moves. */
+ * above. Keep in sync with fast_math.h if that implementation ever moves.
+ *
+ * USE_STANDARD_MATH: fast_math.h swaps fast_sqrt for plain sqrtf under this
+ * flag (debug/parity builds). This kernel follows the SAME flag so a call
+ * site converted from `fast_sqrt(...)` to sk_fast_sqrt_f32 behaves
+ * identically under both build modes (sqrtf per lane == vsqrtq_f32, IEEE
+ * correctly rounded, including sqrtf(-0)=-0 and NaN for negatives). */
+#ifdef USE_STANDARD_MATH
+static inline float sk__fast_sqrt_elem(float v) {
+    return sqrtf(v);
+}
+#else
 static inline float sk__fast_sqrt_elem(float v) {
     if (v <= 0.0f) return 0.0f;
     {
@@ -168,6 +179,7 @@ static inline float sk__fast_sqrt_elem(float v) {
         }
     }
 }
+#endif /* USE_STANDARD_MATH */
 
 #if SK_HAVE_NEON
 /* 4-lane version of sk__cabs_np_elem: `larger==0` lanes computed as 0/0 =
@@ -892,6 +904,14 @@ static inline void sk_fast_sqrt_f32_scalar(const float *x, float *out, int n) {
 }
 
 #if SK_HAVE_NEON
+#ifdef USE_STANDARD_MATH
+static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4)
+        vst1q_f32(out + i, vsqrtq_f32(vld1q_f32(x + i)));
+    for (; i < n; ++i) out[i] = sk__fast_sqrt_elem(x[i]);
+}
+#else
 static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -910,6 +930,7 @@ static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
     }
     for (; i < n; ++i) out[i] = sk__fast_sqrt_elem(x[i]);
 }
+#endif /* USE_STANDARD_MATH */
 #else
 static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
     sk_fast_sqrt_f32_scalar(x, out, n);
