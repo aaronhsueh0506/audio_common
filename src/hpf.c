@@ -3,21 +3,18 @@
  *
  * Bilinear transform from analog prototype.
  * Direct Form II transposed implementation.
- * Matches Python HighPassFilter exactly.
+ * Structurally mirrors the AEC Python reference's HighPassFilter formula
+ * (float32, not bit-exact — see the README precision policy).
  */
 
 #include "hpf.h"
+#include "mem_align.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
-#endif
-
-/* 16-byte alignment for static memory placement */
-#ifndef ALIGN16
-#define ALIGN16(x) (((x) + 15) & ~(size_t)15)
 #endif
 
 struct Hpf {
