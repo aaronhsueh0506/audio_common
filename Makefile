@@ -34,7 +34,13 @@ CXX     ?= c++
 # extension. Consumers may still compile their own code with -std=c99 and link
 # this archive — different TUs, different std is fine.
 CFLAGS  += -Wall -Wextra -O2 -std=gnu99 -Iinclude
-CXXFLAGS+= -O2 -Ilib/ne10/inc -Ilib/ne10/common -Ilib/ne10/modules
+# -isystem (not -I) for the vendor NE10 include dirs: this dir's own headers
+# (include/) are OUR code and stay -I so their diagnostics stay visible; NE10's
+# headers are vendored and carry warnings we don't own, so demoting them to
+# "system" headers suppresses diagnostics originating INSIDE those headers
+# without touching diagnostics for our own TUs that happen to include them
+# (F12 build hygiene -- see also the -isystem swap for lib/kiss_fft below).
+CXXFLAGS+= -O2 -isystem lib/ne10/inc -isystem lib/ne10/common -isystem lib/ne10/modules
 LDFLAGS += -lm
 
 # EXTRA_CFLAGS hook: lets callers inject extra defines/flags (e.g.
@@ -52,31 +58,146 @@ BIN_DIR = bin/$(BACKEND)
 COMMON_SRCS = src/hpf.c
 
 ifeq ($(BACKEND),ne10)
-  # Whole, UNMODIFIED NE10 DSP module (C reference + NEON-intrinsic variants, all
-  # fft/fir/iir + init). No NE10 source edited, no stubs — ne10_init is scoped to
-  # DSP only via NE10's own official NE10_ENABLE_DSP flag (its other sub-inits are
-  # #if-guarded), and on macOS/arm64 it just sets NEON-available without reading
-  # /proc/cpuinfo. Both the CPU (_c) and NEON (_neon) kernels compile in.
-  NE10_C_SRCS  = $(wildcard lib/ne10/modules/*.c lib/ne10/modules/dsp/*.c)
-  NE10_CXXSRCS = $(wildcard lib/ne10/modules/dsp/*.cpp)
-  BE_SRCS  = src/fft_wrapper_ne10.c $(COMMON_SRCS) $(NE10_C_SRCS)
-  BE_CXXSRCS = $(NE10_CXXSRCS)
+  # NE10 source footprint (review F16): fft_wrapper_ne10.c only ever calls the
+  # float32 R2C/C2R entry points (ne10_fft_alloc_r2c_float32 /
+  # ne10_fft_r2c_mem_size_float32 / ne10_fft_init_r2c_float32_ext /
+  # ne10_fft_destroy_r2c_float32 / ne10_fft_r2c_1d_float32_neon /
+  # ne10_fft_c2r_1d_float32_neon) and never calls ne10_init() (see
+  # fft_wrapper_ne10.c's header comment) -- so this is an explicit file list,
+  # NOT a wildcard, empirically pared down to the smallest set that still
+  # links cleanly (verified: `make BACKEND=ne10 clean selftest test_pool
+  # test_wav test_zero_heap`, zero unresolved symbols, all four PASS).
+  #   - NE10_rfft_float32.c / .neonintrinsic.c: the float32 R2C/C2R
+  #     implementation itself (scalar reference + NEON kernels), including
+  #     the P0001 external-memory init (VENDORED.md).
+  #   - NE10_fft.c: not float32-R2C-specific, but the R2C path calls into it
+  #     for ne10_factor()/ne10_fft_generate_twiddles_float32()/
+  #     _transposed_float32(), and fft_wrapper_ne10.c's heap fft_destroy()
+  #     calls its ne10_fft_destroy_r2c_float32() directly.
+  #   - NE10_fft_float32.c, NE10_fft_int32.c, NE10_fft_generic_float32.c,
+  #     NE10_fft_generic_int32.cpp: none of these float32/int32
+  #     complex-to-complex (c2c) or non-power-of-2 "generic" paths are ever
+  #     CALLED by this wrapper (it's real-to-complex, power-of-2-only, all
+  #     the way through) -- but NE10_fft.c unconditionally defines
+  #     ne10_fft_alloc_c2c_float32_neon/_int32_neon, and those reference
+  #     ne10_fft_alloc_c2c_float32_c (NE10_fft_float32.c) and
+  #     ne10_fft_alloc_c2c_int32_c (NE10_fft_int32.c) at file scope (not
+  #     guarded by NE10_UNROLL_LEVEL or any other #if), which in turn
+  #     reference the ALG_ANY/generic butterfly helpers -- confirmed
+  #     empirically by dropping each file in turn and reading the linker's
+  #     "Undefined symbols" list. Since ne10_fft.o is unavoidably pulled into
+  #     the link (for ne10_factor/twiddle-gen above) and static-archive
+  #     linking resolves an entire .o's symbol table as a unit (no
+  #     function-level granularity without -ffunction-sections/--gc-sections,
+  #     which is out of scope for a source-list-only trim), these four files
+  #     must stay to satisfy the linker without editing any NE10 source.
+  #     NE10_fft_generic_int32.cpp is why BACKEND=ne10 still needs a C++ TU
+  #     (LINK=$(CXX)/-lc++ below) despite this trim.
+  # Confirmed EXCLUDABLE (dropping each was verified to still link + pass all
+  # four test targets):
+  #   - NE10_init.c / NE10_init_dsp.c: ne10_init()/ne10_init_dsp() runtime
+  #     dispatch setup -- dead weight now that nothing calls ne10_init().
+  #   - NE10_fft_float32.neonintrinsic.c, NE10_fft_int32.neonintrinsic.c: the
+  #     NEON c2c COMPUTE kernels (ne10_fft_c2c_1d_{float32,int32}_neon) --
+  #     unlike the _c alloc functions above, nothing (not even NE10_fft.c's
+  #     c2c NEON allocators) ever calls the NEON c2c compute entry points
+  #     themselves, only the plain "_c" alloc/factor/twiddle machinery.
+  #   - NE10_fft_generic_float32.neonintrinsic.cpp,
+  #     NE10_fft_generic_int32.neonintrinsic.cpp: NEON-optimised generic
+  #     (non-power-of-2) kernels -- same reasoning, only the "_c" generic
+  #     alloc path is ever reachable from ne10_fft.o, not these.
+  #   - NE10_fft_int16.c/.neonintrinsic.c: integer16 FFT, a fully separate
+  #     family NE10_fft.c never touches.
+  #   - NE10_fir.c/NE10_fir_init.c, NE10_iir.c/NE10_iir_init.c: FIR/IIR DSP
+  #     families, unrelated to the FFT wrapper entirely.
+  # No NE10 source is edited to achieve this trim -- it is purely a build
+  # source-list change; every excluded file is still present under lib/ne10/
+  # (see VENDORED.md) for provenance, just not compiled into this archive.
+  NE10_C_SRCS  = lib/ne10/modules/dsp/NE10_fft.c \
+                 lib/ne10/modules/dsp/NE10_fft_float32.c \
+                 lib/ne10/modules/dsp/NE10_fft_int32.c \
+                 lib/ne10/modules/dsp/NE10_fft_generic_float32.c \
+                 lib/ne10/modules/dsp/NE10_rfft_float32.c \
+                 lib/ne10/modules/dsp/NE10_rfft_float32.neonintrinsic.c
+  NE10_CXXSRCS = lib/ne10/modules/dsp/NE10_fft_generic_int32.cpp
+  # OWN_SRCS/VENDOR_SRCS split (F12 build hygiene): OWN_SRCS is code we wrote
+  # and own the warnings for; VENDOR_SRCS/VENDOR_CXXSRCS is unmodified NE10.
+  # BE_SRCS/BE_CXXSRCS (used by BE_OBJS below) are derived from these so the
+  # archive's file list is unchanged, just re-expressed.
+  OWN_SRCS       = src/fft_wrapper_ne10.c $(COMMON_SRCS)
+  VENDOR_SRCS    = $(NE10_C_SRCS)
+  VENDOR_CXXSRCS = $(NE10_CXXSRCS)
   # NE10_DSP_RFFT_SCALING makes c2r normalise by 1/N (verified round-trip); it is
   # default-on in NE10_fft.h — defined explicitly so no build can silently drop it.
   NE10_DEFS = -DNE10_ENABLE_DSP -DNE10_DSP_RFFT_SCALING
-  CFLAGS  += -Ilib/ne10/inc -Ilib/ne10/common -Ilib/ne10/modules $(NE10_DEFS)
+  # -isystem for the vendor NE10 include dirs (see the CXXFLAGS comment
+  # above); NE10_DEFS stays a plain -D (a set of defines, not a search path --
+  # isystem only applies to -I-style entries).
+  CFLAGS  += -isystem lib/ne10/inc -isystem lib/ne10/common -isystem lib/ne10/modules $(NE10_DEFS)
   CXXFLAGS+= $(NE10_DEFS)
   LDFLAGS += -lc++
 else
-  BE_SRCS  = src/fft_wrapper.c $(COMMON_SRCS) \
-             lib/kiss_fft/kiss_fft.c
-  BE_CXXSRCS =
-  CFLAGS  += -Ilib/kiss_fft
+  OWN_SRCS       = src/fft_wrapper.c $(COMMON_SRCS)
+  VENDOR_SRCS    = lib/kiss_fft/kiss_fft.c
+  VENDOR_CXXSRCS =
+  # -isystem for the vendor KISS FFT include dir (see the CXXFLAGS comment
+  # above for the NE10 side of this same F12 fix).
+  CFLAGS  += -isystem lib/kiss_fft
 endif
+
+BE_SRCS    = $(OWN_SRCS) $(VENDOR_SRCS)
+BE_CXXSRCS = $(VENDOR_CXXSRCS)
 
 BE_OBJS  = $(patsubst %.c,$(OBJ_DIR)/%.o,$(notdir $(BE_SRCS))) \
            $(patsubst %.cpp,$(OBJ_DIR)/%.o,$(notdir $(BE_CXXSRCS)))
+OWN_OBJS = $(patsubst %.c,$(OBJ_DIR)/%.o,$(notdir $(OWN_SRCS)))
 VPATH    = src lib/kiss_fft lib/ne10/modules lib/ne10/modules/dsp
+
+# -Werror opt-in, scoped to OUR OWN objects only (default off; CI can flip it
+# on with `make WERROR=1`). audio_common is the one Makefile in this project
+# that compiles vendored TUs (NE10/KISS FFT) through the exact same generic
+# pattern rule as its own wrapper sources (src/hpf.c, src/fft_wrapper*.c);
+# those vendor bodies carry pre-existing warnings that are out of scope to
+# fix here, so a blanket -Werror would fail the build on code we don't own.
+# A target-specific variable applies -Werror only when building $(OWN_OBJS),
+# leaving $(VENDOR_SRCS)/$(VENDOR_CXXSRCS) compiles unaffected.
+WERROR ?= 0
+ifeq ($(WERROR),1)
+$(OWN_OBJS): CFLAGS += -Werror
+endif
+
+# --- Build-configuration stamp (F12 build hygiene) --------------------------
+# obj/$(BACKEND) already isolates a kiss build from an ne10 build, but
+# EXTRA_CFLAGS (and now WERROR, folded in explicitly since it's target-scoped
+# rather than baked into $(CFLAGS) above) were NOT keyed within a given
+# backend -- a build with one EXTRA_CFLAGS value left its .o's sitting in
+# obj/$(BACKEND), and a later build with a different EXTRA_CFLAGS silently
+# reused/mixed them. CFG_SIG hashes the exact compiler invocation that
+# produces every object in THIS backend's build.
+#
+# This check runs at PARSE time (via $(shell ...), not as a build-rule
+# recipe): an order-only-prerequisite version (a stamp FILE that a rule
+# creates, referenced via `$(OBJ_DIR)/%.o: %.c | $(CFG_STAMP)`) is racy --
+# verified empirically. When several objects share one order-only
+# prerequisite whose recipe wipes the directory they all live in, GNU Make
+# can finalize "is this object out of date?" for one of them using the
+# prerequisite tree it already resolved, before the shared prerequisite's
+# wipe recipe actually runs -- so that object silently keeps its (about to
+# be deleted) stale .o and is never recompiled (reproduced directly: a
+# 2-object minimal Makefile with this shape drops one object every time).
+# Doing the compare-and-wipe unconditionally while the Makefile is being
+# read sidesteps the race entirely: by the time `make` starts asking "is
+# any target out of date", obj/$(BACKEND) has already been wiped (if
+# needed) or left alone (if not).
+CFG_SIG        := $(shell printf '%s' "$(CC) $(CFLAGS) $(EXTRA_CFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR)" | shasum -a 256 | cut -c1-12)
+CFG_STAMP_FILE := $(OBJ_DIR)/.cfg_stamp
+CFG_LAST_SIG   := $(shell test -f $(CFG_STAMP_FILE) && cat $(CFG_STAMP_FILE))
+ifneq ($(CFG_SIG),$(CFG_LAST_SIG))
+$(info audio_common [$(BACKEND)]: build config changed -- wiping $(OBJ_DIR) for a full rebuild)
+$(shell rm -rf $(OBJ_DIR))
+$(shell mkdir -p $(OBJ_DIR))
+$(shell echo $(CFG_SIG) > $(CFG_STAMP_FILE))
+endif
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
@@ -191,4 +312,8 @@ $(OBJ_DIR) $(BIN_DIR):
 	@mkdir -p $@
 
 clean:
-	rm -rf $(OBJ_DIR) $(BIN_DIR)
+	# F12 build hygiene: nuke obj/ and bin/ wholesale (BOTH backends' output
+	# dirs), not just $(OBJ_DIR)/$(BIN_DIR) for whatever BACKEND this
+	# invocation happens to resolve to -- a bare `make clean` (no BACKEND=)
+	# used to leave the other backend's stale build sitting untouched.
+	rm -rf obj bin
