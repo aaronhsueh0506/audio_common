@@ -37,6 +37,12 @@ CFLAGS  += -Wall -Wextra -O2 -std=gnu99 -Iinclude
 CXXFLAGS+= -O2 -Ilib/ne10/inc -Ilib/ne10/common -Ilib/ne10/modules
 LDFLAGS += -lm
 
+# EXTRA_CFLAGS hook: lets callers inject extra defines/flags (e.g.
+# `make selftest EXTRA_CFLAGS=-DSIMD_KERNELS_FORCE_SCALAR`) into every
+# compiled TU without editing this file.
+CFLAGS  += $(EXTRA_CFLAGS)
+CXXFLAGS+= $(EXTRA_CFLAGS)
+
 # Per-backend output dirs so a kiss build and an ne10 build never stomp each
 # other's objects/archive (consumers may build both in one tree).
 OBJ_DIR = obj/$(BACKEND)
@@ -98,6 +104,16 @@ selftest: $(LIB) | $(BIN_DIR)
 	$(LINK) -o $(BIN_DIR)/roundtrip $(OBJ_DIR)/roundtrip.o $(LIB) $(LDFLAGS)
 	@echo "--- audio_common selftest [$(BACKEND)] ---"
 	@$(BIN_DIR)/roundtrip
+	# simd_kernels.h selftest: header-only, needs no FFT/archive objects.
+	# -ffp-contract=off is NOT optional here -- verified empirically that
+	# without it, this compiler auto-fuses the "plain mul/add, no FMA"
+	# scalar reference loops (e.g. sk_ema_f32_scalar) into `fmla` at -O2,
+	# which would then mismatch the deliberately-unfused NEON intrinics
+	# path (see include/simd_kernels.h's FMA-discipline doc comment).
+	$(CC) $(CFLAGS) -ffp-contract=off -c -o $(OBJ_DIR)/simd_selftest.o test/simd_selftest.c
+	$(CC) -o $(BIN_DIR)/simd_selftest $(OBJ_DIR)/simd_selftest.o -lm
+	@echo "--- audio_common SIMD kernel selftest [$(BACKEND)] ---"
+	@$(BIN_DIR)/simd_selftest
 
 $(OBJ_DIR) $(BIN_DIR):
 	@mkdir -p $@

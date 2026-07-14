@@ -1,0 +1,923 @@
+/**
+ * simd_kernels.h - shared NEON/scalar bit-exact DSP micro-kernels.
+ *
+ * A small per-bin kernel library the AEC/NR float32 C code can call instead
+ * of hand-rolled scalar loops, so the same vectorized building blocks are
+ * reused everywhere instead of re-deriving them per call site.
+ *
+ * ─────────────────────────── Bit-exactness contract ──────────────────────
+ * For every kernel, `sk_<name>(...)` (NEON, when available) MUST produce a
+ * byte-identical result to `sk_<name>_scalar(...)` for every input (NaN
+ * payload bits excepted — NaN is out of scope, see below). This is a hard
+ * requirement, not a tolerance: downstream regression gates `cmp` two WAV
+ * files, so any drift anywhere breaks the gate.
+ *
+ * This is achievable because AArch64 NEON per-lane vaddq_f32/vmulq_f32/
+ * vdivq_f32/vsqrtq_f32/vfmaq_f32 are IEEE-754 binary32 correctly-rounded
+ * operations — the exact same rounding the scalar FPU ops use. Given that,
+ * bit-exactness reduces to one rule: **replicate the scalar operation
+ * SEQUENCE (which ops are fused, which are separate, and in what order)
+ * lane-for-lane**. Concretely:
+ *
+ *   1. No estimate instructions anywhere (vrsqrteq_f32, vrecpeq_f32, and
+ *      their Newton-refinement companions are NEVER used in this file —
+ *      every reciprocal/sqrt/divide is the exact vdivq_f32/vsqrtq_f32).
+ *   2. No reassociation: if the scalar source computes `a*b + c*d` as two
+ *      separate rounded multiplies followed by a separate rounded add, the
+ *      NEON path issues `vmulq_f32`, `vmulq_f32`, `vaddq_f32` — never a
+ *      single `vfmaq_f32`. Conversely, where the scalar source explicitly
+ *      calls `fmaf(x, y, z)`, the NEON path uses `vfmaq_f32` (fusing y*x+z
+ *      in one rounding step), because that's what the scalar reference
+ *      itself does.
+ *   3. Every NEON kernel's scalar tail (the `n % 4` leftover elements) calls
+ *      the exact same static per-element helper the `_scalar` entry point
+ *      uses — so the tail is bit-identical to the fully-scalar path *by
+ *      construction*, not by re-derivation.
+ *
+ * ────────────────────────────── FMA discipline ────────────────────────────
+ * Empirically verified on this toolchain (Apple clang 17, arm64): a plain
+ * scalar C loop shaped `state[i] = alpha*state[i] + beta*x[i];` gets
+ * auto-vectorized *and auto-fused into `fmla`* at `-O2` WITHOUT
+ * `-ffp-contract=off` — while two separate `vmulq_f32`/`vaddq_f32`
+ * intrinsic calls never get fused by the compiler regardless of the
+ * contract setting (intrinsics lower to fixed instruction selections, not
+ * generic contraction-eligible IR). That means the "plain mul/add, do NOT
+ * fuse" scalar reference kernels below are only correct references when
+ * compiled with `-ffp-contract=off` — the same flag AEC/NR's own c_impl
+ * builds already mandate. **Any TU that includes this header, or otherwise
+ * reproduces these expression shapes, MUST compile with
+ * `-ffp-contract=off`.**
+ *
+ *   Uses explicit fmaf()/vfmaq_f32 (mirrors an explicit `fmaf(...)` call in
+ *   the AEC/NR source — always fused, with or without -ffp-contract, since
+ *   an explicit fmaf() call requests FMA directly rather than relying on
+ *   contraction of separate ops):
+ *     - the cabs_np/cmag2_np magnitude helper's `ratio*ratio + 1.0f` term
+ *       (kernels 1, 2, 3, 5's internal magnitude computation)
+ *     - sk_cmac_np_f32          (kernel 6)
+ *     - sk_wupdate_nlms_f32's grad = err * conj(X) term (kernel 7)
+ *     - sk_wupdate_kf_f32's final W += K_scaled * error_spec term (kernel 8)
+ *
+ *   Uses separate mul then add, NEVER fused (mirrors the source NOT calling
+ *   fmaf for that particular step — needs -ffp-contract=off to stay this
+ *   way):
+ *     - sk_ema_f32                                   (kernel 4)
+ *     - sk_ema_cmag2_f32's outer alpha*state+beta*mag2 combine (kernel 5)
+ *     - sk_wupdate_nlms_f32's final W += mu_eff*grad combine   (kernel 7)
+ *     - sk_wupdate_kf_f32's K = mu*conj(X) and K *= mu_scale steps
+ *       (kernel 8)
+ *     - sk_sq_scale_f32                              (kernel 11)
+ *
+ * ───────────────────────── min/clip: compare+select, not min/max ─────────
+ * Empirically verified: AArch64 `vminq_f32(-0.0f, +0.0f)` returns -0.0f,
+ * while the plain C ternary `(a < b) ? a : b` (a=-0.0f, b=+0.0f) returns
+ * +0.0f, because IEEE `<` treats -0 and +0 as equal so the ternary falls
+ * through to `b`. The hardware vector min/max instructions do NOT agree
+ * with a naive ternary at a signed-zero tie. Since the self-test's
+ * special-value pool includes ±0.0f, `sk_min_f32` / `sk_clip_f32` are
+ * therefore implemented with compare+select (`vcltq_f32`/`vcgtq_f32` +
+ * `vbslq_f32`), which reproduces the ternary's bit pattern exactly in every
+ * case, instead of `vminq_f32`/`vmaxq_f32`. (The larger/smaller-of-two-
+ * absolute-values step inside cabs_np/cmag2_np is NOT at risk: vabsq_f32
+ * clears the sign bit first, so both operands to that particular max/min
+ * are always +0.0 or positive, and a max/min tie between two bit-identical
+ * non-negative values returns that same bit pattern regardless of which
+ * hardware convention is used.)
+ *
+ * ────────────────────────────── Force-scalar knob ─────────────────────────
+ * Define `SIMD_KERNELS_FORCE_SCALAR` (e.g. `-DSIMD_KERNELS_FORCE_SCALAR`)
+ * to make every `sk_<name>` entry point just call `sk_<name>_scalar`, even
+ * on an AArch64/NEON build. This validates that the non-NEON fallback path
+ * compiles and runs on NEON-capable hardware too. `SK_HAVE_NEON` is 1 when
+ * the NEON bodies are compiled in, 0 otherwise.
+ *
+ * ───────────────────────────────── Style ──────────────────────────────────
+ * Header-only, C99, static inline (same convention as fast_math.h). Only
+ * fft_wrapper.h (for `Complex`) plus <math.h>/<stdint.h>/<stddef.h> (and
+ * <arm_neon.h> under the NEON guard) are included — no dependency on
+ * fast_math.h itself, so this header's bit-exactness cannot be silently
+ * altered by an unrelated `USE_STANDARD_MATH` toggle defined by some other
+ * translation unit that happens to link into the same program. Where a
+ * kernel mirrors a fast_math.h function (fast_sqrt, clip_f, min_f), its
+ * exact algorithm is replicated verbatim as a private per-element helper
+ * instead of calling fast_math.h directly — see the per-kernel comments.
+ *
+ * No `restrict` anywhere: callers may pass overlapping buffers only when
+ * explicitly documented as supporting it (e.g. sk_capply_gain_f32's
+ * out == z in-place case); otherwise pointers are assumed non-aliasing.
+ */
+
+#ifndef SIMD_KERNELS_H
+#define SIMD_KERNELS_H
+
+#include <math.h>
+#include <stdint.h>
+#include <stddef.h>
+
+#include "fft_wrapper.h"   /* Complex { float r; float i; } (interleaved AoS) */
+
+#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(SIMD_KERNELS_FORCE_SCALAR)
+#include <arm_neon.h>
+#define SK_HAVE_NEON 1
+#else
+#define SK_HAVE_NEON 0
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ═══════════════════════════ shared per-element helpers ═══════════════════
+ * Used by every scalar kernel AND by every NEON kernel's scalar tail, so
+ * the tail matches the fully-scalar path bit-for-bit by construction. */
+
+/* numpy complex64 |z| — scaled-hypot with an explicit fmaf, verbatim from
+ * AEC/c_impl/src/aec3_post.c cabs_np() / pbfdkf.c cmag2_np()'s `m`. */
+static inline float sk__cabs_np_elem(float re, float im) {
+    float ar = re < 0.0f ? -re : re;
+    float ai = im < 0.0f ? -im : im;
+    float larger  = ar > ai ? ar : ai;
+    float smaller = ar > ai ? ai : ar;
+    if (larger == 0.0f) return 0.0f;
+    {
+        float ratio = smaller / larger;
+        return larger * sqrtf(fmaf(ratio, ratio, 1.0f));
+    }
+}
+
+/* numpy |z|**2, verbatim from pbfdkf.c cmag2_np() / aec.c cmag2_c(). */
+static inline float sk__cmag2_np_elem(float re, float im) {
+    float m = sk__cabs_np_elem(re, im);
+    return m * m;
+}
+
+/* fast_math.h fast_sqrt(), replicated verbatim (bit-trick seed + 2 Newton
+ * iterations) rather than #include-d, per the header-comment rationale
+ * above. Keep in sync with fast_math.h if that implementation ever moves. */
+static inline float sk__fast_sqrt_elem(float v) {
+    if (v <= 0.0f) return 0.0f;
+    {
+        union { float f; uint32_t u; } fb;
+        fb.f = v;
+        fb.u = (fb.u >> 1) + 0x1FC00000u;
+        {
+            float x = fb.f;
+            x = 0.5f * (x + v / x);  /* iteration 1 */
+            x = 0.5f * (x + v / x);  /* iteration 2 */
+            return x;
+        }
+    }
+}
+
+#if SK_HAVE_NEON
+/* 4-lane version of sk__cabs_np_elem: `larger==0` lanes computed as 0/0 =
+ * NaN through the divide/sqrt, then bslq-selected to an exact +0.0f — same
+ * final bits as the scalar early-return, just reached without branching. */
+static inline float32x4_t sk__cabs_np_neon4(float32x4_t re, float32x4_t im) {
+    float32x4_t ar = vabsq_f32(re);
+    float32x4_t ai = vabsq_f32(im);
+    float32x4_t larger  = vmaxq_f32(ar, ai);   /* both operands >= +0.0f: no
+                                                 * signed-zero tie is possible
+                                                 * here (see header comment). */
+    float32x4_t smaller = vminq_f32(ar, ai);
+    float32x4_t ratio = vdivq_f32(smaller, larger);
+    float32x4_t m = vmulq_f32(larger,
+                       vsqrtq_f32(vfmaq_f32(vdupq_n_f32(1.0f), ratio, ratio)));
+    uint32x4_t is_zero = vceqq_f32(larger, vdupq_n_f32(0.0f));
+    return vbslq_f32(is_zero, vdupq_n_f32(0.0f), m);
+}
+
+static inline float32x4_t sk__cmag2_np_neon4(float32x4_t re, float32x4_t im) {
+    float32x4_t m = sk__cabs_np_neon4(re, im);
+    return vmulq_f32(m, m);
+}
+#endif /* SK_HAVE_NEON */
+
+/* ═══════════════════════════════ kernel 1 ══════════════════════════════════
+ * sk_cabs_np_f32 — out[i] = numpy |z[i]|. */
+
+static inline void sk_cabs_np_f32_scalar(const Complex *z, float *out, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = sk__cabs_np_elem(z[i].r, z[i].i);
+}
+
+#if SK_HAVE_NEON
+static inline void sk_cabs_np_f32(const Complex *z, float *out, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4x2_t v = vld2q_f32((const float *)(z + i));
+        float32x4_t r = sk__cabs_np_neon4(v.val[0], v.val[1]);
+        vst1q_f32(out + i, r);
+    }
+    for (; i < n; ++i) out[i] = sk__cabs_np_elem(z[i].r, z[i].i);
+}
+#else
+static inline void sk_cabs_np_f32(const Complex *z, float *out, int n) {
+    sk_cabs_np_f32_scalar(z, out, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 2 ══════════════════════════════════
+ * sk_cmag2_np_f32 — out[i] = numpy |z[i]|**2. */
+
+static inline void sk_cmag2_np_f32_scalar(const Complex *z, float *out, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = sk__cmag2_np_elem(z[i].r, z[i].i);
+}
+
+#if SK_HAVE_NEON
+static inline void sk_cmag2_np_f32(const Complex *z, float *out, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4x2_t v = vld2q_f32((const float *)(z + i));
+        float32x4_t m2 = sk__cmag2_np_neon4(v.val[0], v.val[1]);
+        vst1q_f32(out + i, m2);
+    }
+    for (; i < n; ++i) out[i] = sk__cmag2_np_elem(z[i].r, z[i].i);
+}
+#else
+static inline void sk_cmag2_np_f32(const Complex *z, float *out, int n) {
+    sk_cmag2_np_f32_scalar(z, out, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 3 ══════════════════════════════════
+ * sk_cmag2_np_acc_f32 — acc[i] += numpy |z[i]|**2 (pbfdaf.c x2_partition_sum
+ * / far-power accumulation pattern: acc[k] += cmag2_np(...)). */
+
+static inline void sk_cmag2_np_acc_f32_scalar(const Complex *z, float *acc, int n) {
+    int i;
+    for (i = 0; i < n; ++i) acc[i] += sk__cmag2_np_elem(z[i].r, z[i].i);
+}
+
+#if SK_HAVE_NEON
+static inline void sk_cmag2_np_acc_f32(const Complex *z, float *acc, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4x2_t v = vld2q_f32((const float *)(z + i));
+        float32x4_t m2 = sk__cmag2_np_neon4(v.val[0], v.val[1]);
+        float32x4_t a = vld1q_f32(acc + i);
+        vst1q_f32(acc + i, vaddq_f32(a, m2));
+    }
+    for (; i < n; ++i) acc[i] += sk__cmag2_np_elem(z[i].r, z[i].i);
+}
+#else
+static inline void sk_cmag2_np_acc_f32(const Complex *z, float *acc, int n) {
+    sk_cmag2_np_acc_f32_scalar(z, acc, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 4 ══════════════════════════════════
+ * sk_ema_f32 — state[i] = alpha*state[i] + beta*x[i]; verbatim shape of the
+ * pbfdkf.c far-power EMA (`p->power[k] = a*p->power[k] + b*cmag2_np(...)`),
+ * NOT collapsed to fmaf: the source computes this as two separate rounded
+ * multiplies then a separate rounded add (no fmaf call at this line), so
+ * this kernel must NOT fuse either — see the FMA-discipline note above.
+ * Requires the including TU to build with -ffp-contract=off (verified: at
+ * -O2 without it, clang auto-fuses this exact shape into fmla). */
+
+static inline void sk_ema_f32_scalar(float *state, const float *x,
+                                      float alpha, float beta, int n) {
+    int i;
+    for (i = 0; i < n; ++i) state[i] = alpha * state[i] + beta * x[i];
+}
+
+#if SK_HAVE_NEON
+static inline void sk_ema_f32(float *state, const float *x,
+                               float alpha, float beta, int n) {
+    int i = 0;
+    float32x4_t va = vdupq_n_f32(alpha), vb = vdupq_n_f32(beta);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t s = vld1q_f32(state + i);
+        float32x4_t xv = vld1q_f32(x + i);
+        float32x4_t r = vaddq_f32(vmulq_f32(va, s), vmulq_f32(vb, xv));
+        vst1q_f32(state + i, r);
+    }
+    for (; i < n; ++i) state[i] = alpha * state[i] + beta * x[i];
+}
+#else
+static inline void sk_ema_f32(float *state, const float *x,
+                               float alpha, float beta, int n) {
+    sk_ema_f32_scalar(state, x, alpha, beta, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 5 ══════════════════════════════════
+ * sk_ema_cmag2_f32 — state[i] = alpha*state[i] + beta*cmag2_np(z[i]).
+ *
+ * Cross-checked against pbfdkf.c:366-385 (the actual far-power EMA call
+ * site): the source is a plain two-branch EMA — a direct assignment on cold
+ * start (`power[k] = cmag2_np(...)` when sum(power) < 1e-10 and far is
+ * active), else `power[k] = a*power[k] + b*cmag2_np(...)`. That cold-start
+ * branch is a CALLER-level condition on the aggregate power sum, not a
+ * per-element algebraic form (e.g. not a `s += a*(x-s)` delta-EMA anywhere
+ * in this call site) — so the per-element kernel below is the vanilla
+ * two-term EMA already covered by kernel 4's shape, just with `x[i]`
+ * replaced by `cmag2_np(z[i])`; no separate "delta-form" kernel is needed.
+ * The outer combine is mul/mul/add, NOT fmaf, same discipline as kernel 4. */
+
+static inline void sk_ema_cmag2_f32_scalar(float *state, const Complex *z,
+                                            float alpha, float beta, int n) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        float mag2 = sk__cmag2_np_elem(z[i].r, z[i].i);
+        state[i] = alpha * state[i] + beta * mag2;
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_ema_cmag2_f32(float *state, const Complex *z,
+                                     float alpha, float beta, int n) {
+    int i = 0;
+    float32x4_t va = vdupq_n_f32(alpha), vb = vdupq_n_f32(beta);
+    for (; i + 4 <= n; i += 4) {
+        float32x4x2_t zv = vld2q_f32((const float *)(z + i));
+        float32x4_t mag2 = sk__cmag2_np_neon4(zv.val[0], zv.val[1]);
+        float32x4_t s = vld1q_f32(state + i);
+        float32x4_t r = vaddq_f32(vmulq_f32(va, s), vmulq_f32(vb, mag2));
+        vst1q_f32(state + i, r);
+    }
+    for (; i < n; ++i) {
+        float mag2 = sk__cmag2_np_elem(z[i].r, z[i].i);
+        state[i] = alpha * state[i] + beta * mag2;
+    }
+}
+#else
+static inline void sk_ema_cmag2_f32(float *state, const Complex *z,
+                                     float alpha, float beta, int n) {
+    sk_ema_cmag2_f32_scalar(state, z, alpha, beta, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 6 ══════════════════════════════════
+ * sk_cmac_np_f32 — acc[i] += w[i] * x[i] (numpy complex64 multiply, FMA
+ * form), verbatim from pbfdkf.c's echo_spec accumulation:
+ *   acc[k].r += fmaf(wr, xr, -(wi * xi));
+ *   acc[k].i += fmaf(wr, xi,  (wi * xr)); */
+
+static inline void sk_cmac_np_f32_scalar(Complex *acc, const Complex *w,
+                                          const Complex *x, int n) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        float wr = w[i].r, wi = w[i].i, xr = x[i].r, xi = x[i].i;
+        acc[i].r += fmaf(wr, xr, -(wi * xi));
+        acc[i].i += fmaf(wr, xi,  (wi * xr));
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_cmac_np_f32(Complex *acc, const Complex *w,
+                                   const Complex *x, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4x2_t wv = vld2q_f32((const float *)(w + i));
+        float32x4_t wr = wv.val[0], wi = wv.val[1];
+        float32x4x2_t xv = vld2q_f32((const float *)(x + i));
+        float32x4_t xr = xv.val[0], xi = xv.val[1];
+        float32x4_t re_prod = vfmaq_f32(vnegq_f32(vmulq_f32(wi, xi)), wr, xr);
+        float32x4_t im_prod = vfmaq_f32(vmulq_f32(wi, xr), wr, xi);
+        float32x4x2_t av = vld2q_f32((const float *)(acc + i));
+        float32x4x2_t rv;
+        rv.val[0] = vaddq_f32(av.val[0], re_prod);
+        rv.val[1] = vaddq_f32(av.val[1], im_prod);
+        vst2q_f32((float *)(acc + i), rv);
+    }
+    for (; i < n; ++i) {
+        float wr = w[i].r, wi = w[i].i, xr = x[i].r, xi = x[i].i;
+        acc[i].r += fmaf(wr, xr, -(wi * xi));
+        acc[i].i += fmaf(wr, xi,  (wi * xr));
+    }
+}
+#else
+static inline void sk_cmac_np_f32(Complex *acc, const Complex *w,
+                                   const Complex *x, int n) {
+    sk_cmac_np_f32_scalar(acc, w, x, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 7 ══════════════════════════════════
+ * sk_wupdate_nlms_f32 — the PBFDAF NLMS coarse-filter W-update, per-bin, for
+ * ONE partition (the outer loop-over-partitions stays scalar at the call
+ * site; this kernel vectorizes over the K frequency bins of a single
+ * partition). Verbatim from pbfdkf.c:504-519:
+ *   cxr = xr, cxi = -xi;                                  // conj(X)
+ *   gr = fmaf(er, cxr, -(ei * cxi));
+ *   gi = fmaf(er, cxi,  (ei * cxr));                      // grad = err*conj(X)
+ *   W[k].r += mu_eff[k] * gr;                             // NOT fmaf
+ *   W[k].i += mu_eff[k] * gi;                             // NOT fmaf
+ * The grad computation is explicit fmaf (fused); the final mu_eff*grad
+ * combine is a plain separate multiply then add (needs -ffp-contract=off). */
+
+static inline void sk_wupdate_nlms_f32_scalar(Complex *W, const Complex *X,
+                                               const Complex *err,
+                                               const float *mu_eff, int n) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        float er = err[i].r, ei = err[i].i;
+        float xr = X[i].r, xi = X[i].i;
+        float cxr = xr, cxi = -xi;
+        float gr = fmaf(er, cxr, -(ei * cxi));
+        float gi = fmaf(er, cxi,  (ei * cxr));
+        W[i].r += mu_eff[i] * gr;
+        W[i].i += mu_eff[i] * gi;
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_wupdate_nlms_f32(Complex *W, const Complex *X,
+                                        const Complex *err,
+                                        const float *mu_eff, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4x2_t ev = vld2q_f32((const float *)(err + i));
+        float32x4_t er = ev.val[0], ei = ev.val[1];
+        float32x4x2_t xv = vld2q_f32((const float *)(X + i));
+        float32x4_t xr = xv.val[0], xi = xv.val[1];
+        float32x4_t cxr = xr;
+        float32x4_t cxi = vnegq_f32(xi);
+        float32x4_t gr = vfmaq_f32(vnegq_f32(vmulq_f32(ei, cxi)), er, cxr);
+        float32x4_t gi = vfmaq_f32(vmulq_f32(ei, cxr), er, cxi);
+        float32x4_t mu = vld1q_f32(mu_eff + i);
+        float32x4x2_t wv = vld2q_f32((const float *)(W + i));
+        float32x4x2_t rv;
+        rv.val[0] = vaddq_f32(wv.val[0], vmulq_f32(mu, gr));
+        rv.val[1] = vaddq_f32(wv.val[1], vmulq_f32(mu, gi));
+        vst2q_f32((float *)(W + i), rv);
+    }
+    for (; i < n; ++i) {
+        float er = err[i].r, ei = err[i].i;
+        float xr = X[i].r, xi = X[i].i;
+        float cxr = xr, cxi = -xi;
+        float gr = fmaf(er, cxr, -(ei * cxi));
+        float gi = fmaf(er, cxi,  (ei * cxr));
+        W[i].r += mu_eff[i] * gr;
+        W[i].i += mu_eff[i] * gi;
+    }
+}
+#else
+static inline void sk_wupdate_nlms_f32(Complex *W, const Complex *X,
+                                        const Complex *err,
+                                        const float *mu_eff, int n) {
+    sk_wupdate_nlms_f32_scalar(W, X, err, mu_eff, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 8 ══════════════════════════════════
+ * sk_wupdate_kf_f32 — the PBFDKF Kalman W-update, per-bin, for ONE
+ * partition. Verbatim from pbfdkf.c:861-874:
+ *   kr = mu[k] * xr;             ki = -(mu[k] * xi);        // K = mu*conj(X)
+ *   ksr = kr * mu_scale[k];      ksi = ki * mu_scale[k];     // K *= mu_scale
+ *   W[k].r += fmaf(ksr, er, -(ksi * ei));
+ *   W[k].i += fmaf(ksr, ei,  (ksi * er));                   // W += K*err
+ * The K/K*=mu_scale steps are plain separate multiplies (no add involved,
+ * so no fusion risk there either way); the final `W += fmaf(...)` step is
+ * itself two operations — the fmaf (fused, explicit) producing the K*err
+ * increment, THEN a separate plain add onto the existing W[k] (the source
+ * writes `+=`, not a second fmaf) — replicated here as vfmaq_f32 followed
+ * by a separate vaddq_f32. */
+
+static inline void sk_wupdate_kf_f32_scalar(Complex *W, const Complex *X,
+                                             const Complex *err,
+                                             const float *mu,
+                                             const float *mu_scale, int n) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        float xr = X[i].r, xi = X[i].i;
+        float kr = mu[i] * xr;
+        float ki = -(mu[i] * xi);
+        float ksr = kr * mu_scale[i];
+        float ksi = ki * mu_scale[i];
+        float er = err[i].r, ei = err[i].i;
+        W[i].r += fmaf(ksr, er, -(ksi * ei));
+        W[i].i += fmaf(ksr, ei,  (ksi * er));
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_wupdate_kf_f32(Complex *W, const Complex *X,
+                                      const Complex *err,
+                                      const float *mu,
+                                      const float *mu_scale, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4x2_t xv = vld2q_f32((const float *)(X + i));
+        float32x4_t xr = xv.val[0], xi = xv.val[1];
+        float32x4_t muv = vld1q_f32(mu + i);
+        float32x4_t msv = vld1q_f32(mu_scale + i);
+        float32x4_t kr = vmulq_f32(muv, xr);
+        float32x4_t ki = vnegq_f32(vmulq_f32(muv, xi));
+        float32x4_t ksr = vmulq_f32(kr, msv);
+        float32x4_t ksi = vmulq_f32(ki, msv);
+        float32x4x2_t ev = vld2q_f32((const float *)(err + i));
+        float32x4_t er = ev.val[0], ei = ev.val[1];
+        float32x4_t dr = vfmaq_f32(vnegq_f32(vmulq_f32(ksi, ei)), ksr, er);
+        float32x4_t di = vfmaq_f32(vmulq_f32(ksi, er), ksr, ei);
+        float32x4x2_t wv = vld2q_f32((const float *)(W + i));
+        float32x4x2_t rv;
+        rv.val[0] = vaddq_f32(wv.val[0], dr);
+        rv.val[1] = vaddq_f32(wv.val[1], di);
+        vst2q_f32((float *)(W + i), rv);
+    }
+    for (; i < n; ++i) {
+        float xr = X[i].r, xi = X[i].i;
+        float kr = mu[i] * xr;
+        float ki = -(mu[i] * xi);
+        float ksr = kr * mu_scale[i];
+        float ksi = ki * mu_scale[i];
+        float er = err[i].r, ei = err[i].i;
+        W[i].r += fmaf(ksr, er, -(ksi * ei));
+        W[i].i += fmaf(ksr, ei,  (ksi * er));
+    }
+}
+#else
+static inline void sk_wupdate_kf_f32(Complex *W, const Complex *X,
+                                      const Complex *err,
+                                      const float *mu,
+                                      const float *mu_scale, int n) {
+    sk_wupdate_kf_f32_scalar(W, X, err, mu, mu_scale, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 9 ══════════════════════════════════
+ * sk_capply_gain_f32 — out[i] = z[i] * g[i] (real gain applied to both
+ * components). Supports out == z (in-place): each iteration fully loads
+ * before it stores, and iterations never revisit an earlier index, so
+ * aliasing at the SAME pointer is safe (no partial-overlap aliasing is
+ * supported/needed beyond that). */
+
+static inline void sk_capply_gain_f32_scalar(Complex *out, const Complex *z,
+                                              const float *g, int n) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        out[i].r = z[i].r * g[i];
+        out[i].i = z[i].i * g[i];
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_capply_gain_f32(Complex *out, const Complex *z,
+                                       const float *g, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4x2_t zv = vld2q_f32((const float *)(z + i));
+        float32x4_t gv = vld1q_f32(g + i);
+        float32x4x2_t rv;
+        rv.val[0] = vmulq_f32(zv.val[0], gv);
+        rv.val[1] = vmulq_f32(zv.val[1], gv);
+        vst2q_f32((float *)(out + i), rv);
+    }
+    for (; i < n; ++i) {
+        out[i].r = z[i].r * g[i];
+        out[i].i = z[i].i * g[i];
+    }
+}
+#else
+static inline void sk_capply_gain_f32(Complex *out, const Complex *z,
+                                       const float *g, int n) {
+    sk_capply_gain_f32_scalar(out, z, g, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 10 ═════════════════════════════════
+ * sk_cadd_f32 — out[i] = a[i] + b[i] (component-wise complex add). */
+
+static inline void sk_cadd_f32_scalar(Complex *out, const Complex *a,
+                                       const Complex *b, int n) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        out[i].r = a[i].r + b[i].r;
+        out[i].i = a[i].i + b[i].i;
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_cadd_f32(Complex *out, const Complex *a,
+                                const Complex *b, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4x2_t av = vld2q_f32((const float *)(a + i));
+        float32x4x2_t bv = vld2q_f32((const float *)(b + i));
+        float32x4x2_t rv;
+        rv.val[0] = vaddq_f32(av.val[0], bv.val[0]);
+        rv.val[1] = vaddq_f32(av.val[1], bv.val[1]);
+        vst2q_f32((float *)(out + i), rv);
+    }
+    for (; i < n; ++i) {
+        out[i].r = a[i].r + b[i].r;
+        out[i].i = a[i].i + b[i].i;
+    }
+}
+#else
+static inline void sk_cadd_f32(Complex *out, const Complex *a,
+                                const Complex *b, int n) {
+    sk_cadd_f32_scalar(out, a, b, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 11 ═════════════════════════════════
+ * sk_sq_scale_f32 — out[i] = (x[i]*x[i]) * scale (e.g. aec.c mean_sq's
+ * `scratch[i] = x[i]*x[i]` per-element step, generalized with a scale).
+ * Two separate multiplies, no add between them, so there is nothing for
+ * -ffp-contract to fuse either way — kept as explicit vmulq/vmulq for
+ * clarity and symmetry with the other "no FMA" kernels. */
+
+static inline void sk_sq_scale_f32_scalar(const float *x, float scale,
+                                           float *out, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = (x[i] * x[i]) * scale;
+}
+
+#if SK_HAVE_NEON
+static inline void sk_sq_scale_f32(const float *x, float scale,
+                                    float *out, int n) {
+    int i = 0;
+    float32x4_t sv = vdupq_n_f32(scale);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t xv = vld1q_f32(x + i);
+        float32x4_t sq = vmulq_f32(xv, xv);
+        vst1q_f32(out + i, vmulq_f32(sq, sv));
+    }
+    for (; i < n; ++i) out[i] = (x[i] * x[i]) * scale;
+}
+#else
+static inline void sk_sq_scale_f32(const float *x, float scale,
+                                    float *out, int n) {
+    sk_sq_scale_f32_scalar(x, scale, out, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 12 ═════════════════════════════════
+ * sk_min_f32 — out[i] = min_f(a[i], b[i]) = (a[i] < b[i]) ? a[i] : b[i]
+ *   (fast_math.h min_f's exact form).
+ * sk_clip_f32 — clip_f's exact branch order (fast_math.h:268-272): check the
+ *   LOW bound first, then the HIGH bound (equivalent to max(lo, min(hi, v))
+ *   for lo <= v, non-NaN inputs, but implemented as compare+select, in that
+ *   order, to avoid the vminq/vmaxq signed-zero tie-break mismatch --- see
+ *   the header-comment note above).
+ * Both use vcltq_f32/vcgtq_f32 + vbslq_f32 rather than vminq_f32/vmaxq_f32
+ * for exactly that reason. */
+
+static inline void sk_min_f32_scalar(float *out, const float *a,
+                                      const float *b, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = (a[i] < b[i]) ? a[i] : b[i];
+}
+
+#if SK_HAVE_NEON
+static inline void sk_min_f32(float *out, const float *a, const float *b, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t av = vld1q_f32(a + i);
+        float32x4_t bv = vld1q_f32(b + i);
+        uint32x4_t mask = vcltq_f32(av, bv);       /* a < b, exact IEEE '<' */
+        float32x4_t r = vbslq_f32(mask, av, bv);    /* mask ? a : b */
+        vst1q_f32(out + i, r);
+    }
+    for (; i < n; ++i) out[i] = (a[i] < b[i]) ? a[i] : b[i];
+}
+#else
+static inline void sk_min_f32(float *out, const float *a, const float *b, int n) {
+    sk_min_f32_scalar(out, a, b, n);
+}
+#endif
+
+static inline void sk_clip_f32_scalar(float *x, float lo, float hi, int n) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        if (x[i] < lo) x[i] = lo;
+        else if (x[i] > hi) x[i] = hi;
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_clip_f32(float *x, float lo, float hi, int n) {
+    int i = 0;
+    float32x4_t lov = vdupq_n_f32(lo), hiv = vdupq_n_f32(hi);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        uint32x4_t lomask = vcltq_f32(v, lov);      /* x < lo */
+        uint32x4_t himask = vcgtq_f32(v, hiv);      /* x > hi */
+        float32x4_t r = vbslq_f32(lomask, lov, v);
+        r = vbslq_f32(himask, hiv, r);              /* mutually exclusive
+                                                      * with lomask when
+                                                      * lo <= hi */
+        vst1q_f32(x + i, r);
+    }
+    for (; i < n; ++i) {
+        if (x[i] < lo) x[i] = lo;
+        else if (x[i] > hi) x[i] = hi;
+    }
+}
+#else
+static inline void sk_clip_f32(float *x, float lo, float hi, int n) {
+    sk_clip_f32_scalar(x, lo, hi, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 13 ═════════════════════════════════
+ * sk_pairwise_sum_f32 — numpy-1.26-bit-exact pairwise float32 sum, verbatim
+ * tree from AEC/c_impl/src/aec3_post.c pairwise_sum_f32() (n<=8 serial;
+ * n<=128 8-accumulator leaf; recursive split with half -= half%8).
+ *
+ * NEON leaf math (verified by hand): q0 holds running column-sums for
+ * acc[0..3], q1 for acc[4..7] (same 8-wide grouping as the scalar leaf).
+ * `t = vpaddq_f32(q0,q1)` = [acc0+acc1, acc2+acc3, acc4+acc5, acc6+acc7].
+ * `u = vpaddq_f32(t,t)` = [ (acc0+acc1)+(acc2+acc3), (acc4+acc5)+(acc6+acc7),
+ * <repeat> ]. `u[0]+u[1]` therefore equals
+ * `((acc0+acc1)+(acc2+acc3)) + ((acc4+acc5)+(acc6+acc7))` — the exact same
+ * grouping as the scalar leaf's `r`. */
+
+static inline float sk__pairwise_sum_leaf_scalar(const float *a, size_t n) {
+    float acc[8];
+    size_t i, j;
+    for (j = 0; j < 8; ++j) acc[j] = a[j];
+    for (i = 8; i + 8 <= n; i += 8)
+        for (j = 0; j < 8; ++j) acc[j] += a[i + j];
+    {
+        float s = 0.0f, r;
+        for (; i < n; ++i) s += a[i];
+        r = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
+          + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+        return r + s;
+    }
+}
+
+static inline float sk_pairwise_sum_f32_scalar(const float *a, size_t n) {
+    if (n <= 8) {
+        float s = 0.0f;
+        size_t i;
+        for (i = 0; i < n; ++i) s += a[i];
+        return s;
+    }
+    if (n <= 128) return sk__pairwise_sum_leaf_scalar(a, n);
+    {
+        size_t half = n / 2;
+        half -= half % 8;
+        return sk_pairwise_sum_f32_scalar(a, half)
+             + sk_pairwise_sum_f32_scalar(a + half, n - half);
+    }
+}
+
+#if SK_HAVE_NEON
+static inline float sk__pairwise_sum_leaf_neon(const float *a, size_t n) {
+    float32x4_t q0 = vld1q_f32(a), q1 = vld1q_f32(a + 4);
+    size_t i;
+    for (i = 8; i + 8 <= n; i += 8) {
+        q0 = vaddq_f32(q0, vld1q_f32(a + i));
+        q1 = vaddq_f32(q1, vld1q_f32(a + i + 4));
+    }
+    {
+        float s = 0.0f, r;
+        for (; i < n; ++i) s += a[i];
+        {
+            float32x4_t t = vpaddq_f32(q0, q1);
+            float32x4_t u = vpaddq_f32(t, t);
+            r = vgetq_lane_f32(u, 0) + vgetq_lane_f32(u, 1);
+        }
+        return r + s;
+    }
+}
+
+static inline float sk_pairwise_sum_f32(const float *a, size_t n) {
+    if (n <= 8) {
+        float s = 0.0f;
+        size_t i;
+        for (i = 0; i < n; ++i) s += a[i];
+        return s;
+    }
+    if (n <= 128) return sk__pairwise_sum_leaf_neon(a, n);
+    {
+        size_t half = n / 2;
+        half -= half % 8;
+        return sk_pairwise_sum_f32(a, half) + sk_pairwise_sum_f32(a + half, n - half);
+    }
+}
+#else
+static inline float sk_pairwise_sum_f32(const float *a, size_t n) {
+    return sk_pairwise_sum_f32_scalar(a, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 14 ═════════════════════════════════
+ * sk_sum_sq_pairwise_f32 — same tree as kernel 13, over squared elements.
+ * Verbatim from AEC/c_impl/src/aec3_post.c sum_sq_f32_pairwise() (lines
+ * 394-423): identical structure/split/combine order, leaf accumulates
+ * a[i+j]*a[i+j] instead of a[i+j]. */
+
+static inline float sk__sum_sq_leaf_scalar(const float *a, size_t n) {
+    float acc[8];
+    size_t i, j;
+    for (j = 0; j < 8; ++j) { float v = a[j]; acc[j] = v * v; }
+    for (i = 8; i + 8 <= n; i += 8)
+        for (j = 0; j < 8; ++j) { float v = a[i + j]; acc[j] += v * v; }
+    {
+        float s = 0.0f, r;
+        for (; i < n; ++i) { float v = a[i]; s += v * v; }
+        r = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
+          + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+        return r + s;
+    }
+}
+
+static inline float sk_sum_sq_pairwise_f32_scalar(const float *a, size_t n) {
+    if (n <= 8) {
+        float s = 0.0f;
+        size_t i;
+        for (i = 0; i < n; ++i) { float v = a[i]; s += v * v; }
+        return s;
+    }
+    if (n <= 128) return sk__sum_sq_leaf_scalar(a, n);
+    {
+        size_t half = n / 2;
+        half -= half % 8;
+        return sk_sum_sq_pairwise_f32_scalar(a, half)
+             + sk_sum_sq_pairwise_f32_scalar(a + half, n - half);
+    }
+}
+
+#if SK_HAVE_NEON
+static inline float sk__sum_sq_leaf_neon(const float *a, size_t n) {
+    float32x4_t a0 = vld1q_f32(a), a1 = vld1q_f32(a + 4);
+    float32x4_t q0 = vmulq_f32(a0, a0), q1 = vmulq_f32(a1, a1);
+    size_t i;
+    for (i = 8; i + 8 <= n; i += 8) {
+        float32x4_t b0 = vld1q_f32(a + i), b1 = vld1q_f32(a + i + 4);
+        q0 = vaddq_f32(q0, vmulq_f32(b0, b0));
+        q1 = vaddq_f32(q1, vmulq_f32(b1, b1));
+    }
+    {
+        float s = 0.0f, r;
+        for (; i < n; ++i) { float v = a[i]; s += v * v; }
+        {
+            float32x4_t t = vpaddq_f32(q0, q1);
+            float32x4_t u = vpaddq_f32(t, t);
+            r = vgetq_lane_f32(u, 0) + vgetq_lane_f32(u, 1);
+        }
+        return r + s;
+    }
+}
+
+static inline float sk_sum_sq_pairwise_f32(const float *a, size_t n) {
+    if (n <= 8) {
+        float s = 0.0f;
+        size_t i;
+        for (i = 0; i < n; ++i) { float v = a[i]; s += v * v; }
+        return s;
+    }
+    if (n <= 128) return sk__sum_sq_leaf_neon(a, n);
+    {
+        size_t half = n / 2;
+        half -= half % 8;
+        return sk_sum_sq_pairwise_f32(a, half) + sk_sum_sq_pairwise_f32(a + half, n - half);
+    }
+}
+#else
+static inline float sk_sum_sq_pairwise_f32(const float *a, size_t n) {
+    return sk_sum_sq_pairwise_f32_scalar(a, n);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 15 ═════════════════════════════════
+ * sk_fast_sqrt_f32 — per-lane replica of fast_math.h fast_sqrt() (bit-trick
+ * seed + 2 Newton iterations). The `v<=0` guard is applied as a final
+ * vcleq_f32+vbslq_f32 select (matching cabs_np's "compute unconditionally,
+ * then select" pattern) rather than a branch: the bit-trick/Newton steps
+ * are well-defined (finite, no trap) for non-positive/negative `v` too —
+ * their result is simply discarded by the select for those lanes, same
+ * final bits as the scalar early return. */
+
+static inline void sk_fast_sqrt_f32_scalar(const float *x, float *out, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = sk__fast_sqrt_elem(x[i]);
+}
+
+#if SK_HAVE_NEON
+static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        uint32x4_t bits = vreinterpretq_u32_f32(v);
+        uint32x4_t seed_bits = vaddq_u32(vshrq_n_u32(bits, 1),
+                                         vdupq_n_u32(0x1FC00000u));
+        float32x4_t xk = vreinterpretq_f32_u32(seed_bits);
+        xk = vmulq_f32(vdupq_n_f32(0.5f), vaddq_f32(xk, vdivq_f32(v, xk)));
+        xk = vmulq_f32(vdupq_n_f32(0.5f), vaddq_f32(xk, vdivq_f32(v, xk)));
+        {
+            uint32x4_t nonpos = vcleq_f32(v, vdupq_n_f32(0.0f));
+            float32x4_t r = vbslq_f32(nonpos, vdupq_n_f32(0.0f), xk);
+            vst1q_f32(out + i, r);
+        }
+    }
+    for (; i < n; ++i) out[i] = sk__fast_sqrt_elem(x[i]);
+}
+#else
+static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
+    sk_fast_sqrt_f32_scalar(x, out, n);
+}
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SIMD_KERNELS_H */
