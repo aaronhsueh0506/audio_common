@@ -94,6 +94,34 @@ void fft_forward(FftHandle* handle, const float* time_in, Complex* freq_out);
 void fft_inverse(FftHandle* handle, const Complex* freq_in, float* time_out);
 
 /**
+ * Forward FFT: real input -> complex output, input clobber PERMITTED.
+ *
+ * Same transform as fft_forward(), but the caller's input buffer contents
+ * are UNDEFINED after the call: a backend that would otherwise stage a
+ * private defensive copy of the input (to protect it from a kernel that
+ * may write through its input pointer) is free to skip that copy and let
+ * the kernel operate on `time_in_clobbered` directly. Use only when the
+ * caller has no further use for the input buffer after this call.
+ *
+ * @param handle FFT handle
+ * @param time_in_clobbered Real input [fft_size]; contents undefined on return
+ * @param complex_out Complex output [n_freqs]
+ */
+void fft_forward_scratch(FftHandle* handle, float* time_in_clobbered, Complex* complex_out);
+
+/**
+ * Inverse FFT: complex input -> real output, input clobber PERMITTED.
+ *
+ * Same transform as fft_inverse(), but the caller's input buffer contents
+ * are UNDEFINED after the call. See fft_forward_scratch() for the rationale.
+ *
+ * @param handle FFT handle
+ * @param freq_in_clobbered Complex input [n_freqs]; contents undefined on return
+ * @param real_out Real output [fft_size]
+ */
+void fft_inverse_scratch(FftHandle* handle, Complex* freq_in_clobbered, float* real_out);
+
+/**
  * Compute magnitude spectrum from complex spectrum
  *
  * @param freq Complex spectrum [n_freqs]

@@ -13,6 +13,10 @@
 #include <string.h>
 #include <math.h>
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 static int ne10_initialized = 0;
 
 // Internal FFT handle structure
@@ -146,27 +150,66 @@ int fft_get_n_freqs(const FftHandle* h) {
 void fft_forward(FftHandle* h, const float* real_in, Complex* complex_out) {
     if (!h || !real_in || !complex_out) return;
 
-    // Copy input to work buffer (NE10 R2C may modify input)
+    // Copy input to work buffer (NE10 R2C may modify input; real_in is the
+    // caller's buffer and fft_forward's contract leaves it unmodified).
     memcpy(h->real_buf, real_in, h->fft_size * sizeof(float));
 
-    // Forward R2C FFT: real[fft_size] -> complex[n_freqs]
-    ne10_fft_r2c_1d_float32_neon(h->cpx_buf, h->real_buf, h->r2c_cfg);
-
-    // Copy output (ne10_fft_cpx_float32_t has same layout as Complex: {float r, float i})
-    memcpy(complex_out, h->cpx_buf, h->n_freqs * sizeof(Complex));
+    // Forward R2C FFT: real[fft_size] -> complex[n_freqs], written straight
+    // into the caller's output buffer. ne10_fft_cpx_float32_t has the same
+    // layout as Complex ({float r, float i}), so the kernel produces the
+    // same bytes whether its destination is h->cpx_buf or complex_out --
+    // the output-side staging copy through h->cpx_buf was pure overhead and
+    // is elided here (h->cpx_buf is still used as the fft_inverse input
+    // staging buffer below).
+    ne10_fft_r2c_1d_float32_neon((ne10_fft_cpx_float32_t*)complex_out, h->real_buf, h->r2c_cfg);
 }
 
 void fft_inverse(FftHandle* h, const Complex* complex_in, float* real_out) {
     if (!h || !complex_in || !real_out) return;
 
-    // Copy n_freqs bins to work buffer (NE10 C2R may modify input)
+    // Copy n_freqs bins to work buffer (NE10 C2R may modify input; complex_in
+    // is the caller's buffer and fft_inverse's contract leaves it unmodified).
     memcpy(h->cpx_buf, complex_in, h->n_freqs * sizeof(ne10_fft_cpx_float32_t));
 
-    // Inverse C2R FFT: complex[n_freqs] -> real[fft_size]
-    ne10_fft_c2r_1d_float32_neon(h->real_buf, h->cpx_buf, h->r2c_cfg);
+    // Inverse C2R FFT: complex[n_freqs] -> real[fft_size], written straight
+    // into the caller's output buffer -- the output-side staging copy
+    // through h->real_buf was pure overhead and is elided here (NE10 C2R
+    // IFFT auto-scales by 1/N, official doc confirmed; h->real_buf is still
+    // used as the fft_forward input staging buffer above).
+    ne10_fft_c2r_1d_float32_neon(real_out, h->cpx_buf, h->r2c_cfg);
+}
 
-    // NE10 C2R IFFT auto-scales by 1/N (official doc confirmed)
-    memcpy(real_out, h->real_buf, h->fft_size * sizeof(float));
+/* --- scratch variants (caller's input buffer contents left undefined) -----
+ * NE10's R2C/C2R kernels are documented (and confirmed by reading
+ * NE10_rfft_float32.neonintrinsic.c's ne10_fft_c2r_1d_float32_neon default
+ * case: it temporarily repurposes fin[0].i to carry the Nyquist bin's real
+ * part -- `fin[0].i = fin[cfg->nfft>>1].r;` ... `fin[0].i = 0.0f;` -- and
+ * the r2c side is documented the same way) to possibly write through their
+ * input pointer. fft_forward/fft_inverse protect the caller's buffer with a
+ * staging copy into h->real_buf/h->cpx_buf for exactly that reason. These
+ * _scratch entry points drop that protection: they feed the caller's own
+ * buffer straight to the kernel as its input AND (per the output elision
+ * above) its output is already the caller's other buffer -- so there is no
+ * staging copy left at all, matching the "contents undefined after the
+ * call" contract in fft_wrapper.h.
+ *
+ * Alignment: ne10_fft_r2c_1d_float32_neon / ne10_fft_c2r_1d_float32_neon
+ * take plain `ne10_float32_t*` / `ne10_fft_cpx_float32_t*` pointers (see
+ * NE10_dsp.h) with no alignment attribute -- NE10_BYTE_ALIGNMENT is only
+ * used internally when carving the twiddle-factor cfg buffer, never applied
+ * to the fin/fout data pointers. AArch64 NEON load/store instructions do
+ * not fault on unaligned addresses, so a caller buffer that is only
+ * ALIGN16-guaranteed (pools/malloc; see mem_align.h) rather than aligned to
+ * some larger NE10-internal boundary is safe to pass here. */
+
+void fft_forward_scratch(FftHandle* h, float* time_in_clobbered, Complex* complex_out) {
+    if (!h || !time_in_clobbered || !complex_out) return;
+    ne10_fft_r2c_1d_float32_neon((ne10_fft_cpx_float32_t*)complex_out, time_in_clobbered, h->r2c_cfg);
+}
+
+void fft_inverse_scratch(FftHandle* h, Complex* freq_in_clobbered, float* real_out) {
+    if (!h || !freq_in_clobbered || !real_out) return;
+    ne10_fft_c2r_1d_float32_neon(real_out, (ne10_fft_cpx_float32_t*)freq_in_clobbered, h->r2c_cfg);
 }
 
 void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
@@ -182,10 +225,28 @@ void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
 void fft_power(const Complex* spectrum, float* power, int n_freqs) {
     if (!spectrum || !power) return;
 
-    for (int k = 0; k < n_freqs; k++) {
+    int k = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    /* Verified via `objdump -d` on the CURRENT build (no -ffp-contract=off
+     * on this TU): clang contracts `re*re + im*im` into
+     *   fmul s1, im, im
+     *   fmadd s0, re, re, s1
+     * i.e. fmaf(re, re, im*im) -- im*im rounded separately, then re*re fused
+     * against it (byte-identical codegen to the KISS TU's fft_power). The
+     * explicit scalar form below reproduces that exactly, and this NEON
+     * path mirrors the same fused/unfused shape lane-for-lane (im*im via
+     * vmulq_f32, then vfmaq_f32(that, re, re)). */
+    for (; k + 4 <= n_freqs; k += 4) {
+        float32x4x2_t v = vld2q_f32((const float*)(spectrum + k));
+        float32x4_t re = v.val[0], im = v.val[1];
+        float32x4_t p = vfmaq_f32(vmulq_f32(im, im), re, re);
+        vst1q_f32(power + k, p);
+    }
+#endif
+    for (; k < n_freqs; k++) {
         float re = spectrum[k].r;
         float im = spectrum[k].i;
-        power[k] = re * re + im * im;
+        power[k] = fmaf(re, re, im * im);
     }
 }
 
@@ -210,7 +271,20 @@ void fft_from_mag_phase(const float* magnitude, const float* phase,
 void fft_apply_gain(Complex* spectrum, const float* gain, int n_freqs) {
     if (!spectrum || !gain) return;
 
-    for (int k = 0; k < n_freqs; k++) {
+    int k = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    /* Pure multiplies, no add -- nothing for fp-contraction to fuse either
+     * way, so this NEON path is a plain deinterleave/vmulq/reinterleave. */
+    for (; k + 4 <= n_freqs; k += 4) {
+        float32x4x2_t v = vld2q_f32((const float*)(spectrum + k));
+        float32x4_t g = vld1q_f32(gain + k);
+        float32x4x2_t r;
+        r.val[0] = vmulq_f32(v.val[0], g);
+        r.val[1] = vmulq_f32(v.val[1], g);
+        vst2q_f32((float*)(spectrum + k), r);
+    }
+#endif
+    for (; k < n_freqs; k++) {
         spectrum[k].r *= gain[k];
         spectrum[k].i *= gain[k];
     }

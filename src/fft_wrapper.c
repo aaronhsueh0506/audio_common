@@ -23,6 +23,10 @@
 #include <string.h>
 #include <math.h>
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 /* Internal FFT handle structure */
 struct FftHandle {
     int fft_size;
@@ -175,6 +179,24 @@ void fft_inverse(FftHandle* h, const Complex* complex_in, float* real_out) {
     }
 }
 
+/* --- scratch variants (caller's input buffer contents left undefined) ----
+ * KISS's fft_forward/fft_inverse already copy the caller's input into a
+ * private buffer (h->fft_in) before touching kiss_fft's engine and never
+ * write back into the caller's buffer -- the staging here is structural,
+ * not a defensive copy against a clobbering kernel. So there is nothing to
+ * elide: real_in/complex_in are never modified by the plain API either.
+ * The _scratch entry points just forward to it; the API contract ("contents
+ * undefined after the call") is satisfied trivially since it only permits
+ * clobbering, it doesn't require it. */
+
+void fft_forward_scratch(FftHandle* h, float* time_in_clobbered, Complex* complex_out) {
+    fft_forward(h, time_in_clobbered, complex_out);
+}
+
+void fft_inverse_scratch(FftHandle* h, Complex* freq_in_clobbered, float* real_out) {
+    fft_inverse(h, freq_in_clobbered, real_out);
+}
+
 /* --- spectral helpers ----------------------------------------------------- */
 
 void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
@@ -187,9 +209,26 @@ void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
 
 void fft_power(const Complex* spectrum, float* power, int n_freqs) {
     if (!spectrum || !power) return;
-    for (int k = 0; k < n_freqs; k++) {
+    int k = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    /* Verified via `objdump -d` on the CURRENT build (no -ffp-contract=off
+     * on this TU): clang contracts `re*re + im*im` into
+     *   fmul s1, im, im
+     *   fmadd s0, re, re, s1
+     * i.e. fmaf(re, re, im*im) -- im*im rounded separately, then re*re fused
+     * against it. The explicit scalar form below reproduces that exactly,
+     * and this NEON path mirrors the same fused/unfused shape lane-for-lane
+     * (im*im via vmulq_f32, then vfmaq_f32(that, re, re)). */
+    for (; k + 4 <= n_freqs; k += 4) {
+        float32x4x2_t v = vld2q_f32((const float*)(spectrum + k));
+        float32x4_t re = v.val[0], im = v.val[1];
+        float32x4_t p = vfmaq_f32(vmulq_f32(im, im), re, re);
+        vst1q_f32(power + k, p);
+    }
+#endif
+    for (; k < n_freqs; k++) {
         float re = spectrum[k].r, im = spectrum[k].i;
-        power[k] = re * re + im * im;
+        power[k] = fmaf(re, re, im * im);
     }
 }
 
@@ -211,7 +250,20 @@ void fft_from_mag_phase(const float* magnitude, const float* phase,
 
 void fft_apply_gain(Complex* spectrum, const float* gain, int n_freqs) {
     if (!spectrum || !gain) return;
-    for (int k = 0; k < n_freqs; k++) {
+    int k = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    /* Pure multiplies, no add -- nothing for fp-contraction to fuse either
+     * way, so this NEON path is a plain deinterleave/vmulq/reinterleave. */
+    for (; k + 4 <= n_freqs; k += 4) {
+        float32x4x2_t v = vld2q_f32((const float*)(spectrum + k));
+        float32x4_t g = vld1q_f32(gain + k);
+        float32x4x2_t r;
+        r.val[0] = vmulq_f32(v.val[0], g);
+        r.val[1] = vmulq_f32(v.val[1], g);
+        vst2q_f32((float*)(spectrum + k), r);
+    }
+#endif
+    for (; k < n_freqs; k++) {
         spectrum[k].r *= gain[k];
         spectrum[k].i *= gain[k];
     }
