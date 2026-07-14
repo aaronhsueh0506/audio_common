@@ -358,6 +358,19 @@ extern "C" {
     extern ne10_fft_r2c_cfg_float32_t ne10_fft_alloc_r2c_float32 (ne10_int32_t nfft);
 
     /**
+     * @brief (P0001) Number of bytes an external-memory config of this nfft needs -- see
+     * @ref ne10_fft_init_r2c_float32_ext.
+     */
+    extern ne10_uint32_t ne10_fft_r2c_mem_size_float32 (ne10_int32_t nfft);
+
+    /**
+     * @brief (P0001) External-memory counterpart to @ref ne10_fft_alloc_r2c_float32: initialises a
+     * configuration structure in caller-supplied memory (at least @ref ne10_fft_r2c_mem_size_float32(nfft)
+     * bytes) instead of malloc()'ing one. Never frees `mem`, on success or failure -- the caller owns it.
+     */
+    extern ne10_fft_r2c_cfg_float32_t ne10_fft_init_r2c_float32_ext (void *mem, ne10_int32_t nfft);
+
+    /**
      * @brief Mixed radix-2/4 real-to-complex FFT of single precision floating point data.
      *
      * @param[out]  *fout            pointer to the output buffer

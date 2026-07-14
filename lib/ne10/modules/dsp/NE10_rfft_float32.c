@@ -745,21 +745,17 @@ NE10_INLINE void ne10_mixed_radix_c2r_butterfly_float32_c (
 }
 
 /**
- * @brief User-callable function to create a configuration structure for the R2C/C2R FFT/IFFT.
+ * @brief Computes the number of bytes needed for an R2C/C2R FFT/IFFT configuration structure.
  * @param[in]   nfft             length of FFT
- * @retval      st               pointer to the FFT configuration memory, allocated with malloc.
+ * @retval      memneeded        number of bytes required by @ref ne10_fft_init_r2c_float32_ext for this nfft.
  *
- * This function allocates and initialises an ne10_fft_r2c_cfg_float32_t configuration structure for the
- * real-to-complex and complex-to-real FFT/IFFT. As part of this, it reserves a buffer used internally
- * by the FFT algorithm, factors the length of the FFT into simpler chunks, and generates a "twiddle
- * table" of coefficients used in the FFT "butterfly" calculations.
+ * P0001 (external-memory r2c config init): a caller that owns a static/pooled memory block (rather
+ * than letting @ref ne10_fft_alloc_r2c_float32 malloc() one) sizes that block with this function, then
+ * hands it to @ref ne10_fft_init_r2c_float32_ext. This is the exact `memneeded` expression
+ * @ref ne10_fft_alloc_r2c_float32 itself uses -- extracted here so both paths size the config identically.
  */
-ne10_fft_r2c_cfg_float32_t ne10_fft_alloc_r2c_float32 (ne10_int32_t nfft)
+ne10_uint32_t ne10_fft_r2c_mem_size_float32 (ne10_int32_t nfft)
 {
-    ne10_fft_r2c_cfg_float32_t st = NULL;
-    ne10_int32_t ncfft = nfft >> 1;
-    ne10_int32_t result;
-
     ne10_uint32_t memneeded =   sizeof (ne10_fft_r2c_state_float32_t)
                               + sizeof (ne10_fft_cpx_float32_t) * nfft              /* buffer*/
                               + sizeof (ne10_int32_t) * (NE10_MAXFACTORS * 2)       /* r_factors */
@@ -768,8 +764,27 @@ ne10_fft_r2c_cfg_float32_t ne10_fft_alloc_r2c_float32 (ne10_int32_t nfft)
                               + sizeof (ne10_fft_cpx_float32_t) * nfft/4            /* r_twiddles_neon */
                               + sizeof (ne10_fft_cpx_float32_t) * (12 + nfft/32*12) /* r_super_twiddles_neon */
                               + NE10_FFT_BYTE_ALIGNMENT;     /* 64-bit alignment*/
+    return memneeded;
+}
 
-    st = (ne10_fft_r2c_cfg_float32_t) NE10_MALLOC (memneeded);
+/**
+ * @brief Initialises an R2C/C2R FFT/IFFT configuration structure in caller-supplied memory.
+ * @param[in]   mem              pointer to a block of at least @ref ne10_fft_r2c_mem_size_float32(nfft) bytes
+ * @param[in]   nfft             length of FFT
+ * @retval      st               pointer to the FFT configuration structure (== mem on success), or NULL
+ *
+ * P0001 (external-memory r2c config init): this is @ref ne10_fft_alloc_r2c_float32's pointer-carve and
+ * twiddle-table generation, unchanged, operating on `mem` instead of a fresh @ref NE10_MALLOC allocation.
+ * @ref ne10_fft_alloc_r2c_float32 is now a thin malloc()-then-call-this wrapper around this function, so
+ * there is exactly one twiddle code path: a heap-allocated config and a caller-pool config for the same
+ * nfft are bit-identical by construction. This function never frees `mem` -- the caller owns that memory
+ * either way, on both success and failure.
+ */
+ne10_fft_r2c_cfg_float32_t ne10_fft_init_r2c_float32_ext (void *mem, ne10_int32_t nfft)
+{
+    ne10_fft_r2c_cfg_float32_t st = (ne10_fft_r2c_cfg_float32_t) mem;
+    ne10_int32_t ncfft = nfft >> 1;
+    ne10_int32_t result;
 
     if (!st)
     {
@@ -845,6 +860,41 @@ ne10_fft_r2c_cfg_float32_t ne10_fft_alloc_r2c_float32 (ne10_int32_t nfft)
             }
         }
     }
+    return st;
+}
+
+/**
+ * @brief User-callable function to create a configuration structure for the R2C/C2R FFT/IFFT.
+ * @param[in]   nfft             length of FFT
+ * @retval      st               pointer to the FFT configuration memory, allocated with malloc.
+ *
+ * This function allocates and initialises an ne10_fft_r2c_cfg_float32_t configuration structure for the
+ * real-to-complex and complex-to-real FFT/IFFT. As part of this, it reserves a buffer used internally
+ * by the FFT algorithm, factors the length of the FFT into simpler chunks, and generates a "twiddle
+ * table" of coefficients used in the FFT "butterfly" calculations.
+ *
+ * P0001 (external-memory r2c config init): the carving/factoring/twiddle body that used to live directly
+ * in this function now lives in @ref ne10_fft_init_r2c_float32_ext, so this is just malloc() sized by
+ * @ref ne10_fft_r2c_mem_size_float32 followed by a call into it -- see that function for the one twiddle
+ * code path both this and the external-memory entry point share.
+ */
+ne10_fft_r2c_cfg_float32_t ne10_fft_alloc_r2c_float32 (ne10_int32_t nfft)
+{
+    ne10_uint32_t memneeded = ne10_fft_r2c_mem_size_float32 (nfft);
+
+    void *mem = NE10_MALLOC (memneeded);
+    if (!mem)
+    {
+        return NULL;
+    }
+
+    ne10_fft_r2c_cfg_float32_t st = ne10_fft_init_r2c_float32_ext (mem, nfft);
+    if (!st)
+    {
+        NE10_FREE (mem);
+        return NULL;
+    }
+
     return st;
 }
 
