@@ -43,7 +43,7 @@ OBJ_DIR = obj/$(BACKEND)
 BIN_DIR = bin/$(BACKEND)
 
 # Backend-independent shared DSP sources (always in the archive).
-COMMON_SRCS = src/hpf.c
+COMMON_SRCS = src/hpf.c src/hpf_f64.c
 
 ifeq ($(BACKEND),ne10)
   # Whole, UNMODIFIED NE10 DSP module (C reference + NEON-intrinsic variants, all

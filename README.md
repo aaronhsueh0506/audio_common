@@ -8,7 +8,8 @@ One copy of the shared DSP code for every consumer repo (AEC, NR, Audio_ALG):
 | KISS FFT | `lib/kiss_fft/` | portable reference backend |
 | NE10 | `lib/ne10/` | whole, **unmodified** NE10 DSP module (C + NEON kernels) |
 | fast_math | `include/fast_math.h` | header-only LUT/Taylor approximations |
-| HPF | `include/hpf.h`, `src/hpf.c` | biquad high-pass |
+| HPF (f32) | `include/hpf.h`, `src/hpf.c` | biquad high-pass, DF2-transposed, `hpf_create`/`hpf_get_mem_size`+`hpf_init` API |
+| HPF (f64) | `include/hpf_f64.h`, `src/hpf_f64.c` | fp64-state Direct Form II biquad, bit-exact port of the AEC Python reference; value-type caller-owned struct (`hpf_f64_*`) — used by AEC's mic path |
 
 ## Build
 
@@ -22,8 +23,9 @@ make selftest      # round-trip + static==heap byte-equality check
 Output: `bin/<backend>/libaudio_common.a` (per-backend dirs — the two builds coexist).
 Consumers add `-I<here>/include` and link the archive for their chosen backend.
 
-Backend policy: `main` branches build against KISS (bit-reproducible reference);
-`feature/static-memory` (embedded deliverable) builds against NE10.
+Backend policy: desktop/CI builds use KISS (bit-reproducible reference); embedded
+builds pass `BACKEND=ne10`. Backend is a build knob, not a branch property — every
+consumer repo is single-branch (`main`).
 
 ## API conventions
 
@@ -39,12 +41,14 @@ Backend policy: `main` branches build against KISS (bit-reproducible reference);
   bit-exactness / parity-vs-Python guarantees are KISS-only; NE10-heap vs
   NE10-static must still be byte-equal (allocation is numerically transparent).
 
-## ⚠ Known collision to resolve before linking hpf anywhere
+## Why two HPFs (collision resolved)
 
-AEC has its OWN internal `src/hpf.c` (embedded-struct API: `hpf_init(Hpf*, cutoff_hz,
-sample_rate)`, `hpf_process`) whose symbol names collide with this library's standalone
-hpf (`hpf_init(void* mem, size_t, ...)` — different signature). A binary that pulls hpf
-members from BOTH archives fails with duplicate symbols (loud, at link time). Until the
-two are reconciled (AEC migrating to this hpf, or a rename), do NOT call audio_common's
-hpf from anything that also links libaec — the AEC mic-path HPF is internal to
-aec_process and needs nothing from here.
+AEC's mic-path HPF is a **bit-exact fp64 port** of its Python reference — its state
+precision and value-type API are part of the Python↔C parity contract, so it cannot
+adopt the f32 platform HPF without changing output. It used to live inside the AEC
+repo under colliding symbol names (`hpf_init`/`hpf_process`/`hpf_reset` with a
+different signature — a latent duplicate-symbol / ABI-mismatch hazard); it now lives
+here as `hpf_f64_*`, so both filters link side by side safely. Pick by need:
+`hpf.h` (f32, heap/pool API) for platform code; `hpf_f64.h` for anything that must
+match the AEC reference bit-for-bit. The fp64 cost is negligible (~6 scalar fp64
+ops/sample on one path; Cortex-A/AArch64 has hardware fp64).
