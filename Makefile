@@ -13,6 +13,19 @@
 
 CC      ?= cc
 
+# -Werror opt-in (default off; CI can flip it on with `make WERROR=1`).
+# Declared this early (rather than down by its ifeq block, where it used to
+# live) because CFG_SIG below folds WERROR into its hash and needs its
+# final value already resolved -- GNU Make expands variable references in a
+# rule's target/prerequisite list (including a target-specific variable
+# assignment's target) IMMEDIATELY when that line is parsed, not deferred
+# like a recipe body, so CFG_SIG must be a fully-resolved `:=` before the
+# first rule mentions anything derived from it (verified empirically: a
+# forward-referenced variable in a target name silently resolves using
+# whatever that variable's value was AT PARSE TIME, which can be the empty
+# string if the real assignment comes later in the file).
+WERROR ?= 0
+
 # FFT backend selection:
 #   - explicit `make BACKEND=kiss|ne10` always wins (policy: host/reference
 #     builds -> kiss, embedded deliverable -> ne10; single main branch).
@@ -49,9 +62,15 @@ LDFLAGS += -lm
 CFLAGS  += $(EXTRA_CFLAGS)
 CXXFLAGS+= $(EXTRA_CFLAGS)
 
-# Per-backend output dirs so a kiss build and an ne10 build never stomp each
-# other's objects/archive (consumers may build both in one tree).
-OBJ_DIR = obj/$(BACKEND)
+# Per-backend, per-config-signature object dir (CFG_SIG is computed further
+# below, after every BACKEND-conditional CFLAGS/CXXFLAGS append) so a kiss
+# build, an ne10 build, and any two builds differing only in EXTRA_CFLAGS/
+# WERROR each land in their own directory automatically -- nothing is ever
+# wiped to "switch" between them, and two such builds (e.g. one per backend)
+# can run concurrently in this same tree without stomping each other's
+# objects. BIN_DIR stays per-backend only: the final archive path doesn't
+# encode EXTRA_CFLAGS/WERROR (it's a last-write-wins whole, same as before).
+OBJ_DIR = obj/$(BACKEND)-$(CFG_SIG)
 BIN_DIR = bin/$(BACKEND)
 
 # Backend-independent shared DSP sources (always in the archive).
@@ -145,6 +164,50 @@ else
   CFLAGS  += -isystem lib/kiss_fft
 endif
 
+# --- Hash-keyed object directory (build hygiene) ----------------------------
+# obj/$(BACKEND) alone isolates a kiss build from an ne10 build, but
+# EXTRA_CFLAGS (and WERROR) were NOT keyed within a given backend -- a build
+# with one EXTRA_CFLAGS value left its .o's sitting in obj/$(BACKEND), and a
+# later build with a different EXTRA_CFLAGS silently reused/mixed them.
+# CFG_SIG hashes the exact compiler invocation that produces every object in
+# this build (CFLAGS is now fully assembled -- every BACKEND-conditional
+# append above has already run), and OBJ_DIR (defined near the top of this
+# file) embeds CFG_SIG directly in its path -- every distinct (BACKEND,
+# CFLAGS, EXTRA_CFLAGS, WERROR) combination gets its own directory,
+# automatically.
+#
+# This MUST be defined here -- after CFLAGS is final, but before the first
+# rule below that mentions $(OBJ_DIR)/anything derived from it (the WERROR
+# and -fno-strict-aliasing target-specific-variable lines just after this,
+# and the pattern rules further down) -- because GNU Make expands a rule's
+# target/prerequisite list (including a target-specific variable
+# assignment's target) IMMEDIATELY when that line is parsed, not deferred
+# like a recipe body. A forward reference there would silently resolve
+# using CFG_SIG's value at THAT point in the file (empty, if this line
+# hadn't run yet), landing objects in a hash-less directory instead of the
+# real one (verified empirically with a minimal reproduction).
+#
+# There is no parse-time comparison and nothing is ever deleted to "detect"
+# a config change (the previous scheme did a $(shell rm -rf ...)/$(shell
+# mkdir ...)/$(shell echo ...) unconditionally while the Makefile was being
+# read, which mutated the filesystem even under `make -n`, and raced two
+# concurrent builds with different flags/backends against each other's
+# shared obj/$(BACKEND) directory). Under this scheme `make -n` touches
+# nothing on disk (CFG_SIG is a pure string hash) and `make BACKEND=kiss
+# -j4 & make BACKEND=ne10 -j4 & wait` (or two differing-EXTRA_CFLAGS
+# builds) can run concurrently in this same tree: each lands in its own
+# obj/<backend>-<sig>/ directory and never touches the other's objects.
+# OBJ_DIR's own creation happens lazily via the order-only prerequisite on
+# the pattern rules below ($(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)), not at
+# Makefile-parse time.
+#
+# cksum (POSIX -- present on macOS/BSD/GNU/busybox, unlike shasum which is a
+# GNU coreutils extension and may be absent from slim embedded build images)
+# computes the hash. On stdin it prints "<checksum> <byte-count>" with no
+# filename field (verified on macOS's BSD cksum), so `cut -d' ' -f1` isolates
+# just the checksum.
+CFG_SIG := $(shell printf '%s' "$(CC) $(CFLAGS) $(EXTRA_CFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR)" | cksum | cut -d' ' -f1)
+
 BE_SRCS    = $(OWN_SRCS) $(VENDOR_SRCS)
 BE_CXXSRCS = $(VENDOR_CXXSRCS)
 
@@ -153,51 +216,32 @@ BE_OBJS  = $(patsubst %.c,$(OBJ_DIR)/%.o,$(notdir $(BE_SRCS))) \
 OWN_OBJS = $(patsubst %.c,$(OBJ_DIR)/%.o,$(notdir $(OWN_SRCS)))
 VPATH    = src lib/kiss_fft lib/ne10/modules lib/ne10/modules/dsp
 
-# -Werror opt-in, scoped to OUR OWN objects only (default off; CI can flip it
-# on with `make WERROR=1`). audio_common is the one Makefile in this project
-# that compiles vendored TUs (NE10/KISS FFT) through the exact same generic
-# pattern rule as its own wrapper sources (src/hpf.c, src/fft_wrapper*.c);
-# those vendor bodies carry pre-existing warnings that are out of scope to
-# fix here, so a blanket -Werror would fail the build on code we don't own.
-# A target-specific variable applies -Werror only when building $(OWN_OBJS),
-# leaving $(VENDOR_SRCS)/$(VENDOR_CXXSRCS) compiles unaffected.
-WERROR ?= 0
+# -Werror opt-in, scoped to OUR OWN objects only (WERROR itself is declared
+# near the top of this file, before CFG_SIG -- see that declaration for why).
+# audio_common is the one Makefile in this project that compiles vendored
+# TUs (NE10/KISS FFT) through the exact same generic pattern rule as its own
+# wrapper sources (src/hpf.c, src/fft_wrapper*.c); those vendor bodies carry
+# pre-existing warnings that are out of scope to fix here, so a blanket
+# -Werror would fail the build on code we don't own. A target-specific
+# variable applies -Werror only when building $(OWN_OBJS), leaving
+# $(VENDOR_SRCS)/$(VENDOR_CXXSRCS) compiles unaffected.
 ifeq ($(WERROR),1)
 $(OWN_OBJS): CFLAGS += -Werror
 endif
 
-# --- Build-configuration stamp (F12 build hygiene) --------------------------
-# obj/$(BACKEND) already isolates a kiss build from an ne10 build, but
-# EXTRA_CFLAGS (and now WERROR, folded in explicitly since it's target-scoped
-# rather than baked into $(CFLAGS) above) were NOT keyed within a given
-# backend -- a build with one EXTRA_CFLAGS value left its .o's sitting in
-# obj/$(BACKEND), and a later build with a different EXTRA_CFLAGS silently
-# reused/mixed them. CFG_SIG hashes the exact compiler invocation that
-# produces every object in THIS backend's build.
-#
-# This check runs at PARSE time (via $(shell ...), not as a build-rule
-# recipe): an order-only-prerequisite version (a stamp FILE that a rule
-# creates, referenced via `$(OBJ_DIR)/%.o: %.c | $(CFG_STAMP)`) is racy --
-# verified empirically. When several objects share one order-only
-# prerequisite whose recipe wipes the directory they all live in, GNU Make
-# can finalize "is this object out of date?" for one of them using the
-# prerequisite tree it already resolved, before the shared prerequisite's
-# wipe recipe actually runs -- so that object silently keeps its (about to
-# be deleted) stale .o and is never recompiled (reproduced directly: a
-# 2-object minimal Makefile with this shape drops one object every time).
-# Doing the compare-and-wipe unconditionally while the Makefile is being
-# read sidesteps the race entirely: by the time `make` starts asking "is
-# any target out of date", obj/$(BACKEND) has already been wiped (if
-# needed) or left alone (if not).
-CFG_SIG        := $(shell printf '%s' "$(CC) $(CFLAGS) $(EXTRA_CFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR)" | shasum -a 256 | cut -c1-12)
-CFG_STAMP_FILE := $(OBJ_DIR)/.cfg_stamp
-CFG_LAST_SIG   := $(shell test -f $(CFG_STAMP_FILE) && cat $(CFG_STAMP_FILE))
-ifneq ($(CFG_SIG),$(CFG_LAST_SIG))
-$(info audio_common [$(BACKEND)]: build config changed -- wiping $(OBJ_DIR) for a full rebuild)
-$(shell rm -rf $(OBJ_DIR))
-$(shell mkdir -p $(OBJ_DIR))
-$(shell echo $(CFG_SIG) > $(CFG_STAMP_FILE))
-endif
+# -fno-strict-aliasing, scoped to ONLY the object for src/fft_wrapper_ne10.c
+# (same target-specific-variable pattern as the -Werror opt-in above, just
+# unconditional and narrower -- one specific object, not a whole class of
+# objects). That TU casts `Complex*` to `ne10_fft_cpx_float32_t*` in place
+# (see the "Residual strict-aliasing caveat" comment in fft_wrapper_ne10.c
+# itself for the layout-equality proof and full rationale) -- two distinct
+# struct types, so reading through one after writing through the other is,
+# strictly, type-based-alias UB even though the layouts provably match. This
+# flag removes the TBAA assumption for this one TU only, formally sanctioning
+# what was previously just an -O2/no-LTO empirical argument; every other
+# object in this archive (including the rest of the NE10 backend) keeps the
+# default strict-aliasing behavior.
+$(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += -fno-strict-aliasing
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
@@ -346,17 +390,19 @@ endif
 #
 # Two full sub-`make`s (via $(MAKE) BACKEND=ne10 ...) rebuild the archive
 # for each EXTRA_CFLAGS value rather than trying to build both variants in
-# one invocation: EXTRA_CFLAGS is baked into every .o in $(OBJ_DIR) (see the
-# CFG_SIG build-configuration stamp above), so switching it means a real
-# rebuild either way -- routing that rebuild through the same top-level
-# Makefile logic (instead of duplicating the CFG_SIG dance here) is exactly
-# what makes the flag switch safe: CFG_SIG wipes obj/ne10 between the two
-# configs instead of silently mixing .o's built under different flags.
+# one invocation: EXTRA_CFLAGS is baked into $(OBJ_DIR)'s own path via
+# CFG_SIG (see the hash-keyed object directory comment above), so the two
+# sub-makes automatically land in two DIFFERENT obj/ne10-<sig>/ directories
+# -- the second sub-make's objects are a real fresh compile, not a stale
+# reuse of the first's, with nothing needing to be wiped in between.
 #
-# The renamed binaries and dump files all live under bin/ne10/, which the
-# CFG_SIG mechanism never wipes (only obj/$(BACKEND) is wiped on a config
-# change -- see the stamp comment above), so the first (NEON) build's
-# artifacts survive the second (forced-C) sub-make's rebuild.
+# The renamed binaries and dump files all live under bin/ne10/, which
+# neither sub-make ever removes (BIN_DIR is a last-write-wins whole, not
+# CFG_SIG-keyed -- see the hash-keyed object directory comment above), so
+# the first (NEON) build's artifacts survive the second (forced-C)
+# sub-make's rebuild only because this recipe cp's them to a variant-
+# specific name in between (bin/ne10/test_ne10_c_parity itself IS
+# overwritten by the second sub-make).
 test_ne10_force_c:
 	@$(MAKE) BACKEND=ne10 _ne10_parity_bin
 	@cp bin/ne10/test_ne10_c_parity bin/ne10/test_ne10_c_parity_neon

@@ -36,22 +36,31 @@
  * extension in gnu99 mode (verified), so this needs no negative-array-size
  * fallback.
  *
- * Residual strict-aliasing caveat: Complex and ne10_fft_cpx_float32_t are
- * still DISTINCT struct types, so this is layout compatibility, not type
- * compatibility -- the C standard does not guarantee that reading through
- * one struct type after writing through the other is defined behavior
- * (a "distinct types" strict-aliasing violation) even when the layouts
- * match byte-for-byte. In practice this is mitigated because: (1) every
- * live pointer of either type used to reach a given byte range in these
- * functions comes from a single cast expression evaluated immediately
- * before the call, never a stored/aliased pointer of one type accessed
- * again later as the other type in the same scope; and (2) this TU is
- * compiled at -O2 without LTO, so the compiler cannot presently see far
- * enough across the NE10 call boundary to apply a type-based-alias
- * optimization that would reorder around this cast. A future LTO or
- * whole-program-optimization build of this archive should re-verify this
- * assumption (e.g. re-run the roundtrip/selftest targets under
- * -flto) rather than assume it still holds. */
+ * Residual strict-aliasing caveat (review R06): Complex and
+ * ne10_fft_cpx_float32_t are still DISTINCT struct types, so this is layout
+ * compatibility, not type compatibility -- the C standard does not
+ * guarantee that reading through one struct type after writing through the
+ * other is defined behavior (a "distinct types" strict-aliasing violation)
+ * even when the layouts match byte-for-byte. This is now formally exempted
+ * rather than merely argued around: the top-level Makefile applies
+ * -fno-strict-aliasing as a target-specific flag to ONLY this TU's object
+ * (obj/.../fft_wrapper_ne10.o), so the compiler drops the type-based-alias
+ * (TBAA) assumption for every cast in this file -- sanctioned containment,
+ * not a blanket -fno-strict-aliasing for the whole archive. Layout equality
+ * is still independently proven by the _Static_asserts below regardless of
+ * the flag; the flag only removes the aliasing assumption, it doesn't
+ * change what's being asserted.
+ *
+ * This exemption is scoped to plain -O2 compilation: LTO/whole-program
+ * optimization must NOT be enabled for this TU (or, transitively, for a
+ * link that would let the compiler inline across the NE10 call boundary
+ * under a shared aliasing model) -- -fno-strict-aliasing suppresses TBAA
+ * for the casts textually in this file, but an LTO build that inlines
+ * fft_forward/fft_inverse's callers into a TU compiled WITHOUT the flag
+ * could still reintroduce the assumption at the inlined call site. If LTO
+ * is ever enabled for this archive, re-verify by re-running the
+ * roundtrip/selftest targets (and ideally UBSan/ASan) under -flto before
+ * trusting this cast again. */
 _Static_assert(sizeof(Complex) == sizeof(ne10_fft_cpx_float32_t),
                "Complex/ne10_fft_cpx_float32_t size mismatch -- fft_forward/"
                "fft_inverse cast between them without copying");
