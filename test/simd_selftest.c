@@ -13,8 +13,16 @@
  *
  * After correctness, runs a small microbenchmark per kernel (n=257,
  * ~200k reps, CLOCK_MONOTONIC) and prints a one-line summary.
+ *
+ * Re-review R07 adds test_fast_math_special_values(): explicit pinned
+ * asserts for the fast_math.h special-value contract table (see that
+ * header's "Special-value contract table" comment) -- fast_exp/fast_log/
+ * fast_sqrt's exact documented return for NaN/+Inf/-Inf/0/negative inputs,
+ * plus the NEON sk_fast_sqrt_f32 lane equivalents. These make the doc-
+ * comment's table an executable regression gate instead of only prose.
  */
 #include "simd_kernels.h"
+#include "fast_math.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -150,6 +158,131 @@ static void check_bits_or_die(const char *kernel, int n, int trial,
  * check_bits_or_die) is not needed here -- it was only ever called by the
  * pairwise-sum-family kernels' tests, all of which moved to
  * AEC/c_impl/test/simd_selftest_aec.c along with their kernels. */
+
+/* ═══════════ pinned special-value contract (re-review R07) ═══════════════
+ * fast_math.h's header comment documents an exact "Special-value contract
+ * table" for fast_exp/fast_log/fast_sqrt (NaN/+-Inf/0/negative -> exact
+ * deterministic float). These two helpers plus test_fast_math_special_values
+ * below turn that table into an executable regression gate: exit(1) on any
+ * deviation, no tolerance, same house style as check_bits_or_die above. */
+
+#ifndef USE_STANDARD_MATH
+/* Only used by the fast-math-path assertions below (bit-exact domain-edge
+ * constants) -- USE_STANDARD_MATH's branch uses assert_f32_eq/assert_is_nan
+ * instead, since libm's NaN/Inf propagation isn't a fixed bit pattern to pin
+ * this precisely. #ifdef-guarded so the USE_STANDARD_MATH build doesn't warn
+ * about an unused static function. */
+static void assert_f32_bits(const char *label, float got, uint32_t want_bits) {
+    uint32_t got_bits;
+    memcpy(&got_bits, &got, sizeof got_bits);
+    if (got_bits != want_bits) {
+        fprintf(stderr,
+            "SPECIAL-VALUE MISMATCH %s: got=0x%08x (%.9g) want=0x%08x\n",
+            label, (unsigned)got_bits, (double)got, (unsigned)want_bits);
+        exit(1);
+    }
+}
+#endif
+
+static void assert_is_nan(const char *label, float got) {
+    if (!isnan(got)) {
+        uint32_t got_bits;
+        memcpy(&got_bits, &got, sizeof got_bits);
+        fprintf(stderr,
+            "SPECIAL-VALUE MISMATCH %s: got=0x%08x (%.9g), expected NaN\n",
+            label, (unsigned)got_bits, (double)got);
+        exit(1);
+    }
+}
+
+#ifdef USE_STANDARD_MATH
+/* Only used by test_fast_math_special_values's USE_STANDARD_MATH branch
+ * below (the fast-math branch uses assert_f32_bits/assert_is_nan instead) --
+ * #ifdef-guarded so the non-USE_STANDARD_MATH build doesn't warn about an
+ * unused static function. */
+static void assert_f32_eq(const char *label, float got, float want) {
+    if (got != want) {
+        fprintf(stderr, "SPECIAL-VALUE MISMATCH %s: got=%.9g want=%.9g\n",
+                label, (double)got, (double)want);
+        exit(1);
+    }
+}
+#endif
+
+/* Two build modes assert two different (each internally consistent) sets of
+ * values: the default fast-math path pins the documented domain-edge
+ * constants; USE_STANDARD_MATH pins ordinary libm NaN/Inf propagation
+ * (fast_math.h's #else branch is a bare expf/logf/sqrtf call, so this is
+ * really pinning libm's own contract) -- so the DIVERGENCE between the two
+ * modes documented in fast_math.h's contract table is itself
+ * regression-tested here, in both directions, not just asserted in prose. */
+static void test_fast_math_special_values(void) {
+    float qnan = bits_to_float(0x7FC00000u);
+    float pinf = (float)INFINITY;
+    float ninf = -(float)INFINITY;
+
+#ifndef USE_STANDARD_MATH
+    /* Fast-math domain-edge constants -- see fast_math.h's "Special-value
+     * contract table" comment for the derivation of each bit pattern. */
+    assert_f32_bits("fast_exp(NaN)",  fast_exp(qnan), 0x00000000u);
+    assert_f32_bits("fast_exp(+Inf)", fast_exp(pinf), 0x4b07975eu); /* 8.8861105e+06f */
+    assert_f32_bits("fast_exp(-Inf)", fast_exp(ninf), 0x00000000u);
+
+    assert_f32_bits("fast_log(NaN)",  fast_log(qnan),  0xd01502f9u); /* -1e10f */
+    assert_f32_bits("fast_log(-1)",   fast_log(-1.0f), 0xd01502f9u);
+    assert_f32_bits("fast_log(0)",    fast_log(0.0f),  0xd01502f9u);
+    assert_f32_bits("fast_log(+Inf)", fast_log(pinf),  0x42b17218u); /* 88.72283935546875f = 128*FM_LN2 */
+
+    assert_f32_bits("fast_sqrt(NaN)",   fast_sqrt(qnan),  0x00000000u);
+    assert_f32_bits("fast_sqrt(-1)",    fast_sqrt(-1.0f), 0x00000000u);
+    assert_f32_bits("fast_sqrt(-0.0)",  fast_sqrt(-0.0f), 0x00000000u); /* sign NOT preserved */
+    assert_is_nan  ("fast_sqrt(+Inf)",  fast_sqrt(pinf));
+#else
+    /* USE_STANDARD_MATH: bare libm calls, ordinary IEEE-754 propagation. */
+    assert_is_nan("fast_exp(NaN) [libm]", fast_exp(qnan));
+    assert_f32_eq("fast_exp(+Inf) [libm]", fast_exp(pinf), pinf);
+    assert_f32_eq("fast_exp(-Inf) [libm]", fast_exp(ninf), 0.0f);
+
+    assert_is_nan("fast_log(NaN) [libm]", fast_log(qnan));
+    assert_is_nan("fast_log(-1) [libm]",  fast_log(-1.0f));
+    assert_f32_eq("fast_log(0) [libm]",   fast_log(0.0f), ninf);
+    assert_f32_eq("fast_log(+Inf) [libm]", fast_log(pinf), pinf);
+
+    assert_is_nan("fast_sqrt(NaN) [libm]", fast_sqrt(qnan));
+    assert_is_nan("fast_sqrt(-1) [libm]",  fast_sqrt(-1.0f));
+    assert_f32_eq("fast_sqrt(+Inf) [libm]", fast_sqrt(pinf), pinf);
+#endif
+
+    /* NEON sk_fast_sqrt_f32 lane equivalents. No #ifdef needed for the
+     * scalar-vs-NEON bit-exactness check itself -- sk__fast_sqrt_elem and
+     * sk_fast_sqrt_f32's NEON body both switch on the SAME USE_STANDARD_MATH
+     * flag (see simd_kernels.h), so they always agree with each other; the
+     * per-lane VALUE assertions below are still fast-math-only, same as
+     * the scalar checks above. */
+    {
+        float in[4], out_scalar[4], out_simd[4];
+        in[0] = qnan; in[1] = -1.0f; in[2] = -0.0f; in[3] = pinf;
+        sk_fast_sqrt_f32_scalar(in, out_scalar, 4);
+        sk_fast_sqrt_f32(in, out_simd, 4);
+        check_bits_or_die("fast_sqrt_f32_special_lanes", 4, 0, out_simd, out_scalar, 4);
+#ifndef USE_STANDARD_MATH
+        assert_f32_bits("sk_fast_sqrt_f32(NaN) scalar",   out_scalar[0], 0x00000000u);
+        assert_f32_bits("sk_fast_sqrt_f32(-1) scalar",    out_scalar[1], 0x00000000u);
+        assert_f32_bits("sk_fast_sqrt_f32(-0.0) scalar",  out_scalar[2], 0x00000000u);
+        assert_is_nan  ("sk_fast_sqrt_f32(+Inf) scalar",  out_scalar[3]);
+        assert_f32_bits("sk_fast_sqrt_f32(NaN) simd",     out_simd[0], 0x00000000u);
+        assert_f32_bits("sk_fast_sqrt_f32(-1) simd",      out_simd[1], 0x00000000u);
+        assert_f32_bits("sk_fast_sqrt_f32(-0.0) simd",    out_simd[2], 0x00000000u);
+        assert_is_nan  ("sk_fast_sqrt_f32(+Inf) simd",    out_simd[3]);
+#endif
+    }
+
+#ifdef USE_STANDARD_MATH
+    printf("PASS fast_math_special_values (USE_STANDARD_MATH=1)\n");
+#else
+    printf("PASS fast_math_special_values (USE_STANDARD_MATH=0)\n");
+#endif
+}
 
 /* ═══════════════════════════ correctness: kernel 4 ═══════════════════════ */
 
@@ -377,9 +510,18 @@ static void test_fast_sqrt(void) {
         sk_fast_sqrt_f32_scalar(nan_in, out_s, 8);
         sk_fast_sqrt_f32(nan_in, out_n, 8);
         check_bits_or_die("fast_sqrt_f32_nan", 8, 0, out_n, out_s, 8);
-        /* Also assert the NaN lanes are actually the documented 0.0f, not
-         * just "scalar and NEON happen to agree on some other garbage". */
+        /* Also assert the NaN lanes land on the documented value for the
+         * ACTIVE build mode, not just "scalar and NEON happen to agree on
+         * some other garbage". Pre-R07 this unconditionally expected 0.0f,
+         * which is only correct for the default fast-math path -- under
+         * USE_STANDARD_MATH, sk__fast_sqrt_elem/sk_fast_sqrt_f32 are bare
+         * sqrtf()/vsqrtq_f32 calls (see simd_kernels.h), so a NaN input
+         * propagates to a NaN output instead; the old hardcoded check would
+         * have exit(1)'d the very first time this file was ever built with
+         * -DUSE_STANDARD_MATH (verified: it does, on the pre-R07 code too --
+         * a latent gap, not a regression introduced here). */
         for (i = 0; i < 4; ++i) {
+#ifndef USE_STANDARD_MATH
             if (out_s[i] != 0.0f || out_n[i] != 0.0f) {
                 fprintf(stderr,
                     "fast_sqrt_f32 NaN guard FAILED: lane %d expected 0.0f, "
@@ -387,6 +529,15 @@ static void test_fast_sqrt(void) {
                     i, (double)out_s[i], (double)out_n[i]);
                 exit(1);
             }
+#else
+            if (!isnan(out_s[i]) || !isnan(out_n[i])) {
+                fprintf(stderr,
+                    "fast_sqrt_f32 NaN guard FAILED [USE_STANDARD_MATH]: lane %d "
+                    "expected NaN, got scalar=%.9g simd=%.9g\n",
+                    i, (double)out_s[i], (double)out_n[i]);
+                exit(1);
+            }
+#endif
         }
     }
     printf("PASS fast_sqrt_f32\n");
@@ -577,6 +728,7 @@ int main(void) {
     test_min();
     test_clip();
     test_fast_sqrt();
+    test_fast_math_special_values();
 
     printf("\n--- microbenchmarks (n=%d, %d reps) ---\n", BENCH_N, BENCH_REPS);
     bench_ema();

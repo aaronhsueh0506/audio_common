@@ -27,6 +27,31 @@
  * agree), this file does not assert or test that payload-bit equality for
  * those kernels — only that NaN inputs don't corrupt unrelated lanes/output.
  *
+ * ───────────────────── Contract summary (re-review R07) ──────────────────
+ * Stated once, plainly, as the one-paragraph version of the two blocks
+ * above: every kernel here is scalar-reference bit-exact for FINITE inputs,
+ * full stop, no exceptions, gated by simd_selftest.c's exit(1)-on-mismatch
+ * finite corpus. For a NaN input, the per-lane contract is "NaN in -> NaN
+ * out, payload unspecified" for the pure-arithmetic kernels, and "matches
+ * whatever branch the scalar reference's own compare+select ternary takes on
+ * that NaN" for the guarded kernels (sk_min_f32/sk_clip_f32/
+ * sk_fast_sqrt_f32) — which this file's kernels satisfy not just as a
+ * behavioural claim but bit-for-bit, verified by simd_selftest.c's dedicated
+ * NaN blocks, because every guard here is a single ordered compare with at
+ * most one NaN operand in play. This header has no multi-NaN-operand
+ * REDUCTION kernel (no pairwise-sum tree, no fmaf-chained accumulator that
+ * folds several independent NaN-carrying inputs together) — those live in
+ * AEC/c_impl's aec_simd_kernels.h, where a NaN can arrive from two different
+ * operands into the same fmaf/add and scalar vs. NEON may legitimately
+ * disagree on WHICH NaN's payload survives (C leaves multi-NaN payload
+ * selection implementation-defined) while still both correctly producing
+ * *a* NaN. aec_simd_kernels.h's own selftest (simd_selftest_aec.c) has a
+ * real classified gate for exactly that "both sides say NaN, payloads
+ * differ" case (bit-exact / both-NaN-payload-unspecified / HARD FAIL,
+ * re-review R07) — see that file's header comment for the full contract and
+ * the empirical result (100% of its historical mismatches are the in-contract
+ * both-NaN case, 0% are a genuine finite-vs-NaN divergence).
+ *
  * This is achievable because AArch64 NEON per-lane vaddq_f32/vmulq_f32/
  * vdivq_f32/vsqrtq_f32/vfmaq_f32 are IEEE-754 binary32 correctly-rounded
  * operations — the exact same rounding the scalar FPU ops use. Given that,

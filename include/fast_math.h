@@ -125,6 +125,83 @@ static inline float exp1_approx(float v) {
  * implementation, not for bit-identical behaviour with the fast path on
  * every possible float bit pattern; only the finite-domain results need to
  * match (and are what the parity/regression gates actually check).
+ *
+ * ───────────────── Special-value contract table (re-review R07) ──────────
+ * Plain statement of the above as a lookup table, one row per non-finite or
+ * boundary input, both build modes side by side. Every "fast_*" entry below
+ * is measured and pinned by test/simd_selftest.c's dedicated special-value
+ * asserts (not just asserted in this comment) -- see that file's "pinned
+ * special-value contract (re-review R07)" section. Bit patterns are this
+ * toolchain's IEEE-754 binary32 (Apple clang 17, arm64, -ffp-contract=off);
+ * they follow deterministically from the source below, not from any
+ * platform-specific rounding mode.
+ *
+ *   fast_exp(x):
+ *     x = NaN        -> 0.0f                    [bits 0x00000000]
+ *                        (USE_STANDARD_MATH: expf(NaN)  = NaN)
+ *     x = +Inf       -> 8.8861105e+06f           [bits 0x4b07975e]
+ *                        (identical to fast_exp(x) for any finite x > 16 --
+ *                        the ">16" saturation constant, NOT a separate
+ *                        Inf-specific branch)
+ *                        (USE_STANDARD_MATH: expf(+Inf) = +Inf; DIFFERS)
+ *     x = -Inf       -> 0.0f                     [bits 0x00000000]
+ *                        (same path as any finite x < -16)
+ *                        (USE_STANDARD_MATH: expf(-Inf) = 0.0f; matches)
+ *     x = 0.0f       -> 1.0f                     (ordinary in-range Taylor
+ *                        result, not a special-cased edge -- listed for
+ *                        completeness only)
+ *
+ *   fast_log(x):
+ *     x = NaN        -> -1e10f                   [bits 0xd01502f9]
+ *                        (USE_STANDARD_MATH: logf(NaN)  = NaN; DIFFERS)
+ *     x = 0.0f/-0.0f -> -1e10f                    (approximate -infinity)
+ *                        (USE_STANDARD_MATH: logf(0)    = -Inf; DIFFERS)
+ *     x < 0          -> -1e10f
+ *                        (USE_STANDARD_MATH: logf(neg)  = NaN; DIFFERS)
+ *     x = +Inf       -> 88.72283935546875f        [bits 0x42b17218]
+ *                        (= 128.0f * FM_LN2, computed via the SAME Taylor
+ *                        fallthrough an ordinary finite x would take --
+ *                        +Inf is deliberately NOT special-cased in
+ *                        fast_log, see that function's own comment; the
+ *                        value is deterministic finite garbage-that-looks-
+ *                        like-a-real-result, pinned here precisely because
+ *                        it is NOT a designed edge value)
+ *                        (USE_STANDARD_MATH: logf(+Inf) = +Inf; DIFFERS)
+ *
+ *   fast_sqrt(v):
+ *     v = NaN        -> 0.0f                     [bits 0x00000000]
+ *                        (USE_STANDARD_MATH: sqrtf(NaN) = NaN)
+ *     v < 0           -> 0.0f
+ *                        (USE_STANDARD_MATH: sqrtf(neg) = NaN; DIFFERS)
+ *     v = -0.0f       -> 0.0f (POSITIVE zero -- the domain-edge return is
+ *                        the literal `0.0f`, so fast_sqrt does NOT preserve
+ *                        the sign of a negative-zero input the way IEEE
+ *                        sqrtf does)
+ *                        (USE_STANDARD_MATH: sqrtf(-0.0) = -0.0f; DIFFERS
+ *                        in sign only)
+ *     v = +Inf        -> NaN [bits 0x7fc00000 on this toolchain/CPU] (falls
+ *                        through the domain guard -- `+Inf > 0.0f` is true
+ *                        -- into the bit-trick seed + 2 Newton iterations;
+ *                        iteration 1 computes Inf/finite = Inf, iteration 2
+ *                        then computes Inf/Inf = NaN; the exact NaN payload
+ *                        is an IEEE-754 implementation-defined "invalid
+ *                        operation" default and not asserted bit-for-bit,
+ *                        only isnan() is)
+ *                        (USE_STANDARD_MATH: sqrtf(+Inf) = +Inf; DIFFERS)
+ *
+ * Summary: fast_* is a finite-domain approximation family. Every non-finite
+ * or out-of-domain input still produces a DETERMINISTIC, TESTED float (never
+ * a trap, never UB, never platform-dependent aside from the one documented
+ * NaN-payload exception above) -- but that value is a domain-edge constant
+ * or Taylor-fallthrough artifact, not a mathematically meaningful result,
+ * and it will generally NOT match USE_STANDARD_MATH's libm behaviour on the
+ * same input (see the DIFFERS annotations above). The system-level defense
+ * against ever exercising this table in production is ingress sanitization
+ * upstream of the DSP: the hardened WAV reader replaces non-finite samples
+ * with 0.0f, and config float fields are range/finite-validated at load --
+ * so in practice fast_exp/fast_log/fast_sqrt are only ever called on finite
+ * inputs, and this table exists to pin the OUT-of-contract behaviour as a
+ * regression gate, not because callers are expected to rely on it.
  */
 
 /**
