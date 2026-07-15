@@ -91,14 +91,24 @@
  *     reproduced under UBSan. Fixed by rounding into a wider int32_t
  *     accumulator first, THEN saturating into [-32768, 32767] before the
  *     final int16_t narrowing. The float rounding arithmetic itself is
- *     unchanged (bit-identical for every |sample| < 1 input, same as
- *     before); only the previously-UB +1.0f/-1.0f boundary now saturates
- *     (+1.0f -> 32767, -1.0f -> -32768, matching what a defined round would
- *     give anyway) instead of invoking UB. The NR-style quantizer gets the
- *     same int32_t-then-saturate treatment for consistency, though it's
- *     pure defense there -- the pre-existing [-1,1] clamp plus the
- *     non-finite sanitize below already bound its input, so its output can
- *     never actually need saturating.
+ *     unchanged (still `sample*32768.0f`, then +-0.5f before truncating):
+ *     verified bit-identical over this repo's regression corpus and its
+ *     byte-exact anchor renders (re-review round-3, B08). That is NOT the
+ *     same claim as "bit-identical for every |sample| < 1 input" -- a value
+ *     arbitrarily close to +-1.0f (e.g. nextafterf(1.0f, 0.0f), |sample| <
+ *     1 by definition) can still push the `scaled +- 0.5f` accumulator past
+ *     +-32768 before saturation, and pre-fix that was undefined behavior
+ *     too (the same out-of-range float-to-int16_t cast as the exact +-1.0f
+ *     case) -- so there was never a defined pre-fix byte value at that
+ *     boundary for this fix to have stayed identical to; no byte contract
+ *     existed there. Post-fix, that boundary region is fully defined for
+ *     the first time (saturates to +-32767/+-32768 like any other
+ *     out-of-range magnitude, +1.0f -> 32767, -1.0f -> -32768, matching
+ *     what a defined round would give anyway) instead of invoking UB. The
+ *     NR-style quantizer gets the same int32_t-then-saturate treatment for
+ *     consistency, though it's pure defense there -- the pre-existing
+ *     [-1,1] clamp plus the non-finite sanitize below already bound its
+ *     input, so its output can never actually need saturating.
  *   - Non-finite (NaN/+-Inf) PCM16-path source samples: previously reached
  *     the quantizer's ordered comparisons unchanged (NaN fails every
  *     ordered comparison, so the [-1,1] clamp was a silent no-op for it)
@@ -201,11 +211,12 @@ typedef struct {
      * fewer elements than requested (e.g. ENOSPC). samples_written is not
      * incremented for that short write (it already reflects exactly what
      * made it to disk so far), and no further samples from that same
-     * wav_write_float() call are attempted. wav_close_write() still
-     * finalizes a header from the true samples_written value; this flag
-     * exists purely so a caller that cares can notice the failure (direct
-     * struct-field read, same convention as nonfinite_sanitized) instead of
-     * it being silent. */
+     * wav_write_float() call are attempted. wav_close_write()/
+     * wav_finalize_write() still finalize a header from the true
+     * samples_written value; this flag exists purely so a caller that cares
+     * can notice the failure -- either directly (struct-field read, same
+     * convention as nonfinite_sanitized) or, since B08, folded automatically
+     * into wav_finalize_write()'s return value. */
     int write_error;
 } WavWriter;
 
@@ -480,9 +491,17 @@ static inline WavWriter* wav_open_write(const char* path, int sample_rate, int c
     w->info.bits_per_sample = 16;
 #endif
 
-    // Write placeholder header (will update at close)
+    // Write placeholder header (will update at close). Checked like every
+    // other open-time failure in this function (B08): a short write here
+    // (e.g. ENOSPC on a full disk) would otherwise leave `w` claiming
+    // data_start==44 over a file that doesn't actually have 44 header bytes
+    // on disk yet, silently desyncing every wav_write_float() call after it.
     uint8_t header[44] = {0};
-    fwrite(header, 1, 44, fp);
+    if (fwrite(header, 1, 44, fp) != 44) {
+        fclose(fp);
+        free(w);
+        return NULL;
+    }
     w->data_start = 44;
 
     return w;
@@ -536,11 +555,16 @@ static inline void wav_write_float(WavWriter* w, const float* buf, int n) {
         // Round-half-away-from-zero into a wider (int32_t) accumulator,
         // THEN saturate into int16_t's representable range. The float
         // rounding arithmetic itself is untouched (still `sample*32768.0f`,
-        // still +-0.5f before truncating), so every |sample| < 1 input
-        // rounds to exactly the same value as before this fix -- only the
-        // +1.0f / -1.0f boundary changes, from a float-to-int16_t cast of
-        // +-32768.5f (out of int16_t's range -- undefined behavior per C99
-        // 6.3.1.4p1, reproduced under UBSan) to a defined saturate at
+        // still +-0.5f before truncating) -- verified bit-identical over
+        // this repo's regression corpus/anchors, NOT a universal "every
+        // |sample| < 1" claim (a value near +-1.0f can still round the
+        // accumulator past +-32768 pre-saturate, and pre-fix THAT was
+        // undefined behavior too, so no byte contract existed there either
+        // -- see the Writer hardening doc in the file header comment for
+        // the full writeup). Only the +1.0f / -1.0f boundary itself changes
+        // behavior here: a float-to-int16_t cast of +-32768.5f (out of
+        // int16_t's range -- undefined behavior per C99 6.3.1.4p1,
+        // reproduced under UBSan) becomes a defined saturate at
         // 32767 / -32768.
         float scaled = sample * 32768.0f;
         int32_t v = (int32_t)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
@@ -571,10 +595,37 @@ static inline void wav_write_float(WavWriter* w, const float* buf, int n) {
 }
 
 /**
- * Close WAV writer and finalize header
+ * Finalizes a WAV writer's header and closes the underlying file (B08).
+ *
+ * Does exactly what wav_close_write() has always done -- seek to the start,
+ * write the real RIFF/fmt/data header now that samples_written is known,
+ * close the stream, free the writer -- but CHECKS every fseek/fwrite/fclose
+ * return value here, and folds in any write_error already flagged by an
+ * earlier short write inside wav_write_float(). The header WRITES
+ * THEMSELVES are byte-for-byte identical to before on every success path
+ * (same fields, same values, same order) -- only the observability of a
+ * failure changes.
+ *
+ * Ownership: `w` is ALWAYS consumed by this call, on success or failure --
+ * the stream is closed and the writer struct freed either way (best-effort:
+ * if a fwrite partway through the header fails, this still attempts to
+ * fclose+free rather than leak the handle; if fclose itself then also fails,
+ * that's still reflected in the return value, but `w` is freed regardless).
+ * Do not call this (or wav_close_write()) again on the same pointer, and do
+ * not dereference `w` afterward either way.
+ *
+ * @param w Writer handle (may be NULL; returns -1 immediately, no-op)
+ * @return 0 if the header was written and the file closed with no error
+ *         observed anywhere in this call AND no write_error was already
+ *         flagged by an earlier wav_write_float() call on this writer;
+ *         -1 otherwise (any fseek/fwrite/fclose failure here, the
+ *         pathological-size abandon path, a NULL writer, or a pre-existing
+ *         write_error).
  */
-static inline void wav_close_write(WavWriter* w) {
-    if (!w) return;
+static inline int wav_finalize_write(WavWriter* w) {
+    if (!w) return -1;
+
+    int ok = (w->write_error == 0);
 
     int sample_bytes = w->info.is_float ? 4 : 2;
 
@@ -587,6 +638,16 @@ static inline void wav_close_write(WavWriter* w) {
      * no-op change here: 2 == sample_bytes there already. See the Writer
      * hardening doc in the file header comment for the full writeup. */
     uint64_t data_sz64 = w->samples_written * (uint64_t)w->info.channels * (uint64_t)sample_bytes;
+    /* This multiply happens BEFORE the >0xFFFFFFFF range check just below,
+     * but it can't realistically overflow its own uint64_t regardless: every
+     * wav_write_float() call increments samples_written by at most an `int`
+     * argument's worth of samples per call (INT_MAX), and channels/
+     * sample_bytes are each tiny (channels <=8 by convention in this
+     * codebase's readers, sample_bytes is 2 or 4) -- reaching anywhere near
+     * UINT64_MAX would require on the order of 2^61 wav_write_float() calls.
+     * The range check below is what actually matters: it's what rejects any
+     * data_sz64 that would silently truncate on narrowing to the real
+     * on-disk uint32_t/uint16_t header fields, not this multiply. */
     uint64_t file_size64 = 36ull + data_sz64;
     uint64_t byte_rate64 = (uint64_t)w->info.sample_rate * (uint64_t)w->info.channels * (uint64_t)sample_bytes;
     uint64_t block_align64 = (uint64_t)w->info.channels * (uint64_t)sample_bytes;
@@ -596,44 +657,60 @@ static inline void wav_close_write(WavWriter* w) {
         // Pathological size (never hit by any real capture) -- would
         // silently truncate a WAV header field. Abandon the file instead
         // of writing a corrupt header.
-        fclose(w->fp);
+        if (fclose(w->fp) != 0) ok = 0;
         free(w);
-        return;
+        return ok ? 0 : -1;
     }
 
     // Seek to beginning and write proper header
-    fseek(w->fp, 0, SEEK_SET);
+    if (fseek(w->fp, 0, SEEK_SET) != 0) ok = 0;
 
     // RIFF header
-    fwrite("RIFF", 1, 4, w->fp);
+    if (fwrite("RIFF", 1, 4, w->fp) != 4) ok = 0;
     uint32_t chunk_size = (uint32_t)file_size64;
-    fwrite(&chunk_size, 4, 1, w->fp);
-    fwrite("WAVE", 1, 4, w->fp);
+    if (fwrite(&chunk_size, 4, 1, w->fp) != 1) ok = 0;
+    if (fwrite("WAVE", 1, 4, w->fp) != 4) ok = 0;
 
     // fmt chunk
-    fwrite("fmt ", 1, 4, w->fp);
+    if (fwrite("fmt ", 1, 4, w->fp) != 4) ok = 0;
     uint32_t subchunk1_size = 16;
-    fwrite(&subchunk1_size, 4, 1, w->fp);
+    if (fwrite(&subchunk1_size, 4, 1, w->fp) != 1) ok = 0;
     uint16_t audio_format = w->info.is_float ? 3 : 1;  // 3 = IEEE float, 1 = PCM
-    fwrite(&audio_format, 2, 1, w->fp);
+    if (fwrite(&audio_format, 2, 1, w->fp) != 1) ok = 0;
     uint16_t num_channels = (uint16_t)w->info.channels;
-    fwrite(&num_channels, 2, 1, w->fp);
+    if (fwrite(&num_channels, 2, 1, w->fp) != 1) ok = 0;
     uint32_t sample_rate = (uint32_t)w->info.sample_rate;
-    fwrite(&sample_rate, 4, 1, w->fp);
+    if (fwrite(&sample_rate, 4, 1, w->fp) != 1) ok = 0;
     uint32_t byte_rate = (uint32_t)byte_rate64;
-    fwrite(&byte_rate, 4, 1, w->fp);
+    if (fwrite(&byte_rate, 4, 1, w->fp) != 1) ok = 0;
     uint16_t block_align = (uint16_t)block_align64;
-    fwrite(&block_align, 2, 1, w->fp);
+    if (fwrite(&block_align, 2, 1, w->fp) != 1) ok = 0;
     uint16_t bits_per_sample = (uint16_t)(sample_bytes * 8);
-    fwrite(&bits_per_sample, 2, 1, w->fp);
+    if (fwrite(&bits_per_sample, 2, 1, w->fp) != 1) ok = 0;
 
     // data chunk header
-    fwrite("data", 1, 4, w->fp);
+    if (fwrite("data", 1, 4, w->fp) != 4) ok = 0;
     uint32_t data_sz = (uint32_t)data_sz64;
-    fwrite(&data_sz, 4, 1, w->fp);
+    if (fwrite(&data_sz, 4, 1, w->fp) != 1) ok = 0;
 
-    fclose(w->fp);
+    if (fclose(w->fp) != 0) ok = 0;
     free(w);
+    return ok ? 0 : -1;
+}
+
+/**
+ * Close WAV writer and finalize header.
+ *
+ * Compat wrapper around wav_finalize_write() (B08) that discards the
+ * success/failure result, preserving this function's original `void`
+ * signature for existing callers. Prefer wav_finalize_write() directly in
+ * new code: it surfaces exactly the same finalize failure (a bad
+ * fseek/fwrite/fclose here, or an earlier short write flagged during
+ * wav_write_float()) that this wrapper silently swallows. Ownership is
+ * identical either way -- `w` is always consumed.
+ */
+static inline void wav_close_write(WavWriter* w) {
+    (void)wav_finalize_write(w);
 }
 
 #endif // WAV_IO_H
