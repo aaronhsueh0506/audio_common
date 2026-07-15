@@ -22,9 +22,12 @@
 # Usage:
 #   scripts/audit_alloc_symbols.sh <path-to-binary> [<path-to-binary> ...]
 #
-# Example:
-#   scripts/audit_alloc_symbols.sh bin/ne10/libaudio_common.a
-#   scripts/audit_alloc_symbols.sh bin/kiss/libaudio_common.a bin/kiss/roundtrip
+# Example (bin/ is now keyed bin/<backend>-<config-hash>/ — round-3 review
+# B01; resolve the exact path for your flags with `make print-bin-dir` /
+# `make print-lib-path`, or use `dist/<backend>/current/` after `make
+# publish`):
+#   scripts/audit_alloc_symbols.sh "$(make -s BACKEND=ne10 print-lib-path)"
+#   scripts/audit_alloc_symbols.sh "$(make -s BACKEND=kiss print-lib-path)" "$(make -s BACKEND=kiss print-bin-dir)/roundtrip"
 #
 # Output: one line per (object file, symbol) reference found, e.g.
 #   bin/kiss/libaudio_common.a:fft_wrapper.o:  U _calloc

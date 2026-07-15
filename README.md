@@ -20,8 +20,13 @@ make BACKEND=ne10  # force NE10 backend (ARM NEON)
 make selftest      # round-trip + static==heap byte-equality check
 ```
 
-Output: `bin/<backend>/libaudio_common.a` (per-backend dirs — the two builds coexist).
-Consumers add `-I<here>/include` and link the archive for their chosen backend.
+Output: `bin/<backend>-<config-hash>/libaudio_common.a` (round-3 review B01:
+keyed by backend AND the exact compiler-flag signature, not just backend — two
+configs, e.g. differing only in `EXTRA_CFLAGS`, never share a directory or
+stomp each other's archive). Run `make print-lib-path` (same flags as your
+build) to get this build's exact archive path, or `make publish` for a stable
+`dist/<backend>/current/` handoff path. Consumers add `-I<here>/include` and
+link the archive for their chosen backend.
 
 Backend policy: desktop/CI builds use KISS (bit-reproducible reference); embedded
 builds pass `BACKEND=ne10`. Backend is a build knob, not a branch property — every

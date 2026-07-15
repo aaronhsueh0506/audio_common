@@ -12,6 +12,27 @@
 # with a runtime pool_owned flag (no compile-time gate).
 
 CC      ?= cc
+CXX     ?= c++
+
+# Archiver tools, explicit (CFG_SIG payload coverage below): a cross-compiling
+# caller overriding AR/RANLIB (e.g. an arm-none-eabi- toolchain) lands in a
+# different config signature automatically, same as overriding CC/CXX.
+AR      ?= ar
+RANLIB  ?= ranlib
+
+# CFG_SIG payload-coverage placeholders (round-3 review B01). CPPFLAGS/
+# EXTRA_LDFLAGS/NO_STDIO/DEBUG are not consumed by this particular Makefile
+# today, but the CFG_SIG payload (see "Hash-keyed object directory" below)
+# unconditionally includes all of them so that (a) the payload string has
+# the same stable shape across all three repos sharing this build design and
+# (b) a future use of any of them here automatically starts keying builds
+# correctly instead of silently aliasing with a build that didn't set it.
+# ?= with an explicit (possibly empty) value, not left undefined, so the
+# payload string never depends on whether the variable happens to be defined.
+CPPFLAGS      ?=
+EXTRA_LDFLAGS ?=
+NO_STDIO      ?= 0
+DEBUG         ?= 0
 
 # -Werror opt-in (default off; CI can flip it on with `make WERROR=1`).
 # Declared this early (rather than down by its ifeq block, where it used to
@@ -40,9 +61,17 @@ ifeq ($(origin BACKEND),undefined)
     BACKEND := kiss
   endif
 endif
+# Gated on MAKECMDGOALS (round-3 review B01, parse purity for query targets):
+# print-bin-dir/print-obj-dir/print-lib-path are consumed programmatically by
+# other Makefiles' recipes (`ac="$$(make -s ... print-lib-path)"`) and by
+# scripts; their stdout must be ONLY the path, nothing else. A bare `make
+# print-lib-path` would otherwise also print this banner (parse time runs
+# unconditionally, before any target is selected), corrupting the captured
+# value.
+ifeq ($(filter print-%,$(MAKECMDGOALS)),)
 $(info audio_common: FFT backend = $(BACKEND))
+endif
 
-CXX     ?= c++
 # gnu99 (not strict c99): the vendored NE10 headers use the GNU asm("label")
 # extension. Consumers may still compile their own code with -std=c99 and link
 # this archive — different TUs, different std is fine.
@@ -61,17 +90,29 @@ LDFLAGS += -lm
 # compiled TU without editing this file.
 CFLAGS  += $(EXTRA_CFLAGS)
 CXXFLAGS+= $(EXTRA_CFLAGS)
+LDFLAGS += $(EXTRA_LDFLAGS)
 
-# Per-backend, per-config-signature object dir (CFG_SIG is computed further
-# below, after every BACKEND-conditional CFLAGS/CXXFLAGS append) so a kiss
-# build, an ne10 build, and any two builds differing only in EXTRA_CFLAGS/
-# WERROR each land in their own directory automatically -- nothing is ever
-# wiped to "switch" between them, and two such builds (e.g. one per backend)
-# can run concurrently in this same tree without stomping each other's
-# objects. BIN_DIR stays per-backend only: the final archive path doesn't
-# encode EXTRA_CFLAGS/WERROR (it's a last-write-wins whole, same as before).
+# Per-backend, per-config-signature object AND binary dir (CFG_SIG is
+# computed further below, after every BACKEND-conditional CFLAGS/CXXFLAGS
+# append) so a kiss build, an ne10 build, and any two builds differing only
+# in EXTRA_CFLAGS/WERROR/etc. each land in their own directory automatically
+# -- nothing is ever wiped to "switch" between them, and two such builds
+# (e.g. one per backend) can run concurrently in this same tree without
+# stomping each other's objects OR each other's final archive (round-3
+# review B01: BIN_DIR used to be per-backend only, `bin/$(BACKEND)`, so an
+# ne10 build after a kiss build -- or a stale mtime from a differently-flagged
+# same-backend build -- could silently deliver the WRONG archive to whatever
+# last happened to write that flat path; test_ne10_force_c's forced-C rebuild
+# also used to overwrite the normal NE10 archive this way). Both OBJ_DIR and
+# BIN_DIR are plain recursive (`=`) assignments referencing $(CFG_SIG) before
+# CFG_SIG's own `:=` line below -- that's fine (and unavoidable, since BACKEND
+# itself must already be resolved above): a recursive assignment just stores
+# the unexpanded text, and nothing between here and CFG_SIG's `:=` assignment
+# below ever expands $(OBJ_DIR)/$(BIN_DIR) (no rule mentions them yet), so by
+# the time anything actually expands either variable, CFG_SIG already holds
+# its final value.
 OBJ_DIR = obj/$(BACKEND)-$(CFG_SIG)
-BIN_DIR = bin/$(BACKEND)
+BIN_DIR = bin/$(BACKEND)-$(CFG_SIG)
 
 # Backend-independent shared DSP sources (always in the archive).
 COMMON_SRCS = src/hpf.c
@@ -164,22 +205,26 @@ else
   CFLAGS  += -isystem lib/kiss_fft
 endif
 
-# --- Hash-keyed object directory (build hygiene) ----------------------------
-# obj/$(BACKEND) alone isolates a kiss build from an ne10 build, but
-# EXTRA_CFLAGS (and WERROR) were NOT keyed within a given backend -- a build
-# with one EXTRA_CFLAGS value left its .o's sitting in obj/$(BACKEND), and a
-# later build with a different EXTRA_CFLAGS silently reused/mixed them.
-# CFG_SIG hashes the exact compiler invocation that produces every object in
-# this build (CFLAGS is now fully assembled -- every BACKEND-conditional
-# append above has already run), and OBJ_DIR (defined near the top of this
-# file) embeds CFG_SIG directly in its path -- every distinct (BACKEND,
-# CFLAGS, EXTRA_CFLAGS, WERROR) combination gets its own directory,
-# automatically.
+# --- Hash-keyed object/binary directory + full-coverage CFG_SIG ------------
+# obj/$(BACKEND)-<sig> and (round-3 review B01) bin/$(BACKEND)-<sig> isolate
+# every distinct build configuration from every other one -- not just
+# BACKEND, but the exact compiler invocation that produces every object AND
+# the exact archive that invocation produces. CFG_SIG_PAYLOAD is the single
+# source string used BOTH to compute CFG_SIG (via cksum) AND, verbatim, as
+# the collision-guard manifest content (see the _cfg_guard target below) --
+# one string, two consumers, so the two can never drift apart.
 #
-# This MUST be defined here -- after CFLAGS is final, but before the first
-# rule below that mentions $(OBJ_DIR)/anything derived from it (the WERROR
-# and -fno-strict-aliasing target-specific-variable lines just after this,
-# and the pattern rules further down) -- because GNU Make expands a rule's
+# Payload coverage (USER-MANDATED, round-3 review B01): CC CXX AR RANLIB
+# CFLAGS CXXFLAGS CPPFLAGS LDFLAGS EXTRA_CFLAGS EXTRA_LDFLAGS BACKEND WERROR
+# NO_STDIO DEBUG -- every variable that can affect what a build produces,
+# even ones this particular Makefile doesn't branch on today (CPPFLAGS/
+# EXTRA_LDFLAGS/NO_STDIO/DEBUG default to an explicit empty/0 value up top so
+# they always participate in the string with a stable shape). This MUST be
+# defined here -- after CFLAGS/CXXFLAGS are final (every BACKEND-conditional
+# append above has already run), but before the first rule below that
+# mentions $(OBJ_DIR)/$(BIN_DIR)/anything derived from them (the WERROR and
+# -fno-strict-aliasing target-specific-variable lines just after this, and
+# the pattern rules further down) -- because GNU Make expands a rule's
 # target/prerequisite list (including a target-specific variable
 # assignment's target) IMMEDIATELY when that line is parsed, not deferred
 # like a recipe body. A forward reference there would silently resolve
@@ -187,26 +232,34 @@ endif
 # hadn't run yet), landing objects in a hash-less directory instead of the
 # real one (verified empirically with a minimal reproduction).
 #
+# Deliberately NOT $(strip)'d: two builds differing only in incidental
+# whitespace (e.g. an EXTRA_CFLAGS with a stray leading space) get different
+# signatures. That's a false MISS (an unnecessary extra directory), which is
+# harmless; collapsing them with $(strip) risks a false HIT (two genuinely
+# different flag strings landing on the same signature by construction),
+# which is the one failure mode this whole mechanism exists to prevent.
+#
 # There is no parse-time comparison and nothing is ever deleted to "detect"
 # a config change (the previous scheme did a $(shell rm -rf ...)/$(shell
 # mkdir ...)/$(shell echo ...) unconditionally while the Makefile was being
-# read, which mutated the filesystem even under `make -n`, and raced two
+# read, which mutated the filesystem even under `make -n` and raced two
 # concurrent builds with different flags/backends against each other's
 # shared obj/$(BACKEND) directory). Under this scheme `make -n` touches
 # nothing on disk (CFG_SIG is a pure string hash) and `make BACKEND=kiss
 # -j4 & make BACKEND=ne10 -j4 & wait` (or two differing-EXTRA_CFLAGS
 # builds) can run concurrently in this same tree: each lands in its own
-# obj/<backend>-<sig>/ directory and never touches the other's objects.
-# OBJ_DIR's own creation happens lazily via the order-only prerequisite on
-# the pattern rules below ($(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)), not at
-# Makefile-parse time.
+# obj/<backend>-<sig>/ + bin/<backend>-<sig>/ directory pair and never
+# touches the other's objects or archive. Directory creation (and the
+# CFG_SIG collision guard) happens lazily via the _cfg_guard order-only
+# prerequisite on the rules below, not at Makefile-parse time.
 #
 # cksum (POSIX -- present on macOS/BSD/GNU/busybox, unlike shasum which is a
 # GNU coreutils extension and may be absent from slim embedded build images)
 # computes the hash. On stdin it prints "<checksum> <byte-count>" with no
 # filename field (verified on macOS's BSD cksum), so `cut -d' ' -f1` isolates
 # just the checksum.
-CFG_SIG := $(shell printf '%s' "$(CC) $(CFLAGS) $(EXTRA_CFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR)" | cksum | cut -d' ' -f1)
+CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG)
+CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 BE_SRCS    = $(OWN_SRCS) $(VENDOR_SRCS)
 BE_CXXSRCS = $(VENDOR_CXXSRCS)
@@ -245,27 +298,82 @@ $(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += -fno-strict-aliasing
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean
+.PHONY: all lib selftest test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path _cfg_guard
 all: lib
 
 lib: $(LIB)
 
-$(LIB): $(BE_OBJS) | $(BIN_DIR)
-	ar rcs $@ $(BE_OBJS)
+# --- CFG_SIG collision guard + directory creation (build hygiene) ----------
+# _cfg_guard is the single order-only prerequisite every compile/link/archive
+# rule below depends on (replacing the previous bare "| $(OBJ_DIR)"/
+# "| $(BIN_DIR)" order-only prerequisites and their own tiny `@mkdir -p $@`
+# rule). Being .PHONY, its recipe runs on every `make` invocation that needs
+# it -- not just the first time $(OBJ_DIR)/$(BIN_DIR) are created -- and GNU
+# Make builds any one target at most once per invocation even when several
+# rules list it as a prerequisite, so under `make -j` it still runs exactly
+# once, and (being an ordinary prerequisite in the dependency graph, order-
+# only or not) make schedules it to completion before any rule that depends
+# on it starts: race-free.
+#
+# It does two things:
+#   1. mkdir -p $(OBJ_DIR) $(BIN_DIR) -- idempotent, safe if two *separate*
+#      `make` processes for the very same config happen to race each other.
+#   2. Writes (first time) or verifies (every subsequent time) a one-line
+#      config.manifest in EACH of the two directories, containing the exact
+#      CFG_SIG_PAYLOAD string that produced this build's CFG_SIG. If a
+#      manifest already exists and its content does not match this build's
+#      payload, two *different* configurations hashed to the same CFG_SIG
+#      (a cksum collision) or the payload has a coverage gap (some flag that
+#      affects the build isn't in it) -- either way, objects from an
+#      unrelated config could silently be reused, so this is a hard error,
+#      never a warning. The write is temp-file-then-mv (atomic rename on the
+#      same filesystem), so a concurrent reader never observes a half-
+#      written manifest.
+#
+# `make -n` only prints this recipe (nothing is created or compared under
+# -n), and nothing here runs unless some real target needs it -- Makefile
+# parsing itself performs no I/O.
+_cfg_guard:
+	@mkdir -p $(OBJ_DIR) $(BIN_DIR)
+	@for d in $(OBJ_DIR) $(BIN_DIR); do \
+	  m="$$d/config.manifest"; \
+	  if [ -f "$$m" ]; then \
+	    old="$$(cat "$$m")"; \
+	    if [ "$$old" != "$(CFG_SIG_PAYLOAD)" ]; then \
+	      echo "FATAL: CFG_SIG collision or coverage gap in $$m" >&2; \
+	      echo "  CFG_SIG=$(CFG_SIG)" >&2; \
+	      echo "  stored : $$old" >&2; \
+	      echo "  current: $(CFG_SIG_PAYLOAD)" >&2; \
+	      exit 1; \
+	    fi; \
+	  else \
+	    tmp="$$d/.config.manifest.tmp.$$$$"; \
+	    printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$tmp"; \
+	    mv -f "$$tmp" "$$m"; \
+	  fi; \
+	done
+
+$(LIB): $(BE_OBJS) | _cfg_guard
+	$(AR) rc $@ $(BE_OBJS)
+	$(RANLIB) $@
 	@echo "audio_common [$(BACKEND)] -> $@"
 
-$(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
-$(OBJ_DIR)/%.o: %.cpp | $(OBJ_DIR)
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+# -MD -MP (NOT -MMD): emits $(OBJ_DIR)/<name>.d per object, listing every
+# header the TU pulled in -- INCLUDING vendored NE10/KISS headers reached via
+# -isystem, which -MMD would omit. Included near the bottom of this file via
+# `-include $(wildcard $(OBJ_DIR)/*.d)`; see that line's comment.
+$(OBJ_DIR)/%.o: %.c | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/%.o: %.cpp | _cfg_guard
+	$(CXX) $(CXXFLAGS) -MD -MP -c -o $@ $<
 
 LINK = $(CC)
 ifeq ($(BACKEND),ne10)
   LINK = $(CXX)   # NE10 archive contains a C++ TU -> link with the C++ driver
 endif
 
-selftest: $(LIB) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -c -o $(OBJ_DIR)/roundtrip.o test/roundtrip.c
+selftest: $(LIB) | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/roundtrip.o test/roundtrip.c
 	$(LINK) -o $(BIN_DIR)/roundtrip $(OBJ_DIR)/roundtrip.o $(LIB) $(LDFLAGS)
 	@echo "--- audio_common selftest [$(BACKEND)] ---"
 	@$(BIN_DIR)/roundtrip
@@ -275,7 +383,7 @@ selftest: $(LIB) | $(BIN_DIR)
 	# scalar reference loops (e.g. sk_ema_f32_scalar) into `fmla` at -O2,
 	# which would then mismatch the deliberately-unfused NEON intrinics
 	# path (see include/simd_kernels.h's FMA-discipline doc comment).
-	$(CC) $(CFLAGS) -ffp-contract=off -c -o $(OBJ_DIR)/simd_selftest.o test/simd_selftest.c
+	$(CC) $(CFLAGS) -ffp-contract=off -MD -MP -c -o $(OBJ_DIR)/simd_selftest.o test/simd_selftest.c
 	$(CC) -o $(BIN_DIR)/simd_selftest $(OBJ_DIR)/simd_selftest.o -lm
 	@echo "--- audio_common SIMD kernel selftest [$(BACKEND)] ---"
 	@$(BIN_DIR)/simd_selftest
@@ -283,8 +391,8 @@ selftest: $(LIB) | $(BIN_DIR)
 # test_pool: pool-contract negative tests (F07 alignment guards, F14 HPF
 # domain validation). Same shape as selftest -- links against the same $(LIB)
 # archive so it exercises whichever backend (kiss/ne10) was built.
-test_pool: $(LIB) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -c -o $(OBJ_DIR)/test_pool_contract.o test/test_pool_contract.c
+test_pool: $(LIB) | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_pool_contract.o test/test_pool_contract.c
 	$(LINK) -o $(BIN_DIR)/test_pool_contract $(OBJ_DIR)/test_pool_contract.o $(LIB) $(LDFLAGS)
 	@echo "--- audio_common pool-contract test [$(BACKEND)] ---"
 	@$(BIN_DIR)/test_pool_contract
@@ -293,8 +401,8 @@ test_pool: $(LIB) | $(BIN_DIR)
 # remediation). Header-only like the simd_kernels.h half of `selftest` --
 # wav_io.h needs no FFT/archive objects, so this doesn't depend on $(LIB)
 # and links with a plain $(CC) (no NE10 C++ TU involved either way).
-test_wav: | $(OBJ_DIR) $(BIN_DIR)
-	$(CC) $(CFLAGS) -c -o $(OBJ_DIR)/test_wav_io.o test/test_wav_io.c
+test_wav: | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_wav_io.o test/test_wav_io.c
 	$(CC) -o $(BIN_DIR)/test_wav_io $(OBJ_DIR)/test_wav_io.o -lm
 	@echo "--- audio_common WAV I/O negative-corpus test [$(BACKEND)] ---"
 	@$(BIN_DIR)/test_wav_io
@@ -305,8 +413,8 @@ test_wav: | $(OBJ_DIR) $(BIN_DIR)
 # never sets that knob, so it only ever exercises the default
 # WAV_IO_WRITER_AEC style (see wav_io.h's WAV_IO_WRITER_STYLE doc). Header-
 # only, same shape as test_wav.
-test_wav_nr_style: | $(OBJ_DIR) $(BIN_DIR)
-	$(CC) $(CFLAGS) -DWAV_IO_WRITER_STYLE=WAV_IO_WRITER_NR -c -o $(OBJ_DIR)/test_wav_writer_nr_style.o test/test_wav_writer_nr_style.c
+test_wav_nr_style: | _cfg_guard
+	$(CC) $(CFLAGS) -DWAV_IO_WRITER_STYLE=WAV_IO_WRITER_NR -MD -MP -c -o $(OBJ_DIR)/test_wav_writer_nr_style.o test/test_wav_writer_nr_style.c
 	$(CC) -o $(BIN_DIR)/test_wav_writer_nr_style $(OBJ_DIR)/test_wav_writer_nr_style.o -lm
 	@echo "--- audio_common WAV writer NR-style special-values test [$(BACKEND)] ---"
 	@$(BIN_DIR)/test_wav_writer_nr_style
@@ -319,8 +427,8 @@ test_wav_nr_style: | $(OBJ_DIR) $(BIN_DIR)
 # non-finite sanitize) it must pass. Sanitizer flags are scoped to this one
 # target's compile+link, same pattern as $(OWN_OBJS): CFLAGS -Werror above
 # -- never applied to the main $(LIB) archive or any other test.
-test-wav-ubsan: | $(OBJ_DIR) $(BIN_DIR)
-	$(CC) $(CFLAGS) -fsanitize=undefined -fno-sanitize-recover=all -c -o $(OBJ_DIR)/test_wav_writer_ubsan.o test/test_wav_writer_ubsan.c
+test-wav-ubsan: | _cfg_guard
+	$(CC) $(CFLAGS) -fsanitize=undefined -fno-sanitize-recover=all -MD -MP -c -o $(OBJ_DIR)/test_wav_writer_ubsan.o test/test_wav_writer_ubsan.c
 	$(CC) -fsanitize=undefined -fno-sanitize-recover=all -o $(BIN_DIR)/test_wav_writer_ubsan $(OBJ_DIR)/test_wav_writer_ubsan.o -lm
 	@echo "--- audio_common WAV writer UBSan probe [$(BACKEND)] ---"
 	@$(BIN_DIR)/test_wav_writer_ubsan
@@ -353,13 +461,13 @@ else
   ZERO_HEAP_HOOK_DEPS  = $(ZERO_HEAP_HOOK_LIB)
 endif
 
-$(BIN_DIR)/libzero_heap_hook.dylib: test/zero_heap_hook.c test/zero_heap_hook.h | $(BIN_DIR)
+$(BIN_DIR)/libzero_heap_hook.dylib: test/zero_heap_hook.c test/zero_heap_hook.h | _cfg_guard
 	$(CC) $(CFLAGS) -dynamiclib -o $@ test/zero_heap_hook.c
 
-$(OBJ_DIR)/zero_heap_hook.o: test/zero_heap_hook.c test/zero_heap_hook.h | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -c -o $@ test/zero_heap_hook.c
+$(OBJ_DIR)/zero_heap_hook.o: test/zero_heap_hook.c test/zero_heap_hook.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ test/zero_heap_hook.c
 
-test_zero_heap: $(LIB) $(ZERO_HEAP_HOOK_DEPS) | $(BIN_DIR)
+test_zero_heap: $(LIB) $(ZERO_HEAP_HOOK_DEPS) | _cfg_guard
 	# -fno-builtin is NOT optional here: without it, clang recognizes
 	# malloc/calloc/realloc/free as builtin allocation functions and, when a
 	# call's returned pointer never "escapes" (isn't dereferenced/printed,
@@ -369,7 +477,7 @@ test_zero_heap: $(LIB) $(ZERO_HEAP_HOOK_DEPS) | $(BIN_DIR)
 	# test_hook_actually_counts() were compiled away entirely). That would
 	# make this test pass for the wrong reason (no calls to observe, rather
 	# than calls correctly observed at zero).
-	$(CC) $(CFLAGS) -fno-builtin -c -o $(OBJ_DIR)/test_fft_zero_heap.o test/test_fft_zero_heap.c
+	$(CC) $(CFLAGS) -fno-builtin -MD -MP -c -o $(OBJ_DIR)/test_fft_zero_heap.o test/test_fft_zero_heap.c
 ifeq ($(shell uname -s),Darwin)
 	$(LINK) -o $(BIN_DIR)/test_fft_zero_heap $(OBJ_DIR)/test_fft_zero_heap.o $(LIB) $(LDFLAGS) $(ZERO_HEAP_LDFLAGS)
 else
@@ -390,46 +498,143 @@ endif
 #
 # Two full sub-`make`s (via $(MAKE) BACKEND=ne10 ...) rebuild the archive
 # for each EXTRA_CFLAGS value rather than trying to build both variants in
-# one invocation: EXTRA_CFLAGS is baked into $(OBJ_DIR)'s own path via
-# CFG_SIG (see the hash-keyed object directory comment above), so the two
-# sub-makes automatically land in two DIFFERENT obj/ne10-<sig>/ directories
-# -- the second sub-make's objects are a real fresh compile, not a stale
-# reuse of the first's, with nothing needing to be wiped in between.
+# one invocation: EXTRA_CFLAGS is baked into $(OBJ_DIR)'s AND $(BIN_DIR)'s
+# own path via CFG_SIG (see the hash-keyed directory section above), so the
+# two sub-makes automatically land in two DIFFERENT bin/ne10-<sig>/
+# directories -- the second sub-make's archive/objects are a real fresh
+# build, not a stale reuse of the first's, with nothing needing to be wiped
+# in between, and (round-3 review B01, the actual bug this rewrite fixes)
+# the FORCED-C sub-make's rebuild of libaudio_common.a can never overwrite
+# the normal NEON build's archive, because the two now live in different
+# directories instead of the same flat bin/ne10/.
 #
-# The renamed binaries and dump files all live under bin/ne10/, which
-# neither sub-make ever removes (BIN_DIR is a last-write-wins whole, not
-# CFG_SIG-keyed -- see the hash-keyed object directory comment above), so
-# the first (NEON) build's artifacts survive the second (forced-C)
-# sub-make's rebuild only because this recipe cp's them to a variant-
-# specific name in between (bin/ne10/test_ne10_c_parity itself IS
-# overwritten by the second sub-make).
+# Each variant's bin dir is resolved at RECIPE time (not parsed/cached) via
+# `$(MAKE) ... print-bin-dir`, so this target never has to guess or
+# reconstruct a keyed path itself -- it just asks the sub-make that built it.
 test_ne10_force_c:
 	@$(MAKE) BACKEND=ne10 _ne10_parity_bin
-	@cp bin/ne10/test_ne10_c_parity bin/ne10/test_ne10_c_parity_neon
-	@$(MAKE) BACKEND=ne10 EXTRA_CFLAGS=-DFFT_NE10_FORCE_C _ne10_parity_bin
-	@cp bin/ne10/test_ne10_c_parity bin/ne10/test_ne10_c_parity_c
-	@echo "--- audio_common NE10 NEON-vs-C parity [test_ne10_force_c] ---"
-	@bin/ne10/test_ne10_c_parity_neon bin/ne10/test_ne10_c_parity_neon.dump
-	@bin/ne10/test_ne10_c_parity_c    bin/ne10/test_ne10_c_parity_c.dump
-	@$(CC) -O2 -Wall -Wextra -o bin/ne10/ne10_parity_compare test/ne10_parity_compare.c -lm
-	@bin/ne10/ne10_parity_compare bin/ne10/test_ne10_c_parity_neon.dump bin/ne10/test_ne10_c_parity_c.dump
+	@bd_neon="$$($(MAKE) -s --no-print-directory BACKEND=ne10 print-bin-dir)"; \
+	 $(MAKE) BACKEND=ne10 EXTRA_CFLAGS=-DFFT_NE10_FORCE_C _ne10_parity_bin; \
+	 bd_c="$$($(MAKE) -s --no-print-directory BACKEND=ne10 EXTRA_CFLAGS=-DFFT_NE10_FORCE_C print-bin-dir)"; \
+	 if [ "$$bd_neon" = "$$bd_c" ]; then \
+	   echo "FATAL: test_ne10_force_c: NEON and forced-C variants resolved to the SAME bin dir ($$bd_neon) -- CFG_SIG did not separate them" >&2; \
+	   exit 1; \
+	 fi; \
+	 echo "--- audio_common NE10 NEON-vs-C parity [test_ne10_force_c] ---"; \
+	 echo "  NEON     bin dir: $$bd_neon"; \
+	 echo "  forced-C bin dir: $$bd_c"; \
+	 "$$bd_neon/test_ne10_c_parity" "$$bd_neon/test_ne10_c_parity_neon.dump"; \
+	 "$$bd_c/test_ne10_c_parity"    "$$bd_c/test_ne10_c_parity_c.dump"; \
+	 $(CC) -O2 -Wall -Wextra -o "$$bd_c/ne10_parity_compare" test/ne10_parity_compare.c -lm; \
+	 "$$bd_c/ne10_parity_compare" "$$bd_neon/test_ne10_c_parity_neon.dump" "$$bd_c/test_ne10_c_parity_c.dump"
 
 # _ne10_parity_bin: internal plumbing target invoked (via $(MAKE) BACKEND=ne10
 # [EXTRA_CFLAGS=...] _ne10_parity_bin) by test_ne10_force_c above; same shape
-# as test_pool/test_wav/etc. but not meant to be run directly since it always
-# overwrites the SAME $(BIN_DIR)/test_ne10_c_parity path on each of the two
-# sub-make calls (that's why test_ne10_force_c cp's it to a variant-specific
-# name immediately after each sub-make returns).
-_ne10_parity_bin: $(LIB) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -c -o $(OBJ_DIR)/test_ne10_c_parity.o test/test_ne10_c_parity.c
+# as test_pool/test_wav/etc. Because BIN_DIR is now CFG_SIG-keyed, the two
+# sub-make invocations (plain NE10 vs EXTRA_CFLAGS=-DFFT_NE10_FORCE_C) each
+# land in their OWN bin/ne10-<sig>/test_ne10_c_parity -- no cp-to-rename
+# dance is needed any more to keep one variant's binary from being clobbered
+# by the other's rebuild (round-3 review B01).
+_ne10_parity_bin: $(LIB) | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_ne10_c_parity.o test/test_ne10_c_parity.c
 	$(LINK) -o $(BIN_DIR)/test_ne10_c_parity $(OBJ_DIR)/test_ne10_c_parity.o $(LIB) $(LDFLAGS)
 
-$(OBJ_DIR) $(BIN_DIR):
-	@mkdir -p $@
+# --- Query targets (round-3 review B01) -------------------------------------
+# Consumers (AEC/NR Makefiles, docs_smoke.sh, scripts) resolve THIS build's
+# actual output paths at recipe time instead of hardcoding
+# bin/<backend>/libaudio_common.a -- e.g.
+# `ac="$$(make -s -C ../../audio_common BACKEND=$$BACKEND print-lib-path)"`.
+# $(abspath ...) is fine here even though it prints an absolute path: the
+# prohibition on absolute paths is about paths landing in COMMITTED files
+# (or generated manifests), not runtime `make` stdout -- and an absolute
+# path is exactly what a caller in a different, unknown-relative-depth
+# directory needs to reliably -I/-L/link against. Parse-time itself never
+# writes stdout (only $(info) above does, and that's gated off for these
+# goals); these targets' only output is the one recipe-time @echo line.
+print-bin-dir:
+	@echo $(abspath $(BIN_DIR))
+print-obj-dir:
+	@echo $(abspath $(OBJ_DIR))
+print-lib-path:
+	@echo $(abspath $(LIB))
+
+# --- publish: immutable per-config release under dist/ (round-3 review B01)
+# dist/<backend>/<cfg_sig>/ holds a copy of this build's artifacts plus a
+# MANIFEST.txt (build identity + per-file sha256, relative paths only);
+# dist/<backend>/current is a symlink to the most-recently-published
+# <cfg_sig> for that backend. Nothing in development ever builds or links
+# against dist/ -- it exists solely as a stable handoff path for whoever
+# consumes a finished build (another repo, a flashable image, a CI artifact
+# upload...). A per-backend lock directory (mkdir is atomic -- POSIX
+# guarantees exactly one caller sees success when two race) serialises
+# concurrent `make publish` for the SAME backend; a different backend's
+# publish uses its own lock and is untouched.
+PUBLISH_ARTIFACTS = $(LIB)
+DIST_BACKEND_DIR  = dist/$(BACKEND)
+DIST_REL_DIR      = $(DIST_BACKEND_DIR)/$(CFG_SIG)
+DIST_LOCK         = dist/.lock.$(BACKEND)
+
+publish: $(PUBLISH_ARTIFACTS)
+	@mkdir -p dist; \
+	if ! mkdir "$(DIST_LOCK)" 2>/dev/null; then \
+	  echo "FATAL: publish lock $(DIST_LOCK) already held (concurrent 'make publish BACKEND=$(BACKEND)'?)" >&2; \
+	  exit 1; \
+	fi; \
+	trap 'rmdir "$(DIST_LOCK)" 2>/dev/null' EXIT INT TERM; \
+	set -e; \
+	commit="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+	dateutc="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+	mkdir -p "$(DIST_BACKEND_DIR)"; \
+	tmp="$(DIST_BACKEND_DIR)/$(CFG_SIG).tmp"; \
+	rm -rf "$$tmp"; mkdir -p "$$tmp"; \
+	cp $(PUBLISH_ARTIFACTS) "$$tmp/"; \
+	shas="$$( cd "$$tmp" && for f in *; do shasum -a 256 "$$f"; done )"; \
+	{ echo "repo=audio_common"; \
+	  echo "backend=$(BACKEND)"; \
+	  echo "cfg_sig=$(CFG_SIG)"; \
+	  echo "cc=$(CC)"; echo "cxx=$(CXX)"; \
+	  echo "cflags=$(CFLAGS)"; echo "cxxflags=$(CXXFLAGS)"; \
+	  echo "extra_cflags=$(EXTRA_CFLAGS)"; \
+	  echo "werror=$(WERROR)"; echo "no_stdio=$(NO_STDIO)"; echo "debug=$(DEBUG)"; \
+	  echo "git_commit=$$commit"; echo "date_utc=$$dateutc"; \
+	  echo "$$shas"; \
+	} > "$$tmp/MANIFEST.txt"; \
+	echo "== publish: backend-symbol audit (staged archive) =="; \
+	if [ "$(BACKEND)" = "ne10" ]; then \
+	  nm "$$tmp/libaudio_common.a" | grep -Eq '_?ne10_fft_r2c_1d_float32_neon' || { echo "FATAL: staged ne10 archive missing ne10_fft_r2c_1d_float32_neon" >&2; exit 1; }; \
+	  ar -t "$$tmp/libaudio_common.a" | grep -q kiss_fft.o && { echo "FATAL: staged ne10 archive unexpectedly contains kiss_fft.o" >&2; exit 1; }; \
+	  true; \
+	else \
+	  nm "$$tmp/libaudio_common.a" | grep -Eq '_?kiss_fft_alloc' || { echo "FATAL: staged kiss archive missing kiss_fft symbols" >&2; exit 1; }; \
+	  ar -t "$$tmp/libaudio_common.a" | grep -qi ne10 && { echo "FATAL: staged kiss archive unexpectedly contains an ne10 object" >&2; exit 1; }; \
+	  true; \
+	fi; \
+	rm -rf "$(DIST_REL_DIR)"; \
+	mv "$$tmp" "$(DIST_REL_DIR)"; \
+	ln -s "$(CFG_SIG)" "$(DIST_BACKEND_DIR)/.current.tmp"; \
+	mv -f "$(DIST_BACKEND_DIR)/.current.tmp" "$(DIST_BACKEND_DIR)/current"; \
+	echo "audio_common: published $(BACKEND)/$(CFG_SIG) -> $(DIST_BACKEND_DIR)/current"
 
 clean:
 	# F12 build hygiene: nuke obj/ and bin/ wholesale (BOTH backends' output
-	# dirs), not just $(OBJ_DIR)/$(BIN_DIR) for whatever BACKEND this
-	# invocation happens to resolve to -- a bare `make clean` (no BACKEND=)
-	# used to leave the other backend's stale build sitting untouched.
+	# dirs, every CFG_SIG subdirectory each), not just $(OBJ_DIR)/$(BIN_DIR)
+	# for whatever BACKEND/config this invocation happens to resolve to -- a
+	# bare `make clean` (no BACKEND=) used to leave other configs' stale
+	# builds sitting untouched. dist/ is NOT removed by clean (round-3
+	# review B01): published releases are meant to survive a dev-tree clean;
+	# `rm -rf dist/` is a manual, deliberate action, not part of the normal
+	# edit/build/clean loop.
 	rm -rf obj bin
+
+# --- Header dependency tracking (round-3 review B01, build hygiene) --------
+# Every compile line above passes -MD -MP, which emits a $(OBJ_DIR)/<name>.d
+# GNU-Make fragment per object, listing every header that object's TU pulled
+# in -- INCLUDING vendored NE10/KISS headers reached via -isystem (-MD, not
+# -MMD, which would omit -isystem/system headers and defeat "touch a
+# vendored NE10 header -> its object rebuilds"). -MP additionally emits a
+# phony no-prerequisites rule per header, so a deleted/renamed header doesn't
+# fail the build with "No rule to make target" against a stale .d fragment.
+# $(wildcard ...) makes this evaluate to nothing (not an error) before any
+# objects exist yet for this CFG_SIG (a clean tree, or this config's first
+# build).
+-include $(wildcard $(OBJ_DIR)/*.d)
