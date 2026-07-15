@@ -27,6 +27,20 @@
 #include <arm_neon.h>
 #endif
 
+/* --- P0003 (re-review R05): fft_size whitelist ----------------------------
+ * Mirrors fft_wrapper_ne10.c's fft_size_in_range: [16, 8192], power of two.
+ * KISS's own arithmetic here already runs through the checked ck_* helpers
+ * (mem_align.h) in 64-bit size_t, so it does not share the NE10 backend's
+ * 32-bit-wraparound exposure -- but every real caller across AEC/NR/
+ * Audio_ALG only ever derives fft_size from {256, 512, 1024}, and the two
+ * backends are meant to be interchangeable behind the same fft_wrapper.h
+ * contract, so this whitelist is applied here too for API symmetry (a
+ * program that only ever validates against one backend should not discover
+ * different accepted-input behavior when relinked against the other). */
+static int fft_size_in_range(int fft_size) {
+    return fft_size >= 16 && fft_size <= 8192 && (fft_size & (fft_size - 1)) == 0;
+}
+
 /* Internal FFT handle structure */
 struct FftHandle {
     int fft_size;
@@ -44,8 +58,8 @@ struct FftHandle {
 /* --- construction (heap) -------------------------------------------------- */
 
 FftHandle* fft_create(int fft_size) {
-    if (fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) {
-        return NULL;  /* fft_size must be power of 2 */
+    if (!fft_size_in_range(fft_size)) {
+        return NULL;  /* fft_size must be a power of 2 in [16, 8192] (P0003) */
     }
 
     FftHandle* h = (FftHandle*)calloc(1, sizeof(FftHandle));
@@ -69,9 +83,8 @@ FftHandle* fft_create(int fft_size) {
 /* --- construction (static pool, heap-free) -------------------------------- */
 
 size_t fft_get_mem_size(int fft_size) {
-    if (fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return 0;
+    if (!fft_size_in_range(fft_size)) return 0;  /* P0003 */
     size_t lf = 0, li = 0;
-    if (fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return 0;
     kiss_fft_alloc(fft_size, 0, NULL, &lf);   /* query forward cfg size */
     kiss_fft_alloc(fft_size, 1, NULL, &li);   /* query inverse cfg size */
     size_t total = 0;
@@ -84,7 +97,7 @@ size_t fft_get_mem_size(int fft_size) {
 }
 
 FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
-    if (!mem || fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return NULL;
+    if (!mem || !fft_size_in_range(fft_size)) return NULL;  /* P0003 */
     if (!MEM_IS_ALIGNED16(mem)) return NULL;  /* F07: reject a misaligned base before any write */
     if (mem_size == 0) return NULL;
     size_t need = fft_get_mem_size(fft_size);

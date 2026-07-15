@@ -13,14 +13,15 @@ Zero local patches prior to this entry.
 |--------|---------------------------------------------------|---------------------------------------------------------------------|-----------|
 | P0001  | External-memory r2c config init                    | `modules/dsp/NE10_rfft_float32.c`, `inc/NE10_dsp.h`                  | The strict caller-pool build (`fft_wrapper_ne10.c`'s static-memory path) must not call `malloc()` anywhere between init and destroy. `ne10_fft_alloc_r2c_float32` did one internal `NE10_MALLOC` with no way to place the R2C/C2R config into caller-owned memory. P0001 splits it into `ne10_fft_r2c_mem_size_float32` (exact size query) + `ne10_fft_init_r2c_float32_ext` (carve + twiddle-generate over caller-supplied memory, never frees it) and rewrites `ne10_fft_alloc_r2c_float32` as a thin `malloc()` + call into the `_ext` function. One twiddle code path -> heap and pool configs are bit-identical by construction. `ne10_fft_destroy_r2c_float32` (bare `free()`) is unchanged; the pool caller never calls it on a pool-placed config. |
 | P0002  | Guard `NE10_DSP_RFFT_SCALING` against redefinition | `modules/dsp/NE10_fft.h`                                             | `audio_common/Makefile`'s `BACKEND=ne10` build passes `-DNE10_ENABLE_DSP -DNE10_DSP_RFFT_SCALING` on the command line explicitly (so no build can silently drop the flag), but this header also unconditionally `#define`s the same macro (line ~76), producing a `-Wmacro-redefined` warning on every NE10 TU that transitively includes it (13 occurrences on a clean `BACKEND=ne10` build, one per compiled `.c`/`.cpp`). P0002 wraps the header's `#define` in `#ifndef NE10_DSP_RFFT_SCALING ... #endif` so the command-line definition wins without a second, textually-different (`1` vs empty) redefinition. Purely a warning-hygiene fix -- behavior is unchanged either way (`NE10_DSP_RFFT_SCALING`'s c2r 1/N auto-scaling was already verified correct with the macro defined via either the command line or the header; only the "is it defined at all" state matters to the code that guards on it). No other NE10 source touched. |
+| P0003  | External-memory size/init boundary hardening (re-review R05) | `modules/dsp/NE10_rfft_float32.c`, `inc/NE10_dsp.h`                  | Two boundary holes in P0001's external-memory API: (1) `ne10_fft_r2c_mem_size_float32` computed its byte total in `ne10_uint32_t` (32-bit) arithmetic with no bound on `nfft`, so a huge `nfft` silently wrapped to a small, deceptively "valid" nonzero result instead of failing (measured: `nfft=2^28` wrapped to 1,342,177,968; `nfft=2^30` to 1,073,742,512) -- a caller's own 64-bit checked-size arithmetic downstream (e.g. `fft_wrapper_ne10.c`'s `ck_*` helpers) can only catch an overflow that happens on its side of the call, not one that already happened inside this 32-bit function before the result was ever returned. (2) `ne10_fft_init_r2c_float32_ext` took no `mem_size` at all, so it had no way to confirm a caller-supplied pool was actually big enough for the `nfft` it was asked to initialise -- and its `if (nfft<16) return st;` early-out silently returned a non-NULL config whose `r_factors`/`r_twiddles`/`r_twiddles_neon`/etc. were never populated for `nfft` in `[1, 15]`. P0003 fixes both: `ne10_fft_r2c_mem_size_float32` now rejects (returns 0) any `nfft` outside `[16, 8192]` or not a power of two -- within that whitelist the true byte requirement (~21*8192+688 =~ 173 KB at the top end) cannot overflow 32 bits, eliminating the wraparound structurally rather than by a runtime overflow check on the arithmetic itself; `ne10_fft_init_r2c_float32_ext` gained a `mem_size` parameter, validates `mem != NULL` and `mem_size >= ne10_fft_r2c_mem_size_float32(nfft)` (which also subsumes the range check, since an out-of-range `nfft` makes that call return 0), and returns `NULL` instead of a partially-initialised `st` for any `nfft` it won't fully initialise -- the old `nfft<16` silent-degenerate path is deleted, not just relocated. `ne10_fft_alloc_r2c_float32` (the malloc() wrapper) now passes the `memneeded` it already computed through as the new `mem_size` argument. Byte-neutral for every previously-valid, in-whitelist `nfft` (256/512/1024/8192 measured identical before/after); the audio_common-side callers (`fft_wrapper_ne10.c`'s `fft_get_mem_size`/`fft_create`/`fft_init`, and `fft_wrapper.c`'s KISS backend for API symmetry) gained the same `[16, 8192]` power-of-two whitelist at their own public entry points, one layer up from this vendored fix. |
 
 ## Vendored-file manifest (review F15)
 
 Every file under `lib/ne10/` (excluding this `VENDORED.md` itself), with its
 SHA-256 as currently checked in. **These hashes are of the file as it sits in
 this tree today** — i.e. they include any local patch listed in the table
-above (currently: P0001's edits to `NE10_rfft_float32.c` and `NE10_dsp.h`, and
-if a later patch touches other files, those too). This manifest does not
+above (currently: P0001's and P0003's edits to `NE10_rfft_float32.c` and
+`NE10_dsp.h`, and if a later patch touches other files, those too). This manifest does not
 separately carry a "pristine upstream" hash per file; provenance back to the
 imported commit is the `Imported commit` line above plus the Local patches
 table's `Files touched` column — re-diffing against a fresh checkout of that
@@ -48,7 +49,7 @@ Build-membership column legend:
 | `modules/dsp/NE10_fft_int32.c` | `b6f7cd5619b931691a97e81b7e44d1282f7f04265b18e142345492302437af91` |
 | `modules/dsp/NE10_fft_generic_float32.c` | `0d2790c16ac26d0efa294ff4c1a01923dd8d48ea5d4c93c4ab59e6bb7101a399` |
 | `modules/dsp/NE10_fft_generic_int32.cpp` | `02ba6c951eeafcab58bf1f830511debab3f4fd75cb5be12d8fa35b17847faa46` |
-| `modules/dsp/NE10_rfft_float32.c` (carries P0001) | `5bf6d655d5d2d24fd0b7590e43153c5714ed70fd10c534db09097da39f012bfe` |
+| `modules/dsp/NE10_rfft_float32.c` (carries P0001, P0003) | `3c129f27e7be8e49aafa6fcfcbd95d78cd25791b60e121ca200f297066d5ca16` |
 | `modules/dsp/NE10_rfft_float32.neonintrinsic.c` | `3506f7a84fc512c36960547dc77e9375f5f28267ffed181a94d51686105e8441` |
 
 `NE10_fft_float32.c`/`NE10_fft_int32.c`/`NE10_fft_generic_float32.c`/
@@ -67,7 +68,7 @@ comment above `NE10_C_SRCS` for the full empirical trail.
 | `common/macros.h` | `7ebd5524636855c348fb30fe5385a4e5ab7315bb84213691b78a138b9c6ca536` |
 | `common/versionheader.h` | `26074a49e1fca81f93e3ef08e1c879b0d94f9092da3975ce77bf5f2bc80796c1` |
 | `inc/NE10.h` | `c7834fa2f1c588ff9715117ec6bb5ecb24ffa89783034ea6b3e6b222b3ed91d2` |
-| `inc/NE10_dsp.h` (carries P0001) | `1f0b2598040a226acdc26a1b79cb7cc0f5fc9ccb10c66bfacfdacd3110751aaf` |
+| `inc/NE10_dsp.h` (carries P0001, P0003) | `076ec0136cb0b749ca080cf5182f188e6ac9ec617f239ac967fc5a3ebd1cef85` |
 | `inc/NE10_imgproc.h` | `2adb7e64ff127e5dc940231b02664ae12d40c3aa8cfa0bafd10e7abafc4a4f61` |
 | `inc/NE10_init.h` | `afc3e6cc252fb7edacf81e18d957ee1fa5cfe412bade9ab2d657e770d5455aed` |
 | `inc/NE10_macros.h` | `11efb68c57eeee69cb4094976d2024dd3422c2d6e5e556876515287b49ffac85` |

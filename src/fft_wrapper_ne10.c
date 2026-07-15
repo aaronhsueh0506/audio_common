@@ -98,6 +98,25 @@ _Static_assert(offsetof(Complex, i) == offsetof(ne10_fft_cpx_float32_t, i),
 #error "NE10 backend requires compile-time NEON (__ARM_NEON && __aarch64__)"
 #endif
 
+/* --- P0003 (re-review R05): fft_size whitelist ----------------------------
+ * All three public entry points below (fft_create/fft_get_mem_size/fft_init)
+ * used to accept ANY positive power of two, including tiny ones (1/2/4/8)
+ * that fall into ne10_fft_init_r2c_float32_ext's pre-P0003 nfft<16
+ * silent-degenerate path, and unboundedly large ones whose byte requirement
+ * this backend's underlying NE10 twiddle-config sizer computes in 32-bit
+ * (ne10_uint32_t) arithmetic that can wrap for huge nfft (see
+ * lib/ne10/modules/dsp/NE10_rfft_float32.c's ne10_fft_r2c_mem_size_float32,
+ * vendored patch P0003). This wrapper now whitelists nfft the same way that
+ * NE10-side fix does -- [16, 8192], power of two -- so a caller here gets a
+ * rejection (0 / NULL) at this layer instead of ever reaching the NE10 sizer
+ * with an out-of-range nfft. 8192 is 8x the largest production fft_size
+ * (1024 @ 48kHz); every real caller (AEC/NR/Audio_ALG, all four sibling
+ * repos) derives fft_size from a validated sample-rate/frame-size config
+ * that never leaves {256, 512, 1024}. */
+static int fft_size_in_range(int fft_size) {
+    return fft_size >= 16 && fft_size <= 8192 && (fft_size & (fft_size - 1)) == 0;
+}
+
 // Internal FFT handle structure
 struct FftHandle {
     int fft_size;
@@ -113,8 +132,8 @@ struct FftHandle {
 /* --- construction (heap) -------------------------------------------------- */
 
 FftHandle* fft_create(int fft_size) {
-    if (fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) {
-        // fft_size must be power of 2
+    if (!fft_size_in_range(fft_size)) {
+        // fft_size must be a power of 2 in [16, 8192] (P0003)
         return NULL;
     }
 
@@ -157,7 +176,7 @@ FftHandle* fft_create(int fft_size) {
  * fft_destroy(), matching the KISS backend (fft_wrapper.c). */
 
 size_t fft_get_mem_size(int fft_size) {
-    if (fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return 0;
+    if (!fft_size_in_range(fft_size)) return 0;  /* P0003 */
     int n_freqs = fft_size / 2 + 1;
     size_t total = 0;
     total = ck_field_size(total, 1, sizeof(FftHandle));
@@ -169,7 +188,7 @@ size_t fft_get_mem_size(int fft_size) {
 }
 
 FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
-    if (!mem || fft_size <= 0 || (fft_size & (fft_size - 1)) != 0) return NULL;
+    if (!mem || !fft_size_in_range(fft_size)) return NULL;  /* P0003 */
     if (!MEM_IS_ALIGNED16(mem)) return NULL;  /* F07: reject a misaligned base before any write */
     if (mem_size == 0) return NULL;
     size_t need = fft_get_mem_size(fft_size);
@@ -196,7 +215,23 @@ FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
 
     // R2C config — carved from the same caller block (P0001 external-memory
     // init): no NE10-internal malloc on this path.
-    h->r2c_cfg = ne10_fft_init_r2c_float32_ext(cursor, fft_size);
+    //
+    // P0003: ne10_fft_init_r2c_float32_ext now takes a mem_size and validates
+    // it against its own re-derived requirement (see that function). `cursor`
+    // is the LAST field in this walk, so the true remaining budget is
+    // `mem_size - (cursor - mem)`; that is bounded above by
+    // `cfg_reserved` (the exact ALIGN16'd amount fft_get_mem_size() reserved
+    // for this field) so the value handed to the _ext call — and the
+    // ne10_uint32_t it gets truncated into — never depends on how much
+    // larger than strictly necessary the caller's pool happens to be (a
+    // caller-supplied mem_size in the billions, cast straight down to
+    // ne10_uint32_t, could otherwise wrap to a small, spuriously-rejecting
+    // value).
+    size_t cfg_offset   = (size_t)(cursor - (uint8_t*)mem);
+    size_t cfg_remaining = mem_size - cfg_offset;
+    size_t cfg_reserved  = ck_align16_size((size_t)ne10_fft_r2c_mem_size_float32(fft_size));
+    size_t cfg_budget    = (cfg_remaining < cfg_reserved) ? cfg_remaining : cfg_reserved;
+    h->r2c_cfg = ne10_fft_init_r2c_float32_ext(cursor, (ne10_uint32_t)cfg_budget, fft_size);
     cursor += ALIGN16((size_t)ne10_fft_r2c_mem_size_float32(fft_size));
     if (!h->r2c_cfg) return NULL;
 

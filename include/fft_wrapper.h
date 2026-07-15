@@ -48,7 +48,11 @@ typedef struct FftHandle FftHandle;
 /**
  * Create FFT handle for given size (heap path).
  *
- * @param fft_size FFT size (must be power of 2)
+ * @param fft_size FFT size — must be a power of 2 in [16, 8192] (P0003,
+ *                 lib/ne10/VENDORED.md); both backends reject anything
+ *                 outside that range (0 / NULL), including other positive
+ *                 powers of two. 8192 is 8x the largest production fft_size
+ *                 (1024 @ 48kHz).
  * @return FFT handle, or NULL on error
  */
 FftHandle* fft_create(int fft_size);
@@ -60,7 +64,9 @@ FftHandle* fft_create(int fft_size);
  *   h     = fft_init(buffer, bytes, fft_size);
  *
  * The buffer must be at least `fft_get_mem_size(fft_size)` bytes and
- * 16-byte aligned. Returns NULL if `mem_size` is too small.
+ * 16-byte aligned. Returns NULL if `mem_size` is too small, or 0 from
+ * `fft_get_mem_size` (and NULL from `fft_init`) if `fft_size` is outside the
+ * [16, 8192] power-of-two range documented on `fft_create` above.
  *
  * Both backends' `fft_get_mem_size` includes every byte fft_init() touches,
  * including backend-internal FFT twiddle/config storage — there is nothing
@@ -68,9 +74,11 @@ FftHandle* fft_create(int fft_size);
  * is queried from kiss_fft_alloc() itself; NE10's is
  * `688 + 21*fft_size` bytes before 16-byte alignment (see
  * ne10_fft_r2c_mem_size_float32() in lib/ne10/modules/dsp/NE10_rfft_float32.c,
- * vendored patch P0001 in lib/ne10/VENDORED.md). Upstream NE10 has no
- * external-memory API for this config, so both backends are fully heap-free
- * on the fft_init() path.
+ * vendored patch P0001 in lib/ne10/VENDORED.md) — computed in 32-bit
+ * (ne10_uint32_t) arithmetic, which is why P0003 whitelists fft_size to a
+ * range that arithmetic cannot overflow within (~173KB at fft_size=8192).
+ * Upstream NE10 has no external-memory API for this config, so both backends
+ * are fully heap-free on the fft_init() path.
  */
 size_t     fft_get_mem_size(int fft_size);
 FftHandle* fft_init(void* mem, size_t mem_size, int fft_size);

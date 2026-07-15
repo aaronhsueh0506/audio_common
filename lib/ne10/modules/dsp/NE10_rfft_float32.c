@@ -747,15 +747,37 @@ NE10_INLINE void ne10_mixed_radix_c2r_butterfly_float32_c (
 /**
  * @brief Computes the number of bytes needed for an R2C/C2R FFT/IFFT configuration structure.
  * @param[in]   nfft             length of FFT
- * @retval      memneeded        number of bytes required by @ref ne10_fft_init_r2c_float32_ext for this nfft.
+ * @retval      memneeded        number of bytes required by @ref ne10_fft_init_r2c_float32_ext for this nfft,
+ *                                or 0 if nfft is outside the supported [16, 8192] power-of-two range.
  *
  * P0001 (external-memory r2c config init): a caller that owns a static/pooled memory block (rather
  * than letting @ref ne10_fft_alloc_r2c_float32 malloc() one) sizes that block with this function, then
  * hands it to @ref ne10_fft_init_r2c_float32_ext. This is the exact `memneeded` expression
  * @ref ne10_fft_alloc_r2c_float32 itself uses -- extracted here so both paths size the config identically.
+ *
+ * P0003 (re-review R05, external-memory size/init boundary): every term below is computed in
+ * `ne10_uint32_t` (32-bit) arithmetic, so a huge nfft can silently wrap this sum to a small,
+ * deceptively "valid" value before it ever reaches a caller's (correctly 64-bit, saturating) size_t
+ * bookkeeping -- e.g. nfft=2^28 previously wrapped to 1,342,177,968 and nfft=2^30 to 1,073,742,512,
+ * both far smaller than the true (unrepresentable) requirement. Rather than widen the arithmetic (this
+ * function's ABI is fixed at ne10_uint32_t by every caller, including upstream's own
+ * ne10_fft_alloc_r2c_float32 below) or add a checked/saturating-add variant, this whitelists nfft to
+ * the only range this codebase ever needs: powers of two in [16, 8192] (matches the fft_wrapper_ne10.c
+ * static-memory path's own whitelist, and NR's independently-derived `fft_size <= 8192` config bound --
+ * 8192 is 8x the largest shipped fft_size, 1024 @ 48kHz). At nfft=8192 the true requirement is
+ * ~21*8192+688 =~ 173 KB, nowhere near UINT32_MAX -- so within this whitelist the 32-bit sum below
+ * structurally cannot overflow (eliminated by construction, not by a runtime overflow check on the
+ * arithmetic itself). nfft<16 also degenerately under-allocates st->r_factors_neon/r_twiddles_neon
+ * (ne10_fft_init_r2c_float32_ext's pre-P0003 `if (nfft<16) return st;` early-out never populated them),
+ * so the lower bound is load-bearing too, not just a style choice.
  */
 ne10_uint32_t ne10_fft_r2c_mem_size_float32 (ne10_int32_t nfft)
 {
+    if (nfft < 16 || nfft > 8192 || (nfft & (nfft - 1)) != 0)
+    {
+        return 0;
+    }
+
     ne10_uint32_t memneeded =   sizeof (ne10_fft_r2c_state_float32_t)
                               + sizeof (ne10_fft_cpx_float32_t) * nfft              /* buffer*/
                               + sizeof (ne10_int32_t) * (NE10_MAXFACTORS * 2)       /* r_factors */
@@ -769,7 +791,8 @@ ne10_uint32_t ne10_fft_r2c_mem_size_float32 (ne10_int32_t nfft)
 
 /**
  * @brief Initialises an R2C/C2R FFT/IFFT configuration structure in caller-supplied memory.
- * @param[in]   mem              pointer to a block of at least @ref ne10_fft_r2c_mem_size_float32(nfft) bytes
+ * @param[in]   mem              pointer to a block of at least `mem_size` bytes
+ * @param[in]   mem_size         number of bytes actually available at `mem` (P0003)
  * @param[in]   nfft             length of FFT
  * @retval      st               pointer to the FFT configuration structure (== mem on success), or NULL
  *
@@ -779,17 +802,38 @@ ne10_uint32_t ne10_fft_r2c_mem_size_float32 (ne10_int32_t nfft)
  * there is exactly one twiddle code path: a heap-allocated config and a caller-pool config for the same
  * nfft are bit-identical by construction. This function never frees `mem` -- the caller owns that memory
  * either way, on both success and failure.
+ *
+ * P0003 (re-review R05, external-memory size/init boundary): this function used to take no `mem_size`
+ * at all -- a caller-carved pool region was handed over with no way for this function to confirm it was
+ * actually big enough for `nfft`, and a too-small `mem` would have its trailing fields (r_twiddles_neon /
+ * r_factors_neon / r_super_twiddles_neon, carved past the end of the caller's actual allocation) written
+ * out of bounds. `mem_size` closes that hole: this function now independently re-derives the required
+ * size via @ref ne10_fft_r2c_mem_size_float32(nfft) and rejects (returns NULL) unless `mem_size` covers
+ * it -- the same "recompute, don't trust the caller's arithmetic" pattern fft_wrapper_ne10.c's fft_init()
+ * already applies one layer up. This also subsumes the nfft range check (nfft outside [16, 8192] or not
+ * a power of two makes @ref ne10_fft_r2c_mem_size_float32 return 0, which this function rejects via the
+ * `required == 0` branch below): the old `if (nfft<16) return st;` silent-degenerate path -- which
+ * returned a non-NULL `st` whose r_factors/r_twiddles/twiddles_backward etc. were never populated -- is
+ * gone; any nfft this function won't fully initialise is now rejected up front instead.
  */
-ne10_fft_r2c_cfg_float32_t ne10_fft_init_r2c_float32_ext (void *mem, ne10_int32_t nfft)
+ne10_fft_r2c_cfg_float32_t ne10_fft_init_r2c_float32_ext (void *mem, ne10_uint32_t mem_size, ne10_int32_t nfft)
 {
-    ne10_fft_r2c_cfg_float32_t st = (ne10_fft_r2c_cfg_float32_t) mem;
-    ne10_int32_t ncfft = nfft >> 1;
-    ne10_int32_t result;
-
-    if (!st)
+    if (!mem)
     {
-        return st;
+        return NULL;
     }
+
+    ne10_uint32_t required = ne10_fft_r2c_mem_size_float32 (nfft);
+    /* required == 0 means nfft is outside the whitelisted [16, 8192] power-of-two
+     * range (P0003) -- reject explicitly rather than let a zero requirement pass
+     * under any mem_size, including 0. */
+    if (required == 0 || mem_size < required)
+    {
+        return NULL;
+    }
+
+    ne10_fft_r2c_cfg_float32_t st = (ne10_fft_r2c_cfg_float32_t) mem;
+    ne10_int32_t result;
 
     ne10_int32_t i,j;
     ne10_fft_cpx_float32_t *tw;
@@ -807,11 +851,6 @@ ne10_fft_r2c_cfg_float32_t ne10_fft_init_r2c_float32_ext (void *mem, ne10_int32_
     st->r_twiddles_neon = (ne10_fft_cpx_float32_t*) (st->r_factors + (NE10_MAXFACTORS * 2));
     st->r_factors_neon = (ne10_int32_t*) (st->r_twiddles_neon + nfft/4);
     st->r_super_twiddles_neon = (ne10_fft_cpx_float32_t*) (st->r_factors_neon + (NE10_MAXFACTORS * 2));
-
-    if (nfft<16)
-    {
-        return st;
-    }
 
     // factors and twiddles for rfft C
     ne10_factor (nfft, st->r_factors, NE10_FACTOR_EIGHT_FIRST_STAGE);
@@ -877,6 +916,12 @@ ne10_fft_r2c_cfg_float32_t ne10_fft_init_r2c_float32_ext (void *mem, ne10_int32_
  * in this function now lives in @ref ne10_fft_init_r2c_float32_ext, so this is just malloc() sized by
  * @ref ne10_fft_r2c_mem_size_float32 followed by a call into it -- see that function for the one twiddle
  * code path both this and the external-memory entry point share.
+ *
+ * P0003 (re-review R05): passes the `memneeded` it just computed through as @ref
+ * ne10_fft_init_r2c_float32_ext's new `mem_size` parameter -- this malloc() path always hands over
+ * exactly the size it allocated, so the bounds check inside always passes for a valid nfft here; a
+ * memneeded==0 (nfft outside the whitelisted range) still fails via NE10_MALLOC(0) or the callee's own
+ * `required == 0` rejection, whichever the platform's malloc(0) behavior triggers first.
  */
 ne10_fft_r2c_cfg_float32_t ne10_fft_alloc_r2c_float32 (ne10_int32_t nfft)
 {
@@ -888,7 +933,7 @@ ne10_fft_r2c_cfg_float32_t ne10_fft_alloc_r2c_float32 (ne10_int32_t nfft)
         return NULL;
     }
 
-    ne10_fft_r2c_cfg_float32_t st = ne10_fft_init_r2c_float32_ext (mem, nfft);
+    ne10_fft_r2c_cfg_float32_t st = ne10_fft_init_r2c_float32_ext (mem, memneeded, nfft);
     if (!st)
     {
         NE10_FREE (mem);

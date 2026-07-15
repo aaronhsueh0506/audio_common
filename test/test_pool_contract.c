@@ -106,6 +106,70 @@ static void test_fft_size_boundary(void) {
     free(pool);
 }
 
+/* P0003 (re-review R05, external-memory size/init boundary): fft_get_mem_size /
+ * fft_create / fft_init must whitelist fft_size to powers of two in [16, 8192]
+ * on BOTH backends -- rejecting (0 / NULL):
+ *   - other positive powers of two (1/2/4/8) that, pre-P0003, reached NE10's
+ *     nfft<16 silent-degenerate path (a non-NULL config whose r_factors/
+ *     r_twiddles/etc. were never populated -- now deleted, replaced by an
+ *     explicit reject);
+ *   - non-powers-of-two (24), already rejected pre-P0003 too;
+ *   - powers of two above the whitelist (16384), previously accepted; and
+ *   - huge powers of two (1<<28, 1<<30) whose true NE10-backend byte
+ *     requirement wrapped in ne10_fft_r2c_mem_size_float32's internal
+ *     ne10_uint32_t arithmetic pre-P0003 (measured: 2^28 -> 1,342,177,968,
+ *     2^30 -> 1,073,742,512 -- both far smaller than the unrepresentable true
+ *     requirement, i.e. fft_get_mem_size used to return a deceptively "valid"
+ *     nonzero size for these instead of failing loudly).
+ * -16 stands in for "negative fft_size", already covered structurally by the
+ * same `>= 16` bound as the other rejects, not a distinct code path.
+ */
+static void test_fft_size_whitelist(void) {
+    const int invalid[] = { 0, 1, 2, 4, 8, -16, 24, 16384, (1 << 28), (1 << 30) };
+    const size_t n_invalid = sizeof(invalid) / sizeof(invalid[0]);
+
+    /* A generously-sized, 16-byte-aligned dummy pool. Every fft_size below
+     * must be rejected by the fft_size whitelist check alone, which fft_init
+     * evaluates before it ever reads/writes through `mem` -- so the pool's
+     * actual contents/size past "aligned and nonzero" are irrelevant to
+     * these particular calls. */
+    unsigned char* base = NULL;
+    unsigned char* pool = aligned_ptr_in(&base, 4096, 16);
+    CHECK(pool != NULL, "malloc for fft size-whitelist test");
+
+    for (size_t i = 0; i < n_invalid; i++) {
+        int n = invalid[i];
+        CHECK(fft_get_mem_size(n) == 0, "fft_get_mem_size must reject an out-of-whitelist fft_size");
+        CHECK(fft_create(n) == NULL, "fft_create must reject an out-of-whitelist fft_size");
+        if (pool) {
+            FftHandle* h = fft_init(pool, 4096, n);
+            CHECK(h == NULL, "fft_init must reject an out-of-whitelist fft_size");
+        }
+    }
+
+    if (base) free(base);
+
+    const int valid[] = { 16, 256, 512, 1024, 8192 };
+    const size_t n_valid = sizeof(valid) / sizeof(valid[0]);
+    for (size_t i = 0; i < n_valid; i++) {
+        CHECK(fft_get_mem_size(valid[i]) > 0, "fft_get_mem_size must accept a whitelisted fft_size");
+    }
+
+#ifdef NE10_ENABLE_DSP
+    /* NE10 backend only (NE10_ENABLE_DSP is defined project-wide by the
+     * Makefile's NE10_DEFS iff BACKEND=ne10 -- see Makefile's CFLAGS block):
+     * byte-neutrality lock for the three production fft_size values. These
+     * three totals were measured on the pre-P0003 tree (git stash + a scratch
+     * probe binary linked against bin/ne10/libaudio_common.a) and must never
+     * move -- P0003 only narrows ACCEPTANCE (which fft_size values are
+     * valid), it must not change the byte count fft_get_mem_size reports for
+     * an fft_size that was already valid before the fix. */
+    CHECK(fft_get_mem_size(256)  == 8176,  "NE10 fft_get_mem_size(256) must be byte-identical to pre-P0003");
+    CHECK(fft_get_mem_size(512)  == 15600, "NE10 fft_get_mem_size(512) must be byte-identical to pre-P0003");
+    CHECK(fft_get_mem_size(1024) == 30448, "NE10 fft_get_mem_size(1024) must be byte-identical to pre-P0003");
+#endif
+}
+
 /* ═══════════════════════════════ hpf pool contract ═══════════════════════ */
 
 static void test_hpf_misaligned_base(void) {
@@ -219,6 +283,7 @@ static void test_hpf_cutoff_validation(void) {
 int main(void) {
     test_fft_misaligned_base();
     test_fft_size_boundary();
+    test_fft_size_whitelist();
     test_hpf_misaligned_base();
     test_hpf_size_boundary();
     test_hpf_cutoff_validation();
