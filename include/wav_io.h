@@ -76,22 +76,63 @@
  *       AEC_OUT_FLOAT=1 env var switches to raw, unquantized IEEE
  *       float32 output (a test-only path for C-vs-Python correlation);
  *       PCM16 quantization is round-half-away-from-zero
- *       (`sample*32768.0f`, then +-0.5f before truncating).
+ *       (`sample*32768.0f`, then +-0.5f before truncating), saturated
+ *       into int16_t range (see R01 fix below).
  *   WAV_IO_WRITER_NR - always PCM16, `sample*32767.0f` truncation (no
- *       rounding, no float32 path) -- NR's historical behavior.
+ *       rounding, no float32 path) -- NR's historical behavior, also
+ *       saturated into int16_t range.
+ *
+ * Writer hardening (external re-review finding R01, PCM16 quantization +
+ * RIFF-size arithmetic -- fixed in place, not preserved as a "quirk"):
+ *   - Undefined behavior at the +-1.0f boundary: the pre-fix AEC-style
+ *     quantizer cast `scaled +- 0.5f` directly to int16_t; for
+ *     sample==+1.0f that's (int16_t)32768.5f, an out-of-range
+ *     float-to-integer conversion -- undefined behavior per C99 6.3.1.4p1,
+ *     reproduced under UBSan. Fixed by rounding into a wider int32_t
+ *     accumulator first, THEN saturating into [-32768, 32767] before the
+ *     final int16_t narrowing. The float rounding arithmetic itself is
+ *     unchanged (bit-identical for every |sample| < 1 input, same as
+ *     before); only the previously-UB +1.0f/-1.0f boundary now saturates
+ *     (+1.0f -> 32767, -1.0f -> -32768, matching what a defined round would
+ *     give anyway) instead of invoking UB. The NR-style quantizer gets the
+ *     same int32_t-then-saturate treatment for consistency, though it's
+ *     pure defense there -- the pre-existing [-1,1] clamp plus the
+ *     non-finite sanitize below already bound its input, so its output can
+ *     never actually need saturating.
+ *   - Non-finite (NaN/+-Inf) PCM16-path source samples: previously reached
+ *     the quantizer's ordered comparisons unchanged (NaN fails every
+ *     ordered comparison, so the [-1,1] clamp was a silent no-op for it)
+ *     and then hit the same float-to-int UB as the +-1.0f case. Now
+ *     sanitized to 0.0f before quantization, mirroring wav_read_float's
+ *     ingress sanitize (see WavWriter.nonfinite_sanitized above). The
+ *     float-mode write path is deliberately UNCHANGED -- still a raw,
+ *     unsanitized bit-exact passthrough (see wav_write_float): that path
+ *     exists specifically for C-vs-Python numerical correlation, where
+ *     silently zeroing a NaN/Inf would hide exactly the divergence it's
+ *     meant to surface; wav_read_float's own ingress sanitize is the
+ *     defense for a non-finite sample actually reaching a consumer.
+ *   - RIFF outer chunk_size: previously computed from a hardcoded 2
+ *     bytes/sample regardless of writer mode, silently under-reporting the
+ *     outer RIFF size specifically for AEC's float32 output (4
+ *     bytes/sample) -- the "data" sub-chunk's OWN size field was always
+ *     correct (it already used sample_bytes). Both the outer RIFF
+ *     chunk_size and the data sub-chunk size are now computed from the
+ *     same sample_bytes-derived value. PCM16 output is a no-op change (2
+ *     == sample_bytes there, both before and after this fix); AEC's
+ *     float32 output path is the only case where the on-disk header bytes
+ *     differ from a pre-fix build. Any byte-exact regression golden built
+ *     from AEC_OUT_FLOAT=1 output predating this fix needs re-baking
+ *     against the corrected header.
+ *   - samples_written widened int -> uint64_t: a long capture could
+ *     overflow a signed int counter before ever reaching the close-time
+ *     uint64_t size arithmetic below. A short fwrite() inside
+ *     wav_write_float now also sets WavWriter.write_error instead of
+ *     silently under-counting.
  * wav_close_write's header size fields (RIFF chunk_size, byte_rate,
  * block_align, data-chunk size) are computed in uint64_t and range
  * checked before being narrowed to their on-disk uint32_t/uint16_t
  * fields; a size that would overflow abandons the file (fclose + free)
- * instead of writing a silently-truncated header. For every size actually
- * reachable by either repo's callers today this is a no-op -- see the
- * in-function comment on the pre-existing (and deliberately preserved)
- * "RIFF-level chunk_size uses a hardcoded 2 bytes/sample" quirk that
- * under-reports the outer RIFF size specifically in AEC's float32 output
- * mode (the "data" sub-chunk's own size field is, and always was,
- * correct). Not in scope to fix here -- preserving it byte-for-bit is the
- * F06 contract; AEC_OUT_FLOAT is a test-only path and no consumer reads
- * the outer RIFF size instead of the data chunk's own.
+ * instead of writing a silently-truncated header.
  *
  * gnu99 (not strict C99): both consumer Makefiles already build with
  * -std=gnu99, so this file may use GNU/POSIX extensions if ever needed;
@@ -146,7 +187,26 @@ typedef struct {
     FILE* fp;
     WavInfo info;
     long data_start;
-    int samples_written;
+    uint64_t samples_written;
+    /* Count of PCM16-path source samples that were NaN/+-Inf and were
+     * replaced with 0.0f before int16 quantization (mirrors WavReader's
+     * nonfinite_sanitized on the read side -- see the Writer hardening doc
+     * above). The FLOAT-mode write path (WAV_IO_WRITER_AEC +
+     * AEC_OUT_FLOAT=1) does NOT sanitize -- it is a raw bit-exact
+     * passthrough for C-vs-Python correlation tooling, and wav_read_float's
+     * ingress sanitize is the actual defense for that path. Always 0 in
+     * float mode. */
+    uint64_t nonfinite_sanitized;
+    /* Set to 1 the first time an fwrite() inside wav_write_float writes
+     * fewer elements than requested (e.g. ENOSPC). samples_written is not
+     * incremented for that short write (it already reflects exactly what
+     * made it to disk so far), and no further samples from that same
+     * wav_write_float() call are attempted. wav_close_write() still
+     * finalizes a header from the true samples_written value; this flag
+     * exists purely so a caller that cares can notice the failure (direct
+     * struct-field read, same convention as nonfinite_sanitized) instead of
+     * it being silent. */
+    int write_error;
 } WavWriter;
 
 // ============================================================================
@@ -437,29 +497,75 @@ static inline WavWriter* wav_open_write(const char* path, int sample_rate, int c
  */
 static inline void wav_write_float(WavWriter* w, const float* buf, int n) {
     if (!w || !buf) return;
+    // Guards the float-mode fwrite() below: a negative n would convert to
+    // a huge size_t element count when passed as fwrite's nmemb argument.
+    if (n <= 0) return;
 
 #if WAV_IO_WRITER_STYLE == WAV_IO_WRITER_AEC
     if (w->info.is_float) {
-        /* IEEE float32 (no quantization, for C-vs-Python correlation tests) */
-        fwrite(buf, sizeof(float), n, w->fp);
-        w->samples_written += n;
+        /* IEEE float32 (no quantization, for C-vs-Python correlation
+         * tests). Deliberately raw bit-exact passthrough, including any
+         * NaN/Inf payload -- see the Writer hardening doc in the file
+         * header comment for why this path does NOT sanitize. */
+        size_t written = fwrite(buf, sizeof(float), (size_t)n, w->fp);
+        w->samples_written += written;
+        if (written != (size_t)n) w->write_error = 1;
         return;
     }
 #endif
 
     for (int i = 0; i < n; i++) {
         float sample = buf[i];
+
+        // Sanitize policy mirrors wav_read_float's ingress sanitize (see
+        // WavWriter.nonfinite_sanitized / file header doc): a non-finite
+        // PCM16-path sample is replaced with 0.0f before it can reach the
+        // int16 conversion below, where a NaN/Inf would otherwise silently
+        // pass the ordered [-1,1] clamp comparisons and hit the same
+        // undefined float-to-int conversion as the +-1.0f boundary case.
+        if (!isfinite(sample)) {
+            sample = 0.0f;
+            w->nonfinite_sanitized++;
+        }
+
         // Clamp to [-1, 1]
         if (sample > 1.0f) sample = 1.0f;
         if (sample < -1.0f) sample = -1.0f;
 
 #if WAV_IO_WRITER_STYLE == WAV_IO_WRITER_AEC
+        // Round-half-away-from-zero into a wider (int32_t) accumulator,
+        // THEN saturate into int16_t's representable range. The float
+        // rounding arithmetic itself is untouched (still `sample*32768.0f`,
+        // still +-0.5f before truncating), so every |sample| < 1 input
+        // rounds to exactly the same value as before this fix -- only the
+        // +1.0f / -1.0f boundary changes, from a float-to-int16_t cast of
+        // +-32768.5f (out of int16_t's range -- undefined behavior per C99
+        // 6.3.1.4p1, reproduced under UBSan) to a defined saturate at
+        // 32767 / -32768.
         float scaled = sample * 32768.0f;
-        int16_t s16 = (int16_t)(scaled >= 0 ? scaled + 0.5f : scaled - 0.5f);
+        int32_t v = (int32_t)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        int16_t s16 = (int16_t)v;
 #else
-        int16_t s16 = (int16_t)(sample * 32767.0f);
+        // NR style: plain truncation, no rounding. The saturate here is
+        // pure defense -- the preceding clamp already bounds `sample` to
+        // [-1,1] and the non-finite sanitize above already removed
+        // NaN/Inf, so `v` can only ever land in [-32767, 32767] for any
+        // real input -- but it keeps the int16_t narrowing itself always
+        // well-defined regardless.
+        int32_t v = (int32_t)(sample * 32767.0f);
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        int16_t s16 = (int16_t)v;
 #endif
-        fwrite(&s16, 2, 1, w->fp);
+        size_t written = fwrite(&s16, 2, 1, w->fp);
+        if (written != 1) {
+            // Short write: flag it and stop attempting further samples in
+            // this call rather than keep spinning through failing fwrites.
+            w->write_error = 1;
+            break;
+        }
         w->samples_written++;
     }
 }
@@ -472,23 +578,21 @@ static inline void wav_close_write(WavWriter* w) {
 
     int sample_bytes = w->info.is_float ? 4 : 2;
 
-    /* Preserves the pre-hardening arithmetic verbatim for BOTH writer
-     * styles: the RIFF-level chunk_size has always been computed here
-     * from a hardcoded 2 bytes/sample -- a pre-existing quirk that
-     * under-reports the outer RIFF size in AEC's float32 output mode (the
-     * "data" sub-chunk's OWN size field below is, and always was, correct
-     * via sample_bytes). NR's writer style never sets is_float, so the
-     * quirk never manifests there (2 == sample_bytes always). Kept
-     * byte-for-byte; not in scope to fix as part of F06. */
-    uint64_t data_size64 = (uint64_t)w->samples_written * 2u * (uint64_t)w->info.channels;
-    uint64_t file_size64 = 36ull + data_size64;
-    uint64_t data_sz64 = (uint64_t)w->samples_written * (uint64_t)w->info.channels * (uint64_t)sample_bytes;
+    /* R01 fix: the outer RIFF chunk_size now uses the SAME sample_bytes-
+     * derived size as the "data" sub-chunk (data_sz64 below), instead of a
+     * hardcoded 2 bytes/sample. Before this fix, the outer RIFF size was
+     * silently under-reported specifically in AEC's float32 output mode (4
+     * bytes/sample) -- the "data" sub-chunk's OWN size field was always
+     * correct even before this fix. PCM16 output (both writer styles) is a
+     * no-op change here: 2 == sample_bytes there already. See the Writer
+     * hardening doc in the file header comment for the full writeup. */
+    uint64_t data_sz64 = w->samples_written * (uint64_t)w->info.channels * (uint64_t)sample_bytes;
+    uint64_t file_size64 = 36ull + data_sz64;
     uint64_t byte_rate64 = (uint64_t)w->info.sample_rate * (uint64_t)w->info.channels * (uint64_t)sample_bytes;
     uint64_t block_align64 = (uint64_t)w->info.channels * (uint64_t)sample_bytes;
 
-    if (data_size64 > 0xFFFFFFFFull || file_size64 > 0xFFFFFFFFull ||
-        data_sz64 > 0xFFFFFFFFull || byte_rate64 > 0xFFFFFFFFull ||
-        block_align64 > 0xFFFFull) {
+    if (file_size64 > 0xFFFFFFFFull || data_sz64 > 0xFFFFFFFFull ||
+        byte_rate64 > 0xFFFFFFFFull || block_align64 > 0xFFFFull) {
         // Pathological size (never hit by any real capture) -- would
         // silently truncate a WAV header field. Abandon the file instead
         // of writing a corrupt header.

@@ -201,7 +201,7 @@ endif
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test_pool test_wav test_zero_heap test_ne10_force_c _ne10_parity_bin clean
+.PHONY: all lib selftest test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean
 all: lib
 
 lib: $(LIB)
@@ -254,6 +254,32 @@ test_wav: | $(OBJ_DIR) $(BIN_DIR)
 	$(CC) -o $(BIN_DIR)/test_wav_io $(OBJ_DIR)/test_wav_io.o -lm
 	@echo "--- audio_common WAV I/O negative-corpus test [$(BACKEND)] ---"
 	@$(BIN_DIR)/test_wav_io
+
+# test_wav_nr_style (review R01): runs the SAME writer special-values
+# corpus (test/test_wav_writer_common.h) as test_wav above, but compiled
+# with WAV_IO_WRITER_STYLE forced to WAV_IO_WRITER_NR -- test_wav's own TU
+# never sets that knob, so it only ever exercises the default
+# WAV_IO_WRITER_AEC style (see wav_io.h's WAV_IO_WRITER_STYLE doc). Header-
+# only, same shape as test_wav.
+test_wav_nr_style: | $(OBJ_DIR) $(BIN_DIR)
+	$(CC) $(CFLAGS) -DWAV_IO_WRITER_STYLE=WAV_IO_WRITER_NR -c -o $(OBJ_DIR)/test_wav_writer_nr_style.o test/test_wav_writer_nr_style.c
+	$(CC) -o $(BIN_DIR)/test_wav_writer_nr_style $(OBJ_DIR)/test_wav_writer_nr_style.o -lm
+	@echo "--- audio_common WAV writer NR-style special-values test [$(BACKEND)] ---"
+	@$(BIN_DIR)/test_wav_writer_nr_style
+
+# test-wav-ubsan (review R01): UBSan probe for wav_write_float's PCM16
+# quantizer -- writes {1.0f,-1.0f,NAN} and must run clean under
+# -fsanitize=undefined -fno-sanitize-recover=all. Pre-fix, +1.0f drove
+# (int16_t)32768.5f (out-of-range float-to-integer conversion, UB per C99
+# 6.3.1.4p1) and this aborted; post-fix (saturating int32_t conversion +
+# non-finite sanitize) it must pass. Sanitizer flags are scoped to this one
+# target's compile+link, same pattern as $(OWN_OBJS): CFLAGS -Werror above
+# -- never applied to the main $(LIB) archive or any other test.
+test-wav-ubsan: | $(OBJ_DIR) $(BIN_DIR)
+	$(CC) $(CFLAGS) -fsanitize=undefined -fno-sanitize-recover=all -c -o $(OBJ_DIR)/test_wav_writer_ubsan.o test/test_wav_writer_ubsan.c
+	$(CC) -fsanitize=undefined -fno-sanitize-recover=all -o $(BIN_DIR)/test_wav_writer_ubsan $(OBJ_DIR)/test_wav_writer_ubsan.o -lm
+	@echo "--- audio_common WAV writer UBSan probe [$(BACKEND)] ---"
+	@$(BIN_DIR)/test_wav_writer_ubsan
 
 # test_zero_heap: allocator-hook acceptance test (review F02/F08) -- proves
 # fft_init()..fft_destroy() makes zero malloc/calloc/realloc/free calls, and

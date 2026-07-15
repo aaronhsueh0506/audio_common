@@ -18,6 +18,7 @@
  * the rest.
  */
 #include "wav_io.h"
+#include "test_wav_writer_common.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,8 @@
 #include <stdint.h>
 #include <math.h>
 #include <unistd.h>
+#include <sys/resource.h>
+#include <signal.h>
 
 static int g_fail = 0;
 
@@ -582,6 +585,202 @@ static void test_write_read_roundtrip_byte_exact(void) {
     unlink(path);
 }
 
+/* ═════════════════════ writer special-values corpus (R01) ═════════════════
+ * The shared corpus/expected-value logic lives in test_wav_writer_common.h
+ * (included above) so it can run unchanged against BOTH writer styles --
+ * this TU gets WAV_IO_WRITER_AEC (the default, since it doesn't set
+ * WAV_IO_WRITER_STYLE, same as every other test in this file). The NR-style
+ * run of the exact same corpus lives in test_wav_writer_nr_style.c.
+ */
+static void test_writer_special_values_corpus_aec_style(void) {
+    if (test_wav_writer_special_values_corpus()) g_fail = 1;
+}
+
+/* Float mode (WAV_IO_WRITER_AEC + AEC_OUT_FLOAT=1) is a raw, unquantized
+ * bit-exact passthrough -- unlike the PCM16 path, it deliberately does NOT
+ * sanitize NaN/Inf (see wav_io.h's Writer hardening doc: that would hide
+ * exactly the divergence this test-only path exists to surface). Verifying
+ * "bit-exact, including the NaN's raw payload" therefore means reading the
+ * on-disk bytes directly, NOT through wav_read_float (which sanitizes NaN/
+ * Inf to 0.0f on ingress and would hide the very thing under test here).
+ * This also asserts the R01 RIFF-size fix: the outer RIFF chunk_size
+ * (bytes 4-7) must now equal file_size-8, and the data sub-chunk size
+ * (bytes 40-43) must equal n*sizeof(float) -- both were already correct
+ * for PCM16 output, but the outer size was wrong for float32 pre-fix.
+ */
+static void test_write_float_mode_bitexact_and_riff_size(void) {
+    setenv("AEC_OUT_FLOAT", "1", 1);
+
+    const int n = 9;
+    float in_samples[9];
+    in_samples[0] = 1.0f;
+    in_samples[1] = -1.0f;
+    in_samples[2] = nextafterf(1.0f, 0.0f);
+    in_samples[3] = nextafterf(-1.0f, 0.0f);
+    /* A NaN with a deliberately non-canonical payload bit pattern: if the
+     * float write path (or a compiler/libc) silently canonicalized this
+     * (unlike the PCM16 path's explicit, intentional sanitize-to-0.0f), the
+     * raw on-disk bytes would differ from this exact pattern. */
+    uint32_t custom_nan_bits = 0x7FC00123u;
+    float custom_nan;
+    memcpy(&custom_nan, &custom_nan_bits, sizeof(float));
+    in_samples[4] = custom_nan;
+    in_samples[5] = INFINITY;
+    in_samples[6] = -INFINITY;
+    in_samples[7] = 0.5f;
+    in_samples[8] = -0.5f;
+
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_writer_f32_XXXXXX");
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "setup: mkstemp for float-mode bit-exact/RIFF-size test");
+    if (fd >= 0) close(fd);
+
+    WavWriter* w = wav_open_write(path, 48000, 1);
+    CHECK(w != NULL, "wav_open_write must succeed (AEC_OUT_FLOAT=1)");
+    if (w) {
+        CHECK(w->info.is_float == 1, "AEC_OUT_FLOAT=1 must select float32 output");
+        wav_write_float(w, in_samples, n);
+        CHECK(w->write_error == 0, "a normal-sized float-mode write must not report write_error");
+        CHECK(w->samples_written == (uint64_t)n, "float-mode samples_written must count all 9 samples");
+        CHECK(w->nonfinite_sanitized == 0, "float mode must never sanitize -- it's a raw passthrough");
+        wav_close_write(w);
+
+        FILE* fp = fopen(path, "rb");
+        CHECK(fp != NULL, "must be able to reopen the float-mode file for raw byte inspection");
+        if (fp) {
+            uint8_t header[44];
+            size_t got_hdr = fread(header, 1, 44, fp);
+            CHECK(got_hdr == 44, "must read the full 44-byte header");
+
+            uint32_t riff_chunk_size, data_chunk_size;
+            memcpy(&riff_chunk_size, &header[4], 4);
+            memcpy(&data_chunk_size, &header[40], 4);
+
+            long file_size = wav_io_file_size(fp);
+            CHECK(file_size >= 44, "sanity: file must be at least header-sized");
+            CHECK((uint64_t)riff_chunk_size == (uint64_t)file_size - 8,
+                  "R01 fix: outer RIFF chunk_size (bytes 4-7) must equal file_size-8 in float32 mode");
+            CHECK((uint64_t)data_chunk_size == (uint64_t)n * sizeof(float),
+                  "data sub-chunk size (bytes 40-43) must equal n*sizeof(float)");
+
+            float raw_samples[9];
+            size_t got_data = fread(raw_samples, sizeof(float), n, fp);
+            CHECK(got_data == (size_t)n, "must read back all 9 raw float samples");
+            for (int i = 0; i < n; i++) {
+                uint32_t a, b;
+                memcpy(&a, &in_samples[i], 4);
+                memcpy(&b, &raw_samples[i], 4);
+                char msg[112];
+                snprintf(msg, sizeof(msg),
+                         "float-mode sample %d must be bit-exact passthrough (incl. NaN payload)", i);
+                CHECK(a == b, msg);
+            }
+            fclose(fp);
+        }
+    }
+    unlink(path);
+    unsetenv("AEC_OUT_FLOAT");
+}
+
+/* n<=0 must be a no-op, not undersized/negative-count UB: the float-mode
+ * fwrite() call passes n straight through as fwrite's nmemb argument, and a
+ * negative int converted to size_t there would be a huge element count. */
+static void test_write_zero_and_negative_n_is_noop(void) {
+    const float dummy[1] = { 0.25f };
+
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_writer_nzero_XXXXXX");
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "setup: mkstemp for n<=0 no-op test");
+    if (fd >= 0) close(fd);
+
+    WavWriter* w = wav_open_write(path, 16000, 1);
+    CHECK(w != NULL, "wav_open_write must succeed for n<=0 no-op test");
+    if (w) {
+        wav_write_float(w, dummy, 0);
+        CHECK(w->samples_written == 0, "n==0 must write nothing");
+        wav_write_float(w, dummy, -5);
+        CHECK(w->samples_written == 0, "n<0 must write nothing (and must not crash)");
+        CHECK(w->write_error == 0, "n<=0 no-op calls must not raise write_error");
+        wav_close_write(w);
+    }
+    unlink(path);
+}
+
+/* Forces a genuine short fwrite() inside wav_write_float's PCM16 loop (via
+ * RLIMIT_FSIZE) and checks write_error gets set, samples_written stops
+ * exactly at the true on-disk count, and the process survives (SIGXFSZ is
+ * explicitly ignored first -- its default disposition is to terminate the
+ * process, which would defeat observing fwrite's short-write return here).
+ *
+ * Two things must happen in a specific order for this to actually exercise
+ * the code path instead of quietly no-oping:
+ *   1. The rlimit is applied only AFTER wav_open_write() returns, so the
+ *      44-byte placeholder header (written inside wav_open_write, and not
+ *      itself return-value-checked -- out of scope for this fix) isn't
+ *      affected by it.
+ *   2. w->fp is switched to unbuffered (setvbuf _IONBF) before the rlimit
+ *      is applied and before any sample is written. Per-sample fwrite calls
+ *      here are only 2 bytes each -- with the default fully-buffered mode,
+ *      those just memcpy into libc's internal buffer and every fwrite call
+ *      would report success regardless of the rlimit, with the eventual
+ *      failure only surfacing (unobserved) at the buffer's first real
+ *      flush. Unbuffered mode makes each 2-byte fwrite hit write(2)
+ *      directly, so the 3rd sample's write can actually be observed
+ *      failing exactly when the limit is crossed.
+ */
+static void test_write_error_on_short_write(void) {
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_writer_shortwr_XXXXXX");
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "setup: mkstemp for short-write test");
+    if (fd < 0) return;
+    close(fd);
+
+    void (*old_handler)(int) = signal(SIGXFSZ, SIG_IGN);
+
+    struct rlimit old_lim;
+    int have_old_lim = (getrlimit(RLIMIT_FSIZE, &old_lim) == 0);
+
+    const float samples[4] = { 0.1f, 0.2f, 0.3f, 0.4f };
+    WavWriter* w = wav_open_write(path, 16000, 1);
+    CHECK(w != NULL, "wav_open_write must succeed (no rlimit applied yet)");
+    if (w) {
+        setvbuf(w->fp, NULL, _IONBF, 0);
+
+        // 44-byte header (already flushed above via the setvbuf-triggered
+        // buffer switch) + exactly 2 PCM16 samples (4 bytes) fit; the 3rd
+        // sample's fwrite must come back short once the limit is hit. Only
+        // rlim_cur is lowered -- rlim_max is left at its original value (a
+        // non-privileged process generally cannot raise rlim_max back up
+        // once lowered, so this keeps the restore-on-exit below possible).
+        struct rlimit lim;
+        lim.rlim_cur = 48;
+        lim.rlim_max = have_old_lim ? old_lim.rlim_max : RLIM_INFINITY;
+        int lim_ok = (setrlimit(RLIMIT_FSIZE, &lim) == 0);
+        CHECK(lim_ok, "setup: setrlimit(RLIMIT_FSIZE) must succeed for short-write test");
+
+        if (lim_ok) {
+            wav_write_float(w, samples, 4);
+            CHECK(w->write_error == 1, "a write past the RLIMIT_FSIZE limit must set write_error");
+            CHECK(w->samples_written == 2,
+                  "samples_written must stop exactly at the count that actually made it to disk");
+            if (have_old_lim) setrlimit(RLIMIT_FSIZE, &old_lim);
+            // wav_close_write still finalizes a header from the true
+            // samples_written -- must not crash even though the file is
+            // right at its size limit (the header is an in-place overwrite
+            // of bytes already on disk, not a growth past the old limit).
+            wav_close_write(w);
+        } else {
+            wav_close_write(w);
+        }
+    }
+
+    signal(SIGXFSZ, old_handler);
+    unlink(path);
+}
+
 /* ═══════════════════════════════════ main ════════════════════════════════ */
 
 int main(void) {
@@ -604,6 +803,11 @@ int main(void) {
     test_valid_pcm16_parses_as_before();
 
     test_write_read_roundtrip_byte_exact();
+
+    test_writer_special_values_corpus_aec_style();
+    test_write_float_mode_bitexact_and_riff_size();
+    test_write_zero_and_negative_n_is_noop();
+    test_write_error_on_short_write();
 
     if (g_fail) {
         printf(">>> FAIL\n");
