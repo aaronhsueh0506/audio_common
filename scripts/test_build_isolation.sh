@@ -1,20 +1,33 @@
 #!/usr/bin/env bash
-# test_build_isolation.sh — round-3/round-4/round-5 review build-isolation
-# regression suite.
+# test_build_isolation.sh — round-3/4/5/6 review build-isolation regression
+# suite.
 #
 # Exercises the CFG_SIG-keyed obj/bin directory design (audio_common's own
 # Makefile, plus the two-phase AC_LIB consumer resolution in AEC/c_impl and
-# NR/c_impl) against every failure mode the round-3 B01 finding described:
-# mtime-staleness delivering another config's artifact, test_ne10_force_c
-# overwriting the normal NE10 archive, parallel different-config builds
-# co-writing, and consumers hardcoding flat paths / forwarding only BACKEND
-# (config skew) -- plus, from the round-4 review, command-line override
-# rejection (P1-1), fresh-archive stale-member removal (P1-4), publish v3
-# content-addressing (P2-2), and the CC/CXX toolchain-coherence guard (P1-2)
-# -- plus, from the round-5 review, the publish v4 redesign: a throwaway
-# DIST_ROOT= knob (P1, this script's own safety fix -- see below), the
-# lock-FIRST publish driver (P1), the deterministic MANIFEST.txt / append-only
-# ATTEST/ split (P2), and the rename(2)-atomic `current` swap helper (P2).
+# NR/c_impl) against every failure mode the round-3 B01 finding described,
+# the round-4 review's command-line override rejection / fresh-archive
+# stale-member removal / publish v3 content-addressing / CC-CXX toolchain
+# guard, the round-5 review's publish v4 redesign (throwaway DIST_ROOT=,
+# lock-FIRST publish driver, deterministic MANIFEST/append-only ATTEST
+# split, rename(2)-atomic `current` swap), and now the round-6 review:
+#
+#   - P1: OBJ_ROOT=/BIN_ROOT= placement knobs, so every throwaway/tamper
+#     scenario in THIS script can drive a scratch-directory build of the
+#     real worktree without ever touching the real obj/ or bin/.
+#   - P2-1: this script's OWN temp management was itself a finding -- the
+#     old new_tmpdir()/new_tmpfile() registered cleanup state by appending
+#     to a variable FROM INSIDE a `$(...)` command substitution, i.e. inside
+#     a subshell whose variable changes never make it back to the parent
+#     shell that owns the EXIT trap. An interrupted run could therefore leak
+#     scratch directories the trap never knew about. Fixed by switching to a
+#     single SCRATCH_ROOT directory tree (one trap, nothing to register).
+#   - P2-2: ATTEST is now one-event-one-file, installed via the helper's
+#     --excl-install (write-temp + link(2), atomic no-clobber) with a
+#     <NNN> retry suffix on same-second/same-commit collisions.
+#   - P2-3: `make -n`/`-q`/`-t publish` must have ZERO filesystem side
+#     effects (no DIST_ROOT/OBJ_ROOT/BIN_ROOT paths created).
+#   - P2 (dirty policy): publish FATALs by default on a dirty/no-git-identity
+#     checkout; ALLOW_DIRTY_PUBLISH=1 is the recorded escape hatch.
 #
 # Scenario index:
 #   S1  - A->B->A + -O0/-O3 delivered-object repro
@@ -24,112 +37,252 @@
 #   S5  - consumer correctness (drives AEC)
 #   S7p - producer-publish (v4 content-addressed dist/ layout; throwaway
 #         DIST_ROOT=)
-#   S8  - CFG_SIG collision guard
+#   S8  - CFG_SIG collision guard (round-6: scratch-side, real obj/ untouched)
 #   S9  - command-line override rejection (round-4 P1-1)
-#   S10 - archive freshness / stale-member removal (round-4 P1-4)
-#   S11 - publish immutability / content-addressing (round-4 P2-2 -> round-5
-#         v4 semantics), in three parts:
+#   S10 - archive freshness / stale-member removal (round-4 P1-4; round-6:
+#         scratch-side, deterministic backdate, real archive untouched)
+#   S11 - publish immutability / content-addressing, in three parts:
 #           S11a - in-tree republish (throwaway DIST_ROOT): byte-verified
-#                  republish, ATTEST/ growth, mtimes untouched
+#                  republish, ATTEST/ growth (round-6: no sleep -- the
+#                  <NNN> suffix disambiguates a same-second republish)
 #           S11b - MANIFEST tamper detection
 #           S11c - content-change publish, exercised in a throwaway sandbox
 #                  copy of the tree (never in $AC_DIR)
 #   S12 - toolchain coherence guard (round-4 P1-2)
-#   S13 - atomic `current` symlink swap hammer (round-5 P2)
+#   S13 - atomic `current` symlink swap hammer + --excl-install no-clobber
+#         mode (round-5 P2; round-6 adds the --excl-install checks)
 #   S14 - lock-before-build: a concurrent publish loser builds nothing
-#         (round-5 P1)
+#         (round-5 P1; round-6: scratch OBJ_ROOT/BIN_ROOT)
+#   S15 - `make -n`/`-q`/`-t publish` zero side effects (round-6 P2-3)
+#   S16 - ATTEST uniqueness under forced same-second collisions (round-6 P2-2)
+#   S17 - dirty-checkout publish policy (round-6 P2)
+#   S18 - interruption-safety probe: EXIT/INT/TERM all clean up the whole
+#         scratch tree, even mid-scenario (round-6 P2-1 acceptance test)
 # S6 (Audio_ALG/pipelines consumer-resolution parity) is a later wave and is
 # intentionally NOT covered here.
+#
+# Round-6 safety contract (supersedes the round-5 version of this comment):
+#   - ONE scratch root for the entire run: SCRATCH_ROOT="$(mktemp -d)",
+#     removed by a single EXIT trap. Every temp file/dir this script uses is
+#     a FIXED path under "$SCRATCH_ROOT/<scenario>/...", created inline with
+#     `mkdir -p` -- never inside a `$(...)` command substitution (that was
+#     the round-6 P2-1 bug: registering cleanup state from inside a subshell
+#     silently drops it). `rm -rf "$SCRATCH_ROOT"` on exit collects
+#     EVERYTHING, including anything a child `make`'s own mktemp calls
+#     create, because TMPDIR is exported pointing inside the scratch root.
+#   - Real obj/ and bin/ (this repo's own, default-rooted) only EVER see the
+#     NORMAL kiss/ne10 configs that S1/S2/S3/S5's real-tree assertions
+#     depend on. Every throwaway/probe config (S1's -O0/-O3, S3's
+#     -DPAR_PROBE, S4's forced-C variant, S9's EXTRA_CFLAGS probe, S14's
+#     -DS14_LOCK_PROBE) and every tamper scenario (S8, S10) builds under a
+#     scratch OBJ_ROOT=/BIN_ROOT= instead.
+#   - The real dist/ is never read, written, or removed: every `make ...
+#     publish` passes an explicit DIST_ROOT= under $SCRATCH_ROOT. A sentinel
+#     digest of the real dist/ (absent, or a full manifest of paths + sha256
+#     + mtime) is captured at the very start and re-checked at the very end.
+#   - No git-tracked file's CONTENT is ever changed (no `git checkout --`
+#     restore, no direct edit of a tracked file in $AC_DIR); a content
+#     change is always exercised in a throwaway sandbox/clone copy instead.
+#     mtime-only `touch` of a handful of already-tracked audio_common
+#     sources (src/hpf.c, include/fast_math.h, include/wav_io.h,
+#     lib/ne10/inc/NE10_dsp.h) remains allowed, used to force a recompile
+#     probe -- `touch` changes mtime, never content. A `tree_state_hash()`
+#     (status --porcelain + diff --binary HEAD, not status alone -- status
+#     alone misses a content edit to an ALREADY-dirty file) is captured for
+#     BOTH $AC_DIR and the AEC repo at $AC_DIR/../AEC (S5 builds there) at
+#     the start and re-checked at the end.
+#   - No `sleep` anywhere. Every place the round-5 script used `sleep 1` to
+#     force a source's mtime strictly past some artifact's mtime is replaced
+#     with a deterministic BSD `touch -r <artifact> -A 01 <source>` bump
+#     (source mtime := artifact's CURRENT mtime + 1s) -- immune to whichever
+#     way whole-second wall-clock/filesystem mtime comparisons round. Where
+#     no artifact-staleness relationship is being forced (a plain "did
+#     nothing rebuild"/"did this relink" check), `mtime()` itself now reads
+#     BSD `stat -f '%Fm'` (fractional seconds), so two genuinely different
+#     real writes are distinguishable without any artificial delay.
+#   - Interruption-safe by construction: cleanup() is the ONLY EXIT-trap
+#     resident, INT/TERM map to the conventional 130/143 exit codes (both
+#     routed back through the same cleanup()), so a `^C`/`kill` mid-scenario
+#     still removes the whole scratch tree. S18 tests exactly this.
 #
 # Design rules (do not violate when editing this script):
 #   - No `make clean` inside any scenario body: the whole point is that
 #     distinct configs coexist WITHOUT ever needing a clean between them.
 #   - Every path is resolved via `make -s ... print-bin-dir` / `print-obj-dir`
-#     / `print-lib-path`, using the EXACT flag set under test for that call
-#     — never a hand-reconstructed path guess.
-#   - "Did this get rebuilt?" is always an mtime comparison, never a content
-#     (sha) comparison: recompiling identical inputs with a deterministic
-#     compiler produces byte-identical output, so sha equality does NOT mean
-#     "not rebuilt" and sha difference is not required for "was rebuilt".
+#     / `print-lib-path`, using the EXACT flag set (INCLUDING OBJ_ROOT=/
+#     BIN_ROOT= when the build under test used them) under test for that
+#     call -- never a hand-reconstructed path guess.
+#   - "Did this get rebuilt?" is an mtime comparison, never a content (sha)
+#     comparison: recompiling identical inputs with a deterministic compiler
+#     produces byte-identical output, so sha equality does NOT mean "not
+#     rebuilt" and sha difference is not required for "was rebuilt".
 #   - "Is this the SAME delivered artifact as its own keyed object?" (the
 #     actual B01 assertion — no cross-config delivery) IS a sha comparison,
 #     via member_sha()/file_sha() below.
-#   - (round-5 review P1) Never touch the REAL dist/: every `make ... publish`
-#     call in this script passes an explicit DIST_ROOT= pointing at a
-#     throwaway mktemp -d. Never `rm -rf dist`, never read dist/ without a
-#     DIST_ROOT= override. See the safety-contract comment below for the
-#     full rationale (this rule replaces a previous version of this script
-#     that destroyed the real dist/ tree).
-#   - (round-5 review P1) Never modify a git-tracked file's CONTENT (no
-#     `git checkout -- ...` restore, no direct append/overwrite onto a
-#     tracked file). A `touch` for an mtime-only recompile probe is fine
-#     (content-neutral); a scenario that needs to exercise an actual content
-#     change does it inside a throwaway sandbox copy of the tree instead.
-#   - Every mktemp/mktemp -d in this script goes through new_tmpfile()/
-#     new_tmpdir() below, so the single CLEANUP_DIRS trap owns all of it —
-#     no scenario hand-rolls its own `rm -f`/`rm -rf` cleanup any more.
 #
 # Usage: ./scripts/test_build_isolation.sh   (run from audio_common/, or
 # anywhere — paths are resolved relative to this script's own location).
+#
+# ISOL_INTERRUPT_PROBE (internal, used only by S18): when set, this script
+# runs as a child re-invocation of itself in "interruption probe" mode
+# instead of running the suite -- see the block immediately after the
+# SCRATCH_ROOT/trap setup below.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 AC_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-AEC_DIR="$(cd "$AC_DIR/../AEC/c_impl" && pwd)"
+AEC_REPO_DIR="$(cd "$AC_DIR/../AEC" && pwd)"
+AEC_DIR="$(cd "$AEC_REPO_DIR/c_impl" && pwd)"
 NR_DIR="$(cd "$AC_DIR/../NR/c_impl" && pwd)"
 
-# --- round-5 review P1 safety contract --------------------------------------
-# What this script writes, and ONLY this:
-#   - its own scratch files/directories, created exclusively via the
-#     new_tmpfile()/new_tmpdir() helpers below, every one of which is tracked
-#     in CLEANUP_DIRS and removed by the single EXIT/INT/TERM trap -- even
-#     when `set -e` aborts the script partway through a scenario.
-#   - this repo's normal CFG_SIG-keyed obj/<backend-sig>/ and bin/<backend-sig>/
-#     build output, created exactly the way any ordinary `make BACKEND=...
-#     lib` invocation would create it -- nothing scenario-specific lives
-#     there, and none of it is git-tracked (see .gitignore).
-#   - mtime-only touches of a handful of already-tracked files (src/hpf.c,
-#     include/fast_math.h, include/wav_io.h, lib/ne10/inc/NE10_dsp.h), used
-#     to force a recompile probe. A `touch` changes mtime, never content.
-#
-# What it NEVER does, after the round-5 review P1 finding that a previous
-# version of this script `rm -rf dist`'d and read/wrote the REAL dist/
-# directly (destroying whatever a real `make publish` had produced there):
-#   - every `make ... publish` call below passes an explicit DIST_ROOT=
-#     pointing at a throwaway mktemp -d; the default dist/ is never read,
-#     written, or removed by this script, full stop.
-#   - no `git checkout -- ...` restore and no direct append/overwrite onto a
-#     git-tracked file's content. S11c needs to exercise "publish sees new
-#     source bytes" -- it does that inside a throwaway tarball copy of the
-#     tree (a "sandbox" living under its own mktemp -d), never in $AC_DIR.
-#
-# A git-status hash of $AC_DIR is taken right now and re-checked in the
-# SUMMARY section at the very end: any drift in $AC_DIR's tracked-file state
-# across the whole run is reported as a hard FAIL, not a silent surprise.
-CLEANUP_DIRS=""
-track_tmp() { CLEANUP_DIRS="$CLEANUP_DIRS $1"; }
-new_tmpdir() {
-  local d
-  d="$(mktemp -d)"
-  track_tmp "$d"
-  printf '%s\n' "$d"
+# --- round-6 review P2-1: single scratch root, single trap ------------------
+SCRATCH_ROOT="$(mktemp -d)"
+cleanup() {
+  rc=$?
+  trap - EXIT INT TERM
+  rm -rf -- "$SCRATCH_ROOT"
+  exit "$rc"
 }
-new_tmpfile() {
-  local f
-  f="$(mktemp)"
-  track_tmp "$f"
-  printf '%s\n' "$f"
-}
-# shellcheck disable=SC2086  # deliberately unquoted: CLEANUP_DIRS is a
-# space-separated list of paths (none of which contain spaces -- they are
-# all mktemp/mktemp -d outputs) and `rm -rf` needs them as separate args.
-trap 'rm -rf $CLEANUP_DIRS' EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+mkdir "$SCRATCH_ROOT/tmp"
+# Child `make`s' own mktemp workdirs (e.g. the publish recipe's `work="$(mktemp
+# -d)"`) land under scratch too via this, so the single `rm -rf` above collects
+# EVERYTHING this run creates, including after an interruption -- see S18.
+export TMPDIR="$SCRATCH_ROOT/tmp"
 
-git_status_hash() {
-  ( cd "$AC_DIR" && git status --porcelain 2>/dev/null | shasum -a 256 | awk '{print $1}' )
+# --- S18 interruption probe: MUST be checked early, before any suite logic --
+# (round-6 review P2-1 acceptance test), and BEFORE the mktemp-shim setup
+# below: probe mode's `set +e` (see the comment inside the branch) needs to
+# take effect before ANY further command runs in this process, since a
+# signal can arrive during the shim's own file writes just as easily as
+# during the probe's own fifo dance -- moving the whole shim setup after
+# this check keeps probe mode's error-handling window as small as possible.
+# When invoked with ISOL_INTERRUPT_PROBE set, this is a CHILD re-invocation
+# of this very script, spawned by the S18 scenario body further down. It
+# signals its own SCRATCH_ROOT back to the parent over a fifo (the write is
+# also the readiness signal), then either exits immediately (mode "exit") or
+# blocks forever on a second fifo that nobody ever writes to, so a
+# parent-delivered INT/TERM is what interrupts it -- exactly mirroring how
+# this script could be interrupted mid-scenario in real use. It does NOT
+# need its own mktemp shim (below): its own `mktemp -d` for SCRATCH_ROOT
+# above already inherited the PARENT's shim via PATH (set before the parent
+# spawned it), which is what lands this SCRATCH_ROOT inside the parent's
+# chosen probe TMPDIR in the first place.
+if [ -n "${ISOL_INTERRUPT_PROBE:-}" ]; then
+  # `set +e` for the rest of probe mode (round-6 review, found while
+  # validating THIS script): with `errexit` still active, a SIGTERM/SIGINT
+  # that arrives while this process is blocked in a syscall (opening the
+  # fifo, or the `read` below) can surface as EINTR turning into that
+  # command's own non-zero return -- and errexit reacts to THAT directly
+  # (running the EXIT trap with the interrupted command's status) before
+  # bash ever services the pending INT/TERM trap, so the child would exit
+  # with the wrong code and skip straight to cleanup with a stale $?
+  # (verified empirically on this host's bash 3.2 to be flaky under load:
+  # which command absorbs the signal-interrupted return varies run to run).
+  # Disabling errexit here removes the whole race: the INT/TERM traps
+  # installed above are what decide this process's exit code, unconditionally.
+  set +e
+  mkdir -p "$SCRATCH_ROOT/probe"
+  : > "$SCRATCH_ROOT/probe/canary_a"
+  : > "$SCRATCH_ROOT/probe/canary_b"
+  printf '%s\n' "$SCRATCH_ROOT" > "$ISOL_PROBE_FIFO"
+  if [ "$ISOL_INTERRUPT_PROBE" = "exit" ]; then
+    exit 0
+  fi
+  # Open the hold-fifo O_RDWR (never blocks on open(), since we hold both
+  # ends ourselves). Block via `wait` on a background reader of that fd,
+  # NOT a direct foreground `read <&9` -- verified empirically (bash 3.2) to
+  # matter: a signal arriving while this shell is itself blocked inside a
+  # foreground `read` builtin can leave the pending INT/TERM trap action
+  # un-run (the interrupted `read` just falls through to whatever comes
+  # next), and a SECOND, deferred delivery of that same signal then fires
+  # AFTER `cleanup()` has already reset the trap to its default disposition
+  # -- killing the process mid-`rm -rf` instead of letting cleanup finish.
+  # `wait` is bash's OWN documented interruptible blocking primitive (see
+  # bash(1), SIGNALS: "SIGINT is caught and handled so that the wait builtin
+  # is interruptible") and does not exhibit this: 8/8 clean runs under both
+  # SIGTERM and SIGINT in isolated repro, vs. a flaky ~1-in-3 failure rate
+  # with a direct `read <&9`.
+  exec 9<>"$ISOL_PROBE_FIFO.hold"
+  cat <&9 >/dev/null &
+  catpid=$!
+  wait "$catpid"
+  exit 0
+fi
+
+# macOS-specific gotcha (found while validating this rewrite): BSD `mktemp`'s
+# bare `-d` / no-template form resolves via _CS_DARWIN_USER_TEMP_DIR FIRST
+# (see mktemp(1): "If no arguments are passed or if only the -d flag is
+# passed mktemp behaves as if -t tmp was supplied", and -t's own fallback
+# order puts $TMPDIR behind that Darwin-specific dir) -- so exporting TMPDIR
+# alone does NOT redirect a child process's own bare `mktemp -d` (e.g. this
+# Makefile's own `publish` recipe: `work="$(mktemp -d)"`, or S18's child
+# re-invocation's own `SCRATCH_ROOT="$(mktemp -d)"`) into our scratch tree.
+# A tiny shim ahead of the real mktemp on PATH closes this gap: it forwards
+# to the real /usr/bin/mktemp, injecting `-p "$TMPDIR"` whenever the caller
+# didn't already give an explicit template or -p (verified empirically: a
+# bare `TMPDIR=/some/dir mktemp -d` on this host ignores TMPDIR entirely
+# without this shim).
+mkdir "$SCRATCH_ROOT/shimbin"
+cat > "$SCRATCH_ROOT/shimbin/mktemp" <<'EOF'
+#!/bin/sh
+has_template=0
+has_p=0
+for a in "$@"; do
+  case "$a" in
+    -p) has_p=1 ;;
+    -*) ;;
+    *) has_template=1 ;;
+  esac
+done
+if [ "$has_template" -eq 0 ] && [ "$has_p" -eq 0 ] && [ -n "${TMPDIR:-}" ]; then
+  exec /usr/bin/mktemp -p "$TMPDIR" "$@"
+fi
+exec /usr/bin/mktemp "$@"
+EOF
+chmod +x "$SCRATCH_ROOT/shimbin/mktemp"
+export PATH="$SCRATCH_ROOT/shimbin:$PATH"
+
+# --- helpers -----------------------------------------------------------------
+mkscratch() { mkdir -p "$SCRATCH_ROOT/$1"; }
+
+# ar -p <archive> <member> | sha256  -- the sha of one member's CONTENT as it
+# sits inside the delivered archive (not the archive's own sha, which would
+# also fold in ar's per-member timestamp/mode header fields).
+member_sha() { ar -p "$1" "$2" | shasum -a 256 | awk '{print $1}'; }
+file_sha()   { shasum -a 256 "$1" | awk '{print $1}'; }
+# Fractional seconds (round-6: replaces whole-second `stat -f %m`) -- two
+# genuinely separate real writes are distinguishable without an artificial
+# delay. GNU fallback loses the fractional part (not exercised on this host).
+mtime()      { stat -f '%Fm' "$1" 2>/dev/null || stat -c %Y "$1"; }
+
+# Tree-state hash (round-6 review): status --porcelain ALONE misses a content
+# edit to an already-dirty file, so this also folds in `diff --binary HEAD`.
+tree_state_hash() {
+  { git -C "$1" status --porcelain; git -C "$1" diff --binary HEAD; } 2>/dev/null | shasum -a 256 | awk '{print $1}'
 }
-GIT_STATUS_BEFORE="$(git_status_hash)"
+
+# Real dist/ sentinel (round-6 review, standing guard): absent stays absent;
+# otherwise a full path list + per-file sha256 + per-file (name, mtime).
+real_dist_sentinel() {
+  if [ ! -e "$AC_DIR/dist" ]; then
+    echo absent
+    return
+  fi
+  ( cd "$AC_DIR" && {
+      find dist -print | sort
+      find dist -type f -print | sort | while read -r f; do shasum -a 256 "$f"; done
+      find dist -print | sort | while read -r f; do stat -f '%N %m' "$f"; done
+    } ) | shasum -a 256 | awk '{print $1}'
+}
+
+AC_STATE_BEFORE="$(tree_state_hash "$AC_DIR")"
+AEC_STATE_BEFORE="$(tree_state_hash "$AEC_REPO_DIR")"
+REAL_DIST_BEFORE="$(real_dist_sentinel)"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -137,13 +290,6 @@ FAILURES=()
 
 pass() { PASS_COUNT=$((PASS_COUNT + 1)); echo "  PASS: $*"; }
 fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); FAILURES+=("$*"); echo "  FAIL: $*" >&2; }
-
-# ar -p <archive> <member> | sha256  -- the sha of one member's CONTENT as it
-# sits inside the delivered archive (not the archive's own sha, which would
-# also fold in ar's per-member timestamp/mode header fields).
-member_sha() { ar -p "$1" "$2" | shasum -a 256 | awk '{print $1}'; }
-file_sha()   { shasum -a 256 "$1" | awk '{print $1}'; }
-mtime()      { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
 
 echo "############################################################"
 echo "# S1: A->B->A + -O0/-O3 delivered-object repro"
@@ -185,12 +331,20 @@ ar -t "$ne10_lib" | grep -q '^kiss_fft\.o$' && fail "S1: ne10 archive unexpected
 # The reviewer's literal repro: EXTRA_CFLAGS=-O0 vs -O3 must never let one
 # config's compiled object be delivered under the other's archive member
 # (the actual B01 bug: mtime staleness across differing flag sets).
-make -s BACKEND=kiss EXTRA_CFLAGS=-O0 lib >/dev/null
-lib_o0="$(make -s BACKEND=kiss EXTRA_CFLAGS=-O0 print-lib-path)"
-objdir_o0="$(make -s BACKEND=kiss EXTRA_CFLAGS=-O0 print-obj-dir)"
-make -s BACKEND=kiss EXTRA_CFLAGS=-O3 lib >/dev/null
-lib_o3="$(make -s BACKEND=kiss EXTRA_CFLAGS=-O3 print-lib-path)"
-objdir_o3="$(make -s BACKEND=kiss EXTRA_CFLAGS=-O3 print-obj-dir)"
+#
+# round-6 review P1: -O0/-O3 are throwaway probe configs, not one of the
+# normal kiss/ne10 configs the rest of this repo's real obj/bin is meant to
+# hold -- so this builds under a scratch OBJ_ROOT=/BIN_ROOT= instead. Every
+# print-* query below is resolved against that SAME scratch root pair.
+mkscratch s1
+S1_OBJ_ROOT="$SCRATCH_ROOT/s1/obj"
+S1_BIN_ROOT="$SCRATCH_ROOT/s1/bin"
+make -s BACKEND=kiss EXTRA_CFLAGS=-O0 OBJ_ROOT="$S1_OBJ_ROOT" BIN_ROOT="$S1_BIN_ROOT" lib >/dev/null
+lib_o0="$(make -s BACKEND=kiss EXTRA_CFLAGS=-O0 OBJ_ROOT="$S1_OBJ_ROOT" BIN_ROOT="$S1_BIN_ROOT" print-lib-path)"
+objdir_o0="$(make -s BACKEND=kiss EXTRA_CFLAGS=-O0 OBJ_ROOT="$S1_OBJ_ROOT" BIN_ROOT="$S1_BIN_ROOT" print-obj-dir)"
+make -s BACKEND=kiss EXTRA_CFLAGS=-O3 OBJ_ROOT="$S1_OBJ_ROOT" BIN_ROOT="$S1_BIN_ROOT" lib >/dev/null
+lib_o3="$(make -s BACKEND=kiss EXTRA_CFLAGS=-O3 OBJ_ROOT="$S1_OBJ_ROOT" BIN_ROOT="$S1_BIN_ROOT" print-lib-path)"
+objdir_o3="$(make -s BACKEND=kiss EXTRA_CFLAGS=-O3 OBJ_ROOT="$S1_OBJ_ROOT" BIN_ROOT="$S1_BIN_ROOT" print-obj-dir)"
 
 [ "$lib_o0" != "$lib_o3" ] && pass "S1: -O0/-O3 land in different bin dirs" \
   || fail "S1: -O0/-O3 COLLIDE in the same bin dir ($lib_o0)"
@@ -225,9 +379,17 @@ m2="$(member_sha "$ne10_lib" hpf.o)"; o2="$(file_sha "$ne10_objdir/hpf.o")"
 echo "############################################################"
 echo "# S3: parallel differing-config builds"
 echo "############################################################"
-S3_LOG_A="$(new_tmpfile)"; S3_LOG_B="$(new_tmpfile)"
+mkscratch s3
+# round-6 review P1: the ne10+PAR_PROBE side is a throwaway probe config ->
+# scratch OBJ_ROOT/BIN_ROOT. The plain kiss side stays in the real tree (this
+# half is exactly the normal-config concurrency this scenario exists to
+# verify).
+S3_OBJ_ROOT="$SCRATCH_ROOT/s3/obj"
+S3_BIN_ROOT="$SCRATCH_ROOT/s3/bin"
+S3_LOG_A="$SCRATCH_ROOT/s3/log_a"
+S3_LOG_B="$SCRATCH_ROOT/s3/log_b"
 ( make -j4 -s BACKEND=kiss lib >"$S3_LOG_A" 2>&1 ) & p1=$!
-( make -j4 -s BACKEND=ne10 EXTRA_CFLAGS=-DPAR_PROBE lib >"$S3_LOG_B" 2>&1 ) & p2=$!
+( make -j4 -s BACKEND=ne10 EXTRA_CFLAGS=-DPAR_PROBE OBJ_ROOT="$S3_OBJ_ROOT" BIN_ROOT="$S3_BIN_ROOT" lib >"$S3_LOG_B" 2>&1 ) & p2=$!
 r1=0; r2=0
 wait "$p1" || r1=$?
 wait "$p2" || r2=$?
@@ -240,8 +402,8 @@ else
 fi
 
 kiss_lib="$(make -s BACKEND=kiss print-lib-path)";  kiss_objdir="$(make -s BACKEND=kiss print-obj-dir)"
-ne10p_lib="$(make -s BACKEND=ne10 EXTRA_CFLAGS=-DPAR_PROBE print-lib-path)"
-ne10p_objdir="$(make -s BACKEND=ne10 EXTRA_CFLAGS=-DPAR_PROBE print-obj-dir)"
+ne10p_lib="$(make -s BACKEND=ne10 EXTRA_CFLAGS=-DPAR_PROBE OBJ_ROOT="$S3_OBJ_ROOT" BIN_ROOT="$S3_BIN_ROOT" print-lib-path)"
+ne10p_objdir="$(make -s BACKEND=ne10 EXTRA_CFLAGS=-DPAR_PROBE OBJ_ROOT="$S3_OBJ_ROOT" BIN_ROOT="$S3_BIN_ROOT" print-obj-dir)"
 m1="$(member_sha "$kiss_lib" hpf.o)"; o1="$(file_sha "$kiss_objdir/hpf.o")"
 m2="$(member_sha "$ne10p_lib" hpf.o)"; o2="$(file_sha "$ne10p_objdir/hpf.o")"
 [ "$m1" = "$o1" ] && [ "$m2" = "$o2" ] && \
@@ -256,8 +418,18 @@ make -s BACKEND=ne10 lib >/dev/null
 sha_before="$(file_sha "$ne10_lib")"
 mtime_before="$(mtime "$ne10_lib")"
 
-S4_LOG="$(new_tmpfile)"
-if make test_ne10_force_c >"$S4_LOG" 2>&1; then
+# round-6 review P1: test_ne10_force_c's own internal NEON+forced-C sub-makes
+# are throwaway diagnostic builds, never one of the real tree's normal
+# configs -- run the WHOLE invocation under a scratch OBJ_ROOT/BIN_ROOT (both
+# of its internal sub-makes inherit these, being ordinary command-line
+# variable overrides forwarded automatically to $(MAKE) recursive calls), so
+# it can never touch the real ne10-<sig>/ directory at all, regardless of
+# what it does internally.
+mkscratch s4
+S4_OBJ_ROOT="$SCRATCH_ROOT/s4/obj"
+S4_BIN_ROOT="$SCRATCH_ROOT/s4/bin"
+S4_LOG="$SCRATCH_ROOT/s4/log"
+if make test_ne10_force_c OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" >"$S4_LOG" 2>&1; then
   pass "S4: test_ne10_force_c exits green"
 else
   fail "S4: test_ne10_force_c FAILED"
@@ -267,16 +439,17 @@ fi
 sha_after="$(file_sha "$ne10_lib")"
 mtime_after="$(mtime "$ne10_lib")"
 [ "$sha_before" = "$sha_after" ] && [ "$mtime_before" = "$mtime_after" ] && \
-  pass "S4: normal ne10 archive byte-identical + mtime-untouched after forced-C run" \
+  pass "S4: normal ne10 archive byte-identical + mtime-untouched after forced-C run (scratch-redirected)" \
   || fail "S4: normal ne10 archive CHANGED by the forced-C sub-make (sha $sha_before -> $sha_after, mtime $mtime_before -> $mtime_after)"
 
-forcedc_lib="$(make -s BACKEND=ne10 EXTRA_CFLAGS=-DFFT_NE10_FORCE_C print-lib-path)"
-[ "$forcedc_lib" != "$ne10_lib" ] && pass "S4: forced-C archive lives at a different keyed path" \
-  || fail "S4: forced-C archive path COLLIDES with the normal ne10 path"
+normal_lib_scratch="$(make -s BACKEND=ne10 OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" print-lib-path)"
+forcedc_lib="$(make -s BACKEND=ne10 EXTRA_CFLAGS=-DFFT_NE10_FORCE_C OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" print-lib-path)"
+[ "$forcedc_lib" != "$normal_lib_scratch" ] && pass "S4: forced-C archive lives at a different keyed path than the normal ne10 build (both under the SAME scratch roots)" \
+  || fail "S4: forced-C archive path COLLIDES with the normal ne10 path ($forcedc_lib)"
 [ -f "$forcedc_lib" ] && pass "S4: forced-C archive exists on disk" || fail "S4: forced-C archive missing"
 
-forcedc_objdir="$(make -s BACKEND=ne10 EXTRA_CFLAGS=-DFFT_NE10_FORCE_C print-obj-dir)"
-normal_objdir="$(make -s BACKEND=ne10 print-obj-dir)"
+forcedc_objdir="$(make -s BACKEND=ne10 EXTRA_CFLAGS=-DFFT_NE10_FORCE_C OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" print-obj-dir)"
+normal_objdir="$(make -s BACKEND=ne10 OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" print-obj-dir)"
 if [ -f "$forcedc_objdir/fft_wrapper_ne10.o" ] && [ -f "$normal_objdir/fft_wrapper_ne10.o" ]; then
   s1="$(file_sha "$forcedc_objdir/fft_wrapper_ne10.o")"
   s2="$(file_sha "$normal_objdir/fft_wrapper_ne10.o")"
@@ -298,8 +471,31 @@ aecwav="$bindir_kiss/aec_wav"
 [ -f "$aecwav" ] && pass "S5: aec_wav built" || fail "S5: aec_wav missing after initial build"
 mtime_1="$(mtime "$aecwav")"
 
-# no-op rebuild -> NOT relinked
-sleep 1
+# Backdate aec_wav (round-6 review, found while validating THIS script; AEC's
+# own real build ARTIFACT, not one of audio_common's real-obj/bin-under-
+# OBJ_ROOT/BIN_ROOT paths this suite otherwise never touches -- S5's whole
+# purpose is REAL cross-repo propagation in AEC's real tree, so mutating
+# AEC's own artifacts here is the point, not a violation of it): GNU Make
+# 3.81's own prerequisite-newer-than-target check truncates to whole
+# seconds, so aec_wav's relink decision (against $(AC_LIB)'s freshly
+# rebuilt, real "now" mtime) can silently NOT fire if aec_wav's own existing
+# mtime happens to truncate to that SAME integer second -- reproduced
+# empirically: a real, later archive rebuild whose timestamp nonetheless
+# landed in the same second as aec_wav's last link, so make itself declined
+# to relink. A safe backdate (5 minutes), called ONLY right before each of
+# the three relink-triggering builds further below (never before the no-op
+# check just below, which must see aec_wav's NATURAL, untouched mtime to
+# mean anything), removes the collision with certainty -- the same way
+# `touch -r/-A 01` removes it for a source-vs-object comparison one line
+# later in each case, just applied to the TARGET side of a target-vs-
+# prerequisite comparison this script cannot touch the prerequisite's own
+# real timestamp for (that prerequisite is a real rebuild's output, not our
+# own touch).
+backdate_aecwav() { touch -A -0500 "$aecwav"; }
+
+# no-op rebuild -> NOT relinked. No sleep needed (round-6): nothing is
+# touched here, so aec_wav's mtime cannot change regardless of how much
+# wall-clock time elapses between the two `make` calls.
 make -s BACKEND=kiss all AC_LIB="$ac_kiss" >/dev/null
 mtime_2="$(mtime "$aecwav")"
 [ "$mtime_1" = "$mtime_2" ] && pass "S5: aec_wav NOT relinked on a no-op rebuild" \
@@ -309,56 +505,87 @@ mtime_2="$(mtime "$aecwav")"
 # recompiles AND aec_wav relinks. audio_common's own CFG_SIG (a hash of its
 # COMPILER INVOCATION, not file content) does not change from a source edit,
 # so its archive path stays the same -- only its mtime should advance.
-sleep 1
-touch "$AC_DIR/src/hpf.c"
+#
+# round-6 review: deterministic strictly-newer bump replaces `sleep 1; touch
+# hpf.c`. Resolve hpf.o's path FIRST (it already exists from earlier
+# scenarios), then set hpf.c's mtime to hpf_o's CURRENT mtime + 1s via BSD
+# `touch -r/-A` -- this guarantees make ITSELF sees the source as newer than
+# the object (make's own dependency check truncates to whole seconds on this
+# GNU Make 3.81, so the +1s bump is load-bearing, not just extra caution).
+#
+# Verifying "did it actually recompile" afterward is a SEPARATE problem from
+# "did make decide to": found empirically while validating this rewrite that
+# comparing two mtime snapshots OF THE SAME output file, taken moments apart
+# by this SCRIPT itself (not by make), can land in the very same whole
+# second when the whole edit-recompile-relink chain runs fast and back-to-
+# back (no human/sleep delay between steps) -- a real false-negative, not a
+# hypothetical one (reproduced: audio_common's own archive rebuilt with a
+# real, later timestamp that nonetheless truncated to the SAME integer
+# second as its prior build, so make itself also declined to relink aec_wav
+# next). So "recompiled?" is verified from make's own build LOG instead of
+# an mtime diff: this Makefile still echoes "audio_common [$(BACKEND)] ->
+# $@" whenever the archive rule actually runs (even under -s, since a plain
+# `@echo` line's own output is never silenced -- only the recipe-echo
+# itself is), so its presence/absence in a captured log is a timing-proof
+# signal for "did the archive (and therefore hpf.o) actually rebuild".
+mkscratch s5
 ac_objdir="$(make -s -C "$AC_DIR" BACKEND=kiss print-obj-dir)"
 hpf_o="$ac_objdir/hpf.o"
-mtime_hpf_before="$(mtime "$hpf_o" 2>/dev/null || echo 0)"
-make -s -C "$AC_DIR" BACKEND=kiss lib >/dev/null
-mtime_hpf_after="$(mtime "$hpf_o")"
-[ "$mtime_hpf_after" != "$mtime_hpf_before" ] && pass "S5: hpf.c edit recompiled audio_common's hpf.o" \
-  || fail "S5: hpf.o did NOT recompile after touching hpf.c"
+touch -r "$hpf_o" -A 01 "$AC_DIR/src/hpf.c"
+S5_LOG_HPF="$SCRATCH_ROOT/s5/log_hpf"
+make -s -C "$AC_DIR" BACKEND=kiss lib >"$S5_LOG_HPF" 2>&1
+grep -q "^audio_common \[kiss\] ->" "$S5_LOG_HPF" && pass "S5: hpf.c edit recompiled audio_common's hpf.o (archive rebuilt)" \
+  || fail "S5: hpf.o did NOT recompile after touching hpf.c (no archive-rebuild line in the log)"
 
-sleep 1
-make -s BACKEND=kiss all AC_LIB="$ac_kiss" >/dev/null
-mtime_3="$(mtime "$aecwav")"
-[ "$mtime_3" != "$mtime_1" ] && pass "S5: touching audio_common/src/hpf.c relinked aec_wav" \
-  || fail "S5: aec_wav NOT relinked after audio_common's hpf.o changed"
+# Same log-based technique for "did aec_wav relink": AEC's own Makefile
+# echoes "aec_wav [$(BACKEND)] -> $@" whenever ITS link rule runs.
+S5_LOG_RELINK="$SCRATCH_ROOT/s5/log_relink"
+backdate_aecwav
+make -s BACKEND=kiss all AC_LIB="$ac_kiss" >"$S5_LOG_RELINK" 2>&1
+grep -q "^aec_wav \[kiss\] ->" "$S5_LOG_RELINK" && pass "S5: touching audio_common/src/hpf.c relinked aec_wav" \
+  || fail "S5: aec_wav NOT relinked after audio_common's hpf.o changed (no relink line in the log)"
 
 # Header-only test 1: touch fast_math.h -> AEC objects that include it
-# (aec3_post.c, suppression_gain.c) recompile.
-sleep 1
-touch "$AC_DIR/include/fast_math.h"
+# (aec3_post.c, suppression_gain.c) recompile, then aec_wav relinks. Same
+# deterministic source bump; same log-based relink verification (AEC has no
+# per-object echo, but a relink only happens if SOME object actually
+# changed, and this is the only header touched in this step).
 aec_objdir="$(make -s BACKEND=kiss print-obj-dir AC_LIB="$ac_kiss")"
-t_before="$(mtime "$aec_objdir/aec3_post.o")"
-make -s BACKEND=kiss all AC_LIB="$ac_kiss" >/dev/null
-t_after="$(mtime "$aec_objdir/aec3_post.o")"
-[ "$t_after" != "$t_before" ] && pass "S5: touching audio_common/include/fast_math.h recompiled AEC's aec3_post.o" \
-  || fail "S5: aec3_post.o did NOT recompile after touching fast_math.h"
+touch -r "$aec_objdir/aec3_post.o" -A 01 "$AC_DIR/include/fast_math.h"
+S5_LOG_FASTMATH="$SCRATCH_ROOT/s5/log_fastmath"
+backdate_aecwav
+make -s BACKEND=kiss all AC_LIB="$ac_kiss" >"$S5_LOG_FASTMATH" 2>&1
+grep -q "^aec_wav \[kiss\] ->" "$S5_LOG_FASTMATH" && pass "S5: touching audio_common/include/fast_math.h recompiled AEC's aec3_post.o (relink observed)" \
+  || fail "S5: aec_wav did NOT relink after touching fast_math.h (aec3_post.o likely did not recompile)"
 
 # Header-only test 2: touch wav_io.h -> example objs (aec_wav.o, which
 # #includes example/wav_io.h -> audio_common/include/wav_io.h) recompile.
-sleep 1
-touch "$AC_DIR/include/wav_io.h"
-t_before="$(mtime "$aec_objdir/aec_wav.o")"
-make -s BACKEND=kiss all AC_LIB="$ac_kiss" >/dev/null
-t_after="$(mtime "$aec_objdir/aec_wav.o")"
-[ "$t_after" != "$t_before" ] && pass "S5: touching audio_common/include/wav_io.h recompiled AEC's aec_wav.o" \
-  || fail "S5: aec_wav.o did NOT recompile after touching wav_io.h"
+touch -r "$aec_objdir/aec_wav.o" -A 01 "$AC_DIR/include/wav_io.h"
+S5_LOG_WAVIO="$SCRATCH_ROOT/s5/log_wavio"
+backdate_aecwav
+make -s BACKEND=kiss all AC_LIB="$ac_kiss" >"$S5_LOG_WAVIO" 2>&1
+grep -q "^aec_wav \[kiss\] ->" "$S5_LOG_WAVIO" && pass "S5: touching audio_common/include/wav_io.h recompiled AEC's aec_wav.o (relink observed)" \
+  || fail "S5: aec_wav did NOT relink after touching wav_io.h (aec_wav.o likely did not recompile)"
 
 # NE10 vendored header touch -> NE10 objects recompile (audio_common level).
 # NE10_dsp.h (not the top-level NE10.h umbrella -- verified via NE10_fft.o's
 # own -MD -MP .d fragment that NE10_fft.c pulls in NE10_dsp.h/NE10_types.h/
 # NE10_macros.h transitively, but never NE10.h itself; only THIS repo's own
-# fft_wrapper_ne10.c includes the top-level NE10.h directly).
-sleep 1
-touch "$AC_DIR/lib/ne10/inc/NE10_dsp.h"
+# fft_wrapper_ne10.c includes the top-level NE10.h directly). Same log-based
+# verification (audio_common's own "audio_common [ne10] -> ..." echo).
 ac_ne10_objdir="$(make -s -C "$AC_DIR" BACKEND=ne10 print-obj-dir)"
-t_before="$(mtime "$ac_ne10_objdir/NE10_fft.o" 2>/dev/null || echo 0)"
-make -s -C "$AC_DIR" BACKEND=ne10 lib >/dev/null
-t_after="$(mtime "$ac_ne10_objdir/NE10_fft.o")"
-[ "$t_after" != "$t_before" ] && pass "S5: touching a vendored NE10 header (NE10_dsp.h) recompiled NE10_fft.o" \
-  || fail "S5: NE10_fft.o did NOT recompile after touching lib/ne10/inc/NE10_dsp.h"
+if [ -f "$ac_ne10_objdir/NE10_fft.o" ]; then
+  touch -r "$ac_ne10_objdir/NE10_fft.o" -A 01 "$AC_DIR/lib/ne10/inc/NE10_dsp.h"
+else
+  # Cold start (no prior ne10 build under this exact objdir): no reference
+  # artifact exists yet to bump from, so just touch the header directly --
+  # still mtime-only, still content-neutral.
+  touch "$AC_DIR/lib/ne10/inc/NE10_dsp.h"
+fi
+S5_LOG_NE10H="$SCRATCH_ROOT/s5/log_ne10h"
+make -s -C "$AC_DIR" BACKEND=ne10 lib >"$S5_LOG_NE10H" 2>&1
+grep -q "^audio_common \[ne10\] ->" "$S5_LOG_NE10H" && pass "S5: touching a vendored NE10 header (NE10_dsp.h) recompiled NE10_fft.o (archive rebuilt)" \
+  || fail "S5: NE10_fft.o did NOT recompile after touching lib/ne10/inc/NE10_dsp.h (no archive-rebuild line in the log)"
 
 # A->B->A at the AEC level -> nm shows backend-appropriate FFT symbols each
 # time (never a stale symbol set from the OTHER backend's link).
@@ -383,12 +610,16 @@ echo "############################################################"
 echo "# S7p: producer-publish (v4 layout; throwaway DIST_ROOT)"
 echo "############################################################"
 cd "$AC_DIR"
-# round-5 review P1: throwaway DIST_ROOT under our own mktemp -d -- the real
-# dist/ is never read, written, or removed by this script.
-S7P_DIST="$(new_tmpdir)/dist"
+mkscratch s7p
+# round-6: ALLOW_DIRTY_PUBLISH=1 on every publish call in this script -- a
+# dev tree is legitimately dirty (this very round-6 change is uncommitted),
+# and the policy itself is exercised on purpose in S17. DIST_ROOT stays a
+# throwaway scratch path (round-5 review P1): the real dist/ is never read,
+# written, or removed.
+S7P_DIST="$SCRATCH_ROOT/s7p/dist"
 
-S7P_LOG_FIRST="$(new_tmpfile)"
-make -s BACKEND=kiss publish DIST_ROOT="$S7P_DIST" >"$S7P_LOG_FIRST" 2>&1
+S7P_LOG_FIRST="$SCRATCH_ROOT/s7p/log_first"
+make -s BACKEND=kiss publish DIST_ROOT="$S7P_DIST" ALLOW_DIRTY_PUBLISH=1 >"$S7P_LOG_FIRST" 2>&1
 grep -q "(attested: attest-" "$S7P_LOG_FIRST" && pass "S7p: kiss publish success line ends with '(attested: <name>)'" \
   || fail "S7p: kiss publish success line missing '(attested: <name>)'"
 
@@ -397,10 +628,6 @@ kiss_current_target="$(readlink "$S7P_DIST/kiss/current" || true)"
   pass "S7p: kiss publish -- current symlink resolves to a real release dir" \
   || fail "S7p: kiss publish -- current symlink broken or missing"
 
-# v4 layout: the release dir is $S7P_DIST/<backend>/<cfg_sig>-<content12>,
-# resolved ONLY via readlink above -- never hardcoded here. MANIFEST.txt is
-# now DETERMINISTIC (config + tool identities + per-file sha256 only): no
-# git_commit=/git_dirty=/date_utc= any more -- those moved to ATTEST/.
 manifest_path="$S7P_DIST/kiss/current/MANIFEST.txt"
 grep -q "^release_id=$kiss_current_target$" "$manifest_path" && \
   pass "S7p: kiss MANIFEST release_id= matches the resolved current target (v4 content-addressed id)" \
@@ -416,8 +643,6 @@ else
   fail "S7p: kiss MANIFEST missing one of ar=/ranlib=/link= lines"
 fi
 
-# git_commit=/git_dirty=/date_utc= now live in ATTEST/, one file per publish
-# event -- this first publish must have produced exactly one.
 attest_files="$(find "$S7P_DIST/kiss/current/ATTEST" -name 'attest-*.txt')"
 attest_n="$(printf '%s\n' "$attest_files" | grep -c . || true)"
 [ "$attest_n" -eq 1 ] && pass "S7p: kiss release has exactly one ATTEST/attest-*.txt after the first publish" \
@@ -438,7 +663,7 @@ done < <(grep -E '^[0-9a-f]{64}  ' "$manifest_path")
   || fail "S7p: kiss MANIFEST sha mismatch against files on disk"
 
 kiss_dist_sha_before="$(file_sha "$S7P_DIST/kiss/current/libaudio_common.a")"
-make -s BACKEND=ne10 publish DIST_ROOT="$S7P_DIST" >/dev/null
+make -s BACKEND=ne10 publish DIST_ROOT="$S7P_DIST" ALLOW_DIRTY_PUBLISH=1 >/dev/null
 kiss_dist_sha_after="$(file_sha "$S7P_DIST/kiss/current/libaudio_common.a")"
 [ "$kiss_dist_sha_before" = "$kiss_dist_sha_after" ] && pass "S7p: publishing ne10 left the kiss release untouched" \
   || fail "S7p: publishing ne10 CHANGED the kiss release"
@@ -452,9 +677,10 @@ kiss_dist_sha_after="$(file_sha "$S7P_DIST/kiss/current/libaudio_common.a")"
 # always has been): either one caller fails fast with "already held", or
 # both complete; either way `current` must end up pointing at a COMPLETE,
 # self-consistent release.
-S7P_LOG_A="$(new_tmpfile)"; S7P_LOG_B="$(new_tmpfile)"
-( make -s BACKEND=kiss publish DIST_ROOT="$S7P_DIST" >"$S7P_LOG_A" 2>&1 ) & cp1=$!
-( make -s BACKEND=kiss publish DIST_ROOT="$S7P_DIST" >"$S7P_LOG_B" 2>&1 ) & cp2=$!
+S7P_LOG_A="$SCRATCH_ROOT/s7p/log_a"
+S7P_LOG_B="$SCRATCH_ROOT/s7p/log_b"
+( make -s BACKEND=kiss publish DIST_ROOT="$S7P_DIST" ALLOW_DIRTY_PUBLISH=1 >"$S7P_LOG_A" 2>&1 ) & cp1=$!
+( make -s BACKEND=kiss publish DIST_ROOT="$S7P_DIST" ALLOW_DIRTY_PUBLISH=1 >"$S7P_LOG_B" 2>&1 ) & cp2=$!
 cr1=0; cr2=0
 wait "$cp1" || cr1=$?
 wait "$cp2" || cr2=$?
@@ -483,34 +709,80 @@ done < <(grep -E '^[0-9a-f]{64}  ' "$S7P_DIST/kiss/$final_target/MANIFEST.txt")
   || fail "S7p: final current release's MANIFEST does not match its own files"
 
 echo "############################################################"
-echo "# S8: CFG_SIG collision guard"
+echo "# S8: CFG_SIG collision guard (round-6: scratch-side)"
 echo "############################################################"
 cd "$AC_DIR"
-kiss_objdir="$(make -s BACKEND=kiss print-obj-dir)"
-manifest="$kiss_objdir/config.manifest"
-backup="$(new_tmpfile)"
-cp "$manifest" "$backup"
+mkscratch s8
+S8_OBJ_ROOT="$SCRATCH_ROOT/s8/obj"
+S8_BIN_ROOT="$SCRATCH_ROOT/s8/bin"
+
+# Fresh scratch build of the REAL worktree's normal kiss config -- exercises
+# the CURRENT (possibly-uncommitted) Makefile without ever touching the real
+# obj/ tree (round-6 review P1: the round-5 script mutated the REAL obj dir
+# here -- the actual finding this rewrite fixes).
+make -s BACKEND=kiss OBJ_ROOT="$S8_OBJ_ROOT" BIN_ROOT="$S8_BIN_ROOT" lib >/dev/null
+s8_objdir="$(make -s BACKEND=kiss OBJ_ROOT="$S8_OBJ_ROOT" BIN_ROOT="$S8_BIN_ROOT" print-obj-dir)"
+s8_lib="$(make -s BACKEND=kiss OBJ_ROOT="$S8_OBJ_ROOT" BIN_ROOT="$S8_BIN_ROOT" print-lib-path)"
+manifest="$s8_objdir/config.manifest"
+
+real_kiss_objdir="$(make -s BACKEND=kiss print-obj-dir)"
+real_kiss_lib="$(make -s BACKEND=kiss print-lib-path)"
+real_manifest="$real_kiss_objdir/config.manifest"
+real_manifest_sha_before="$(file_sha "$real_manifest")"
+real_manifest_mtime_before="$(mtime "$real_manifest")"
+
 echo "CORRUPTED PAYLOAD (test_build_isolation.sh S8)" > "$manifest"
-s8_log="$(new_tmpfile)"
-if make BACKEND=kiss lib >"$s8_log" 2>&1; then
+s8_log="$SCRATCH_ROOT/s8/log"
+if make BACKEND=kiss OBJ_ROOT="$S8_OBJ_ROOT" BIN_ROOT="$S8_BIN_ROOT" lib >"$s8_log" 2>&1; then
   fail "S8: corrupted config.manifest did NOT fail the next build (collision guard not firing)"
 else
   grep -q "CFG_SIG collision" "$s8_log" && pass "S8: corrupted config.manifest correctly FAILS the next build with the collision message" \
     || fail "S8: build failed but NOT with the expected collision message"
 fi
-cp "$backup" "$manifest"
-make -s BACKEND=kiss lib >/dev/null && pass "S8: manifest restored, build green again" \
-  || fail "S8: build still failing after manifest restore"
+
+real_manifest_sha_after="$(file_sha "$real_manifest")"
+real_manifest_mtime_after="$(mtime "$real_manifest")"
+[ "$real_manifest_sha_before" = "$real_manifest_sha_after" ] && [ "$real_manifest_mtime_before" = "$real_manifest_mtime_after" ] && \
+  pass "S8: the REAL keyed obj dir's config.manifest sha+mtime unchanged (tamper was scratch-only)" \
+  || fail "S8: the REAL keyed obj dir's config.manifest CHANGED (scratch isolation failed)"
+
+# Knob byte-neutrality: OBJ_ROOT/BIN_ROOT is deliberately NOT in CFG_SIG (a
+# placement knob, not a build-content knob -- see the Makefile). Every .o in
+# the scratch keyed obj dir (built BEFORE the manifest corruption above, so
+# unaffected by it) must be byte-identical to the same-named .o in the real
+# keyed obj dir. We do NOT compare archive bytes: ar embeds each member's
+# mtime in the archive header, so two freshly-built archives (real vs
+# scratch, built at different wall-clock times) differ byte-for-byte even
+# though every member is content-identical -- only `ar -t`'s member NAME
+# LIST is compared for the archive itself.
+neutral_ok=1
+for o in "$real_kiss_objdir"/*.o; do
+  bn="$(basename "$o")"
+  if [ ! -f "$s8_objdir/$bn" ] || [ "$(file_sha "$o")" != "$(file_sha "$s8_objdir/$bn")" ]; then
+    neutral_ok=0
+  fi
+done
+[ "$neutral_ok" -eq 1 ] && pass "S8: OBJ_ROOT/BIN_ROOT is knob-neutral -- every scratch .o is byte-identical to its real counterpart" \
+  || fail "S8: a scratch .o differs from (or is missing vs.) its real counterpart -- OBJ_ROOT/BIN_ROOT is not build-content-neutral"
+
+[ "$(ar -t "$s8_lib" | sort)" = "$(ar -t "$real_kiss_lib" | sort)" ] && \
+  pass "S8: ar -t member name-lists of scratch vs real kiss archive are identical" \
+  || fail "S8: ar -t member name-lists differ between scratch and real kiss archive"
 
 echo "############################################################"
 echo "# S9: command-line override rejection (round-4 review P1-1)"
 echo "############################################################"
 cd "$AC_DIR"
+mkscratch s9
+S9_OBJ_ROOT="$SCRATCH_ROOT/s9/obj"
+S9_BIN_ROOT="$SCRATCH_ROOT/s9/bin"
 
 # Plain baseline (no BACKEND= given -- whatever this Makefile auto-detects
 # from the compiler is fine; only used below to prove EXTRA_CFLAGS lands
-# somewhere DIFFERENT, never compared against a hardcoded backend).
-baseline_objdir="$(make -s print-obj-dir)"
+# somewhere DIFFERENT, never compared against a hardcoded backend). Both
+# queries share the SAME scratch OBJ_ROOT/BIN_ROOT so the comparison isolates
+# the CFG_SIG effect of EXTRA_CFLAGS, not an incidental root-path difference.
+baseline_objdir="$(make -s OBJ_ROOT="$S9_OBJ_ROOT" BIN_ROOT="$S9_BIN_ROOT" print-obj-dir)"
 
 # CFLAGS=/CXXFLAGS=/LDFLAGS=/FP_POLICY= set on the command line must be
 # rejected at PARSE time (before any obj/bin dir is even created) with a
@@ -521,8 +793,8 @@ baseline_objdir="$(make -s print-obj-dir)"
 for pair in "CFLAGS=-O3" "CXXFLAGS=-O0" "LDFLAGS=-lfoo" "FP_POLICY=-ffp-contract=fast"; do
   ov_var="${pair%%=*}"
   ov_val="${pair#*=}"
-  S9_LOG="$(new_tmpfile)"
-  if make "$ov_var=$ov_val" print-obj-dir >"$S9_LOG" 2>&1; then
+  S9_LOG="$SCRATCH_ROOT/s9/log_$ov_var"
+  if make "$ov_var=$ov_val" OBJ_ROOT="$S9_OBJ_ROOT" BIN_ROOT="$S9_BIN_ROOT" print-obj-dir >"$S9_LOG" 2>&1; then
     fail "S9: make $ov_var=$ov_val print-obj-dir unexpectedly SUCCEEDED (must be rejected at parse time)"
   else
     if grep -q "cannot be overridden" "$S9_LOG"; then
@@ -536,40 +808,51 @@ done
 
 # EXTRA_CFLAGS is the supported hook: must still succeed, and (being folded
 # into CFG_SIG) must land in a DIFFERENT keyed dir than the plain baseline.
-extra_objdir="$(make -s EXTRA_CFLAGS=-DS9_PROBE print-obj-dir)"
+extra_objdir="$(make -s EXTRA_CFLAGS=-DS9_PROBE OBJ_ROOT="$S9_OBJ_ROOT" BIN_ROOT="$S9_BIN_ROOT" print-obj-dir)"
 [ -n "$extra_objdir" ] && [ "$extra_objdir" != "$baseline_objdir" ] && \
   pass "S9: EXTRA_CFLAGS=-DS9_PROBE print-obj-dir succeeds and lands in a different keyed dir than the plain baseline" \
   || fail "S9: EXTRA_CFLAGS=-DS9_PROBE print-obj-dir did NOT differ from the plain baseline ($baseline_objdir vs $extra_objdir)"
 
 echo "############################################################"
-echo "# S10: archive freshness -- stale-member removal (round-4 review P1-4)"
+echo "# S10: archive freshness -- stale-member removal (round-6: scratch-side)"
 echo "############################################################"
 cd "$AC_DIR"
+mkscratch s10
+S10_OBJ_ROOT="$SCRATCH_ROOT/s10/obj"
+S10_BIN_ROOT="$SCRATCH_ROOT/s10/bin"
 
-make -s BACKEND=kiss lib >/dev/null
-kiss_lib="$(make -s BACKEND=kiss print-lib-path)"
+make -s BACKEND=kiss OBJ_ROOT="$S10_OBJ_ROOT" BIN_ROOT="$S10_BIN_ROOT" lib >/dev/null
+kiss_lib="$(make -s BACKEND=kiss OBJ_ROOT="$S10_OBJ_ROOT" BIN_ROOT="$S10_BIN_ROOT" print-lib-path)"
 
-# Inject a foreign object directly into the delivered archive (simulating
-# what an old `ar rc` onto an EXISTING archive would leave behind forever for
-# a source file that's since been removed from the SRCS list).
-S10_TMPDIR="$(new_tmpdir)"
-cat > "$S10_TMPDIR/s10_foreign.c" <<'EOF'
+real_kiss_lib="$(make -s BACKEND=kiss print-lib-path)"
+real_lib_sha_before="$(file_sha "$real_kiss_lib")"
+real_lib_mtime_before="$(mtime "$real_kiss_lib")"
+
+# Inject a foreign object directly into the SCRATCH delivered archive
+# (simulating what an old `ar rc` onto an EXISTING archive would leave
+# behind forever for a source file that's since been removed from SRCS).
+cat > "$SCRATCH_ROOT/s10/s10_foreign.c" <<'EOF'
 int s10_foreign_symbol(void) { return 42; }
 EOF
-cc -c -o "$S10_TMPDIR/s10_foreign.o" "$S10_TMPDIR/s10_foreign.c"
-ar r "$kiss_lib" "$S10_TMPDIR/s10_foreign.o"
-ar -t "$kiss_lib" | grep -q '^s10_foreign\.o$' && pass "S10: foreign object successfully injected into archive (pre-condition)" \
-  || fail "S10: failed to inject foreign object into archive (pre-condition broken -- cannot test freshness)"
+cc -c -o "$SCRATCH_ROOT/s10/s10_foreign.o" "$SCRATCH_ROOT/s10/s10_foreign.c"
+ar r "$kiss_lib" "$SCRATCH_ROOT/s10/s10_foreign.o"
+ar -t "$kiss_lib" | grep -q '^s10_foreign\.o$' && pass "S10: foreign object successfully injected into the SCRATCH archive (pre-condition)" \
+  || fail "S10: failed to inject foreign object into scratch archive (pre-condition broken -- cannot test freshness)"
 
 # A normal rebuild (source touched, config unchanged) must produce a FRESH
 # archive (rm -f $@.tmp; ar rc $@.tmp $(BE_OBJS); ranlib; mv -f) -- never
 # `ar rc` onto the existing archive -- so the foreign member must be GONE
 # afterward, while hpf.o (a real, current source) must still be present.
-# The touch below is mtime-only (content-neutral): it forces the recompile
-# without ever modifying src/hpf.c's bytes.
-sleep 1
-touch "$AC_DIR/src/hpf.c"
-make -s BACKEND=kiss lib >/dev/null
+#
+# round-6 review: deterministic re-archive trigger replaces `sleep 1; touch
+# src/hpf.c`. Backdate the SCRATCH archive itself to a fixed date well in
+# the past -- older than every one of its member .o files (all built just
+# now, real "current" mtimes) -- so make's own dependency check ($(LIB):
+# $(BE_OBJS)) sees the archive as stale and re-archives from scratch on the
+# very next build. Touches NOTHING real: not a member .o, not any tracked
+# source.
+touch -t 202001010000 "$kiss_lib"
+make -s BACKEND=kiss OBJ_ROOT="$S10_OBJ_ROOT" BIN_ROOT="$S10_BIN_ROOT" lib >/dev/null
 
 ar -t "$kiss_lib" | grep -q '^s10_foreign\.o$' && fail "S10: stale foreign member s10_foreign.o SURVIVED a fresh archive rebuild (ar rc onto an existing archive?)" \
   || pass "S10: stale foreign member s10_foreign.o REMOVED by the fresh-archive rebuild"
@@ -578,17 +861,23 @@ ar -t "$kiss_lib" | grep -q '^hpf\.o$' && pass "S10: rebuilt archive still conta
 
 # SRCS= (the sorted source list) participates in CFG_SIG_PAYLOAD, visible
 # verbatim in this config's config.manifest.
-kiss_objdir="$(make -s BACKEND=kiss print-obj-dir)"
-manifest="$kiss_objdir/config.manifest"
+s10_objdir="$(make -s BACKEND=kiss OBJ_ROOT="$S10_OBJ_ROOT" BIN_ROOT="$S10_BIN_ROOT" print-obj-dir)"
+manifest="$s10_objdir/config.manifest"
 if grep -q 'SRCS=' "$manifest" && grep -q 'src/hpf\.c' "$manifest"; then
   pass "S10: config.manifest's SRCS= entry participates in CFG_SIG and lists src/hpf.c"
 else
   fail "S10: config.manifest missing SRCS= or src/hpf.c reference ($manifest)"
 fi
 
+real_lib_sha_after="$(file_sha "$real_kiss_lib")"
+real_lib_mtime_after="$(mtime "$real_kiss_lib")"
+[ "$real_lib_sha_before" = "$real_lib_sha_after" ] && [ "$real_lib_mtime_before" = "$real_lib_mtime_after" ] && \
+  pass "S10: the REAL kiss archive sha+mtime unchanged across the whole scenario" \
+  || fail "S10: the REAL kiss archive CHANGED during S10 (scratch isolation failed)"
+
 echo "############################################################"
 echo "# S11: publish immutability / content-addressing"
-echo "# (round-4 review P2-2 -> round-5 v4 semantics)"
+echo "# (round-4 review P2-2 -> round-5 v4 semantics -> round-6 P2-2 ATTEST)"
 echo "############################################################"
 cd "$AC_DIR"
 
@@ -609,8 +898,9 @@ release_snapshot() {
 count_attest() { find "$1/ATTEST" -name 'attest-*.txt' 2>/dev/null | grep -c . || true; }
 
 echo "--- S11a: in-tree republish (throwaway DIST_ROOT) --------------------"
-S11A_DIST="$(new_tmpdir)/dist"
-make -s BACKEND=kiss publish DIST_ROOT="$S11A_DIST" >/dev/null
+mkscratch s11a
+S11A_DIST="$SCRATCH_ROOT/s11a/dist"
+make -s BACKEND=kiss publish DIST_ROOT="$S11A_DIST" ALLOW_DIRTY_PUBLISH=1 >/dev/null
 id1="$(readlink "$S11A_DIST/kiss/current" || true)"
 [ -n "$id1" ] && [ -d "$S11A_DIST/kiss/$id1" ] && \
   pass "S11a: first kiss publish -- current resolves to a real release dir ($id1)" \
@@ -633,22 +923,28 @@ n_attest="$(count_attest "$S11A_DIST/kiss/$id1")"
 [ "$n_attest" -eq 1 ] && pass "S11a: ATTEST/ has exactly 1 attest-*.txt after the first publish" \
   || fail "S11a: ATTEST/ has $n_attest attest-*.txt file(s) after the first publish (expected 1)"
 attest1="$(find "$S11A_DIST/kiss/$id1/ATTEST" -name 'attest-*.txt')"
-if grep -q "^git_commit=" "$attest1" && grep -q "^git_dirty=" "$attest1" && grep -q "^date_utc=" "$attest1"; then
-  pass "S11a: the ATTEST file carries git_commit=/git_dirty=/date_utc="
+attest1_base="$(basename "$attest1")"
+attest1_stem="${attest1_base%.txt}"
+if grep -q "^event_id=$attest1_stem$" "$attest1" && grep -q "^git_commit=" "$attest1" && grep -q "^git_dirty=" "$attest1" && grep -q "^date_utc=" "$attest1"; then
+  pass "S11a: the ATTEST file's event_id= matches its own filename stem, plus git_commit=/git_dirty=/date_utc="
 else
-  fail "S11a: ATTEST file $attest1 missing git_commit=/git_dirty=/date_utc="
+  fail "S11a: ATTEST file $attest1 missing event_id=/git_commit=/git_dirty=/date_utc=, or event_id doesn't match its filename"
 fi
+commit1="$(grep '^git_commit=' "$attest1" | head -1 | cut -d= -f2)"
+echo "$commit1" | grep -Eq '^[0-9a-f]{40}$' && pass "S11a: git_commit= is a full 40-hex-character OID" \
+  || fail "S11a: git_commit=$commit1 is not 40 hex characters"
 
 snap_before="$(release_snapshot "$S11A_DIST/kiss/$id1")"
 
-# Republishing IDENTICAL content: byte-verified against the stored release,
-# `current` repointed to the SAME id, artifact/MANIFEST mtimes untouched --
-# only ATTEST/ gains a second file. `sleep 1` so the second attest gets a
-# distinct <utcstamp> (two publishes in the same second idempotently
-# overwrite the same attest filename instead of adding a second one).
-sleep 1
-S11A_LOG="$(new_tmpfile)"
-make -s BACKEND=kiss publish DIST_ROOT="$S11A_DIST" >"$S11A_LOG" 2>&1
+# round-6 review: no sleep. The one-event-one-file ATTEST install
+# (--excl-install + retry-with-next-<NNN>) disambiguates a same-second
+# republish via the numeric suffix instead of requiring a distinct
+# <utcstamp> -- the round-5 version of this scenario needed `sleep 1` here
+# so the two publishes landed in different UTC seconds; that dependency is
+# gone (S16 stress-tests the same-second case directly, forcing 20 publishes
+# into ONE literal second via ATTEST_STAMP=).
+S11A_LOG="$SCRATCH_ROOT/s11a/republish.log"
+make -s BACKEND=kiss publish DIST_ROOT="$S11A_DIST" ALLOW_DIRTY_PUBLISH=1 >"$S11A_LOG" 2>&1
 grep -q "byte-verified" "$S11A_LOG" && pass "S11a: identical-content republish reports 'byte-verified'" \
   || fail "S11a: identical-content republish did NOT report 'byte-verified'"
 
@@ -661,16 +957,28 @@ snap_after="$(release_snapshot "$S11A_DIST/kiss/$id1")"
   || fail "S11a: release dir/artifact mtimes CHANGED by identical-content republish"
 
 n_attest2="$(count_attest "$S11A_DIST/kiss/$id1")"
-[ "$n_attest2" -eq 2 ] && pass "S11a: ATTEST/ has exactly 2 attest-*.txt files after the republish" \
+[ "$n_attest2" -eq 2 ] && pass "S11a: ATTEST/ has exactly 2 attest-*.txt files after the (same-second-capable) republish" \
   || fail "S11a: ATTEST/ has $n_attest2 attest-*.txt file(s) after the republish (expected 2)"
 
+attest2="$(find "$S11A_DIST/kiss/$id1/ATTEST" -name 'attest-*.txt' | grep -v -F "$attest1" || true)"
+if [ -n "$attest2" ] && [ "$attest2" != "$attest1" ]; then
+  pass "S11a: republish's ATTEST file is a NEW, distinct file from the first publish's"
+else
+  fail "S11a: could not identify a second distinct ATTEST file after the republish"
+fi
+attest2_base="$(basename "$attest2")"
+attest2_stem="${attest2_base%.txt}"
+grep -q "^event_id=$attest2_stem$" "$attest2" 2>/dev/null && pass "S11a: second ATTEST file's event_id= matches its own filename stem" \
+  || fail "S11a: second ATTEST file's event_id= does not match its filename"
+
 echo "--- S11b: MANIFEST tamper detection -----------------------------------"
-S11B_DIST="$(new_tmpdir)/dist"
-make -s BACKEND=kiss publish DIST_ROOT="$S11B_DIST" >/dev/null
+mkscratch s11b
+S11B_DIST="$SCRATCH_ROOT/s11b/dist"
+make -s BACKEND=kiss publish DIST_ROOT="$S11B_DIST" ALLOW_DIRTY_PUBLISH=1 >/dev/null
 idb="$(readlink "$S11B_DIST/kiss/current" || true)"
 printf 'X' >> "$S11B_DIST/kiss/$idb/MANIFEST.txt"
-S11B_LOG="$(new_tmpfile)"
-if make -s BACKEND=kiss publish DIST_ROOT="$S11B_DIST" >"$S11B_LOG" 2>&1; then
+S11B_LOG="$SCRATCH_ROOT/s11b/log"
+if make -s BACKEND=kiss publish DIST_ROOT="$S11B_DIST" ALLOW_DIRTY_PUBLISH=1 >"$S11B_LOG" 2>&1; then
   fail "S11b: republish after tampering with the stored MANIFEST unexpectedly SUCCEEDED"
 else
   grep -q "differs from staged content" "$S11B_LOG" && \
@@ -686,18 +994,46 @@ echo "--- S11c: content-change publish, exercised in a SANDBOX --------------"
 # property under test elsewhere, not a bug). To exercise "same flags,
 # different content -> new release id" without ever touching the real repo,
 # this copies the tree into a throwaway sandbox and edits THAT copy.
-SANDBOX="$(new_tmpdir)"
-mkdir "$SANDBOX/ac"
-tar -c -C "$AC_DIR" --exclude obj --exclude bin --exclude dist --exclude .git . | tar -x -C "$SANDBOX/ac"
-S11C_DIST="$(new_tmpdir)/dist"
+mkscratch s11c
+SANDBOX="$SCRATCH_ROOT/s11c/ac"
+mkdir -p "$SANDBOX"
+tar -c -C "$AC_DIR" --exclude obj --exclude bin --exclude dist --exclude .git . | tar -x -C "$SANDBOX"
+S11C_DIST="$SCRATCH_ROOT/s11c/dist"
 
-make -C "$SANDBOX/ac" -s BACKEND=kiss publish DIST_ROOT="$S11C_DIST" >/dev/null
+# The sandbox has no .git (excluded from the tar copy above) -> commit
+# unknown -> same dirty-policy gate as any other no-git-identity checkout
+# (round-6 review P2), hence ALLOW_DIRTY_PUBLISH=1 here too.
+make -C "$SANDBOX" -s BACKEND=kiss publish DIST_ROOT="$S11C_DIST" ALLOW_DIRTY_PUBLISH=1 >/dev/null
 sid1="$(readlink "$S11C_DIST/kiss/current" || true)"
 [ -n "$sid1" ] && pass "S11c: sandbox publish #1 -- current resolves ($sid1)" \
   || fail "S11c: sandbox publish #1 -- current symlink broken or missing"
 
-echo "void s11_isolation_probe(void) {}" >> "$SANDBOX/ac/src/hpf.c"
-make -C "$SANDBOX/ac" -s BACKEND=kiss publish DIST_ROOT="$S11C_DIST" >/dev/null
+# round-6 review: resolve the sandbox's OWN hpf.o AND archive paths before
+# the edit. Force hpf.c's mtime to hpf.o's CURRENT mtime + 1s (BSD
+# touch -r/-A) right after appending the real content change below, exactly
+# as S5 does -- needed so make recompiles hpf.o at all (GNU Make 3.81
+# truncates its prerequisite-newer-than-target check to whole seconds, and
+# an append immediately after the sandbox's first publish can otherwise land
+# in the very SAME integer second as hpf.o's existing mtime).
+#
+# That alone is NOT sufficient, though (found empirically): the SAME
+# whole-second truncation applies one level up too, between the freshly
+# recompiled hpf.o and the ARCHIVE's own prior build -- a real, later hpf.o
+# compile whose timestamp nonetheless truncates to the SAME second as the
+# archive's last build leaves make believing the archive is still up to
+# date, so it never re-runs `ar rc`, and the archive (what publish actually
+# stages) stays byte-identical even though hpf.o now contains a genuinely
+# different symbol. So the archive itself (a sandbox artifact, not one of
+# audio_common's real obj/bin under OBJ_ROOT/BIN_ROOT -- freely mutable here,
+# same rationale as S5's aec_wav backdate) is ALSO backdated by a safe
+# margin before the edit, guaranteeing make sees it as older than whatever
+# real "now" the subsequent `ar rc` lands on.
+sandbox_kiss_lib="$(make -C "$SANDBOX" -s BACKEND=kiss print-lib-path)"
+sandbox_hpf_o="$(make -C "$SANDBOX" -s BACKEND=kiss print-obj-dir)/hpf.o"
+touch -A -0500 "$sandbox_kiss_lib"
+echo "void s11_isolation_probe(void) {}" >> "$SANDBOX/src/hpf.c"
+touch -r "$sandbox_hpf_o" -A 01 "$SANDBOX/src/hpf.c"
+make -C "$SANDBOX" -s BACKEND=kiss publish DIST_ROOT="$S11C_DIST" ALLOW_DIRTY_PUBLISH=1 >/dev/null
 sid2="$(readlink "$S11C_DIST/kiss/current" || true)"
 
 [ -n "$sid2" ] && [ "$sid2" != "$sid1" ] && pass "S11c: sandbox content change -- publish produced a NEW release id ($sid1 -> $sid2)" \
@@ -715,12 +1051,6 @@ scfg2="${sid2%-*}"
   pass "S11c: sid1/sid2 share the same cfg_sig prefix ($scfg1) -- flags unchanged, only content differed" \
   || fail "S11c: sid1/sid2 cfg_sig prefixes DIFFER ($scfg1 vs $scfg2) though only source content changed"
 
-# The sandbox has no .git (excluded from the tar copy above), so the
-# Makefile's `git rev-parse` there falls back to a placeholder value --
-# deliberately NOT asserting on that field's exact contents here, since it's
-# an artifact of running outside any checkout rather than something this
-# isolation scenario is testing.
-
 # The REAL repo's src/hpf.c must be untouched: compare against the shasum
 # captured at the very start of S11, not `git diff --quiet` (which would
 # wrongly assume the file was clean to begin with).
@@ -732,12 +1062,12 @@ echo "############################################################"
 echo "# S12: toolchain coherence guard (round-4 review P1-2)"
 echo "############################################################"
 cd "$AC_DIR"
+mkscratch s12
 
 # fake-cxx: reports a bogus -dumpmachine triple (so it can never match a
 # real CC's), otherwise transparently forwards to the real c++ so a build
 # using it as CXX still actually compiles/links.
-S12_TMPDIR="$(new_tmpdir)"
-SHIM="$S12_TMPDIR/fake-cxx"
+SHIM="$SCRATCH_ROOT/s12/fake-cxx"
 cat > "$SHIM" <<'EOF'
 #!/usr/bin/env bash
 if [ "$1" = "-dumpmachine" ]; then
@@ -748,7 +1078,7 @@ exec c++ "$@"
 EOF
 chmod +x "$SHIM"
 
-S12_LOG="$(new_tmpfile)"
+S12_LOG="$SCRATCH_ROOT/s12/log1"
 if make BACKEND=ne10 CXX="$SHIM" lib >"$S12_LOG" 2>&1; then
   fail "S12: make BACKEND=ne10 CXX=<mismatched shim> lib unexpectedly SUCCEEDED (toolchain guard did not fire)"
 else
@@ -756,7 +1086,7 @@ else
     || fail "S12: BACKEND=ne10 with a mismatched CXX FAILED but WITHOUT the expected 'different targets' message"
 fi
 
-S12_LOG2="$(new_tmpfile)"
+S12_LOG2="$SCRATCH_ROOT/s12/log2"
 if make BACKEND=ne10 CXX="$SHIM" TOOLCHAIN_CHECK=0 lib >"$S12_LOG2" 2>&1; then
   pass "S12: TOOLCHAIN_CHECK=0 skips the guard -- BACKEND=ne10 build with the mismatched CXX shim SUCCEEDS (its own keyed dir)"
 else
@@ -764,7 +1094,7 @@ else
   cat "$S12_LOG2" >&2
 fi
 
-S12_LOG3="$(new_tmpfile)"
+S12_LOG3="$SCRATCH_ROOT/s12/log3"
 if make BACKEND=kiss CXX="$SHIM" lib >"$S12_LOG3" 2>&1; then
   pass "S12: BACKEND=kiss with the mismatched CXX shim SUCCEEDS (guard is ne10-only)"
 else
@@ -773,12 +1103,13 @@ else
 fi
 
 echo "############################################################"
-echo "# S13: atomic \`current\` symlink swap hammer (round-5 review P2)"
+echo "# S13: atomic \`current\` symlink swap hammer + --excl-install"
+echo "# (round-5 review P2; round-6 adds the --excl-install checks)"
 echo "############################################################"
-S13_TMPDIR="$(new_tmpdir)"
-cc -O2 -o "$S13_TMPDIR/swapln" "$AC_DIR/tools/atomic_symlink_swap.c"
-mkdir -p "$S13_TMPDIR/d/relA" "$S13_TMPDIR/d/relB"
-"$S13_TMPDIR/swapln" relA "$S13_TMPDIR/d/current"
+mkscratch s13
+cc -O2 -o "$SCRATCH_ROOT/s13/swapln" "$AC_DIR/tools/atomic_symlink_swap.c"
+mkdir -p "$SCRATCH_ROOT/s13/d/relA" "$SCRATCH_ROOT/s13/d/relB"
+"$SCRATCH_ROOT/s13/swapln" relA "$SCRATCH_ROOT/s13/d/current"
 
 # Background sampler: reads `current` as fast as possible. The assertion is
 # on HARD misses -- a failed readlink whose IMMEDIATE re-read ALSO fails.
@@ -792,12 +1123,12 @@ mkdir -p "$S13_TMPDIR/d/relA" "$S13_TMPDIR/d/relB"
 # sampled at the same rate showed 0 misses of any kind -- i.e. the transient
 # tracks concurrent rename activity in the kernel's name lookup, not the
 # helper). Soft misses are reported as INFO, never a failure.
-S13_SAMPLER_LOG="$(new_tmpfile)"
+S13_SAMPLER_LOG="$SCRATCH_ROOT/s13/sampler.log"
 (
   while true; do
-    v="$(readlink "$S13_TMPDIR/d/current" 2>/dev/null || true)"
+    v="$(readlink "$SCRATCH_ROOT/s13/d/current" 2>/dev/null || true)"
     if [ -z "$v" ]; then
-      v2="$(readlink "$S13_TMPDIR/d/current" 2>/dev/null || true)"
+      v2="$(readlink "$SCRATCH_ROOT/s13/d/current" 2>/dev/null || true)"
       if [ -z "$v2" ]; then printf 'HARDMISS\n' >> "$S13_SAMPLER_LOG"; \
       else printf 'SOFTMISS\n' >> "$S13_SAMPLER_LOG"; fi
     fi
@@ -808,9 +1139,9 @@ s13_sampler_pid=$!
 # 200 alternating foreground swaps between relA and relB.
 for i in $(seq 1 200); do
   if [ $((i % 2)) -eq 1 ]; then
-    "$S13_TMPDIR/swapln" relA "$S13_TMPDIR/d/current"
+    "$SCRATCH_ROOT/s13/swapln" relA "$SCRATCH_ROOT/s13/d/current"
   else
-    "$S13_TMPDIR/swapln" relB "$S13_TMPDIR/d/current"
+    "$SCRATCH_ROOT/s13/swapln" relB "$SCRATCH_ROOT/s13/d/current"
   fi
 done
 
@@ -827,24 +1158,50 @@ soft_count="${soft_count:-0}"
 [ "$hard_count" -eq 0 ] && pass "S13: readlink sampler recorded ZERO hard misses across 200 alternating swaps (no missing-\`current\` window)" \
   || fail "S13: readlink sampler recorded $hard_count HARD miss(es) -- \`current\` was persistently missing/broken mid-swap"
 
-leftover="$(ls "$S13_TMPDIR/d" 2>/dev/null | grep -cE '^current\.[0-9]+\.tmp$' || true)"
+leftover="$(ls "$SCRATCH_ROOT/s13/d" 2>/dev/null | grep -cE '^current\.[0-9]+\.tmp$' || true)"
 leftover="${leftover:-0}"
-[ "$leftover" -eq 0 ] && pass "S13: no current.*.tmp leftovers under $S13_TMPDIR/d" \
-  || fail "S13: $leftover leftover current.*.tmp temp file(s) under $S13_TMPDIR/d"
+[ "$leftover" -eq 0 ] && pass "S13: no current.*.tmp leftovers under $SCRATCH_ROOT/s13/d" \
+  || fail "S13: $leftover leftover current.*.tmp temp file(s) under $SCRATCH_ROOT/s13/d"
 
-s13_final="$(readlink "$S13_TMPDIR/d/current" || true)"
+s13_final="$(readlink "$SCRATCH_ROOT/s13/d/current" || true)"
 if [ "$s13_final" = "relA" ] || [ "$s13_final" = "relB" ]; then
   pass "S13: final current resolves to relA or relB ($s13_final)"
 else
   fail "S13: final current does NOT resolve to relA or relB ($s13_final)"
 fi
 
+echo "--- S13: --excl-install no-clobber mode (round-6 review P2-2) --------"
+echo "hello-v1" > "$SCRATCH_ROOT/s13/src_v1.txt"
+echo "hello-v2-should-not-land" > "$SCRATCH_ROOT/s13/src_v2.txt"
+rc1=0
+"$SCRATCH_ROOT/s13/swapln" --excl-install "$SCRATCH_ROOT/s13/src_v1.txt" "$SCRATCH_ROOT/s13/dst.txt" || rc1=$?
+[ "$rc1" -eq 0 ] && pass "S13: --excl-install first call rc=0 (fresh install)" \
+  || fail "S13: --excl-install first call rc=$rc1 (expected 0)"
+rc2=0
+"$SCRATCH_ROOT/s13/swapln" --excl-install "$SCRATCH_ROOT/s13/src_v2.txt" "$SCRATCH_ROOT/s13/dst.txt" || rc2=$?
+[ "$rc2" -eq 2 ] && pass "S13: --excl-install second call (same dst) rc=2 (no-clobber EEXIST)" \
+  || fail "S13: --excl-install second call rc=$rc2 (expected 2)"
+dst_content="$(cat "$SCRATCH_ROOT/s13/dst.txt")"
+[ "$dst_content" = "hello-v1" ] && pass "S13: --excl-install did NOT overwrite existing content on rc=2" \
+  || fail "S13: --excl-install dst content changed despite rc=2 (dst=$dst_content)"
+leftover_tmp="$(ls "$SCRATCH_ROOT/s13" 2>/dev/null | grep -cE '^dst\.txt\.[0-9]+\.tmp$' || true)"
+leftover_tmp="${leftover_tmp:-0}"
+[ "$leftover_tmp" -eq 0 ] && pass "S13: no dst.txt.*.tmp leftovers after the --excl-install collision" \
+  || fail "S13: $leftover_tmp leftover dst.txt.*.tmp temp file(s)"
+
 echo "############################################################"
 echo "# S14: lock-before-build -- a concurrent publish loser builds nothing"
-echo "#       (round-5 review P1)"
+echo "#       (round-5 review P1; round-6: scratch OBJ_ROOT/BIN_ROOT)"
 echo "############################################################"
 cd "$AC_DIR"
-S14_DIST="$(new_tmpdir)/dist"
+mkscratch s14
+S14_DIST="$SCRATCH_ROOT/s14/dist"
+# round-6 review P1: one shared scratch OBJ_ROOT/BIN_ROOT pair for BOTH
+# racers -- the lock still serialises the winner's build (this is exactly
+# what the scenario tests), and the real obj/bin never see this throwaway
+# -DS14_LOCK_PROBE config either way.
+S14_OBJ_ROOT="$SCRATCH_ROOT/s14/obj"
+S14_BIN_ROOT="$SCRATCH_ROOT/s14/bin"
 
 # A fresh, never-before-built config (BACKEND=kiss + a probe define unique to
 # this scenario) -- the winner's critical section (a real compile+link+stage,
@@ -852,16 +1209,16 @@ S14_DIST="$(new_tmpdir)/dist"
 # genuinely contend for the lock, making "exactly one winner" a reliable
 # assertion rather than a scheduling-dependent guess (contrast with S7p's
 # already-built-config concurrency check, which stays deliberately lenient).
-S14_LOG_A="$(new_tmpfile)"; S14_LOG_B="$(new_tmpfile)"
-S14_RC_A="$(new_tmpfile)"; S14_RC_B="$(new_tmpfile)"
+S14_LOG_A="$SCRATCH_ROOT/s14/log_a"; S14_LOG_B="$SCRATCH_ROOT/s14/log_b"
+S14_RC_A="$SCRATCH_ROOT/s14/rc_a"; S14_RC_B="$SCRATCH_ROOT/s14/rc_b"
 # `rc=0; cmd || rc=$?; ...` (not `cmd; echo $? >file`): under `set -e`, a
 # bare failing command followed by `;` would abort this subshell BEFORE the
 # echo ever ran. A command that is not the final one in a `||` list is
 # exempt from triggering errexit, so this form reliably captures the make
 # invocation's real exit status into its rc file even when it fails.
-( rc=0; make -s BACKEND=kiss EXTRA_CFLAGS=-DS14_LOCK_PROBE publish DIST_ROOT="$S14_DIST" >"$S14_LOG_A" 2>&1 || rc=$?; echo "$rc" > "$S14_RC_A" ) &
+( rc=0; make -s BACKEND=kiss EXTRA_CFLAGS=-DS14_LOCK_PROBE OBJ_ROOT="$S14_OBJ_ROOT" BIN_ROOT="$S14_BIN_ROOT" publish DIST_ROOT="$S14_DIST" ALLOW_DIRTY_PUBLISH=1 >"$S14_LOG_A" 2>&1 || rc=$?; echo "$rc" > "$S14_RC_A" ) &
 p1=$!
-( rc=0; make -s BACKEND=kiss EXTRA_CFLAGS=-DS14_LOCK_PROBE publish DIST_ROOT="$S14_DIST" >"$S14_LOG_B" 2>&1 || rc=$?; echo "$rc" > "$S14_RC_B" ) &
+( rc=0; make -s BACKEND=kiss EXTRA_CFLAGS=-DS14_LOCK_PROBE OBJ_ROOT="$S14_OBJ_ROOT" BIN_ROOT="$S14_BIN_ROOT" publish DIST_ROOT="$S14_DIST" ALLOW_DIRTY_PUBLISH=1 >"$S14_LOG_B" 2>&1 || rc=$?; echo "$rc" > "$S14_RC_B" ) &
 p2=$!
 wait "$p1" || true
 wait "$p2" || true
@@ -898,13 +1255,284 @@ stage_leftovers="$(find "$S14_DIST/kiss" -maxdepth 1 -name '.stage.*' 2>/dev/nul
 [ "$stage_leftovers" -eq 0 ] && pass "S14: no .stage.* leftovers under $S14_DIST/kiss/" \
   || fail "S14: $stage_leftovers .stage.* leftover(s) under $S14_DIST/kiss/"
 
-# --- final safety check: this whole run must leave $AC_DIR's tracked-file --
-# state bit-identical (round-5 review P1). Checked here, before the summary
-# tally, so any drift shows up as a normal FAIL line rather than a silent
-# discrepancy the reader has to notice on their own.
-GIT_STATUS_AFTER="$(git_status_hash)"
-[ "$GIT_STATUS_BEFORE" = "$GIT_STATUS_AFTER" ] && pass "repo tree drift check: \$AC_DIR git status unchanged across the whole run" \
-  || fail "repo tree drift check: \$AC_DIR git status CHANGED during this run ($GIT_STATUS_BEFORE -> $GIT_STATUS_AFTER)"
+echo "############################################################"
+echo "# S15: make -n/-q/-t publish zero side effects (round-6 review P2-3)"
+echo "############################################################"
+cd "$AC_DIR"
+mkscratch s15
+for be in kiss ne10; do
+  S15_DIST="$SCRATCH_ROOT/s15/${be}_nx"
+  S15_OBJ="$SCRATCH_ROOT/s15/${be}_no"
+  S15_BIN="$SCRATCH_ROOT/s15/${be}_nb"
+  S15_LOG="$SCRATCH_ROOT/s15/${be}_log"
+
+  rc=0
+  make -n BACKEND="$be" DIST_ROOT="$S15_DIST" OBJ_ROOT="$S15_OBJ" BIN_ROOT="$S15_BIN" publish >"$S15_LOG.n" 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] && pass "S15[$be]: make -n publish exits rc=0" || fail "S15[$be]: make -n publish exits rc=$rc (expected 0)"
+  if [ ! -e "$S15_DIST" ] && [ ! -e "$S15_OBJ" ] && [ ! -e "$S15_BIN" ]; then
+    pass "S15[$be]: make -n publish created NONE of DIST_ROOT/OBJ_ROOT/BIN_ROOT"
+  else
+    fail "S15[$be]: make -n publish left behind a path (dist=$([ -e "$S15_DIST" ] && echo yes || echo no) obj=$([ -e "$S15_OBJ" ] && echo yes || echo no) bin=$([ -e "$S15_BIN" ] && echo yes || echo no))"
+  fi
+
+  rc=0
+  make -q BACKEND="$be" DIST_ROOT="$S15_DIST" OBJ_ROOT="$S15_OBJ" BIN_ROOT="$S15_BIN" publish >"$S15_LOG.q" 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] && pass "S15[$be]: make -q publish exits NONZERO (rc=$rc)" || fail "S15[$be]: make -q publish exited 0 (expected nonzero)"
+  if [ ! -e "$S15_DIST" ] && [ ! -e "$S15_OBJ" ] && [ ! -e "$S15_BIN" ]; then
+    pass "S15[$be]: make -q publish created NONE of DIST_ROOT/OBJ_ROOT/BIN_ROOT"
+  else
+    fail "S15[$be]: make -q publish left behind a path (dist=$([ -e "$S15_DIST" ] && echo yes || echo no) obj=$([ -e "$S15_OBJ" ] && echo yes || echo no) bin=$([ -e "$S15_BIN" ] && echo yes || echo no))"
+  fi
+
+  make -t BACKEND="$be" DIST_ROOT="$S15_DIST" OBJ_ROOT="$S15_OBJ" BIN_ROOT="$S15_BIN" publish >"$S15_LOG.t" 2>&1 || true
+  if [ ! -e "$S15_DIST" ] && [ ! -e "$S15_OBJ" ] && [ ! -e "$S15_BIN" ]; then
+    pass "S15[$be]: make -t publish created NONE of DIST_ROOT/OBJ_ROOT/BIN_ROOT"
+  else
+    fail "S15[$be]: make -t publish left behind a path (dist=$([ -e "$S15_DIST" ] && echo yes || echo no) obj=$([ -e "$S15_OBJ" ] && echo yes || echo no) bin=$([ -e "$S15_BIN" ] && echo yes || echo no))"
+  fi
+done
+
+echo "############################################################"
+echo "# S16: ATTEST uniqueness under forced same-second collisions"
+echo "#       (round-6 review P2-2)"
+echo "############################################################"
+cd "$AC_DIR"
+mkscratch s16
+S16_DIST="$SCRATCH_ROOT/s16/dist"
+make -s BACKEND=kiss publish DIST_ROOT="$S16_DIST" ALLOW_DIRTY_PUBLISH=1 >/dev/null
+s16_id="$(readlink "$S16_DIST/kiss/current" || true)"
+s16_attest_dir="$S16_DIST/kiss/$s16_id/ATTEST"
+
+s16_before_list="$(find "$s16_attest_dir" -name 'attest-*.txt' | sort)"
+s16_before_snap="$SCRATCH_ROOT/s16/before_snap.txt"
+: > "$s16_before_snap"
+for f in $s16_before_list; do
+  [ -n "$f" ] || continue
+  printf '%s %s %s %s\n' "$f" "$(stat -f '%i' "$f")" "$(mtime "$f")" "$(file_sha "$f")" >> "$s16_before_snap"
+done
+
+for i in $(seq 1 20); do
+  make -s BACKEND=kiss publish DIST_ROOT="$S16_DIST" ALLOW_DIRTY_PUBLISH=1 ATTEST_STAMP=20260715T999999Z >/dev/null
+done
+
+s16_after_list="$(find "$s16_attest_dir" -name 'attest-*.txt' | sort)"
+new_files="$(comm -13 <(printf '%s\n' "$s16_before_list") <(printf '%s\n' "$s16_after_list"))"
+new_count="$(printf '%s\n' "$new_files" | grep -c . || true)"
+new_count="${new_count:-0}"
+[ "$new_count" -eq 20 ] && pass "S16: exactly 20 new ATTEST files after 20 same-stamp publishes" \
+  || fail "S16: expected 20 new ATTEST files, found $new_count"
+
+suffixes="$(printf '%s\n' "$new_files" | while read -r f; do [ -n "$f" ] || continue; bn="$(basename "$f" .txt)"; echo "${bn##*-}"; done | sort)"
+expected="$(printf '%03d\n' $(seq 1 20))"
+[ "$suffixes" = "$expected" ] && pass "S16: new files' -NNN suffixes are exactly 001..020, all distinct" \
+  || fail "S16: -NNN suffixes ($(printf '%s' "$suffixes" | tr '\n' ',')) do not exactly match 001..020"
+
+unchanged_ok=1
+while read -r f inode mt sha; do
+  [ -n "$f" ] || continue
+  if [ ! -f "$f" ]; then unchanged_ok=0; continue; fi
+  [ "$(stat -f '%i' "$f")" = "$inode" ] && [ "$(mtime "$f")" = "$mt" ] && [ "$(file_sha "$f")" = "$sha" ] || unchanged_ok=0
+done < "$s16_before_snap"
+[ "$unchanged_ok" -eq 1 ] && pass "S16: every pre-existing ATTEST file's inode+mtime+sha is unchanged" \
+  || fail "S16: a pre-existing ATTEST file's inode/mtime/sha CHANGED"
+
+tmp_leftovers="$(find "$s16_attest_dir" -name '*.tmp' 2>/dev/null | grep -c . || true)"
+tmp_leftovers="${tmp_leftovers:-0}"
+[ "$tmp_leftovers" -eq 0 ] && pass "S16: no *.tmp leftovers under ATTEST/" \
+  || fail "S16: $tmp_leftovers *.tmp leftover(s) under ATTEST/"
+
+spot_ok=1
+spot_n=0
+for f in $new_files; do
+  [ -n "$f" ] || continue
+  spot_n=$((spot_n + 1))
+  [ "$spot_n" -gt 3 ] && break
+  stem="$(basename "$f" .txt)"
+  grep -q "^event_id=$stem$" "$f" || spot_ok=0
+done
+if [ "$spot_ok" -eq 1 ] && [ "$spot_n" -ge 1 ]; then
+  pass "S16: spot-checked $([ "$spot_n" -gt 3 ] && echo 3 || echo "$spot_n") new ATTEST file(s) -- event_id= matches filename stem"
+else
+  fail "S16: a spot-checked ATTEST file's event_id= did not match its filename stem"
+fi
+
+echo "############################################################"
+echo "# S17: dirty-checkout publish policy (round-6 review P2)"
+echo "############################################################"
+mkscratch s17
+S17_CLONE="$SCRATCH_ROOT/s17/clone"
+# A plain `git clone` only reproduces $AC_DIR's last COMMIT -- it transfers
+# committed objects, never uncommitted working-tree bytes, so it can never
+# by itself see today's (deliberately uncommitted, per this task's own
+# constraints) round-6 Makefile. To test THIS Makefile's dirty-publish gate
+# against a checkout that starts genuinely clean, this clones $AC_DIR (fully
+# read-only on the real repo -- the explicitly allowed exception to "no
+# mutating git commands") and then overlays every currently-modified TRACKED
+# file on top, adopting them as one throwaway commit INSIDE THE SCRATCH
+# CLONE ONLY -- a disposable git repository living entirely under
+# $SCRATCH_ROOT, destroyed by the EXIT trap, whose own history never touches
+# $AC_DIR's real .git in any way (a distinct clone, never pushed/fetched
+# back). This is not a mutating git command against the real repo; it is the
+# only way to hand this scenario a real, CLEAN git identity to start from
+# (needed since the Makefile treats "no git identity" the same as "dirty",
+# same as S11c's sandbox) while still reflecting today's Makefile content.
+git clone --no-hardlinks --quiet "$AC_DIR" "$S17_CLONE"
+while IFS= read -r relf; do
+  [ -n "$relf" ] || continue
+  mkdir -p "$(dirname "$S17_CLONE/$relf")"
+  cp "$AC_DIR/$relf" "$S17_CLONE/$relf"
+done < <(git -C "$AC_DIR" diff --name-only HEAD)
+git -C "$S17_CLONE" add -A
+git -C "$S17_CLONE" -c user.email=scratch@example.invalid -c user.name="scratch clone" \
+  commit -q -m "scratch: adopt current worktree for S17 (disposable clone only, never touches the real repo)"
+
+S17_OBJ_ROOT="$SCRATCH_ROOT/s17/obj"
+S17_BIN_ROOT="$SCRATCH_ROOT/s17/bin"
+S17_DIST="$SCRATCH_ROOT/s17/dist"
+
+# attest_from_log(): the publish recipe's own success line ends with
+# "(attested: <name>)" -- extracting the exact attest filename from THIS
+# invocation's own log is unambiguous regardless of which release dir it
+# landed in, unlike `find ATTEST -name 'attest-*.txt' | head -1` (round-6
+# review, found while validating THIS script: a comment-only edit to hpf.c
+# -- see S17b below -- produces byte-identical object code, so a
+# deterministic archiver correctly reuses the SAME content-addressed release
+# id as the clean publish; `find | head -1` then has TWO candidate attest
+# files to choose from in that one release dir, in filesystem-listing order,
+# not necessarily the one THIS publish just wrote).
+attest_from_log() {
+  local log="$1" name
+  name="$(grep -o '(attested: [^)]*)' "$log" | sed -e 's/^(attested: //' -e 's/)$//' | head -1)"
+  [ -n "$name" ] || return 1
+  printf '%s\n' "$name"
+}
+
+echo "--- S17a: clean clone, DEFAULT publish -> must succeed ----------------"
+S17_LOG_A="$SCRATCH_ROOT/s17/log_a"
+if make -C "$S17_CLONE" -s BACKEND=kiss OBJ_ROOT="$S17_OBJ_ROOT" BIN_ROOT="$S17_BIN_ROOT" DIST_ROOT="$S17_DIST" publish >"$S17_LOG_A" 2>&1; then
+  pass "S17a: default publish on a CLEAN clone succeeds"
+else
+  fail "S17a: default publish on a clean clone FAILED"
+  cat "$S17_LOG_A" >&2
+fi
+sid_a="$(readlink "$S17_DIST/kiss/current" || true)"
+attest_a_name="$(attest_from_log "$S17_LOG_A" || true)"
+attest_a="$S17_DIST/kiss/$sid_a/ATTEST/$attest_a_name"
+clone_head="$(git -C "$S17_CLONE" rev-parse HEAD)"
+if [ -n "$attest_a_name" ] && [ -f "$attest_a" ] && grep -q "^git_dirty=0$" "$attest_a" && grep -q "^allow_dirty_publish=0$" "$attest_a" \
+   && grep -q "^git_commit=$clone_head$" "$attest_a" && ! grep -q "^dirty_diff_sha256=" "$attest_a"; then
+  pass "S17a: attestation shows git_dirty=0, allow_dirty_publish=0, git_commit matches clone HEAD, no dirty_diff_sha256="
+else
+  fail "S17a: attestation ($attest_a) does not match the expected clean-clone shape"
+fi
+
+echo "--- S17b: dirty the clone's disposable hpf.c -> default publish FAILS --"
+# A disposable edit to the CLONE's own hpf.c (never the real repo's). This
+# is intentionally comment-only text -- see attest_from_log()'s comment
+# above for why that's fine: this scenario tests the DIRTY-PUBLISH POLICY
+# (attestation fields), not content-addressing (S11c already covers that
+# with a real code change), so whether the resulting object/archive bytes
+# happen to change is irrelevant here.
+echo "/* s17 disposable dirty probe */" >> "$S17_CLONE/src/hpf.c"
+S17_LOG_B="$SCRATCH_ROOT/s17/log_b"
+if make -C "$S17_CLONE" -s BACKEND=kiss OBJ_ROOT="$S17_OBJ_ROOT" BIN_ROOT="$S17_BIN_ROOT" DIST_ROOT="$S17_DIST" publish >"$S17_LOG_B" 2>&1; then
+  fail "S17b: default publish on a DIRTY clone unexpectedly SUCCEEDED"
+else
+  grep -qi "publish refused" "$S17_LOG_B" && grep -qi "dirty" "$S17_LOG_B" && \
+    pass "S17b: default publish on a dirty clone FAILS, mentioning 'publish refused' and 'dirty'" \
+    || fail "S17b: publish failed but without the expected 'publish refused'/'dirty' wording"
+fi
+
+echo "--- S17c: same dirty clone + ALLOW_DIRTY_PUBLISH=1 -> succeeds --------"
+S17_LOG_C="$SCRATCH_ROOT/s17/log_c"
+if make -C "$S17_CLONE" -s BACKEND=kiss OBJ_ROOT="$S17_OBJ_ROOT" BIN_ROOT="$S17_BIN_ROOT" DIST_ROOT="$S17_DIST" ALLOW_DIRTY_PUBLISH=1 publish >"$S17_LOG_C" 2>&1; then
+  pass "S17c: dirty clone + ALLOW_DIRTY_PUBLISH=1 succeeds"
+else
+  fail "S17c: dirty clone + ALLOW_DIRTY_PUBLISH=1 FAILED"
+  cat "$S17_LOG_C" >&2
+fi
+sid_c="$(readlink "$S17_DIST/kiss/current" || true)"
+attest_c_name="$(attest_from_log "$S17_LOG_C" || true)"
+attest_c="$S17_DIST/kiss/$sid_c/ATTEST/$attest_c_name"
+expected_ddiff="$(git -C "$S17_CLONE" diff --binary HEAD | shasum -a 256 | cut -d' ' -f1)"
+if [ -n "$attest_c_name" ] && [ -f "$attest_c" ] && grep -q "^git_dirty=1$" "$attest_c" && grep -q "^allow_dirty_publish=1$" "$attest_c" \
+   && grep -q "^dirty_diff_sha256=$expected_ddiff$" "$attest_c" && printf '%s' "$attest_c_name" | grep -q -- "-dirty-"; then
+  pass "S17c: attestation shows git_dirty=1, allow_dirty_publish=1, matching dirty_diff_sha256=, and -dirty- in the filename"
+else
+  fail "S17c: attestation ($attest_c) does not match the expected dirty-publish shape"
+fi
+
+echo "############################################################"
+echo "# S18: interruption-safety probe (round-6 review P2-1 acceptance)"
+echo "############################################################"
+mkscratch s18
+cat > "$SCRATCH_ROOT/s18/sigreset_exec.c" <<'EOF'
+/* Tiny launcher: resets SIGINT/SIGQUIT to their default disposition before
+ * exec'ing the real command. Needed because bash, for a NON-interactive
+ * script's backgrounded (`cmd &`) jobs, sets SIGINT/SIGQUIT to SIG_IGN in
+ * the forked child -- and bash's own `trap` builtin refuses to install (or
+ * even reset) a handler for a signal that was already SIG_IGN "upon entry
+ * to the shell" (see bash(1), SIGNALS: "Signals ignored upon entry to the
+ * shell cannot be trapped or reset."). A plain C signal()/execvp() is not
+ * bound by that bash-specific policy, so this helper is the only reliable
+ * way for this scenario's backgrounded child to actually SEE a SIGINT its
+ * own `trap ... INT` can catch (verified empirically: without this, `kill
+ * -INT` on a `(...) &`-launched child never invokes its INT trap at all). */
+#include <signal.h>
+#include <unistd.h>
+int main(int argc, char** argv) {
+    signal(SIGINT, SIG_DFL);
+    signal(SIGQUIT, SIG_DFL);
+    if (argc < 2) return 127;
+    execvp(argv[1], argv + 1);
+    return 127;
+}
+EOF
+cc -O2 -o "$SCRATCH_ROOT/s18/sigreset_exec" "$SCRATCH_ROOT/s18/sigreset_exec.c"
+
+run_s18_mode() {
+  mode="$1" sig="$2" expect_rc="$3"
+  d="$SCRATCH_ROOT/s18/$mode"
+  mkdir -p "$d/probe_tmp"
+  mkfifo "$d/ready.fifo" "$d/hold.fifo"
+  ( ISOL_INTERRUPT_PROBE="$mode" ISOL_PROBE_FIFO="$d/ready.fifo" TMPDIR="$d/probe_tmp" \
+    "$SCRATCH_ROOT/s18/sigreset_exec" bash "$SCRIPT_PATH" ) &
+  pid=$!
+  child_scratch="$(cat "$d/ready.fifo")"
+  if [ -n "$sig" ]; then
+    kill "-$sig" "$pid" 2>/dev/null || true
+  fi
+  rc=0
+  wait "$pid" || rc=$?
+  [ "$rc" -eq "$expect_rc" ] && pass "S18[$mode]: child exit code = $rc (expected $expect_rc)" \
+    || fail "S18[$mode]: child exit code = $rc (expected $expect_rc)"
+  [ ! -e "$child_scratch" ] && pass "S18[$mode]: child's own SCRATCH_ROOT no longer exists after exit" \
+    || fail "S18[$mode]: child's SCRATCH_ROOT ($child_scratch) STILL EXISTS after exit"
+  if [ -d "$d/probe_tmp" ] && [ -z "$(ls -A "$d/probe_tmp" 2>/dev/null)" ]; then
+    pass "S18[$mode]: probe TMPDIR is empty afterward (the child's scratch root landed inside it and was fully removed)"
+  else
+    fail "S18[$mode]: probe TMPDIR ($d/probe_tmp) is NOT empty afterward"
+  fi
+}
+
+run_s18_mode exit "" 0
+run_s18_mode term TERM 143
+run_s18_mode intr INT 130
+
+echo "############################################################"
+echo "# Final integrity guards"
+echo "############################################################"
+AC_STATE_AFTER="$(tree_state_hash "$AC_DIR")"
+[ "$AC_STATE_BEFORE" = "$AC_STATE_AFTER" ] && pass "integrity: \$AC_DIR tree-state (status+diff) unchanged across the whole run" \
+  || fail "integrity: \$AC_DIR tree-state CHANGED during this run"
+
+AEC_STATE_AFTER="$(tree_state_hash "$AEC_REPO_DIR")"
+[ "$AEC_STATE_BEFORE" = "$AEC_STATE_AFTER" ] && pass "integrity: AEC repo (\$AC_DIR/../AEC) tree-state (status+diff) unchanged across the whole run" \
+  || fail "integrity: AEC repo tree-state CHANGED during this run"
+
+REAL_DIST_AFTER="$(real_dist_sentinel)"
+[ "$REAL_DIST_BEFORE" = "$REAL_DIST_AFTER" ] && pass "integrity: real \$AC_DIR/dist sentinel unchanged (absent stays absent, or byte+mtime identical)" \
+  || fail "integrity: real \$AC_DIR/dist sentinel CHANGED during this run"
 
 echo "############################################################"
 echo "SUMMARY: $PASS_COUNT passed, $FAIL_COUNT failed"
