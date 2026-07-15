@@ -145,6 +145,15 @@
  * No `restrict` anywhere: callers may pass overlapping buffers only when
  * explicitly documented as supporting it (e.g. sk_capply_gain_f32's
  * out == z in-place case); otherwise pointers are assumed non-aliasing.
+ *
+ * Round-3 review B05: only the alias form actually exercised by
+ * simd_selftest.c's matrix is contractually supported -- sk_capply_gain_f32's
+ * literal out == z is the sole one in this file (dedicated in-place check in
+ * test_capply_gain()). Every other kernel's edge-case matrix uses
+ * NON-overlapping buffers at every offset combination it tests; partial
+ * overlap (out == z + k for some nonzero k) is neither documented nor
+ * tested anywhere in this file and is unsupported, even if it happens to
+ * work today on some input.
  */
 
 #ifndef SIMD_KERNELS_H

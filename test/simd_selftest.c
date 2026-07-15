@@ -35,7 +35,15 @@
 /* ═══════════════════════════════ config ═══════════════════════════════ */
 
 #define SK_TEST_MAX_N 512
-static const int N_LIST[] = {1, 3, 4, 5, 8, 9, 16, 128, 129, 160, 255, 256, 257, 512};
+/* Round-3 review B05: extended to n=0 (must be a zero-read/zero-write no-op,
+ * see the canary section below) plus the COMPLETE 1..17 run (every kernel's
+ * 4-lane NEON/scalar-tail boundary crossed at every possible remainder, not
+ * just a sparse sample) -- on top of the original hand-picked lane/leaf/
+ * split boundary values, which stay for their own documented reasons. */
+static const int N_LIST[] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+    128, 129, 160, 255, 256, 257, 512
+};
 #define N_LIST_COUNT ((int)(sizeof(N_LIST) / sizeof(N_LIST[0])))
 #define TRIALS 8
 
@@ -127,7 +135,17 @@ static void fill_bench_complex(Complex *a, int n) {
     for (i = 0; i < n; ++i) { a[i].r = gen_bench_float(); a[i].i = gen_bench_float(); }
 }
 
-/* ═══════════════════════════ mismatch reporting ═══════════════════════════ */
+/* ═══════════════════════════ mismatch reporting ═══════════════════════════
+ * g_total_checks (round-3 review B05): a running count of individual
+ * bit-pattern comparisons actually performed, incremented at each of the
+ * few chokepoints every check funnels through (check_bits_or_die,
+ * check_scalar_bits_or_die, the special-value asserts, and the new canary
+ * checks below) -- so main()'s final printout is a real, reproducible
+ * "how much did this run actually verify" number instead of a hand count,
+ * and the review's requested before/after totals are just two runs of the
+ * same binary at two points in this file's history. */
+
+static long g_total_checks = 0;
 
 static int first_diff_bits(const float *a, const float *b, int count) {
     int i;
@@ -142,7 +160,9 @@ static int first_diff_bits(const float *a, const float *b, int count) {
 
 static void check_bits_or_die(const char *kernel, int n, int trial,
                                const float *simd, const float *scalar, int count) {
-    int idx = first_diff_bits(simd, scalar, count);
+    int idx;
+    g_total_checks += count;
+    idx = first_diff_bits(simd, scalar, count);
     if (idx >= 0) {
         uint32_t gb, wb;
         memcpy(&gb, &simd[idx], sizeof gb);
@@ -174,6 +194,7 @@ static void check_bits_or_die(const char *kernel, int n, int trial,
  * about an unused static function. */
 static void assert_f32_bits(const char *label, float got, uint32_t want_bits) {
     uint32_t got_bits;
+    g_total_checks++;
     memcpy(&got_bits, &got, sizeof got_bits);
     if (got_bits != want_bits) {
         fprintf(stderr,
@@ -185,6 +206,7 @@ static void assert_f32_bits(const char *label, float got, uint32_t want_bits) {
 #endif
 
 static void assert_is_nan(const char *label, float got) {
+    g_total_checks++;
     if (!isnan(got)) {
         uint32_t got_bits;
         memcpy(&got_bits, &got, sizeof got_bits);
@@ -201,6 +223,7 @@ static void assert_is_nan(const char *label, float got) {
  * #ifdef-guarded so the non-USE_STANDARD_MATH build doesn't warn about an
  * unused static function. */
 static void assert_f32_eq(const char *label, float got, float want) {
+    g_total_checks++;
     if (got != want) {
         fprintf(stderr, "SPECIAL-VALUE MISMATCH %s: got=%.9g want=%.9g\n",
                 label, (double)got, (double)want);
@@ -521,6 +544,7 @@ static void test_fast_sqrt(void) {
          * -DUSE_STANDARD_MATH (verified: it does, on the pre-R07 code too --
          * a latent gap, not a regression introduced here). */
         for (i = 0; i < 4; ++i) {
+            g_total_checks++;
 #ifndef USE_STANDARD_MATH
             if (out_s[i] != 0.0f || out_n[i] != 0.0f) {
                 fprintf(stderr,
@@ -541,6 +565,385 @@ static void test_fast_sqrt(void) {
         }
     }
     printf("PASS fast_sqrt_f32\n");
+}
+
+/* ═══════════ alignment + canary edge-case matrix (round-3 review B05) ═════
+ * Finding B05's edge-case matrix, layered on top of the per-kernel
+ * correctness tests above:
+ *
+ *   - n=0: every test above already runs it (see the extended N_LIST). For
+ *     n=0 specifically, "correct" means the kernel touches NOTHING (every
+ *     loop here is a plain `for(i=0;i<n;...)`/`i+4<=n` guard, zero
+ *     iterations when n==0) -- the canary buffers below turn that
+ *     "touches nothing" claim into something actually checked, not just
+ *     implied by code inspection.
+ *   - n=1..17: also already covered by the same extended N_LIST (every
+ *     kernel's 4-lane tail boundary, every possible remainder).
+ *   - Unaligned float-element offsets 1..15: NOT covered above -- every
+ *     existing test calls each kernel at the natural start of a plain
+ *     array (offset 0). This section is new: every buffer lives in its own
+ *     64-byte-aligned arena (posix_memalign), and each kernel is called at
+ *     a deliberately +1..+15-FLOAT offset into it -- always 4-byte aligned
+ *     (a float is always 4-byte aligned; a whole-float-element offset can
+ *     never construct a misaligned float*, that would be UB and isn't what
+ *     "unaligned" means for a NEON kernel test), but deliberately NOT
+ *     16-byte (4-lane) or 64-byte aligned, so vld1q_f32/vst1q_f32 land on
+ *     every possible sub-vector byte lane. Three forms, per the finding's
+ *     ask: input-buffer offset only, output-buffer offset only, both
+ *     buffers offset to DIFFERENT values (edge_offsets_for_form's "+7 mod
+ *     15" derangement, never equal by construction -- see its own
+ *     comment). For kernels with more than one read-only input array
+ *     (cadd/min: a,b) or an extra scalar-per-bin array (capply_gain's g),
+ *     only the first/primary array plays "input" for this matrix; the
+ *     remaining array(s) stay at offset 0 -- a deliberate scope decision
+ *     (the finding's own wording is binary: "input offset only, output
+ *     offset only, both"), documented here rather than left implicit.
+ *     sk_clip_f32 is a single in-place buffer (no separate output array),
+ *     so its own test below sweeps just that one offset instead of the
+ *     3-form matrix -- see test_clip_edge's comment.
+ *   - Canary guard (the finding's own ask): every arena is entirely
+ *     canary-filled (float bit pattern 0x7fc0dead) before each call, then
+ *     the payload window is overwritten with real generated data (inputs)
+ *     or left as canary (pure outputs, so the kernel's own write is what
+ *     populates it). After the call, every element OUTSIDE the payload
+ *     window must still read back as the untouched canary pattern, in
+ *     EVERY arena the kernel touched (including read-only ones, as a
+ *     defense-in-depth cross-check against unexpected aliasing writes).
+ *     Because the window can be placed anywhere (offset 1..15) or be EMPTY
+ *     (n==0), one check function catches an out-of-bounds write on either
+ *     side of the payload, or literally any write at all when n==0,
+ *     without a separate front/back special case.
+ *
+ * scalar-vs-NEON comparison is inherent to every check_bits_or_die call
+ * below, same as the rest of this file -- this satisfies the review's
+ * forced-scalar/forced-NEON comparison ask for this file's kernels (the
+ * NE10 FFT kernel side of that same ask is covered by audio_common's
+ * FFT_NE10_FORCE_C knob, exercised via `make test_ne10_force_c`, not by
+ * this file). */
+
+#define EDGE_GUARD 32           /* guaranteed guard elements each side of the
+                                 * payload window, regardless of offset/n */
+#define EDGE_OFFSET_MAX 15      /* max float/Complex element offset under test */
+#define EDGE_MAX_N SK_TEST_MAX_N
+#define EDGE_ARENA_LEN (EDGE_GUARD + EDGE_OFFSET_MAX + EDGE_MAX_N + EDGE_GUARD)
+#define EDGE_CANARY_BITS 0x7fc0deadu
+#define EDGE_FORM_COUNT 3
+
+static float edge_canary_float(void) { return bits_to_float(EDGE_CANARY_BITS); }
+
+static void *edge_aligned_alloc(size_t bytes) {
+    void *p = NULL;
+    if (posix_memalign(&p, 64, bytes) != 0 || p == NULL) {
+        fprintf(stderr, "FATAL: posix_memalign(64, %zu) failed\n", bytes);
+        exit(1);
+    }
+    return p;
+}
+
+static void edge_fill_canary_f(float *arena, int len) {
+    int i;
+    float c = edge_canary_float();
+    for (i = 0; i < len; ++i) arena[i] = c;
+}
+
+/* Verifies every float in arena[0,len) OUTSIDE the payload window
+ * [win_lo, win_lo+win_len) still holds the exact canary bit pattern -- an
+ * empty window (win_len==0, i.e. n==0) means the ENTIRE arena must still be
+ * canary, which is exactly the "n==0 performs zero reads/writes" contract
+ * this section exists to check. exit(1) with a precise diagnostic on the
+ * first violation, same house style as check_bits_or_die. */
+static void edge_check_canary_f(const char *label, const float *arena, int len,
+                                 int win_lo, int win_len) {
+    int i;
+    uint32_t want = EDGE_CANARY_BITS;
+    int win_hi = win_lo + win_len;
+    for (i = 0; i < len; ++i) {
+        uint32_t got;
+        if (i >= win_lo && i < win_hi) continue; /* payload window, not guarded */
+        g_total_checks++;
+        memcpy(&got, &arena[i], sizeof got);
+        if (got != want) {
+            fprintf(stderr,
+                "CANARY VIOLATION %s: arena[%d]=0x%08x (want canary 0x%08x) "
+                "-- out-of-bounds access, payload window=[%d,%d)\n",
+                label, i, (unsigned)got, (unsigned)want, win_lo, win_hi);
+            exit(1);
+        }
+    }
+}
+
+/* Complex-array counterparts: Complex is {float r; float i;} contiguous
+ * (fft_wrapper.h), so a Complex arena is just a float arena with every
+ * length/offset doubled -- reuses the float helpers above instead of
+ * duplicating the canary logic for a second type. */
+static void edge_fill_canary_c(Complex *arena, int len) {
+    edge_fill_canary_f((float *)arena, len * 2);
+}
+static void edge_check_canary_c(const char *label, const Complex *arena, int len,
+                                 int win_lo, int win_len) {
+    edge_check_canary_f(label, (const float *)arena, len * 2, win_lo * 2, win_len * 2);
+}
+
+/* Derives the (input-role, output-role) element offsets for the matrix's
+ * three forms. Form 2 ("both, different") uses `((o+7)%15)+1` rather than
+ * the obvious mirror `16-o`: the mirror collides with o itself at the
+ * midpoint (o==8 -> 16-8==8), silently degrading "both different" into
+ * "both the same" for exactly one offset value. `(o+7)%15` is a fixed-
+ * point-free derangement over {1..15} (o+7 == o (mod 15) requires
+ * 7 == 0 (mod 15), which is false for every o), so out_off != in_off for
+ * every o in 1..15 by construction, not by empirical luck. */
+static void edge_offsets_for_form(int form, int o, int *in_off, int *out_off) {
+    switch (form) {
+    case 0: *in_off = o; *out_off = 0; break;                   /* input offset only */
+    case 1: *in_off = 0; *out_off = o; break;                   /* output offset only */
+    default: *in_off = o; *out_off = ((o + 7) % 15) + 1; break;  /* both, different */
+    }
+}
+
+static void test_ema_edge(void) {
+    float *x_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *state_ref_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *state_scalar_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *state_simd_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    const float alpha = 0.9f, beta = 0.1f;
+    int ni, form, o;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (form = 0; form < EDGE_FORM_COUNT; ++form) {
+            for (o = 1; o <= EDGE_OFFSET_MAX; ++o) {
+                int in_off, out_off;
+                edge_offsets_for_form(form, o, &in_off, &out_off);
+
+                edge_fill_canary_f(x_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(state_ref_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(state_scalar_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(state_simd_arena, EDGE_ARENA_LEN);
+                fill_floats(x_arena + in_off, n);
+                fill_floats(state_ref_arena + out_off, n);
+                memcpy(state_scalar_arena + out_off, state_ref_arena + out_off, (size_t)n * sizeof(float));
+                memcpy(state_simd_arena + out_off, state_ref_arena + out_off, (size_t)n * sizeof(float));
+
+                sk_ema_f32_scalar(state_scalar_arena + out_off, x_arena + in_off, alpha, beta, n);
+                sk_ema_f32(state_simd_arena + out_off, x_arena + in_off, alpha, beta, n);
+
+                check_bits_or_die("ema_f32_edge", n, form * 100 + o,
+                                   state_simd_arena + out_off, state_scalar_arena + out_off, n);
+                edge_check_canary_f("ema_f32_edge:x", x_arena, EDGE_ARENA_LEN, in_off, n);
+                edge_check_canary_f("ema_f32_edge:state_scalar", state_scalar_arena, EDGE_ARENA_LEN, out_off, n);
+                edge_check_canary_f("ema_f32_edge:state_simd", state_simd_arena, EDGE_ARENA_LEN, out_off, n);
+            }
+        }
+    }
+    free(x_arena); free(state_ref_arena); free(state_scalar_arena); free(state_simd_arena);
+    printf("PASS ema_f32_edge (n=0..17+existing x offset 1..15 x 3 forms, canary-guarded)\n");
+}
+
+static void test_capply_gain_edge(void) {
+    Complex *z_arena = (Complex *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(Complex));
+    Complex *out_scalar_arena = (Complex *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(Complex));
+    Complex *out_simd_arena = (Complex *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(Complex));
+    float *g_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    int ni, form, o;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (form = 0; form < EDGE_FORM_COUNT; ++form) {
+            for (o = 1; o <= EDGE_OFFSET_MAX; ++o) {
+                int in_off, out_off;
+                edge_offsets_for_form(form, o, &in_off, &out_off);
+
+                edge_fill_canary_c(z_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_c(out_scalar_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_c(out_simd_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(g_arena, EDGE_ARENA_LEN);
+                fill_complex(z_arena + in_off, n);
+                fill_floats(g_arena, n); /* g stays at a fixed offset 0, see header note */
+
+                sk_capply_gain_f32_scalar(out_scalar_arena + out_off, z_arena + in_off, g_arena, n);
+                sk_capply_gain_f32(out_simd_arena + out_off, z_arena + in_off, g_arena, n);
+
+                check_bits_or_die("capply_gain_f32_edge", n, form * 100 + o,
+                                   (const float *)(out_simd_arena + out_off),
+                                   (const float *)(out_scalar_arena + out_off), 2 * n);
+                edge_check_canary_c("capply_gain_f32_edge:z", z_arena, EDGE_ARENA_LEN, in_off, n);
+                edge_check_canary_c("capply_gain_f32_edge:out_scalar", out_scalar_arena, EDGE_ARENA_LEN, out_off, n);
+                edge_check_canary_c("capply_gain_f32_edge:out_simd", out_simd_arena, EDGE_ARENA_LEN, out_off, n);
+                edge_check_canary_f("capply_gain_f32_edge:g", g_arena, EDGE_ARENA_LEN, 0, n);
+            }
+        }
+    }
+    free(z_arena); free(out_scalar_arena); free(out_simd_arena); free(g_arena);
+    printf("PASS capply_gain_f32_edge (n=0..17+existing x offset 1..15 x 3 forms, canary-guarded)\n");
+}
+
+static void test_cadd_edge(void) {
+    Complex *a_arena = (Complex *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(Complex));
+    Complex *b_arena = (Complex *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(Complex));
+    Complex *out_scalar_arena = (Complex *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(Complex));
+    Complex *out_simd_arena = (Complex *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(Complex));
+    int ni, form, o;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (form = 0; form < EDGE_FORM_COUNT; ++form) {
+            for (o = 1; o <= EDGE_OFFSET_MAX; ++o) {
+                int in_off, out_off;
+                edge_offsets_for_form(form, o, &in_off, &out_off);
+
+                edge_fill_canary_c(a_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_c(b_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_c(out_scalar_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_c(out_simd_arena, EDGE_ARENA_LEN);
+                fill_complex(a_arena + in_off, n);
+                fill_complex(b_arena, n); /* b stays at a fixed offset 0 */
+
+                sk_cadd_f32_scalar(out_scalar_arena + out_off, a_arena + in_off, b_arena, n);
+                sk_cadd_f32(out_simd_arena + out_off, a_arena + in_off, b_arena, n);
+
+                check_bits_or_die("cadd_f32_edge", n, form * 100 + o,
+                                   (const float *)(out_simd_arena + out_off),
+                                   (const float *)(out_scalar_arena + out_off), 2 * n);
+                edge_check_canary_c("cadd_f32_edge:a", a_arena, EDGE_ARENA_LEN, in_off, n);
+                edge_check_canary_c("cadd_f32_edge:b", b_arena, EDGE_ARENA_LEN, 0, n);
+                edge_check_canary_c("cadd_f32_edge:out_scalar", out_scalar_arena, EDGE_ARENA_LEN, out_off, n);
+                edge_check_canary_c("cadd_f32_edge:out_simd", out_simd_arena, EDGE_ARENA_LEN, out_off, n);
+            }
+        }
+    }
+    free(a_arena); free(b_arena); free(out_scalar_arena); free(out_simd_arena);
+    printf("PASS cadd_f32_edge (n=0..17+existing x offset 1..15 x 3 forms, canary-guarded)\n");
+}
+
+static void test_sq_scale_edge(void) {
+    float *x_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *out_scalar_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *out_simd_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    const float scale = 0.5f;
+    int ni, form, o;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (form = 0; form < EDGE_FORM_COUNT; ++form) {
+            for (o = 1; o <= EDGE_OFFSET_MAX; ++o) {
+                int in_off, out_off;
+                edge_offsets_for_form(form, o, &in_off, &out_off);
+
+                edge_fill_canary_f(x_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(out_scalar_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(out_simd_arena, EDGE_ARENA_LEN);
+                fill_floats(x_arena + in_off, n);
+
+                sk_sq_scale_f32_scalar(x_arena + in_off, scale, out_scalar_arena + out_off, n);
+                sk_sq_scale_f32(x_arena + in_off, scale, out_simd_arena + out_off, n);
+
+                check_bits_or_die("sq_scale_f32_edge", n, form * 100 + o,
+                                   out_simd_arena + out_off, out_scalar_arena + out_off, n);
+                edge_check_canary_f("sq_scale_f32_edge:x", x_arena, EDGE_ARENA_LEN, in_off, n);
+                edge_check_canary_f("sq_scale_f32_edge:out_scalar", out_scalar_arena, EDGE_ARENA_LEN, out_off, n);
+                edge_check_canary_f("sq_scale_f32_edge:out_simd", out_simd_arena, EDGE_ARENA_LEN, out_off, n);
+            }
+        }
+    }
+    free(x_arena); free(out_scalar_arena); free(out_simd_arena);
+    printf("PASS sq_scale_f32_edge (n=0..17+existing x offset 1..15 x 3 forms, canary-guarded)\n");
+}
+
+static void test_min_edge(void) {
+    float *a_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *b_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *out_scalar_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *out_simd_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    int ni, form, o;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (form = 0; form < EDGE_FORM_COUNT; ++form) {
+            for (o = 1; o <= EDGE_OFFSET_MAX; ++o) {
+                int in_off, out_off;
+                edge_offsets_for_form(form, o, &in_off, &out_off);
+
+                edge_fill_canary_f(a_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(b_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(out_scalar_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(out_simd_arena, EDGE_ARENA_LEN);
+                fill_floats(a_arena + in_off, n);
+                fill_floats(b_arena, n);
+
+                sk_min_f32_scalar(out_scalar_arena + out_off, a_arena + in_off, b_arena, n);
+                sk_min_f32(out_simd_arena + out_off, a_arena + in_off, b_arena, n);
+
+                check_bits_or_die("min_f32_edge", n, form * 100 + o,
+                                   out_simd_arena + out_off, out_scalar_arena + out_off, n);
+                edge_check_canary_f("min_f32_edge:a", a_arena, EDGE_ARENA_LEN, in_off, n);
+                edge_check_canary_f("min_f32_edge:b", b_arena, EDGE_ARENA_LEN, 0, n);
+                edge_check_canary_f("min_f32_edge:out_scalar", out_scalar_arena, EDGE_ARENA_LEN, out_off, n);
+                edge_check_canary_f("min_f32_edge:out_simd", out_simd_arena, EDGE_ARENA_LEN, out_off, n);
+            }
+        }
+    }
+    free(a_arena); free(b_arena); free(out_scalar_arena); free(out_simd_arena);
+    printf("PASS min_f32_edge (n=0..17+existing x offset 1..15 x 3 forms, canary-guarded)\n");
+}
+
+static void test_clip_edge(void) {
+    float *x_ref_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *x_scalar_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *x_simd_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    const float lo = -1.0f, hi = 1.0f;
+    int ni, o;
+    /* sk_clip_f32 is a single in-place buffer (no separate input/output
+     * array), so the 3-form input/output split used by every other kernel
+     * in this section doesn't apply here -- there is exactly one buffer
+     * role to offset, tested directly at each of the 15 offsets (documented
+     * deviation, see this section's header comment). */
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (o = 1; o <= EDGE_OFFSET_MAX; ++o) {
+            edge_fill_canary_f(x_ref_arena, EDGE_ARENA_LEN);
+            edge_fill_canary_f(x_scalar_arena, EDGE_ARENA_LEN);
+            edge_fill_canary_f(x_simd_arena, EDGE_ARENA_LEN);
+            fill_floats(x_ref_arena + o, n);
+            memcpy(x_scalar_arena + o, x_ref_arena + o, (size_t)n * sizeof(float));
+            memcpy(x_simd_arena + o, x_ref_arena + o, (size_t)n * sizeof(float));
+
+            sk_clip_f32_scalar(x_scalar_arena + o, lo, hi, n);
+            sk_clip_f32(x_simd_arena + o, lo, hi, n);
+
+            check_bits_or_die("clip_f32_edge", n, o, x_simd_arena + o, x_scalar_arena + o, n);
+            edge_check_canary_f("clip_f32_edge:x_scalar", x_scalar_arena, EDGE_ARENA_LEN, o, n);
+            edge_check_canary_f("clip_f32_edge:x_simd", x_simd_arena, EDGE_ARENA_LEN, o, n);
+        }
+    }
+    free(x_ref_arena); free(x_scalar_arena); free(x_simd_arena);
+    printf("PASS clip_f32_edge (n=0..17+existing x offset 1..15, single in-place buffer, canary-guarded)\n");
+}
+
+static void test_fast_sqrt_edge(void) {
+    float *x_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *out_scalar_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *out_simd_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    int ni, form, o;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (form = 0; form < EDGE_FORM_COUNT; ++form) {
+            for (o = 1; o <= EDGE_OFFSET_MAX; ++o) {
+                int in_off, out_off;
+                edge_offsets_for_form(form, o, &in_off, &out_off);
+
+                edge_fill_canary_f(x_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(out_scalar_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(out_simd_arena, EDGE_ARENA_LEN);
+                fill_floats(x_arena + in_off, n);
+
+                sk_fast_sqrt_f32_scalar(x_arena + in_off, out_scalar_arena + out_off, n);
+                sk_fast_sqrt_f32(x_arena + in_off, out_simd_arena + out_off, n);
+
+                check_bits_or_die("fast_sqrt_f32_edge", n, form * 100 + o,
+                                   out_simd_arena + out_off, out_scalar_arena + out_off, n);
+                edge_check_canary_f("fast_sqrt_f32_edge:x", x_arena, EDGE_ARENA_LEN, in_off, n);
+                edge_check_canary_f("fast_sqrt_f32_edge:out_scalar", out_scalar_arena, EDGE_ARENA_LEN, out_off, n);
+                edge_check_canary_f("fast_sqrt_f32_edge:out_simd", out_simd_arena, EDGE_ARENA_LEN, out_off, n);
+            }
+        }
+    }
+    free(x_arena); free(out_scalar_arena); free(out_simd_arena);
+    printf("PASS fast_sqrt_f32_edge (n=0..17+existing x offset 1..15 x 3 forms, canary-guarded)\n");
 }
 
 /* ═══════════════════════════════ microbench ═══════════════════════════════
@@ -730,6 +1133,15 @@ int main(void) {
     test_fast_sqrt();
     test_fast_math_special_values();
 
+    printf("\n--- alignment + canary edge-case matrix (round-3 review B05) ---\n");
+    test_ema_edge();
+    test_capply_gain_edge();
+    test_cadd_edge();
+    test_sq_scale_edge();
+    test_min_edge();
+    test_clip_edge();
+    test_fast_sqrt_edge();
+
     printf("\n--- microbenchmarks (n=%d, %d reps) ---\n", BENCH_N, BENCH_REPS);
     bench_ema();
     bench_capply_gain();
@@ -740,6 +1152,7 @@ int main(void) {
     bench_fast_sqrt();
 
     printf("\nALL PASS (SK_HAVE_NEON=%d)\n", SK_HAVE_NEON);
+    printf("TOTAL CHECKS: %ld\n", g_total_checks);
     (void)g_bench_sink;
     return 0;
 }
