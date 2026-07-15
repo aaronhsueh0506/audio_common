@@ -853,7 +853,27 @@ ne10_fft_r2c_cfg_float32_t ne10_fft_init_r2c_float32_ext (void *mem, ne10_uint32
     st->r_super_twiddles_neon = (ne10_fft_cpx_float32_t*) (st->r_factors_neon + (NE10_MAXFACTORS * 2));
 
     // factors and twiddles for rfft C
-    ne10_factor (nfft, st->r_factors, NE10_FACTOR_EIGHT_FIRST_STAGE);
+    //
+    // P0003 amendment (re-review round-3 B07): this call's result used to be
+    // discarded outright, and the nfft/4 call below returned the partially-
+    // initialised, non-NULL `st` on failure instead of NULL -- a caller had
+    // no way to distinguish that from a fully-initialised config. Both calls
+    // are now checked and either failing returns NULL, matching this
+    // function's documented init-fully-or-NULL contract (see the function
+    // doc above). This is defensively unreachable in practice: ne10_factor()
+    // only returns NE10_ERR for a NULL facbuf, n<=0, or stage_num>21 (n so
+    // large that more than 21 radix stages are needed -- impossible for an
+    // ne10_int32_t nfft per ne10_factor's own comment), and by this point
+    // `nfft` has already been whitelisted to [16, 8192] powers of two by the
+    // mem_size check above -- every value in that whitelist (and nfft/4,
+    // [4, 2048]) factors cleanly. Kept as a real check anyway rather than an
+    // assert: the contract should hold even if the whitelist above ever
+    // changes.
+    result = ne10_factor (nfft, st->r_factors, NE10_FACTOR_EIGHT_FIRST_STAGE);
+    if (result == NE10_ERR)
+    {
+        return NULL;
+    }
 
     // backward twiddles pointers
     st->r_twiddles_backward = ne10_fft_generate_twiddles_float32 (st->r_twiddles, st->r_factors, nfft);
@@ -862,7 +882,7 @@ ne10_fft_r2c_cfg_float32_t ne10_fft_init_r2c_float32_ext (void *mem, ne10_uint32
     result = ne10_factor (nfft/4, st->r_factors_neon, NE10_FACTOR_EIGHT_FIRST_STAGE);
     if (result == NE10_ERR)
     {
-        return st;
+        return NULL;
     }
 
     // Twiddle table is transposed here to improve cache access performance.
