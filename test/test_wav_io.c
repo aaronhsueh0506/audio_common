@@ -14,16 +14,34 @@
  *
  * Also covers the writer's finalize path (B08, re-review round-3):
  * wav_finalize_write()'s checked fseek/fwrite/fclose failure paths, via a
- * funopen()-backed injectable-failure FILE* (see the section above main()
- * below) -- RLIMIT_FSIZE (used for the plain wav_write_float short-write
- * test) can only reach fwrite, not fseek or fclose, and not a fwrite
- * failure at finalize time specifically.
+ * funopen()/fopencookie()-backed injectable-failure FILE* (see the section
+ * above main() below) -- RLIMIT_FSIZE (used for the plain wav_write_float
+ * short-write test) can only reach fwrite, not fseek or fclose, and not a
+ * fwrite failure at finalize time specifically. That fake-stream backend is
+ * BSD/macOS funopen() or glibc fopencookie(); on any other platform the
+ * injectable-failure test group is skipped with a clear SKIP message
+ * instead of failing to compile/link (round-4 review P2-3) -- everything
+ * else in this file is portable C99/POSIX and still runs there.
+ *
+ * Also covers wav_open_write()'s fail-fast argument/header-field validation
+ * and wav_finalize_write()'s pathological-size abandon path (round-4 review
+ * P1-3).
  *
  * Plain assert-and-report harness, same shape as test_pool_contract.c: no
  * external framework, every failure prints and flips a global fail flag,
  * main() reports ALL PASS / FAIL at the end so one bad check doesn't hide
  * the rest.
  */
+/* Must precede every #include (round-4 review P2-3): glibc's fopencookie()/
+ * off64_t/cookie_io_functions_t are only declared behind _GNU_SOURCE, and
+ * that has to be visible before <stdio.h> is first pulled in by ANY header
+ * below (including wav_io.h itself). __linux__ is a compiler-predefined
+ * macro, available before any header is processed, so this is safe to gate
+ * on unconditionally (a no-op on non-Linux platforms). */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "wav_io.h"
 #include "test_wav_writer_common.h"
 
@@ -33,6 +51,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <unistd.h>
+#include <limits.h>
 #include <sys/resource.h>
 #include <signal.h>
 
@@ -798,15 +817,25 @@ static void test_write_error_on_short_write(void) {
  * can't reach a fwrite() failure at finalize time specifically (the header
  * writes wav_finalize_write() itself performs).
  *
- * funopen(3) (BSD/macOS) backs a FILE* with caller-supplied read/write/seek/
- * close callbacks instead of a real fd/file, so each of the three can be
- * made to fail independently and on demand. Each test below builds a
- * WavWriter the normal way -- wav_open_write() against a real throwaway temp
- * file, so the genuine 44-byte placeholder header actually lands on disk --
- * then swaps w->fp to one of these funopen streams before calling
- * wav_finalize_write(). WavWriter.fp is a plain public struct field (wav_io.h
- * has no opaque/private convention for it), so this needs no change to the
- * public API surface beyond wav_finalize_write() itself.
+ * A FILE* backed by caller-supplied read/write/seek/close callbacks instead
+ * of a real fd/file lets each of the three be made to fail independently
+ * and on demand. Two such APIs exist, with different callback signatures,
+ * and neither is portable C99/POSIX-base (round-4 review P2-3):
+ *   - funopen(3) on BSD/macOS.
+ *   - fopencookie(3) (a cookie_io_functions_t of read/write/seek/close
+ *     function pointers) on glibc.
+ * HAVE_FAKE_STREAM selects whichever this platform offers; on any other
+ * platform it's 0 and test_finalize_write_injectable_failures() below prints
+ * one clear SKIP line instead of running (everything else in this file is
+ * portable and still runs there).
+ *
+ * Each test below builds a WavWriter the normal way -- wav_open_write()
+ * against a real throwaway temp file, so the genuine 44-byte placeholder
+ * header actually lands on disk -- then swaps w->fp to one of these fake
+ * streams before calling wav_finalize_write(). WavWriter.fp is a plain
+ * public struct field (wav_io.h has no opaque/private convention for it),
+ * so this needs no change to the public API surface beyond
+ * wav_finalize_write() itself.
  */
 
 typedef struct {
@@ -817,6 +846,9 @@ typedef struct {
     int fail_close;         /* nonzero => close fails */
     int total_written;
 } FakeStreamState;
+
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#define HAVE_FAKE_STREAM 1
 
 static int fake_stream_write(void* cookie, const char* buf, int n) {
     (void)buf;
@@ -840,14 +872,59 @@ static int fake_stream_close(void* cookie) {
     return s->fail_close ? -1 : 0;
 }
 
+static FILE* make_fake_stream(FakeStreamState* state) {
+    return funopen(state, NULL, fake_stream_write, fake_stream_seek, fake_stream_close);
+}
+
+#elif defined(__GLIBC__)
+#define HAVE_FAKE_STREAM 1
+
+static ssize_t fake_stream_write(void* cookie, const char* buf, size_t size) {
+    (void)buf;
+    FakeStreamState* s = (FakeStreamState*)cookie;
+    if (s->fail_write_after >= 0 && s->total_written >= s->fail_write_after) {
+        return -1;
+    }
+    s->total_written += (int)size;
+    return (ssize_t)size;
+}
+
+static int fake_stream_seek(void* cookie, off64_t* offset, int whence) {
+    FakeStreamState* s = (FakeStreamState*)cookie;
+    (void)whence;
+    if (s->fail_seek) return -1;
+    /* *offset already holds the caller's requested position (every call
+     * wav_finalize_write() makes here is fseek(w->fp, 0, SEEK_SET), i.e.
+     * offset 0) -- leave it as-is to report a successful seek to exactly
+     * that position. This fake stream doesn't track a real cursor, and no
+     * test here reads the position back via ftell(). */
+    return 0;
+}
+
+static int fake_stream_close(void* cookie) {
+    FakeStreamState* s = (FakeStreamState*)cookie;
+    return s->fail_close ? -1 : 0;
+}
+
+static FILE* make_fake_stream(FakeStreamState* state) {
+    cookie_io_functions_t io_funcs = { NULL, fake_stream_write, fake_stream_seek, fake_stream_close };
+    return fopencookie(state, "w", io_funcs);
+}
+
+#else
+#define HAVE_FAKE_STREAM 0
+#endif
+
+#if HAVE_FAKE_STREAM
 /* Builds a WavWriter over a real temp file (so the placeholder header is
- * genuinely on disk), then swaps its fp to a funopen() stream driven by
- * `state`, set unbuffered so every wav_finalize_write() fwrite call maps
- * directly to one fake_stream_write() call (a buffered stream would just
- * memcpy small writes into libc's internal buffer and defer the real
- * write(2)-equivalent call to flush/close time, same caveat documented
- * above test_write_error_on_short_write()). *out_path must be unlink()ed +
- * free()d by the caller. Returns NULL on any setup failure. */
+ * genuinely on disk), then swaps its fp to a fake stream driven by `state`
+ * (see make_fake_stream() above), set unbuffered so every
+ * wav_finalize_write() fwrite call maps directly to one fake_stream_write()
+ * call (a buffered stream would just memcpy small writes into libc's
+ * internal buffer and defer the real write(2)-equivalent call to
+ * flush/close time, same caveat documented above
+ * test_write_error_on_short_write()). *out_path must be unlink()ed + free()d
+ * by the caller. Returns NULL on any setup failure. */
 static WavWriter* make_writer_over_fake_stream(FakeStreamState* state, char** out_path) {
     char* path = (char*)malloc(64);
     if (!path) return NULL;
@@ -860,7 +937,7 @@ static WavWriter* make_writer_over_fake_stream(FakeStreamState* state, char** ou
     if (!w) { unlink(path); free(path); return NULL; }
 
     FILE* real_fp = w->fp;
-    FILE* fake_fp = funopen(state, NULL, fake_stream_write, fake_stream_seek, fake_stream_close);
+    FILE* fake_fp = make_fake_stream(state);
     if (!fake_fp) {
         fclose(real_fp);
         free(w);
@@ -875,8 +952,16 @@ static WavWriter* make_writer_over_fake_stream(FakeStreamState* state, char** ou
     *out_path = path;
     return w;
 }
+#endif /* HAVE_FAKE_STREAM */
 
 static void test_finalize_write_injectable_failures(void) {
+#if !HAVE_FAKE_STREAM
+    fprintf(stderr,
+            "SKIP: wav_finalize_write() injectable-failure coverage -- "
+            "no funopen()/fopencookie() fake-stream backend on this platform "
+            "(round-4 review P2-3)\n");
+    return;
+#else
     char* path = NULL;
 
     /* Seek failure: wav_finalize_write's fseek(w->fp, 0, SEEK_SET) fails. */
@@ -944,6 +1029,70 @@ static void test_finalize_write_injectable_failures(void) {
             cleanup_temp(path);
         }
     }
+#endif /* HAVE_FAKE_STREAM */
+}
+
+/* ═════════ round-4 review P1-3: wav_open_write / wav_finalize_write ════════
+ * negative-argument and pathological-size coverage.
+ */
+
+/* wav_open_write() must fail fast -- returning NULL before ever touching the
+ * filesystem for a NULL path or a non-positive sample_rate/channels, and
+ * before writing a placeholder header for a channels/sample_rate combination
+ * whose block_align or byte_rate could never fit the on-disk WAV header
+ * fields (mirrors wav_finalize_write's own pathological-size checks). */
+static void test_open_write_rejects_invalid_args(void) {
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_io_badopen_XXXXXX");
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "setup: mkstemp for wav_open_write invalid-argument tests");
+    if (fd >= 0) close(fd);
+
+    CHECK(wav_open_write(NULL, 16000, 1) == NULL,
+          "wav_open_write must reject a NULL path");
+
+    if (fd >= 0) {
+        CHECK(wav_open_write(path, 0, 1) == NULL,
+              "wav_open_write must reject sample_rate == 0");
+        CHECK(wav_open_write(path, -1, 1) == NULL,
+              "wav_open_write must reject a negative sample_rate");
+        CHECK(wav_open_write(path, 16000, 0) == NULL,
+              "wav_open_write must reject channels == 0");
+        CHECK(wav_open_write(path, 16000, -2) == NULL,
+              "wav_open_write must reject a negative channels count");
+        CHECK(wav_open_write(path, 16000, 0x10000) == NULL,
+              "wav_open_write must reject a channels count whose block_align "
+              "(channels*sample_bytes) exceeds 0xFFFF");
+        CHECK(wav_open_write(path, INT_MAX, 8) == NULL,
+              "wav_open_write must reject a sample_rate/channels combo whose "
+              "byte_rate (sample_rate*channels*sample_bytes) exceeds "
+              "0xFFFFFFFF");
+        unlink(path);
+    }
+}
+
+/* wav_finalize_write()'s pathological-size abandon path (wav_io.h) must
+ * always report failure (-1), reached here via a directly-corrupted
+ * samples_written rather than an injected I/O failure -- WavWriter is a
+ * plain public struct (same convention the fake-stream tests above already
+ * rely on for w->fp), so a caller/test can set this field straight through.
+ * 0x80000000 mono PCM16 samples alone computes a data_sz64 of 0x100000000
+ * bytes, one past the 32-bit on-disk data-chunk-size field's range. */
+static void test_finalize_write_rejects_oversize_samples_written(void) {
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_io_oversize_XXXXXX");
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "setup: mkstemp for oversize-finalize test");
+    if (fd >= 0) close(fd);
+
+    WavWriter* w = wav_open_write(path, 16000, 1);
+    CHECK(w != NULL, "wav_open_write must succeed (setup for oversize-finalize test)");
+    if (w) {
+        w->samples_written = 0x80000000ull;
+        int rc = wav_finalize_write(w);
+        CHECK(rc == -1, "wav_finalize_write must return -1 for a pathologically large samples_written");
+    }
+    unlink(path);
 }
 
 /* ═══════════════════════════════════ main ════════════════════════════════ */
@@ -974,6 +1123,9 @@ int main(void) {
     test_write_zero_and_negative_n_is_noop();
     test_write_error_on_short_write();
     test_finalize_write_injectable_failures();
+
+    test_open_write_rejects_invalid_args();
+    test_finalize_write_rejects_oversize_samples_written();
 
     if (g_fail) {
         printf(">>> FAIL\n");

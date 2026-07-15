@@ -467,9 +467,44 @@ static inline void wav_close_read(WavReader* r) {
  * @param path Path to output WAV file
  * @param sample_rate Sample rate
  * @param channels Number of channels (usually 1)
- * @return Writer handle, or NULL on error
+ * @return Writer handle, or NULL on error -- including invalid arguments
+ *         (NULL path, sample_rate <= 0, channels <= 0, round-4 review P1-3)
+ *         and a header-field range that would not fit the on-disk WAV
+ *         fields (block_align > 0xFFFF or byte_rate > 0xFFFFFFFF, mirroring
+ *         wav_finalize_write's pathological-size checks -- see below)
  */
 static inline WavWriter* wav_open_write(const char* path, int sample_rate, int channels) {
+    // Fail fast on invalid arguments (round-4 review P1-3), before ever
+    // touching the filesystem.
+    if (!path || sample_rate <= 0 || channels <= 0) return NULL;
+
+    // The is_float/bits_per_sample decision (normally made after fopen,
+    // just below) is hoisted up here so the header-field range checks that
+    // follow can run BEFORE fopen() ever creates/truncates the output file
+    // -- for any input where these checks pass, the resulting struct fields
+    // and on-disk header bytes are identical to before this change.
+    int is_float;
+    int bits_per_sample;
+#if WAV_IO_WRITER_STYLE == WAV_IO_WRITER_AEC
+    /* Default PCM16. Set AEC_OUT_FLOAT=1 to write IEEE float32 (for testing) */
+    const char* float_env = getenv("AEC_OUT_FLOAT");
+    is_float = (float_env && float_env[0] == '1') ? 1 : 0;
+    bits_per_sample = is_float ? 32 : 16;
+#else
+    is_float = 0;
+    bits_per_sample = 16;
+#endif
+    int sample_bytes = is_float ? 4 : 2;
+
+    // Mirrors wav_finalize_write's pathological-size abandon checks (round-4
+    // review P1-3): reject up front, matching the same block_align/byte_rate
+    // bounds the finalize path enforces on close, instead of writing a
+    // placeholder header for a WavWriter that could never finalize a valid
+    // one anyway.
+    uint64_t block_align64 = (uint64_t)channels * (uint64_t)sample_bytes;
+    uint64_t byte_rate64 = (uint64_t)sample_rate * block_align64;
+    if (block_align64 > 0xFFFFull || byte_rate64 > 0xFFFFFFFFull) return NULL;
+
     FILE* fp = fopen(path, "wb");
     if (!fp) return NULL;
 
@@ -481,15 +516,8 @@ static inline WavWriter* wav_open_write(const char* path, int sample_rate, int c
     w->fp = fp;
     w->info.sample_rate = sample_rate;
     w->info.channels = channels;
-#if WAV_IO_WRITER_STYLE == WAV_IO_WRITER_AEC
-    /* Default PCM16. Set AEC_OUT_FLOAT=1 to write IEEE float32 (for testing) */
-    const char* float_env = getenv("AEC_OUT_FLOAT");
-    w->info.is_float = (float_env && float_env[0] == '1') ? 1 : 0;
-    w->info.bits_per_sample = w->info.is_float ? 32 : 16;
-#else
-    w->info.is_float = 0;
-    w->info.bits_per_sample = 16;
-#endif
+    w->info.is_float = is_float;
+    w->info.bits_per_sample = bits_per_sample;
 
     // Write placeholder header (will update at close). Checked like every
     // other open-time failure in this function (B08): a short write here
@@ -629,6 +657,31 @@ static inline int wav_finalize_write(WavWriter* w) {
 
     int sample_bytes = w->info.is_float ? 4 : 2;
 
+    /* Checked multiply (round-4 review P1-3): per_sample is tiny in every
+     * real build (channels <=8 by convention in this codebase's readers,
+     * sample_bytes is 2 or 4), so in practice this can only actually reject
+     * a hand-built WavWriter/WavInfo outside wav_open_write (which now
+     * itself validates channels -- see its own doc) -- a real capture would
+     * need on the order of 2^61 wav_write_float() calls to threaten this.
+     * The check now exists for real rather than resting on that argument,
+     * though: it's what stands between `w->samples_written * per_sample`
+     * below and a silent uint64_t wraparound. per_sample==0 (e.g. a
+     * hand-built WavInfo with channels==0) is folded into the same
+     * abandon path rather than left to divide-by-zero in the comparison. */
+    uint64_t per_sample = (uint64_t)w->info.channels * (uint64_t)sample_bytes;
+    if (per_sample == 0 || w->samples_written > (UINT64_MAX - 36ull) / per_sample) {
+        // Pathological size -- the data_sz64/file_size64 arithmetic below
+        // would wrap before it could even be range-checked. Abandon the
+        // file (fclose + free) instead of finalizing from wrapped values.
+        // Same "always report failure" contract as the range-check abandon
+        // path just below (round-4 review P1-3): the on-disk placeholder
+        // header is stale/incomplete by design here, regardless of whether
+        // fclose itself happens to also succeed.
+        fclose(w->fp);
+        free(w);
+        return -1;
+    }
+
     /* R01 fix: the outer RIFF chunk_size now uses the SAME sample_bytes-
      * derived size as the "data" sub-chunk (data_sz64 below), instead of a
      * hardcoded 2 bytes/sample. Before this fix, the outer RIFF size was
@@ -637,29 +690,26 @@ static inline int wav_finalize_write(WavWriter* w) {
      * correct even before this fix. PCM16 output (both writer styles) is a
      * no-op change here: 2 == sample_bytes there already. See the Writer
      * hardening doc in the file header comment for the full writeup. */
-    uint64_t data_sz64 = w->samples_written * (uint64_t)w->info.channels * (uint64_t)sample_bytes;
-    /* This multiply happens BEFORE the >0xFFFFFFFF range check just below,
-     * but it can't realistically overflow its own uint64_t regardless: every
-     * wav_write_float() call increments samples_written by at most an `int`
-     * argument's worth of samples per call (INT_MAX), and channels/
-     * sample_bytes are each tiny (channels <=8 by convention in this
-     * codebase's readers, sample_bytes is 2 or 4) -- reaching anywhere near
-     * UINT64_MAX would require on the order of 2^61 wav_write_float() calls.
-     * The range check below is what actually matters: it's what rejects any
-     * data_sz64 that would silently truncate on narrowing to the real
-     * on-disk uint32_t/uint16_t header fields, not this multiply. */
+    uint64_t data_sz64 = w->samples_written * per_sample;
     uint64_t file_size64 = 36ull + data_sz64;
-    uint64_t byte_rate64 = (uint64_t)w->info.sample_rate * (uint64_t)w->info.channels * (uint64_t)sample_bytes;
-    uint64_t block_align64 = (uint64_t)w->info.channels * (uint64_t)sample_bytes;
+    uint64_t byte_rate64 = (uint64_t)w->info.sample_rate * per_sample;
+    uint64_t block_align64 = per_sample;
 
     if (file_size64 > 0xFFFFFFFFull || data_sz64 > 0xFFFFFFFFull ||
         byte_rate64 > 0xFFFFFFFFull || block_align64 > 0xFFFFull) {
         // Pathological size (never hit by any real capture) -- would
         // silently truncate a WAV header field. Abandon the file instead
-        // of writing a corrupt header.
-        if (fclose(w->fp) != 0) ok = 0;
+        // of writing a corrupt header. This path ALWAYS reports failure
+        // (round-4 review P1-3, fixing a prior bug here: a clean fclose on
+        // this abandon path used to make this return 0/success, silently
+        // contradicting this function's own @return doc, which already
+        // promised -1 for exactly this path) -- the file is abandoned with
+        // only the stale placeholder header on disk, never the real one,
+        // so the call must report that unconditionally, independent of
+        // whether fclose itself happens to also succeed.
+        fclose(w->fp);
         free(w);
-        return ok ? 0 : -1;
+        return -1;
     }
 
     // Seek to beginning and write proper header
