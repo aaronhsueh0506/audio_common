@@ -34,6 +34,11 @@ EXTRA_LDFLAGS ?=
 NO_STDIO      ?= 0
 DEBUG         ?= 0
 
+# TOOLCHAIN_CHECK=0 skips the CC/CXX -dumpmachine target-coherence guard in
+# _cfg_guard below (round-4 review P1-2). Participates in CFG_SIG, so a
+# guard-skipped build can never alias a guarded one.
+TOOLCHAIN_CHECK ?= 1
+
 # -Werror opt-in (default off; CI can flip it on with `make WERROR=1`).
 # Declared this early (rather than down by its ifeq block, where it used to
 # live) because CFG_SIG below folds WERROR into its hash and needs its
@@ -152,7 +157,7 @@ ifeq ($(BACKEND),ne10)
   #     which is out of scope for a source-list-only trim), these four files
   #     must stay to satisfy the linker without editing any NE10 source.
   #     NE10_fft_generic_int32.cpp is why BACKEND=ne10 still needs a C++ TU
-  #     (LINK=$(CXX)/-lc++ below) despite this trim.
+  #     (LINK=$(CXX) below) despite this trim.
   # Confirmed EXCLUDABLE (dropping each was verified to still link + pass all
   # four test targets):
   #   - NE10_init.c / NE10_init_dsp.c: ne10_init()/ne10_init_dsp() runtime
@@ -195,7 +200,6 @@ ifeq ($(BACKEND),ne10)
   # isystem only applies to -I-style entries).
   CFLAGS  += -isystem lib/ne10/inc -isystem lib/ne10/common -isystem lib/ne10/modules $(NE10_DEFS)
   CXXFLAGS+= $(NE10_DEFS)
-  LDFLAGS += -lc++
 else
   OWN_SRCS       = src/fft_wrapper.c $(COMMON_SRCS)
   VENDOR_SRCS    = lib/kiss_fft/kiss_fft.c
@@ -204,6 +208,36 @@ else
   # above for the NE10 side of this same F12 fix).
   CFLAGS  += -isystem lib/kiss_fft
 endif
+
+# Link driver (round-4 review P1-2: declared HERE, before CFG_SIG, so it can
+# participate in the payload below -- it used to live after CFG_SIG, where a
+# command-line LINK= override changed the produced binaries without changing
+# their keyed directory). The NE10 archive contains a C++ TU
+# (NE10_fft_generic_int32.cpp), so anything linking it uses the C++ driver --
+# which also supplies the correct C++ runtime library itself (libc++ on
+# macOS/clang, libstdc++ on GNU/Linux gcc); the old hardcoded `-lc++` in
+# LDFLAGS was a macOS-ism (duplicate of what the driver adds there, and a
+# link error on GNU/Linux where the library is libstdc++) and is gone.
+LINK = $(CC)
+ifeq ($(BACKEND),ne10)
+  LINK = $(CXX)
+endif
+
+# --- Command-line override rejection (round-4 review P1-1) ------------------
+# CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/FP_POLICY are INTERNAL: GNU Make silently
+# ignores every one of this file's own `+=`/`:=` assignments to a variable
+# that was set on the command line (`make CFLAGS=-O3`), which would strip the
+# FP-contraction policy, the backend defines/-isystem paths, and -lm from the
+# build while still producing artifacts (verified: the compile line really
+# loses -ffp-contract=off). The supported user hooks are EXTRA_CFLAGS /
+# EXTRA_LDFLAGS (folded in above, covered by CFG_SIG, policy still appended
+# after them). A plain environment CFLAGS is NOT rejected: this file's own
+# assignments fold it in normally (origin becomes "file"), the policy flags
+# still land last, and the value participates in CFG_SIG -- only "command
+# line" and the -e "environment override" origins defeat the assignments.
+$(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY,\
+  $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
+    $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently drop this Makefile's own flag appends (FP policy, backend defines); use EXTRA_CFLAGS / EXTRA_LDFLAGS instead)))
 
 # --- FP-contraction policy: unified across all four repos (round-3 review
 # B04). Every TU THIS Makefile compiles -- our own sources AND the vendored
@@ -312,7 +346,16 @@ CXXFLAGS  += $(FP_POLICY)
 # computes the hash. On stdin it prints "<checksum> <byte-count>" with no
 # filename field (verified on macOS's BSD cksum), so `cut -d' ' -f1` isolates
 # just the checksum.
-CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG)
+# Round-4 review additions to the payload: LINK (P2-1 -- the link driver
+# affects every produced binary, and a command-line LINK= override is
+# legitimate for exotic toolchains, so it must key the build), TOOLCHAIN_CHECK
+# (the guard-skip knob must not alias a guarded build), and SRCS (P1-4 -- the
+# SORTED source list, so ADDING or REMOVING a source file lands in a fresh
+# keyed directory; without it, a removed .c left its stale .o AND its stale
+# archive member behind under the same key, and `ar rc` on the existing
+# archive would never delete that member -- see the fresh-archive recipe
+# below for the other half of that fix).
+CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) SRCS=$(sort $(OWN_SRCS) $(VENDOR_SRCS) $(VENDOR_CXXSRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 BE_SRCS    = $(OWN_SRCS) $(VENDOR_SRCS)
@@ -388,6 +431,17 @@ lib: $(LIB)
 # -n), and nothing here runs unless some real target needs it -- Makefile
 # parsing itself performs no I/O.
 _cfg_guard:
+	@if [ "$(BACKEND)" = "ne10" ] && [ "$(TOOLCHAIN_CHECK)" = "1" ]; then \
+	  cc_m="$$($(CC) -dumpmachine 2>/dev/null)"; cxx_m="$$($(CXX) -dumpmachine 2>/dev/null)"; \
+	  if [ -z "$$cc_m" ] || [ "$$cc_m" != "$$cxx_m" ]; then \
+	    echo "FATAL: CC/CXX compile for different targets (CC='$(CC)' -> '$$cc_m', CXX='$(CXX)' -> '$$cxx_m')." >&2; \
+	    echo "  BACKEND=ne10 builds one C++ TU, so a partial cross-toolchain (only CC= passed)" >&2; \
+	    echo "  would mix host C++ objects into a cross build. Pass the FULL toolchain, e.g.:" >&2; \
+	    echo "    make BACKEND=ne10 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ AR=aarch64-linux-gnu-ar RANLIB=aarch64-linux-gnu-ranlib" >&2; \
+	    echo "  (TOOLCHAIN_CHECK=0 skips this check; it participates in CFG_SIG.)" >&2; \
+	    exit 1; \
+	  fi; \
+	fi
 	@mkdir -p $(OBJ_DIR) $(BIN_DIR)
 	@for d in $(OBJ_DIR) $(BIN_DIR); do \
 	  m="$$d/config.manifest"; \
@@ -407,9 +461,19 @@ _cfg_guard:
 	  fi; \
 	done
 
+# Fresh-archive discipline (round-4 review P1-4): the archive is always built
+# from scratch into a temp file and renamed into place -- NEVER `ar rc` onto
+# an existing archive, which only ever ADDS/REPLACES members and would leave
+# a removed source's stale .o member in the delivered archive forever. The
+# rename is also atomic, so a concurrent reader (another config's consumer
+# resolving this same path) never observes a half-written archive. The other
+# half of the source-removal fix is SRCS in CFG_SIG_PAYLOAD above (a changed
+# source list keys to a fresh directory in the first place).
 $(LIB): $(BE_OBJS) | _cfg_guard
-	$(AR) rc $@ $(BE_OBJS)
-	$(RANLIB) $@
+	rm -f $@.tmp
+	$(AR) rc $@.tmp $(BE_OBJS)
+	$(RANLIB) $@.tmp
+	mv -f $@.tmp $@
 	@echo "audio_common [$(BACKEND)] -> $@"
 
 # -MD -MP (NOT -MMD): emits $(OBJ_DIR)/<name>.d per object, listing every
@@ -420,11 +484,6 @@ $(OBJ_DIR)/%.o: %.c | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 $(OBJ_DIR)/%.o: %.cpp | _cfg_guard
 	$(CXX) $(CXXFLAGS) -MD -MP -c -o $@ $<
-
-LINK = $(CC)
-ifeq ($(BACKEND),ne10)
-  LINK = $(CXX)   # NE10 archive contains a C++ TU -> link with the C++ driver
-endif
 
 selftest: $(LIB) | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/roundtrip.o test/roundtrip.c
@@ -612,20 +671,25 @@ print-obj-dir:
 print-lib-path:
 	@echo $(abspath $(LIB))
 
-# --- publish: immutable per-config release under dist/ (round-3 review B01)
-# dist/<backend>/<cfg_sig>/ holds a copy of this build's artifacts plus a
-# MANIFEST.txt (build identity + per-file sha256, relative paths only);
-# dist/<backend>/current is a symlink to the most-recently-published
-# <cfg_sig> for that backend. Nothing in development ever builds or links
-# against dist/ -- it exists solely as a stable handoff path for whoever
-# consumes a finished build (another repo, a flashable image, a CI artifact
-# upload...). A per-backend lock directory (mkdir is atomic -- POSIX
-# guarantees exactly one caller sees success when two race) serialises
-# concurrent `make publish` for the SAME backend; a different backend's
-# publish uses its own lock and is untouched.
+# --- publish v3: immutable, content-addressed release under dist/ ----------
+# (round-3 review B01, hardened by round-4 review P2-2.) The release
+# directory is dist/<backend>/<cfg_sig>-<content12>/, where content12 is the
+# first 12 hex chars of the SHA-256 over the (sorted) per-artifact SHA-256
+# list -- so two builds with the SAME flags but DIFFERENT sources (a new
+# commit, or an uncommitted edit) land in two different release directories
+# instead of the second silently `rm -rf`ing the first (the v2 scheme keyed
+# the release dir on CFG_SIG alone, which does not cover source content).
+# An existing release directory is NEVER deleted or overwritten: republishing
+# identical content just verifies it byte-for-byte and repoints the `current`
+# symlink (idempotent); a content-addressed id collision with different
+# content is checked for and is a hard error. MANIFEST.txt records the
+# release id, full build identity (incl. ar/ranlib/link and a git_dirty
+# flag), per-file SHA-256 -- relative paths only. dist/<backend>/current is
+# the stable consumer handoff path, as before. A per-backend lock directory
+# (mkdir is atomic) serialises concurrent `make publish` for the same
+# backend.
 PUBLISH_ARTIFACTS = $(LIB)
 DIST_BACKEND_DIR  = dist/$(BACKEND)
-DIST_REL_DIR      = $(DIST_BACKEND_DIR)/$(CFG_SIG)
 DIST_LOCK         = dist/.lock.$(BACKEND)
 
 publish: $(PUBLISH_ARTIFACTS)
@@ -634,23 +698,28 @@ publish: $(PUBLISH_ARTIFACTS)
 	  echo "FATAL: publish lock $(DIST_LOCK) already held (concurrent 'make publish BACKEND=$(BACKEND)'?)" >&2; \
 	  exit 1; \
 	fi; \
-	trap 'rmdir "$(DIST_LOCK)" 2>/dev/null' EXIT INT TERM; \
+	tmp="$(DIST_BACKEND_DIR)/.stage.$$$$"; \
+	trap 'rmdir "$(DIST_LOCK)" 2>/dev/null; rm -rf "$$tmp"' EXIT INT TERM; \
 	set -e; \
 	commit="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+	dirty=0; [ -n "$$(git status --porcelain 2>/dev/null)" ] && dirty=1; \
 	dateutc="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
 	mkdir -p "$(DIST_BACKEND_DIR)"; \
-	tmp="$(DIST_BACKEND_DIR)/$(CFG_SIG).tmp"; \
 	rm -rf "$$tmp"; mkdir -p "$$tmp"; \
 	cp $(PUBLISH_ARTIFACTS) "$$tmp/"; \
 	shas="$$( cd "$$tmp" && for f in *; do shasum -a 256 "$$f"; done )"; \
+	content12="$$(printf '%s\n' "$$shas" | sort | shasum -a 256 | cut -c1-12)"; \
+	rel_id="$(CFG_SIG)-$$content12"; \
+	rel_dir="$(DIST_BACKEND_DIR)/$$rel_id"; \
 	{ echo "repo=audio_common"; \
+	  echo "release_id=$$rel_id"; \
 	  echo "backend=$(BACKEND)"; \
 	  echo "cfg_sig=$(CFG_SIG)"; \
-	  echo "cc=$(CC)"; echo "cxx=$(CXX)"; \
+	  echo "cc=$(CC)"; echo "cxx=$(CXX)"; echo "ar=$(AR)"; echo "ranlib=$(RANLIB)"; echo "link=$(LINK)"; \
 	  echo "cflags=$(CFLAGS)"; echo "cxxflags=$(CXXFLAGS)"; \
 	  echo "extra_cflags=$(EXTRA_CFLAGS)"; \
 	  echo "werror=$(WERROR)"; echo "no_stdio=$(NO_STDIO)"; echo "debug=$(DEBUG)"; \
-	  echo "git_commit=$$commit"; echo "date_utc=$$dateutc"; \
+	  echo "git_commit=$$commit"; echo "git_dirty=$$dirty"; echo "date_utc=$$dateutc"; \
 	  echo "$$shas"; \
 	} > "$$tmp/MANIFEST.txt"; \
 	echo "== publish: backend-symbol audit (staged archive) =="; \
@@ -663,11 +732,22 @@ publish: $(PUBLISH_ARTIFACTS)
 	  ar -t "$$tmp/libaudio_common.a" | grep -qi ne10 && { echo "FATAL: staged kiss archive unexpectedly contains an ne10 object" >&2; exit 1; }; \
 	  true; \
 	fi; \
-	rm -rf "$(DIST_REL_DIR)"; \
-	mv "$$tmp" "$(DIST_REL_DIR)"; \
-	ln -s "$(CFG_SIG)" "$(DIST_BACKEND_DIR)/.current.tmp"; \
-	mv -f "$(DIST_BACKEND_DIR)/.current.tmp" "$(DIST_BACKEND_DIR)/current"; \
-	echo "audio_common: published $(BACKEND)/$(CFG_SIG) -> $(DIST_BACKEND_DIR)/current"
+	if [ -d "$$rel_dir" ]; then \
+	  for f in "$$tmp"/*; do \
+	    bn="$$(basename "$$f")"; [ "$$bn" = "MANIFEST.txt" ] && continue; \
+	    cmp -s "$$f" "$$rel_dir/$$bn" || { echo "FATAL: existing release $$rel_id differs from staged content for $$bn (content-address collision -- should be impossible)" >&2; exit 1; }; \
+	  done; \
+	  rm -rf "$$tmp"; \
+	  echo "audio_common: $$rel_id already published (identical content) -- repointing current only"; \
+	else \
+	  mv "$$tmp" "$$rel_dir"; \
+	fi; \
+	ln -s "$$rel_id" "$(DIST_BACKEND_DIR)/.current.tmp"; \
+	if ! mv -fT "$(DIST_BACKEND_DIR)/.current.tmp" "$(DIST_BACKEND_DIR)/current" 2>/dev/null; then \
+	  rm -f "$(DIST_BACKEND_DIR)/current"; \
+	  mv -f "$(DIST_BACKEND_DIR)/.current.tmp" "$(DIST_BACKEND_DIR)/current"; \
+	fi; \
+	echo "audio_common: published $(BACKEND)/$$rel_id -> $(DIST_BACKEND_DIR)/current"
 
 clean:
 	# F12 build hygiene: nuke obj/ and bin/ wholesale (BOTH backends' output

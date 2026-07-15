@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# test_build_isolation.sh — round-3 review B01 build-isolation regression suite.
+# test_build_isolation.sh — round-3/round-4 review build-isolation regression
+# suite.
 #
 # Exercises the CFG_SIG-keyed obj/bin directory design (audio_common's own
 # Makefile, plus the two-phase AC_LIB consumer resolution in AEC/c_impl and
@@ -7,7 +8,24 @@
 # mtime-staleness delivering another config's artifact, test_ne10_force_c
 # overwriting the normal NE10 archive, parallel different-config builds
 # co-writing, and consumers hardcoding flat paths / forwarding only BACKEND
-# (config skew).
+# (config skew) -- plus, from the round-4 review, command-line override
+# rejection (P1-1), fresh-archive stale-member removal (P1-4), publish v3
+# content-addressing (P2-2), and the CC/CXX toolchain-coherence guard (P1-2).
+#
+# Scenario index:
+#   S1  - A->B->A + -O0/-O3 delivered-object repro
+#   S2  - same-second kiss<->ne10 switching
+#   S3  - parallel differing-config builds
+#   S4  - test_ne10_force_c isolation
+#   S5  - consumer correctness (drives AEC)
+#   S7p - producer-publish (v3 content-addressed dist/ layout)
+#   S8  - CFG_SIG collision guard
+#   S9  - command-line override rejection (round-4 P1-1)
+#   S10 - archive freshness / stale-member removal (round-4 P1-4)
+#   S11 - publish immutability / content-addressing (round-4 P2-2)
+#   S12 - toolchain coherence guard (round-4 P1-2)
+# S6 (Audio_ALG/pipelines consumer-resolution parity) is a later wave and is
+# intentionally NOT covered here.
 #
 # Design rules (do not violate when editing this script):
 #   - No `make clean` inside any scenario body: the whole point is that
@@ -22,9 +40,6 @@
 #   - "Is this the SAME delivered artifact as its own keyed object?" (the
 #     actual B01 assertion — no cross-config delivery) IS a sha comparison,
 #     via member_sha()/file_sha() below.
-#
-# Pipelines (Audio_ALG) scenarios (S6/S7) come in a later wave and are
-# intentionally NOT covered here.
 #
 # Usage: ./scripts/test_build_isolation.sh   (run from audio_common/, or
 # anywhere — paths are resolved relative to this script's own location).
@@ -293,6 +308,24 @@ kiss_current_target="$(readlink dist/kiss/current || true)"
 [ -n "$kiss_current_target" ] && [ -d "dist/kiss/$kiss_current_target" ] && \
   pass "S7p: kiss publish -- current symlink resolves to a real release dir" \
   || fail "S7p: kiss publish -- current symlink broken or missing"
+
+# v3 layout (round-4 review P2-2): the release dir is now
+# dist/<backend>/<cfg_sig>-<content12>, resolved ONLY via readlink above --
+# never hardcoded here -- and MANIFEST.txt carries several new fields tying
+# the on-disk release id back to the manifest content itself.
+grep -q "^release_id=$kiss_current_target$" "dist/kiss/current/MANIFEST.txt" && \
+  pass "S7p: kiss MANIFEST release_id= matches the resolved current target (v3 content-addressed id)" \
+  || fail "S7p: kiss MANIFEST release_id= missing or does not match readlink target ($kiss_current_target)"
+grep -q "^git_dirty=[01]$" "dist/kiss/current/MANIFEST.txt" && \
+  pass "S7p: kiss MANIFEST has a git_dirty= line (round-4 P2-2 field)" \
+  || fail "S7p: kiss MANIFEST missing a git_dirty= line"
+if grep -q "^ar=" "dist/kiss/current/MANIFEST.txt" && grep -q "^ranlib=" "dist/kiss/current/MANIFEST.txt" \
+   && grep -q "^link=" "dist/kiss/current/MANIFEST.txt"; then
+  pass "S7p: kiss MANIFEST has ar=/ranlib=/link= lines (round-4 P2-2 fields)"
+else
+  fail "S7p: kiss MANIFEST missing one of ar=/ranlib=/link= lines"
+fi
+
 manifest_ok=1
 while read -r sha fname; do
   [ "$fname" = "MANIFEST.txt" ] && continue
@@ -362,6 +395,216 @@ cp "$backup" "$manifest"
 rm -f "$backup" /tmp/s8.log
 make -s BACKEND=kiss lib >/dev/null && pass "S8: manifest restored, build green again" \
   || fail "S8: build still failing after manifest restore"
+
+echo "############################################################"
+echo "# S9: command-line override rejection (round-4 review P1-1)"
+echo "############################################################"
+cd "$AC_DIR"
+
+# Plain baseline (no BACKEND= given -- whatever this Makefile auto-detects
+# from the compiler is fine; only used below to prove EXTRA_CFLAGS lands
+# somewhere DIFFERENT, never compared against a hardcoded backend).
+baseline_objdir="$(make -s print-obj-dir)"
+
+# CFLAGS=/CXXFLAGS=/LDFLAGS=/FP_POLICY= set on the command line must be
+# rejected at PARSE time (before any obj/bin dir is even created) with a
+# message mentioning "cannot be overridden" -- these variables are internal
+# (this Makefile's own +=/:= appends to them would be silently defeated by a
+# command-line origin, per GNU Make semantics); EXTRA_CFLAGS/EXTRA_LDFLAGS are
+# the supported hook instead.
+for pair in "CFLAGS=-O3" "CXXFLAGS=-O0" "LDFLAGS=-lfoo" "FP_POLICY=-ffp-contract=fast"; do
+  ov_var="${pair%%=*}"
+  ov_val="${pair#*=}"
+  S9_LOG="$(mktemp)"
+  if make "$ov_var=$ov_val" print-obj-dir >"$S9_LOG" 2>&1; then
+    fail "S9: make $ov_var=$ov_val print-obj-dir unexpectedly SUCCEEDED (must be rejected at parse time)"
+  else
+    if grep -q "cannot be overridden" "$S9_LOG"; then
+      pass "S9: make $ov_var=$ov_val print-obj-dir correctly FAILS, mentioning 'cannot be overridden'"
+    else
+      fail "S9: make $ov_var=$ov_val print-obj-dir failed but WITHOUT the expected 'cannot be overridden' message"
+      cat "$S9_LOG" >&2
+    fi
+  fi
+  rm -f "$S9_LOG"
+done
+
+# EXTRA_CFLAGS is the supported hook: must still succeed, and (being folded
+# into CFG_SIG) must land in a DIFFERENT keyed dir than the plain baseline.
+extra_objdir="$(make -s EXTRA_CFLAGS=-DS9_PROBE print-obj-dir)"
+[ -n "$extra_objdir" ] && [ "$extra_objdir" != "$baseline_objdir" ] && \
+  pass "S9: EXTRA_CFLAGS=-DS9_PROBE print-obj-dir succeeds and lands in a different keyed dir than the plain baseline" \
+  || fail "S9: EXTRA_CFLAGS=-DS9_PROBE print-obj-dir did NOT differ from the plain baseline ($baseline_objdir vs $extra_objdir)"
+
+echo "############################################################"
+echo "# S10: archive freshness -- stale-member removal (round-4 review P1-4)"
+echo "############################################################"
+cd "$AC_DIR"
+
+make -s BACKEND=kiss lib >/dev/null
+kiss_lib="$(make -s BACKEND=kiss print-lib-path)"
+
+# Inject a foreign object directly into the delivered archive (simulating
+# what an old `ar rc` onto an EXISTING archive would leave behind forever for
+# a source file that's since been removed from the SRCS list).
+S10_TMPDIR="$(mktemp -d)"
+cat > "$S10_TMPDIR/s10_foreign.c" <<'EOF'
+int s10_foreign_symbol(void) { return 42; }
+EOF
+cc -c -o "$S10_TMPDIR/s10_foreign.o" "$S10_TMPDIR/s10_foreign.c"
+ar r "$kiss_lib" "$S10_TMPDIR/s10_foreign.o"
+ar -t "$kiss_lib" | grep -q '^s10_foreign\.o$' && pass "S10: foreign object successfully injected into archive (pre-condition)" \
+  || fail "S10: failed to inject foreign object into archive (pre-condition broken -- cannot test freshness)"
+
+# A normal rebuild (source touched, config unchanged) must produce a FRESH
+# archive (rm -f $@.tmp; ar rc $@.tmp $(BE_OBJS); ranlib; mv -f) -- never
+# `ar rc` onto the existing archive -- so the foreign member must be GONE
+# afterward, while hpf.o (a real, current source) must still be present.
+sleep 1
+touch "$AC_DIR/src/hpf.c"
+make -s BACKEND=kiss lib >/dev/null
+
+ar -t "$kiss_lib" | grep -q '^s10_foreign\.o$' && fail "S10: stale foreign member s10_foreign.o SURVIVED a fresh archive rebuild (ar rc onto an existing archive?)" \
+  || pass "S10: stale foreign member s10_foreign.o REMOVED by the fresh-archive rebuild"
+ar -t "$kiss_lib" | grep -q '^hpf\.o$' && pass "S10: rebuilt archive still contains hpf.o" \
+  || fail "S10: rebuilt archive missing hpf.o"
+
+# SRCS= (the sorted source list) participates in CFG_SIG_PAYLOAD, visible
+# verbatim in this config's config.manifest.
+kiss_objdir="$(make -s BACKEND=kiss print-obj-dir)"
+manifest="$kiss_objdir/config.manifest"
+if grep -q 'SRCS=' "$manifest" && grep -q 'src/hpf\.c' "$manifest"; then
+  pass "S10: config.manifest's SRCS= entry participates in CFG_SIG and lists src/hpf.c"
+else
+  fail "S10: config.manifest missing SRCS= or src/hpf.c reference ($manifest)"
+fi
+
+rm -rf "$S10_TMPDIR"
+
+echo "############################################################"
+echo "# S11: publish immutability / content-addressing (round-4 review P2-2)"
+echo "############################################################"
+cd "$AC_DIR"
+# Clean slate: dist/ is never committed, and this scenario's assertions
+# depend on knowing exactly which release ids exist.
+rm -rf dist
+
+make -s BACKEND=kiss publish >/dev/null
+id1="$(readlink dist/kiss/current || true)"
+[ -n "$id1" ] && [ -d "dist/kiss/$id1" ] && \
+  pass "S11: first kiss publish -- current resolves to a real release dir ($id1)" \
+  || fail "S11: first kiss publish -- current symlink broken or missing"
+
+manifest1="dist/kiss/$id1/MANIFEST.txt"
+if [ -f "$manifest1" ] && grep -q "^release_id=$id1$" "$manifest1" && grep -q "^git_dirty=" "$manifest1" \
+   && grep -q "^ar=" "$manifest1" && grep -q "^ranlib=" "$manifest1" && grep -q "^link=" "$manifest1"; then
+  pass "S11: MANIFEST.txt has release_id=/git_dirty=/ar=/ranlib=/link= (v3 fields)"
+else
+  fail "S11: MANIFEST.txt missing one of release_id=/git_dirty=/ar=/ranlib=/link= ($manifest1)"
+fi
+
+mtime_id1_before="$(mtime "dist/kiss/$id1")"
+
+# Republishing IDENTICAL content must be a no-op on the release dir itself
+# (verified byte-for-byte, never re-created) -- only `current` is repointed
+# (to the SAME id here, since nothing changed).
+sleep 1
+S11_LOG="$(mktemp)"
+make -s BACKEND=kiss publish >"$S11_LOG" 2>&1
+grep -q "already published" "$S11_LOG" && pass "S11: identical-content republish reports 'already published'" \
+  || fail "S11: identical-content republish did NOT report 'already published'"
+rm -f "$S11_LOG"
+
+id1_again="$(readlink dist/kiss/current || true)"
+[ "$id1_again" = "$id1" ] && pass "S11: current still points at id1 after identical-content republish" \
+  || fail "S11: current CHANGED after identical-content republish ($id1 -> $id1_again)"
+
+mtime_id1_after="$(mtime "dist/kiss/$id1")"
+[ "$mtime_id1_before" = "$mtime_id1_after" ] && pass "S11: release dir dist/kiss/$id1 mtime UNCHANGED by identical-content republish" \
+  || fail "S11: release dir dist/kiss/$id1 mtime CHANGED by identical-content republish ($mtime_id1_before -> $mtime_id1_after)"
+
+# Content change, SAME flags: publish must mint a NEW content-addressed id,
+# and the OLD release dir must survive untouched alongside it (never deleted
+# or overwritten).
+# A REAL codegen change, not a comment: a comment-only edit produces a
+# byte-identical object (and the archiver runs in deterministic mode, so the
+# archive doesn't even pick up a new member timestamp) -- the content-
+# addressed release id then CORRECTLY stays the same, which is exactly the
+# immutability property, not a bug. To exercise "same flags, different
+# content -> new release id" the artifact bytes must actually change.
+echo "void s11_isolation_probe(void) {}" >> "$AC_DIR/src/hpf.c"
+make -s BACKEND=kiss publish >/dev/null
+id2="$(readlink dist/kiss/current || true)"
+
+[ -n "$id2" ] && [ "$id2" != "$id1" ] && pass "S11: content change -- publish produced a NEW release id ($id1 -> $id2)" \
+  || fail "S11: content change did NOT produce a new release id (id1=$id1 id2=$id2)"
+[ -d "dist/kiss/$id1" ] && [ -d "dist/kiss/$id2" ] && \
+  pass "S11: both the old (id1) and new (id2) release dirs coexist -- old release never deleted" \
+  || fail "S11: old release dir dist/kiss/$id1 or new dist/kiss/$id2 missing after content change"
+
+# ids are <cfg_sig>-<content12>; same flags => same cfg_sig prefix (the part
+# before the LAST '-', since content12 itself is plain lowercase hex with no
+# dashes).
+cfgsig1="${id1%-*}"
+cfgsig2="${id2%-*}"
+[ -n "$cfgsig1" ] && [ "$cfgsig1" = "$cfgsig2" ] && \
+  pass "S11: id1/id2 share the same cfg_sig prefix ($cfgsig1) -- flags unchanged, only content differed" \
+  || fail "S11: id1/id2 cfg_sig prefixes DIFFER ($cfgsig1 vs $cfgsig2) though only source content changed"
+
+# Restore: leave the tree clean for whatever else is using it, and dist/ is
+# never committed either way.
+git checkout -- "$AC_DIR/src/hpf.c"
+make -s BACKEND=kiss lib >/dev/null
+rm -rf dist
+
+echo "############################################################"
+echo "# S12: toolchain coherence guard (round-4 review P1-2)"
+echo "############################################################"
+cd "$AC_DIR"
+
+# fake-cxx: reports a bogus -dumpmachine triple (so it can never match a
+# real CC's), otherwise transparently forwards to the real c++ so a build
+# using it as CXX still actually compiles/links.
+S12_TMPDIR="$(mktemp -d)"
+SHIM="$S12_TMPDIR/fake-cxx"
+cat > "$SHIM" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-dumpmachine" ]; then
+  echo "s12-mismatched-triple"
+  exit 0
+fi
+exec c++ "$@"
+EOF
+chmod +x "$SHIM"
+
+S12_LOG="$(mktemp)"
+if make BACKEND=ne10 CXX="$SHIM" lib >"$S12_LOG" 2>&1; then
+  fail "S12: make BACKEND=ne10 CXX=<mismatched shim> lib unexpectedly SUCCEEDED (toolchain guard did not fire)"
+else
+  grep -q "different targets" "$S12_LOG" && pass "S12: BACKEND=ne10 with a mismatched CXX -dumpmachine FAILS, mentioning 'different targets'" \
+    || fail "S12: BACKEND=ne10 with a mismatched CXX FAILED but WITHOUT the expected 'different targets' message"
+fi
+rm -f "$S12_LOG"
+
+S12_LOG2="$(mktemp)"
+if make BACKEND=ne10 CXX="$SHIM" TOOLCHAIN_CHECK=0 lib >"$S12_LOG2" 2>&1; then
+  pass "S12: TOOLCHAIN_CHECK=0 skips the guard -- BACKEND=ne10 build with the mismatched CXX shim SUCCEEDS (its own keyed dir)"
+else
+  fail "S12: TOOLCHAIN_CHECK=0 build with the mismatched CXX shim FAILED (guard should have been skipped)"
+  cat "$S12_LOG2" >&2
+fi
+rm -f "$S12_LOG2"
+
+S12_LOG3="$(mktemp)"
+if make BACKEND=kiss CXX="$SHIM" lib >"$S12_LOG3" 2>&1; then
+  pass "S12: BACKEND=kiss with the mismatched CXX shim SUCCEEDS (guard is ne10-only)"
+else
+  fail "S12: BACKEND=kiss with the mismatched CXX shim FAILED (guard should never run for kiss)"
+  cat "$S12_LOG3" >&2
+fi
+rm -f "$S12_LOG3"
+
+rm -rf "$S12_TMPDIR"
 
 echo "############################################################"
 echo "SUMMARY: $PASS_COUNT passed, $FAIL_COUNT failed"
