@@ -205,6 +205,60 @@ else
   CFLAGS  += -isystem lib/kiss_fft
 endif
 
+# --- FP-contraction policy: unified across all four repos (round-3 review
+# B04). Every TU THIS Makefile compiles -- our own sources AND the vendored
+# KISS/NE10 C and C++ TUs alike -- builds with -ffp-contract=off, positioned
+# so nothing can override it: appended here, AFTER every prior CFLAGS/
+# CXXFLAGS append in this file (base flags, EXTRA_CFLAGS, and the
+# BACKEND-conditional NE10_DEFS/-isystem/kiss appends just above), and BEFORE
+# CFG_SIG_PAYLOAD is computed below (so it automatically participates in
+# CFG_SIG -- no separate payload entry needed, same as CFLAGS/CXXFLAGS
+# themselves). A caller's EXTRA_CFLAGS can add flags but can no longer
+# silently re-enable contraction after this file's own flags, because
+# nothing after this line ever appends to CFLAGS/CXXFLAGS again.
+#
+# Policy scope: contraction must be off repo-wide, not just for code we own
+# -- a compiler-fused FMA in vendored scalar reference code (KISS, or NE10's
+# non-neonintrinsic .c/.cpp files) is exactly the build-order-dependent
+# numeric drift this flag exists to eliminate. This does NOT touch explicit
+# NEON intrinsics (fft_wrapper_ne10.c's vfmaq_f32/vmulq_f32, or NE10's own
+# *.neonintrinsic.c) or explicit fmaf() calls (fft_wrapper.c's/
+# fft_wrapper_ne10.c's fft_power() scalar tail, deliberately mirroring the
+# NEON path bit-for-bit -- see that function's own comment) -- those are
+# EXPLICIT fusion requests the source code asks for regardless of this flag,
+# not compiler-chosen contraction of a plain `a*b+c` expression, and
+# -ffp-contract only controls the latter. See scripts/audit_fp_contract.sh
+# for the disassembly-level verification (PASS/EXEMPT table distinguishing
+# the two) and each repo's README/CLAUDE.md for the cross-repo policy note.
+#
+# Conflict detection (round-3 review B04): a caller passing
+# EXTRA_CFLAGS=-Ofast/-ffast-math (both of which imply -ffp-contract=fast on
+# gcc/clang) or EXTRA_CFLAGS=-ffp-contract=<anything> would either directly
+# re-enable contraction or silently do so via an implied flag, despite this
+# repo's pinned policy -- rejected outright rather than allowed to land.
+# Checked against the fully-assembled $(CFLAGS) (already includes
+# EXTRA_CFLAGS folded in above, AND any CFLAGS= command-line override, since
+# a command-line-set CFLAGS is what every prior `+=` in this file appended
+# to) -- BEFORE FP_POLICY is appended below and BEFORE CFG_SIG is computed,
+# so a rejected build never creates an obj/bin directory. Using $(CFLAGS)
+# here (not a separate raw EXTRA_CFLAGS-only check) also catches
+# CXXFLAGS-only conflicts for free, since EXTRA_CFLAGS is the one hook both
+# CFLAGS and CXXFLAGS fold in identically (this Makefile has no separate
+# EXTRA_CXXFLAGS knob).
+ifneq ($(findstring -Ofast,$(CFLAGS)),)
+$(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -Ofast; this repo pins -ffp-contract=off; remove -Ofast from EXTRA_CFLAGS)
+endif
+ifneq ($(findstring -ffast-math,$(CFLAGS)),)
+$(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from EXTRA_CFLAGS)
+endif
+ifneq ($(findstring -ffp-contract=,$(CFLAGS)),)
+$(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -ffp-contract=; this repo pins -ffp-contract=off; remove -ffp-contract= from EXTRA_CFLAGS)
+endif
+
+FP_POLICY := -ffp-contract=off
+CFLAGS    += $(FP_POLICY)
+CXXFLAGS  += $(FP_POLICY)
+
 # --- Hash-keyed object/binary directory + full-coverage CFG_SIG ------------
 # obj/$(BACKEND)-<sig> and (round-3 review B01) bin/$(BACKEND)-<sig> isolate
 # every distinct build configuration from every other one -- not just

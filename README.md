@@ -32,6 +32,39 @@ Backend policy: desktop/CI builds use KISS (bit-reproducible reference); embedde
 builds pass `BACKEND=ne10`. Backend is a build knob, not a branch property — every
 consumer repo is single-branch (`main`).
 
+## FP-contraction policy (round-3 review B04)
+
+`-ffp-contract=off` is a **unified policy spanning all four repos**
+(`audio_common`, `NR/c_impl`, `AEC/c_impl`, `Audio_ALG/pipelines`): every
+translation unit any of their Makefiles compile — each repo's own sources
+*and* the vendored KISS/NE10 C and C++ TUs alike — builds with this flag,
+positioned so nothing can override it. In each Makefile the flag is the
+LAST token appended to `CFLAGS`/`CXXFLAGS` (after `EXTRA_CFLAGS`, after any
+BACKEND-conditional append, after `WERROR`/`NO_STDIO`), and each Makefile
+rejects, at parse time, an `EXTRA_CFLAGS` (or `CFLAGS=` override) containing
+`-Ofast`, `-ffast-math`, or `-ffp-contract=<anything>`:
+
+```
+$ make EXTRA_CFLAGS=-ffast-math
+Makefile:252: *** FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from EXTRA_CFLAGS.  Stop.
+```
+
+`scripts/audit_fp_contract.sh` is the disassembly-level proof: it builds the
+`kiss`/`ne10` configs, disassembles a fixed list of TUs expected to be
+genuinely scalar (this repo's `hpf.o`/`kiss_fft.o`/the NE10 scalar-C
+objects, plus NR's three core objects), and fails if any fmadd/fmsub/
+fnmadd/fnmsub/fmla/fmls instruction shows up — the signature of the
+compiler choosing, on its own, to fuse a plain `a*b+c` expression, which is
+exactly what this flag forbids. It does NOT flag TUs that request fusion
+**explicitly** — `fft_wrapper.c`/`fft_wrapper_ne10.c`'s `fft_power()` scalar
+tail calls `fmaf()` directly (see that function's own comment) and both
+files carry an `__ARM_NEON`-guarded explicit `vfmaq_f32` block; those are
+EXEMPT (reported, never failed) with the exact source-level reason — see
+the script's own header comment for the full rationale, including a
+non-obvious finding (`NE10_rfft_float32.neonintrinsic.o`, despite its name,
+uses no fused intrinsic anywhere and is audited like any other scalar TU).
+Run it with `scripts/audit_fp_contract.sh kiss ne10`.
+
 ## API conventions
 
 - Every module exposes a heap path (`X_create`/`X_destroy`) and a static-memory
