@@ -48,17 +48,24 @@
 #include <fcntl.h>
 #include <errno.h>
 
+/* Builds "<path>.<pid>.tmp" into buf and clears any stale same-PID temp (it
+ * can only be our own, from a previous failed run of this exact path in this
+ * exact process id -- safe to clear). Shared by both modes so the temp-naming
+ * scheme cannot drift between them. */
+static int make_tmp_path(char* buf, size_t bufsz, const char* path) {
+    int n = snprintf(buf, bufsz, "%s.%ld.tmp", path, (long)getpid());
+    if (n < 0 || (size_t)n >= bufsz) {
+        fprintf(stderr, "swapln: path too long\n");
+        return -1;
+    }
+    (void)unlink(buf);
+    return 0;
+}
+
 static int swap_symlink(const char* target, const char* linkpath) {
     char tmp[4096];
-    int n = snprintf(tmp, sizeof(tmp), "%s.%ld.tmp", linkpath, (long)getpid());
-    if (n < 0 || (size_t)n >= sizeof(tmp)) {
-        fprintf(stderr, "swapln: link path too long\n");
+    if (make_tmp_path(tmp, sizeof(tmp), linkpath) != 0)
         return 1;
-    }
-
-    /* A stale same-PID temp can only be our own from a previous failed run
-     * of this exact path in this exact process id -- safe to clear. */
-    (void)unlink(tmp);
 
     if (symlink(target, tmp) != 0) {
         fprintf(stderr, "swapln: symlink(%s, %s): %s\n", target, tmp, strerror(errno));
@@ -74,11 +81,8 @@ static int swap_symlink(const char* target, const char* linkpath) {
 
 static int excl_install(const char* src, const char* dst) {
     char tmp[4096];
-    int n = snprintf(tmp, sizeof(tmp), "%s.%ld.tmp", dst, (long)getpid());
-    if (n < 0 || (size_t)n >= sizeof(tmp)) {
-        fprintf(stderr, "swapln: dst path too long\n");
+    if (make_tmp_path(tmp, sizeof(tmp), dst) != 0)
         return 1;
-    }
 
     int in = open(src, O_RDONLY);
     if (in < 0) {
@@ -86,7 +90,6 @@ static int excl_install(const char* src, const char* dst) {
         return 1;
     }
 
-    (void)unlink(tmp); /* same-PID leftover: ours, safe to clear */
     int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out < 0) {
         fprintf(stderr, "swapln: open(%s): %s\n", tmp, strerror(errno));

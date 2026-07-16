@@ -61,14 +61,38 @@ TOOLCHAIN_CHECK ?= 1
 # against a scratch-directory build of the real worktree, so the REAL
 # obj/ and bin/ artifacts are never modified -- not even transiently.
 #
-# ALLOW_DIRTY_PUBLISH (round-6 review P2): `make publish` REFUSES by default
-# when this checkout has uncommitted tracked changes or is not a git
+# ALLOW_DIRTY_PUBLISH (round-6 review P2, scope narrowed in round-7):
+# `make publish` REFUSES by default when this checkout has uncommitted
+# TRACKED changes (`git status --porcelain -uno` non-empty) or is not a git
 # checkout at all (commit unknown) -- a release whose ATTEST provenance
 # cannot name the exact source state is not a board deliverable.
 # ALLOW_DIRTY_PUBLISH=1 is the explicit escape hatch for dev publishes; it
 # is recorded in the attestation together with a sha256 of
-# `git diff --binary HEAD` so the deviation itself is traceable. Not in
-# CFG_SIG: it never changes what is built, only whether publish proceeds.
+# `git diff --binary HEAD` so the deviation itself is traceable. It covers
+# TRACKED changes only -- untracked files have their own dimension below
+# (round-7 review: the tracked diff hash says nothing about untracked
+# bytes, so lumping the two under one flag let two different untracked
+# source states publish with identical provenance).
+#
+# ALLOW_UNTRACKED_PUBLISH (round-7 review): publish also REFUSES by default
+# when the checkout contains ANY untracked, non-ignored file (`git ls-files
+# --others --exclude-standard` non-empty; gitignored build output is
+# excluded by design and never part of this provenance) -- an untracked
+# source a (possibly dirty) Makefile references can change the artifact
+# without leaving a trace in the tracked diff. ALLOW_UNTRACKED_PUBLISH=1 is
+# the separate escape hatch; it records untracked_tree_sha256 in the
+# attestation: sha256 over sorted FIXED-FIELD per-file records --
+# "L <sha256(path)> <sha256(readlink output)>" for symlinks,
+# "F <mode> <sha256(path)> <sha256(content)>" for regular files -- every
+# variable-length value is itself hashed, so records concatenate
+# unambiguously (raw space-joined path/target strings were collision-prone:
+# "a b"->"c" vs "a"->"b c" encoded identically) and any stat/readlink/
+# shasum failure downgrades the entry to an X record => FATAL, never an
+# empty hash (fail-closed). A path that is neither a regular file nor a
+# symlink (an embedded git checkout, a fifo) is always refused, named.
+# A checkout with NO git identity at all is refused UNCONDITIONALLY --
+# neither knob admits it (provenance is impossible). Neither knob is in
+# CFG_SIG: they never change what is built, only whether publish proceeds.
 #
 # ATTEST_STAMP (round-6 review P2, TEST-ONLY): overrides the UTC timestamp
 # embedded in the attestation FILENAME so the isolation tests can
@@ -82,6 +106,7 @@ HOSTCC    ?= cc
 OBJ_ROOT  ?= obj
 BIN_ROOT  ?= bin
 ALLOW_DIRTY_PUBLISH ?= 0
+ALLOW_UNTRACKED_PUBLISH ?= 0
 ATTEST_STAMP ?=
 
 # -Werror opt-in (default off; CI can flip it on with `make WERROR=1`).
@@ -757,13 +782,24 @@ print-lib-path:
 # in an existing release dir is ever modified or deleted (ATTEST/ gains
 # files; artifacts/MANIFEST never change after first publish).
 #
-# Dirty policy (round-6 review P2): publish FATALs by default when this
-# checkout has uncommitted tracked changes (`git status --porcelain` after
-# excluding nothing -- untracked files count here) or no git identity at
-# all. ALLOW_DIRTY_PUBLISH=1 overrides; the attestation then records
-# allow_dirty_publish=1 plus dirty_diff_sha256 (sha256 of
-# `git diff --binary HEAD`, tracked changes only) so the deviation is
-# itself traceable.
+# Dirty/untracked policy (round-6 P2, split into two dimensions by
+# round-7): publish FATALs by default when this checkout (a) has
+# uncommitted TRACKED changes (`git status --porcelain -uno` non-empty),
+# (b) contains ANY untracked, non-ignored file (`git ls-files --others
+# --exclude-standard` non-empty), or (c) has no git identity at all.
+# (c) is UNCONDITIONAL -- no escape hatch admits an identity-less
+# checkout, because neither the commit nor the untracked enumeration can
+# be named for it. The two escape hatches for (a)/(b) are separate and
+# orthogonal: ALLOW_DIRTY_PUBLISH=1 admits tracked changes and records
+# dirty_diff_sha256 (sha256 of `git diff --binary HEAD`);
+# ALLOW_UNTRACKED_PUBLISH=1 admits untracked files and records
+# untracked_tree_sha256 over sorted fixed-field records (see the knob
+# comment up top for the exact encoding and its fail-closed I/O
+# semantics -- round-7: the tracked diff hash says nothing about
+# untracked bytes, so two different untracked source states must not
+# share a provenance record). An untracked path that is neither a regular
+# file nor a symlink (an embedded git checkout, a fifo, ...) cannot be
+# hashed deterministically and is always refused by name.
 #
 # `current` is swapped with tools/atomic_symlink_swap.c (built at publish
 # time with $(HOSTCC), never the possibly-cross $(CC)): symlink to a
@@ -784,22 +820,32 @@ DIST_BACKEND_DIR  = $(DIST_ROOT)/$(BACKEND)
 DIST_LOCK         = $(DIST_ROOT)/.lock.$(BACKEND)
 
 .PHONY: publish _publish_impl
-# Dry-run guard (round-6 review P2-3): this recipe mentions $(MAKE), so GNU
-# make executes it for real under -n/-q/-t (all three share that rule) --
-# which used to mkdir $(DIST_ROOT) persistently and take/release the real
-# publish lock on every dry run. The word-scan below detects those flags in
-# MAKEFLAGS and branches: -n/-t exec a recursion-only path (the child make
-# inherits the flag and merely prints / applies standard -t touch semantics
-# to the impl chain); -q exits 1 directly (question mode's documented
-# "needs updating" answer -- publish is phony, so it always would run --
-# with no output). Either way: no DIST_ROOT, no lock, no stage/helper/
-# MANIFEST/ATTEST writes. MAKEFLAGS parsing (verified against GNU make
-# 3.81: 17 flag combinations incl. long forms): bundled no-dash short flags
-# may appear as the first word ("n", "sn") OR as separate dashed words
-# ("-n" after a long option); long options start with "--"; a literal "--"
-# separates flags from command-line variable overrides (which can
-# themselves contain n/q/t -- BACKEND=ne10 -- hence the explicit skips).
-# Normal invocations keep the round-5 lock-FIRST discipline unchanged.
+# Dry-run guard (round-6 review P2-3, -t tightened by round-7): this
+# recipe mentions $(MAKE), so GNU make executes it for real under -n/-q/-t
+# (all three share that rule) -- which used to mkdir $(DIST_ROOT)
+# persistently and take/release the real publish lock on every dry run.
+# The word-scan below detects those flags in MAKEFLAGS and branches:
+#   -t  prints a one-line note and exits 0 WITHOUT recursing (round-7:
+#       recursing let standard touch semantics bump the mtimes of hpf.o
+#       and the delivered archive -- real writes. publish is a phony
+#       ACTION, not a build product; touching its artifact prerequisites
+#       without attesting would fabricate state, so touch mode is an
+#       explicit no-op here). Checked FIRST: in a COMBINED invocation like
+#       `make -nt publish`, recursing for -n would hand the child make
+#       both flags and GNU make then really applies touch semantics
+#       (reproduced) -- so any t wins over n, conservatively;
+#   -q  exits 1 directly (question mode's documented "needs updating"
+#       answer -- publish is phony, so it always would run -- no output);
+#   -n  exec a recursion-only path (the child make inherits -n and merely
+#       PRINTS _publish_impl's commands).
+# All three are now ZERO-WRITE: no DIST_ROOT, no lock, no stage/helper/
+# MANIFEST/ATTEST writes, and no artifact mtime changes. MAKEFLAGS parsing
+# (verified against GNU make 3.81: 17 flag combinations incl. long forms):
+# bundled no-dash short flags may appear as the first word ("n", "sn") OR
+# as separate dashed words ("-n" after a long option); long options start
+# with "--"; a literal "--" separates flags from command-line variable
+# overrides (which can themselves contain n/q/t -- BACKEND=ne10 -- hence
+# the explicit skips). Normal invocations keep lock-FIRST unchanged.
 publish:
 	+@has_n=0; has_q=0; has_t=0; \
 	for w in $(MAKEFLAGS); do \
@@ -808,8 +854,9 @@ publish:
 	  case "$$w" in *q*) has_q=1 ;; esac; \
 	  case "$$w" in *t*) has_t=1 ;; esac; \
 	done; \
-	if [ "$$has_n" = 1 ] || [ "$$has_t" = 1 ]; then exec $(MAKE) --no-print-directory _publish_impl; fi; \
+	if [ "$$has_t" = 1 ]; then echo "publish: -t (touch) is a no-op here -- publish is an action, not a build product; nothing was touched"; exit 0; fi; \
 	if [ "$$has_q" = 1 ]; then exit 1; fi; \
+	if [ "$$has_n" = 1 ]; then exec $(MAKE) --no-print-directory _publish_impl; fi; \
 	mkdir -p $(DIST_ROOT); \
 	if ! mkdir "$(DIST_LOCK)" 2>/dev/null; then \
 	  echo "FATAL: publish lock $(DIST_LOCK) already held (concurrent 'make publish BACKEND=$(BACKEND)'?)" >&2; \
@@ -823,21 +870,60 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	work="$$(mktemp -d)"; \
 	tmp="$(DIST_BACKEND_DIR)/.stage.$$$$"; \
 	trap 'rm -rf "$$tmp" "$$work"' EXIT INT TERM; \
+	hash_untracked() { \
+	  LC_ALL=C sort | while IFS= read -r p; do \
+	    fp="$$1$$p"; \
+	    ph="$$(printf '%s' "$$p" | shasum -a 256 | cut -d' ' -f1)"; \
+	    [ "$${#ph}" -eq 64 ] || { printf 'X %s\n' "$$p"; continue; }; \
+	    if [ -L "$$fp" ]; then \
+	      tgt="$$(readlink "$$fp")" || { printf 'X %s\n' "$$p"; continue; }; \
+	      th="$$(printf '%s' "$$tgt" | shasum -a 256 | cut -d' ' -f1)"; \
+	      [ "$${#th}" -eq 64 ] || { printf 'X %s\n' "$$p"; continue; }; \
+	      printf 'L %s %s\n' "$$ph" "$$th"; \
+	    elif [ -f "$$fp" ]; then \
+	      m="$$(stat -f '%Lp' "$$fp" 2>/dev/null || stat -c '%a' "$$fp" 2>/dev/null)"; \
+	      ch="$$(shasum -a 256 "$$fp" 2>/dev/null | cut -d' ' -f1)"; \
+	      { [ -n "$$m" ] && [ "$${#ch}" -eq 64 ]; } || { printf 'X %s\n' "$$p"; continue; }; \
+	      printf 'F %s %s %s\n' "$$m" "$$ph" "$$ch"; \
+	    else printf 'X %s\n' "$$p"; fi; \
+	  done; \
+	}; \
 	commit="$$(git rev-parse HEAD 2>/dev/null || echo unknown)"; \
-	if [ "$$commit" = "unknown" ]; then dirty=unknown; else \
-	  dirty=0; [ -n "$$(git status --porcelain 2>/dev/null)" ] && dirty=1; \
+	if [ "$$commit" = "unknown" ]; then \
+	  echo "FATAL: publish refused -- audio_common has no git identity here (not a git checkout)." >&2; \
+	  echo "  Without an identity the attestation cannot name the source state OR enumerate untracked" >&2; \
+	  echo "  content, so NO escape hatch admits this (round-7: ALLOW_DIRTY_PUBLISH used to). Publish" >&2; \
+	  echo "  from a real checkout or a scratch clone with a disposable commit instead." >&2; \
+	  exit 1; \
 	fi; \
-	ddiff=""; [ "$$dirty" = "1" ] && ddiff="$$(git diff --binary HEAD 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"; \
+	dirty=0; [ -n "$$(git status --porcelain -uno 2>/dev/null)" ] && dirty=1; \
+	unt_list="$$(git ls-files --others --exclude-standard 2>/dev/null)"; \
+	untracked=0; [ -n "$$unt_list" ] && untracked=1; \
 	adp=0; [ "$(ALLOW_DIRTY_PUBLISH)" = "1" ] && adp=1; \
-	if [ "$$adp" != "1" ] && [ "$$dirty" != "0" ]; then \
-	  if [ "$$dirty" = "unknown" ]; then \
-	    echo "FATAL: publish refused -- audio_common has no git identity here (not a git checkout), so the attestation cannot name the source state." >&2; \
-	  else \
-	    echo "FATAL: publish refused -- audio_common working tree is dirty (uncommitted changes)." >&2; \
-	  fi; \
+	aup=0; [ "$(ALLOW_UNTRACKED_PUBLISH)" = "1" ] && aup=1; \
+	if [ "$$adp" != "1" ] && [ "$$dirty" = "1" ]; then \
+	  echo "FATAL: publish refused -- audio_common working tree is dirty (uncommitted TRACKED changes)." >&2; \
 	  echo "  Commit (or clone a clean checkout) for a board deliverable, or pass ALLOW_DIRTY_PUBLISH=1" >&2; \
 	  echo "  for a dev publish -- the escape hatch is recorded in the attestation." >&2; \
 	  exit 1; \
+	fi; \
+	if [ "$$aup" != "1" ] && [ "$$untracked" = "1" ]; then \
+	  echo "FATAL: publish refused -- audio_common contains UNTRACKED (non-ignored) files (they can change the artifact without a trace in the tracked diff):" >&2; \
+	  printf '%s\n' "$$unt_list" | head -5 | sed 's/^/    /' >&2; \
+	  echo "  Track/remove them for a board deliverable, or pass ALLOW_UNTRACKED_PUBLISH=1 -- the escape" >&2; \
+	  echo "  hatch is recorded in the attestation with untracked_tree_sha256 over their exact contents." >&2; \
+	  exit 1; \
+	fi; \
+	ddiff=""; [ "$$dirty" = "1" ] && ddiff="$$(git diff --binary HEAD 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"; \
+	uhash=""; \
+	if [ "$$untracked" = "1" ]; then \
+	  printf '%s\n' "$$unt_list" | hash_untracked "./" > "$$work/untracked.records"; \
+	  if grep -q '^X ' "$$work/untracked.records"; then \
+	    echo "FATAL: publish refused -- an untracked path cannot be hashed deterministically (embedded git checkout / special file / I/O failure) and so cannot enter the provenance record:" >&2; \
+	    grep '^X ' "$$work/untracked.records" | sed 's/^X /    /' >&2; \
+	    exit 1; \
+	  fi; \
+	  uhash="$$(shasum -a 256 < "$$work/untracked.records" | cut -d' ' -f1)"; \
 	fi; \
 	dateutc="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
 	stamp='$(ATTEST_STAMP)'; [ -n "$$stamp" ] || stamp="$$(date -u +%Y%m%dT%H%M%SZ)"; \
@@ -892,8 +978,11 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	    echo "backend=$(BACKEND)"; \
 	    echo "git_commit=$$commit"; echo "git_dirty=$$dirty"; \
 	    [ -n "$$ddiff" ] && echo "dirty_diff_sha256=$$ddiff"; \
+	    echo "git_untracked=$$untracked"; \
+	    [ -n "$$uhash" ] && echo "untracked_tree_sha256=$$uhash"; \
 	    echo "date_utc=$$dateutc"; \
 	    echo "allow_dirty_publish=$$adp"; \
+	    echo "allow_untracked_publish=$$aup"; \
 	  } > "$$work/attest.txt"; \
 	  rc=0; "$$work/swapln" --excl-install "$$work/attest.txt" "$$rel_dir/ATTEST/$$attest_name" || rc=$$?; \
 	  [ "$$rc" -eq 0 ] && break; \
