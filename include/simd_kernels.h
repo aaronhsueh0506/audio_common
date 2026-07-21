@@ -13,19 +13,22 @@
  * files, so any drift anywhere breaks the gate.
  *
  * NaN caveat, precisely: for the compare+select kernels (sk_min_f32,
- * sk_clip_f32, sk_fast_sqrt_f32) NaN is actually deterministic and IS
- * verified bit-exact scalar-vs-NEON (see simd_selftest.c's dedicated NaN
- * blocks) — every IEEE ordered comparison (<, <=, >, >=) is false for NaN,
- * on both the scalar FPU and NEON, so the "select" always lands on the same
- * documented branch (fast_sqrt: the 0.0f domain-edge constant; min/clip:
+ * sk_clip_f32, sk_fast_sqrt_f32, sk_fast_exp_f32, sk_fast_exp_neg_f32,
+ * sk_fast_log_f32, sk_fast_log10_f32, sk_exp1_approx_f32) NaN is actually
+ * deterministic and IS verified bit-exact scalar-vs-NEON (see
+ * simd_selftest.c's dedicated NaN blocks) — every IEEE ordered comparison
+ * (<, <=, >, >=) is false for NaN, on both the scalar FPU and NEON, so the
+ * "select" always lands on the same documented branch (fast_sqrt/fast_exp/
+ * fast_log: the domain-edge constant fast_math.h documents; min/clip:
  * whichever operand the ternary/mask falls through to) in both paths.
  * "NaN is out of scope" applies to the pure-arithmetic kernels (sk_ema_f32,
- * sk_cadd_f32, sk_sq_scale_f32, sk_capply_gain_f32): a NaN operand
- * propagates through +/- correctly-rounded arithmetic with no compare/select
- * involved, and while AArch64 scalar and NEON FP units are architecturally
- * the same IEEE-754 hardware (so payload propagation should in practice
- * agree), this file does not assert or test that payload-bit equality for
- * those kernels — only that NaN inputs don't corrupt unrelated lanes/output.
+ * sk_cadd_f32, sk_sq_scale_f32, sk_capply_gain_f32, sk_mcra_noise_update_f32):
+ * a NaN operand propagates through +/- correctly-rounded arithmetic with no
+ * compare/select involved, and while AArch64 scalar and NEON FP units are
+ * architecturally the same IEEE-754 hardware (so payload propagation should
+ * in practice agree), this file does not assert or test that payload-bit
+ * equality for those kernels — only that NaN inputs don't corrupt unrelated
+ * lanes/output.
  *
  * ───────────────────── Contract summary (re-review R07) ──────────────────
  * Stated once, plainly, as the one-paragraph version of the two blocks
@@ -107,6 +110,12 @@
  *     - sk_wupdate_kf_f32's K = mu*conj(X) and K *= mu_scale steps
  *       (kernel 8)
  *     - sk_sq_scale_f32                              (kernel 11)
+ *     - sk_fast_exp_f32 / sk_fast_exp_neg_f32's Taylor expansion and
+ *       sk_fast_log_f32 / sk_fast_log10_f32's Taylor expansion (kernels
+ *       23-26) — fast_math.h's fast_exp/fast_log never call fmaf, so
+ *       neither do these
+ *     - sk_exp1_approx_f32's three branch formulas               (kernel 27)
+ *     - sk_mcra_noise_update_f32                                  (kernel 28)
  *
  * ───────────────────────── min/clip: compare+select, not min/max ─────────
  * Empirically verified: AArch64 `vminq_f32(-0.0f, +0.0f)` returns -0.0f,
@@ -138,22 +147,35 @@
  * fast_math.h itself, so this header's bit-exactness cannot be silently
  * altered by an unrelated `USE_STANDARD_MATH` toggle defined by some other
  * translation unit that happens to link into the same program. Where a
- * kernel mirrors a fast_math.h function (fast_sqrt, clip_f, min_f), its
- * exact algorithm is replicated verbatim as a private per-element helper
- * instead of calling fast_math.h directly — see the per-kernel comments.
+ * kernel mirrors a fast_math.h function (fast_sqrt, clip_f, min_f, fast_exp,
+ * fast_exp_neg, fast_log, fast_log10, exp1_approx), its exact algorithm is
+ * replicated verbatim as a private per-element helper instead of calling
+ * fast_math.h directly — see the per-kernel comments. This DOES include
+ * mirroring fast_math.h's own `USE_STANDARD_MATH` build-mode switch (a
+ * separate `#ifdef USE_STANDARD_MATH` inside this header, not a dependency
+ * on the other one) so a call site converted from a bare fast_math.h call to
+ * the matching sk_ kernel behaves identically in both build modes.
  *
  * No `restrict` anywhere: callers may pass overlapping buffers only when
  * explicitly documented as supporting it (e.g. sk_capply_gain_f32's
- * out == z in-place case); otherwise pointers are assumed non-aliasing.
+ * out == z in-place case, and the exp/log family's out == x case, kernels
+ * 23/24/25/27, documented at their definitions below); otherwise pointers
+ * are assumed non-aliasing.
  *
- * Round-3 review B05: only the alias form actually exercised by
- * simd_selftest.c's matrix is contractually supported -- sk_capply_gain_f32's
- * literal out == z is the sole one in this file (dedicated in-place check in
- * test_capply_gain()). Every other kernel's edge-case matrix uses
- * NON-overlapping buffers at every offset combination it tests; partial
- * overlap (out == z + k for some nonzero k) is neither documented nor
- * tested anywhere in this file and is unsupported, even if it happens to
- * work today on some input.
+ * Round-3 review B05 (extended by the NR/c_impl calculate_gain()/
+ * spp_estimate() scratch-buffer-reuse review): only the alias forms actually
+ * exercised by simd_selftest.c's matrix are contractually supported --
+ * sk_capply_gain_f32's literal out == z (dedicated in-place check in
+ * test_capply_gain()), plus sk_fast_exp_f32/sk_fast_exp_neg_f32/
+ * sk_fast_log_f32/sk_exp1_approx_f32's literal out == x (dedicated in-place
+ * check in test_exp_log_family_inplace()). sk_fast_log10_f32 shares the
+ * identical per-block load-then-store shape but has no call site relying on
+ * it yet and no dedicated in-place selftest, so out == x for it is NOT
+ * contractually supported until one is added. Every other kernel's edge-case
+ * matrix uses NON-overlapping buffers at every offset combination it tests;
+ * partial overlap (out == z + k / out == x + k for any nonzero k) is neither
+ * documented nor tested anywhere in this file and is unsupported, even if it
+ * happens to work today on some input.
  */
 
 #ifndef SIMD_KERNELS_H
@@ -485,6 +507,533 @@ static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
 #else
 static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
     sk_fast_sqrt_f32_scalar(x, out, n);
+}
+#endif
+
+/* ═══════════════════ kernels 23-27: fast_math.h exp/log family ════════════
+ * Array-kernel NEON twins for fast_math.h's fast_exp/fast_exp_neg/fast_log/
+ * fast_log10/exp1_approx — added per the s4-audio-common-sweep review
+ * (fast_math.h had zero NEON coverage anywhere, and these five functions sit
+ * in NR's hottest per-bin loops: spp_estimator.c's fast_exp_neg, mmse_lsa_
+ * denoiser.c's calculate_gain, mcra_noise_estimator.c's per-hop hi-freq
+ * flatness loop). Per this header's own "no dependency on fast_math.h" rule
+ * (see the Style section above), the table/constants/algorithm are
+ * replicated verbatim as private SK_-prefixed helpers below rather than
+ * included from fast_math.h — keep them in sync with fast_math.h if that
+ * implementation ever moves. Validated against the REAL fast_math.h
+ * (fast_exp/fast_exp_neg/fast_log/fast_log10/exp1_approx) bit-for-bit over
+ * tens of thousands of random + curated-boundary values by
+ * test/simd_selftest.c's test_fast_exp()/test_fast_exp_neg()/test_fast_log()/
+ * test_fast_log10()/test_exp1_approx().
+ *
+ * Memory-safety note (table gather): fast_exp's exp_int_table lookup has no
+ * native NEON gather on this target, so the NEON path does 4 scalar table
+ * reads assembled into a vector (see sk__fast_exp_vec below). The table
+ * index is derived from an internally range-clamped copy of the input
+ * (vminq_f32/vmaxq_f32 to [-16,16]) so the gather is ALWAYS in-bounds
+ * (index in [0,32]) regardless of the real, unclamped input — including
+ * NaN and any out-of-[-16,16]-domain finite value whose result will be
+ * overridden by the domain-edge select afterward anyway (same "compute
+ * unconditionally, then select" shape as sk_fast_sqrt_f32 above, kernel 15).
+ * NaN specifically: vminq_f32/vmaxq_f32 (NOT vminnmq_f32/vmaxnmq_f32) are
+ * ordinary NaN-propagating IEEE FMIN/FMAX, so a NaN input stays NaN through
+ * the clamp and vrndmq_f32 (floor); AArch64's FCVTZS (float-to-signed-int
+ * convert, `vcvtq_s32_f32`) is architecturally defined to return 0 for a NaN
+ * source (ARMv8 ARM, not implementation-defined), so the resulting table
+ * index for a NaN lane is exactly SK_EXP_TABLE_OFFSET (16) — safely
+ * in-bounds — confirmed empirically on this toolchain, not just asserted
+ * from the architecture reference. Without the clamp, a huge finite input
+ * (e.g. 1e30f) would FCVTZS-saturate to INT32_MAX/INT32_MIN and then
+ * overflow signed int on the `+ SK_EXP_TABLE_OFFSET` add (UB) before ever
+ * indexing the table — the clamp is load-bearing for that case, confirmed
+ * empirically too (see the review's validation notes). The scalar reference
+ * never hits either hazard: its two domain guards (`!(x>=-16.0f)` /
+ * `x>16.0f`) return early, before the `(int)floorf(x)` line, for every
+ * input that isn't already in [-16,16].
+ *
+ * FMA discipline: fast_math.h's fast_exp/fast_log never call fmaf() at any
+ * step, so none of these kernels do either — every combine below is a
+ * separate vmulq_f32/vaddq_f32/vsubq_f32, matching the "separate mul then
+ * add, never fused" list in the file header comment. Requires
+ * -ffp-contract=off on the including TU, same as every other kernel here.
+ *
+ * USE_STANDARD_MATH: mirrors fast_math.h's toggle (bare expf/logf/log10f/
+ * powf calls, no domain-edge constants). There is no native vectorized
+ * transcendental on this target, so under USE_STANDARD_MATH the "NEON" entry
+ * points below just call the scalar loop — same honest fallback shape as
+ * every other `#if SK_HAVE_NEON ... #else scalar ... #endif` kernel when
+ * there is genuinely nothing to vectorize.
+ *
+ * In-place (out==x) safety (NR/c_impl calculate_gain()/spp_estimate()
+ * scratch-buffer-reuse review): sk_fast_exp_f32 (23), sk_fast_exp_neg_f32
+ * (24), sk_fast_log_f32 (25), and sk_exp1_approx_f32 (27) all SUPPORT
+ * out==x. Every NEON body below processes one 4-lane block per iteration by
+ * fully loading it (vld1q_f32) into registers, computing entirely from
+ * those registers (no further memory reads), and only THEN storing
+ * (vst1q_f32) that same block back — no iteration reads a lane any other
+ * iteration writes, so aliasing the output onto the exact same input
+ * pointer is safe (the same reasoning as sk_capply_gain_f32's existing
+ * out==z contract, kernel 9, above). The scalar tail (and the
+ * USE_STANDARD_MATH / non-NEON scalar-only fallback) is the same
+ * read-into-a-value-then-write-out[i] shape per element, so it agrees.
+ * sk_fast_log10_f32 (26) shares the identical shape but is NOT covered by a
+ * dedicated in-place selftest (no call site needs it yet) -- see the "no
+ * restrict" contract note near the top of this file. This is exercised by
+ * simd_selftest.c's test_exp_log_family_inplace(). Partial-offset aliasing
+ * (out == x + k, k != 0) remains unsupported for all five, same as
+ * everywhere else in this file. */
+
+#define SK_FM_LN2      0.693147180559945f
+#define SK_FM_LOG10E   0.4342944819032518f
+#define SK_FM_LN10     2.302585092994046f
+#define SK_FM_EPSILON  1e-10f
+
+#define SK_EXP_TABLE_OFFSET 16
+#define SK_EXP_TABLE_SIZE 33
+
+/* Verbatim copy of fast_math.h's exp_int_table (e^n for n=-16..16). */
+static const float sk_exp_int_table[SK_EXP_TABLE_SIZE] = {
+    1.1253517471925912e-07f,  /* e^-16 */
+    3.0590232050182579e-07f,  /* e^-15 */
+    8.3152871910356788e-07f,  /* e^-14 */
+    2.2603294069810542e-06f,  /* e^-13 */
+    6.1442123533282097e-06f,  /* e^-12 */
+    1.6701700790245659e-05f,  /* e^-11 */
+    4.5399929762484854e-05f,  /* e^-10 */
+    1.2340980408667956e-04f,  /* e^-9  */
+    3.3546262790251185e-04f,  /* e^-8  */
+    9.1188196555451624e-04f,  /* e^-7  */
+    2.4787521766663585e-03f,  /* e^-6  */
+    6.7379469990854670e-03f,  /* e^-5  */
+    1.8315638888734180e-02f,  /* e^-4  */
+    4.9787068367863944e-02f,  /* e^-3  */
+    1.3533528323661270e-01f,  /* e^-2  */
+    3.6787944117144233e-01f,  /* e^-1  */
+    1.0000000000000000e+00f,  /* e^0   */
+    2.7182818284590452e+00f,  /* e^1   */
+    7.3890560989306502e+00f,  /* e^2   */
+    2.0085536923187668e+01f,  /* e^3   */
+    5.4598150033144236e+01f,  /* e^4   */
+    1.4841315910257660e+02f,  /* e^5   */
+    4.0342879349273511e+02f,  /* e^6   */
+    1.0966331584284585e+03f,  /* e^7   */
+    2.9809579870417283e+03f,  /* e^8   */
+    8.1030839275753840e+03f,  /* e^9   */
+    2.2026465794806718e+04f,  /* e^10  */
+    5.9874141715197819e+04f,  /* e^11  */
+    1.6275479141900392e+05f,  /* e^12  */
+    4.4241339200892050e+05f,  /* e^13  */
+    1.2026042841647768e+06f,  /* e^14  */
+    3.2690173724721107e+06f,  /* e^15  */
+    8.8861105205078726e+06f   /* e^16  */
+};
+
+/* Private mirror of fast_math.h's FloatBits union (own SK-prefixed name so a
+ * TU that includes BOTH headers, e.g. simd_selftest.c, never sees a
+ * conflicting typedef). Relies on the mantissa-then-exponent-then-sign
+ * bitfield packing every GCC/Clang target this project builds for actually
+ * uses for a little-endian `unsigned int`-backed bitfield — the SAME
+ * assumption fast_math.h's own fast_log() already makes; this is not a new
+ * assumption introduced here. */
+typedef union {
+    float f;
+    uint32_t i;
+    struct { uint32_t mantissa : 23; uint32_t exponent : 8; uint32_t sign : 1; } parts;
+} SkFloatBits;
+
+#ifdef USE_STANDARD_MATH
+static inline float sk__fast_exp_elem(float x)     { return expf(x); }
+static inline float sk__fast_exp_neg_elem(float x) { return expf(-x); }
+static inline float sk__fast_log_elem(float x)     { return logf(x); }
+static inline float sk__fast_log10_elem(float x)   { return log10f(x); }
+static inline float sk__exp1_approx_elem(float v) {
+    if (v <= 1e-10f) v = 1e-10f;
+    if (v < 0.1f) {
+        return -2.31f * log10f(v) - 0.6f;
+    } else if (v <= 1.0f) {
+        return -1.544f * log10f(v) + 0.166f;
+    } else {
+        return powf(10.0f, -0.52f * v - 0.26f);
+    }
+}
+#else
+/* Verbatim from fast_math.h's fast_exp() (see that function's own comment
+ * for the NaN-safety rationale of the `!(x >= -16.0f)` guard form). */
+static inline float sk__fast_exp_elem(float x) {
+    if (!(x >= -16.0f)) return 0.0f;
+    if (x > 16.0f) return 8.8861105e+06f;
+    int x0 = (int)floorf(x);
+    float dx = x - (float)x0;
+    if (dx > 0.5f) { dx -= 1.0f; x0 += 1; }
+    float exp_x0 = sk_exp_int_table[x0 + SK_EXP_TABLE_OFFSET];
+    float dx2 = dx * dx;
+    float exp_dx = 1.0f + dx + 0.5f * dx2 + (1.0f / 6.0f) * dx2 * dx;
+    return exp_x0 * exp_dx;
+}
+/* Verbatim from fast_math.h's fast_exp_neg(). */
+static inline float sk__fast_exp_neg_elem(float x) {
+    if (x <= 0.0f) return 1.0f;
+    if (x >= 16.0f) return 0.0f;
+    return sk__fast_exp_elem(-x);
+}
+/* Verbatim from fast_math.h's fast_log() (see that function's own comment
+ * for the NaN-safety rationale of the `!(x > 0.0f)` guard form). */
+static inline float sk__fast_log_elem(float x) {
+    if (!(x > 0.0f)) return -1e10f;
+    SkFloatBits fb;
+    fb.f = x;
+    int E = (int)fb.parts.exponent - 127;
+    fb.parts.exponent = 127;
+    float m = fb.f - 1.0f;
+    float m2 = m * m;
+    float m3 = m2 * m;
+    float ln_1_m = m - 0.5f * m2 + (1.0f / 3.0f) * m3 - 0.25f * m2 * m2;
+    return (float)E * SK_FM_LN2 + ln_1_m;
+}
+/* Verbatim from fast_math.h's fast_log10(). */
+static inline float sk__fast_log10_elem(float x) {
+    return sk__fast_log_elem(x) * SK_FM_LOG10E;
+}
+/* Verbatim from fast_math.h's exp1_approx() DEFAULT (non-USE_OPTIMIZED_E1)
+ * branch order. fast_math.h's USE_OPTIMIZED_E1 variant reorders which check
+ * runs first (v>1.0 first, single fast_log10 call reused for the v<=1.0
+ * cases) but computes the IDENTICAL formula for every input with fast_log10
+ * called exactly once either way — the two source variants are provably
+ * bit-identical for every v, so replicating only this one branch order
+ * covers both fast_math.h build modes (verified by test_exp1_approx()
+ * against fast_math.h's actual exp1_approx() regardless of whether that TU
+ * defines USE_OPTIMIZED_E1). */
+static inline float sk__exp1_approx_elem(float v) {
+    if (v <= SK_FM_EPSILON) v = SK_FM_EPSILON;
+    if (v < 0.1f) {
+        return -2.31f * sk__fast_log10_elem(v) - 0.6f;
+    } else if (v <= 1.0f) {
+        return -1.544f * sk__fast_log10_elem(v) + 0.166f;
+    } else {
+        return sk__fast_exp_elem((-0.52f * v - 0.26f) * SK_FM_LN10);
+    }
+}
+#endif /* USE_STANDARD_MATH */
+
+static inline void sk_fast_exp_f32_scalar(const float *x, float *out, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = sk__fast_exp_elem(x[i]);
+}
+static inline void sk_fast_exp_neg_f32_scalar(const float *x, float *out, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = sk__fast_exp_neg_elem(x[i]);
+}
+static inline void sk_fast_log_f32_scalar(const float *x, float *out, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = sk__fast_log_elem(x[i]);
+}
+static inline void sk_fast_log10_f32_scalar(const float *x, float *out, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = sk__fast_log10_elem(x[i]);
+}
+static inline void sk_exp1_approx_f32_scalar(const float *x, float *out, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = sk__exp1_approx_elem(x[i]);
+}
+
+#if SK_HAVE_NEON && !defined(USE_STANDARD_MATH)
+/* Shared vector core for kernel 23 (sk_fast_exp_f32) — also reused by
+ * kernel 24 (fast_exp_neg calls this on -x, mirroring fast_math.h's
+ * fast_exp_neg calling fast_exp(-x)) and kernel 27 (exp1_approx's v>1.0
+ * branch). Domain-safe for ANY input (NaN, ±Inf, arbitrary finite
+ * magnitude) — see the memory-safety note in this section's header
+ * comment. */
+static inline float32x4_t sk__fast_exp_vec(float32x4_t x) {
+    float32x4_t neg16 = vdupq_n_f32(-16.0f);
+    float32x4_t pos16 = vdupq_n_f32(16.0f);
+    /* Range-clamp ONLY for the table-index computation below (memory
+     * safety) -- the final domain-edge select at the bottom uses the REAL,
+     * unclamped x, so this clamp never changes the mathematical result for
+     * any lane, only what "garbage" a masked-out lane's discarded
+     * intermediate looks like. */
+    float32x4_t xc = vminq_f32(vmaxq_f32(x, neg16), pos16);
+    float32x4_t floor_xc = vrndmq_f32(xc);       /* floorf; exact integral here */
+    float32x4_t dx = vsubq_f32(xc, floor_xc);
+    uint32x4_t adjmask = vcgtq_f32(dx, vdupq_n_f32(0.5f));
+    float32x4_t dx_adj = vsubq_f32(dx, vdupq_n_f32(1.0f));
+    float32x4_t x0f = vbslq_f32(adjmask, vaddq_f32(floor_xc, vdupq_n_f32(1.0f)), floor_xc);
+    dx = vbslq_f32(adjmask, dx_adj, dx);
+
+    {
+        int32x4_t x0i = vaddq_s32(vcvtq_s32_f32(x0f), vdupq_n_s32(SK_EXP_TABLE_OFFSET));
+        float table_lanes[4];
+        /* No native NEON gather on this target -- 4 scalar table reads,
+         * per this section's header comment. x0i is always in [0,32]
+         * (in-bounds) for every possible input, including NaN. */
+        table_lanes[0] = sk_exp_int_table[vgetq_lane_s32(x0i, 0)];
+        table_lanes[1] = sk_exp_int_table[vgetq_lane_s32(x0i, 1)];
+        table_lanes[2] = sk_exp_int_table[vgetq_lane_s32(x0i, 2)];
+        table_lanes[3] = sk_exp_int_table[vgetq_lane_s32(x0i, 3)];
+        {
+            float32x4_t exp_x0 = vld1q_f32(table_lanes);
+            /* 1.0f + dx + 0.5f*dx2 + (1/6)*dx2*dx, same left-to-right
+             * separate-rounding op sequence as sk__fast_exp_elem -- no
+             * vfmaq_f32 anywhere (see this section's FMA-discipline note). */
+            float32x4_t dx2 = vmulq_f32(dx, dx);
+            float32x4_t term4 = vmulq_f32(vmulq_f32(vdupq_n_f32(1.0f / 6.0f), dx2), dx);
+            float32x4_t term3 = vmulq_f32(vdupq_n_f32(0.5f), dx2);
+            float32x4_t sum = vaddq_f32(vdupq_n_f32(1.0f), dx);
+            sum = vaddq_f32(sum, term3);
+            sum = vaddq_f32(sum, term4);
+            {
+                float32x4_t normal = vmulq_f32(exp_x0, sum);
+                /* Domain-edge select on the REAL x, priority-ordered to
+                 * match the scalar guard sequence: lomask (checked first
+                 * in scalar, so applied LAST/highest-priority here) can
+                 * never overlap himask for any real input, but this order
+                 * keeps the blend's priority explicit regardless. */
+                uint32x4_t himask = vcgtq_f32(x, pos16);            /* x > 16 (finite only) */
+                uint32x4_t lomask = vmvnq_u32(vcgeq_f32(x, neg16)); /* !(x>=-16): x<-16 or NaN */
+                float32x4_t r = vbslq_f32(himask, vdupq_n_f32(8.8861105e+06f), normal);
+                r = vbslq_f32(lomask, vdupq_n_f32(0.0f), r);
+                return r;
+            }
+        }
+    }
+}
+
+/* Supports out == x (in-place): each 4-lane block is fully loaded
+ * (vld1q_f32) before it is stored (vst1q_f32), and no iteration reads a
+ * lane an earlier iteration wrote -- same shape as sk_capply_gain_f32's
+ * (kernel 9) documented out==z contract. See the section-header comment
+ * above for the full writeup covering this kernel family. */
+static inline void sk_fast_exp_f32(const float *x, float *out, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) vst1q_f32(out + i, sk__fast_exp_vec(vld1q_f32(x + i)));
+    for (; i < n; ++i) out[i] = sk__fast_exp_elem(x[i]);
+}
+
+/* Supports out == x (in-place) -- same read-before-write-per-block shape as
+ * sk_fast_exp_f32 above (sk__fast_exp_vec operates entirely on the
+ * already-loaded `xv` register, not on memory). */
+static inline void sk_fast_exp_neg_f32(const float *x, float *out, int n) {
+    int i = 0;
+    float32x4_t zero = vdupq_n_f32(0.0f), sixteen = vdupq_n_f32(16.0f), one = vdupq_n_f32(1.0f);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t xv = vld1q_f32(x + i);
+        /* if (x<=0) return 1.0f; if (x>=16) return 0.0f; return fast_exp(-x);
+         * -- mask priority mirrors the scalar if/else-if chain (mask_le0
+         * checked first in scalar, so applied LAST here). */
+        uint32x4_t mask_le0 = vcleq_f32(xv, zero);
+        uint32x4_t mask_ge16 = vcgeq_f32(xv, sixteen);
+        float32x4_t inner = sk__fast_exp_vec(vnegq_f32(xv));
+        float32x4_t r = vbslq_f32(mask_ge16, zero, inner);
+        r = vbslq_f32(mask_le0, one, r);
+        vst1q_f32(out + i, r);
+    }
+    for (; i < n; ++i) out[i] = sk__fast_exp_neg_elem(x[i]);
+}
+
+/* Shared vector core for kernel 25 (sk_fast_log_f32) -- also reused by
+ * kernel 26 (fast_log10 = fast_log*const) and kernel 27 (exp1_approx's
+ * v<=1.0 branches). Pure bit manipulation (no memory access, no gather), so
+ * unlike sk__fast_exp_vec there is no memory-safety concern computing this
+ * unconditionally for every lane including out-of-domain ones -- exactly
+ * the exponent-extract-and-rebias trick fast_math.h's fast_log() does,
+ * replicated lane-for-lane. */
+static inline float32x4_t sk__fast_log_vec(float32x4_t x) {
+    uint32x4_t bits = vreinterpretq_u32_f32(x);
+    int32x4_t exp_bits = vreinterpretq_s32_u32(vandq_u32(vshrq_n_u32(bits, 23), vdupq_n_u32(0xFFu)));
+    int32x4_t E = vsubq_s32(exp_bits, vdupq_n_s32(127));
+    /* Clear the exponent field, force it to 127 (bias) -- fb.parts.exponent
+     * = 127 in the scalar union version; mant_sign_mask keeps sign+mantissa,
+     * bias127 ORs in exponent=127 (0x3F800000 == 127<<23). */
+    uint32x4_t mant_sign_mask = vdupq_n_u32(0x807FFFFFu);
+    uint32x4_t bias127 = vdupq_n_u32(0x3F800000u);
+    uint32x4_t new_bits = vorrq_u32(vandq_u32(bits, mant_sign_mask), bias127);
+    float32x4_t mant_f = vreinterpretq_f32_u32(new_bits);
+    float32x4_t m = vsubq_f32(mant_f, vdupq_n_f32(1.0f));
+    float32x4_t m2 = vmulq_f32(m, m);
+    float32x4_t m3 = vmulq_f32(m2, m);
+    /* m - 0.5f*m2 + (1/3)*m3 - 0.25f*m2*m2, same left-to-right separate-
+     * rounding op sequence as sk__fast_log_elem -- no vfmaq_f32 anywhere. */
+    float32x4_t t1 = vsubq_f32(m, vmulq_f32(vdupq_n_f32(0.5f), m2));
+    float32x4_t t2 = vaddq_f32(t1, vmulq_f32(vdupq_n_f32(1.0f / 3.0f), m3));
+    float32x4_t ln_1_m = vsubq_f32(t2, vmulq_f32(vdupq_n_f32(0.25f), vmulq_f32(m2, m2)));
+    {
+        float32x4_t Ef = vcvtq_f32_s32(E);
+        float32x4_t result = vaddq_f32(vmulq_f32(Ef, vdupq_n_f32(SK_FM_LN2)), ln_1_m);
+        uint32x4_t badmask = vmvnq_u32(vcgtq_f32(x, vdupq_n_f32(0.0f))); /* !(x>0): x<=0 or NaN */
+        return vbslq_f32(badmask, vdupq_n_f32(-1e10f), result);
+    }
+}
+
+/* Supports out == x (in-place): sk__fast_log_vec is pure bit manipulation on
+ * an already-loaded register (no memory access besides the one load/store
+ * per block); same read-before-write-per-block shape as sk_fast_exp_f32
+ * above. */
+static inline void sk_fast_log_f32(const float *x, float *out, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) vst1q_f32(out + i, sk__fast_log_vec(vld1q_f32(x + i)));
+    for (; i < n; ++i) out[i] = sk__fast_log_elem(x[i]);
+}
+
+static inline void sk_fast_log10_f32(const float *x, float *out, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t lg = sk__fast_log_vec(vld1q_f32(x + i));
+        vst1q_f32(out + i, vmulq_f32(lg, vdupq_n_f32(SK_FM_LOG10E)));
+    }
+    for (; i < n; ++i) out[i] = sk__fast_log10_elem(x[i]);
+}
+
+/* Supports out == x (in-place): the whole 4-lane block is loaded once at
+ * the top (`v = vld1q_f32(x + i)`) and only written once at the bottom
+ * (`vst1q_f32(out + i, r)`), with everything in between computed from
+ * registers; same shape as sk_fast_exp_f32/sk_fast_log_f32 above. */
+static inline void sk_exp1_approx_f32(const float *x, float *out, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        float32x4_t eps = vdupq_n_f32(SK_FM_EPSILON);
+        /* if (v<=EPS) v=EPS; -- false for NaN (matches scalar: NaN stays
+         * NaN through this line, same as sk__exp1_approx_elem). */
+        uint32x4_t clampmask = vcleq_f32(v, eps);
+        float32x4_t vc = vbslq_f32(clampmask, eps, v);
+        uint32x4_t mask_lt01 = vcltq_f32(vc, vdupq_n_f32(0.1f));
+        uint32x4_t mask_le1  = vcleq_f32(vc, vdupq_n_f32(1.0f));
+
+        float32x4_t log10v = vmulq_f32(sk__fast_log_vec(vc), vdupq_n_f32(SK_FM_LOG10E));
+
+        /* -2.31f*log10v - 0.6f (branch1), -1.544f*log10v + 0.166f (branch2),
+         * fast_exp((-0.52f*vc - 0.26f) * LN10) (branch3) -- each exactly the
+         * scalar op order, no fusion. */
+        float32x4_t branch1 = vsubq_f32(vmulq_f32(vdupq_n_f32(-2.31f), log10v), vdupq_n_f32(0.6f));
+        float32x4_t branch2 = vaddq_f32(vmulq_f32(vdupq_n_f32(-1.544f), log10v), vdupq_n_f32(0.166f));
+        float32x4_t exparg = vmulq_f32(
+            vsubq_f32(vmulq_f32(vdupq_n_f32(-0.52f), vc), vdupq_n_f32(0.26f)),
+            vdupq_n_f32(SK_FM_LN10));
+        float32x4_t branch3 = sk__fast_exp_vec(exparg);
+
+        {
+            /* if/else-if priority: mask_le1 is a superset of mask_lt01 (any
+             * v<0.1 also satisfies v<=1.0), so applying branch2 for the
+             * whole mask_le1 region THEN overriding the narrower mask_lt01
+             * region with branch1 reproduces if(v<0.1)/else-if(v<=1.0)/else
+             * exactly. */
+            float32x4_t r = branch3;
+            r = vbslq_f32(mask_le1, branch2, r);
+            r = vbslq_f32(mask_lt01, branch1, r);
+            vst1q_f32(out + i, r);
+        }
+    }
+    for (; i < n; ++i) out[i] = sk__exp1_approx_elem(x[i]);
+}
+#else
+/* USE_STANDARD_MATH or non-NEON target: these delegate straight to the
+ * *_scalar() entry points above, which are per-element `out[i]=f(x[i])`
+ * with no cross-index dependency -- out == x (in-place) is safe here for
+ * the identical reason as the NEON bodies above (fast_exp/fast_exp_neg/
+ * fast_log/exp1_approx; fast_log10 is NOT contractually covered, see the
+ * section-header comment). */
+static inline void sk_fast_exp_f32(const float *x, float *out, int n) {
+    sk_fast_exp_f32_scalar(x, out, n);
+}
+static inline void sk_fast_exp_neg_f32(const float *x, float *out, int n) {
+    sk_fast_exp_neg_f32_scalar(x, out, n);
+}
+static inline void sk_fast_log_f32(const float *x, float *out, int n) {
+    sk_fast_log_f32_scalar(x, out, n);
+}
+static inline void sk_fast_log10_f32(const float *x, float *out, int n) {
+    sk_fast_log10_f32_scalar(x, out, n);
+}
+static inline void sk_exp1_approx_f32(const float *x, float *out, int n) {
+    sk_exp1_approx_f32_scalar(x, out, n);
+}
+#endif /* SK_HAVE_NEON && !USE_STANDARD_MATH */
+
+/* ═══════════════════════════════ kernel 28 ═════════════════════════════════
+ * sk_mcra_noise_update_f32 — verbatim shape of NR/c_impl/src/
+ * mcra_noise_estimator.c's per-hop, per-bin noise-PSD update (mcra_update(),
+ * ~line 605-612):
+ *
+ *   su = spp[i] * bb_scale;
+ *   tilde_alpha_d = alpha_d + (1.0f - alpha_d) * su;
+ *   noise_psd[i] = tilde_alpha_d*noise_psd[i] + (1.0f-tilde_alpha_d)*power[i];
+ *
+ * A per-bin-VARYING-alpha EMA (tilde_alpha_d depends on spp[i], unlike
+ * kernel 4's sk_ema_f32 which takes a single scalar alpha for the whole
+ * call) -- added per the s4-audio-common-sweep review. Per that review's
+ * independent-verifier correction, this is a FUSED, single-purpose kernel
+ * matching the call site's exact shape (alpha_d, bb_scale scalars; spp,
+ * power, noise_psd arrays) rather than a generic "alpha-array" primitive:
+ * the fused form needs no extra n_freqs-sized scratch buffer for a
+ * precomputed tilde_alpha_d array, so it doesn't grow NR's static-memory
+ * pool budget the way a generic two-array-weight kernel would, matching
+ * this file's existing "verbatim kernel per call site" convention (see
+ * sk_ema_cmag2_f32/sk_n2_track_f32/sk_n2_initial_track_f32 in AEC's
+ * aec_simd_kernels.h for the same pattern). NOT wired into NR's call site by
+ * this change -- NR is a sibling repo built separately; this kernel is
+ * added and validated here in isolation (test/simd_selftest.c) so it is
+ * ready for that call site to adopt in NR's own review pass.
+ *
+ * No fmaf anywhere: the source computes `alpha_d + (1-alpha_d)*su` and
+ * `tilde*noise_psd + (1-tilde)*power` as separate rounded multiplies then
+ * separate rounded adds (no fmaf call at either line), so this kernel must
+ * not fuse either -- same -ffp-contract=off requirement as every other
+ * kernel in this file. `(1.0f - alpha_d)` is loop-invariant in the source
+ * (alpha_d is a per-call scalar, re-evaluated identically every iteration)
+ * so hoisting it out of the loop here changes nothing bit-wise -- same
+ * `vdupq_n_f32`-once-before-the-loop pattern sk_ema_f32 (kernel 4) already
+ * uses for its own scalar alpha/beta. */
+
+static inline void sk_mcra_noise_update_f32_scalar(float *noise_psd,
+                                                     const float *spp,
+                                                     const float *power,
+                                                     float alpha_d,
+                                                     float bb_scale,
+                                                     int n) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        float su = spp[i] * bb_scale;
+        float tilde_alpha_d = alpha_d + (1.0f - alpha_d) * su;
+        noise_psd[i] = tilde_alpha_d * noise_psd[i] + (1.0f - tilde_alpha_d) * power[i];
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_mcra_noise_update_f32(float *noise_psd,
+                                             const float *spp,
+                                             const float *power,
+                                             float alpha_d,
+                                             float bb_scale,
+                                             int n) {
+    int i = 0;
+    float32x4_t va_d = vdupq_n_f32(alpha_d);
+    float32x4_t vbb = vdupq_n_f32(bb_scale);
+    float32x4_t one = vdupq_n_f32(1.0f);
+    float32x4_t one_minus_ad = vsubq_f32(one, va_d);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t spp_v = vld1q_f32(spp + i);
+        float32x4_t power_v = vld1q_f32(power + i);
+        float32x4_t npsd_v = vld1q_f32(noise_psd + i);
+        float32x4_t su = vmulq_f32(spp_v, vbb);
+        float32x4_t tilde = vaddq_f32(va_d, vmulq_f32(one_minus_ad, su));
+        float32x4_t one_minus_tilde = vsubq_f32(one, tilde);
+        float32x4_t term1 = vmulq_f32(tilde, npsd_v);
+        float32x4_t term2 = vmulq_f32(one_minus_tilde, power_v);
+        vst1q_f32(noise_psd + i, vaddq_f32(term1, term2));
+    }
+    for (; i < n; ++i) {
+        float su = spp[i] * bb_scale;
+        float tilde_alpha_d = alpha_d + (1.0f - alpha_d) * su;
+        noise_psd[i] = tilde_alpha_d * noise_psd[i] + (1.0f - tilde_alpha_d) * power[i];
+    }
+}
+#else
+static inline void sk_mcra_noise_update_f32(float *noise_psd,
+                                             const float *spp,
+                                             const float *power,
+                                             float alpha_d,
+                                             float bb_scale,
+                                             int n) {
+    sk_mcra_noise_update_f32_scalar(noise_psd, spp, power, alpha_d, bb_scale, n);
 }
 #endif
 

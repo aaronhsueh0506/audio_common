@@ -54,7 +54,50 @@ int main(void) {
     fft_destroy(hs);
     free(pool);
 
-    int ok = (maxerr < 1e-3) && spec_eq && time_eq;
+    /* fft_magnitude() NEON-path sanity (s4-audio-common-sweep review):
+     * fft_magnitude has no production caller anywhere in the four-repo tree
+     * (currently dead code -- see the review), so there is no existing
+     * consumer regression gate covering it. Cross-check the function's
+     * output bit-for-bit against the exact same `sqrtf(re*re+im*im)`
+     * formula computed independently right here, in the SAME translation
+     * unit under the SAME -ffp-contract=off build flag -- this directly
+     * exercises whichever path (NEON body + scalar tail, or plain scalar on
+     * a non-NEON build) fft_magnitude() actually took, at several n_freqs
+     * values that cross the kernel's 4-lane boundary (0, 1, 3, 4, 5, 257 --
+     * matching the KISS nf=257 buffer already built above). */
+    int mag_ok = 1;
+    {
+        Complex mspec[257];
+        float mag[257], mag_ref[257];
+        int nvals[] = { 0, 1, 3, 4, 5, 257 };
+        int vi;
+        for (int i = 0; i < 257; i++) {
+            mspec[i].r = sinf(0.7f * (float)i) * 3.0f - 1.0f;
+            mspec[i].i = cosf(1.3f * (float)i) * 2.0f + 0.5f;
+        }
+        for (vi = 0; vi < (int)(sizeof(nvals) / sizeof(nvals[0])); vi++) {
+            int m = nvals[vi];
+            memset(mag, 0, sizeof(mag));
+            memset(mag_ref, 0, sizeof(mag_ref));
+            fft_magnitude(mspec, mag, m);
+            for (int i = 0; i < m; i++) {
+                float re = mspec[i].r, im = mspec[i].i;
+                mag_ref[i] = sqrtf(re * re + im * im);
+            }
+            if (memcmp(mag, mag_ref, sizeof(mag)) != 0) {
+                mag_ok = 0;
+                printf("FAIL: fft_magnitude n_freqs=%d differs from scalar reference\n", m);
+            }
+        }
+        /* NULL-input no-op guard (matches every other fft_wrapper entry
+         * point's `if (!spectrum || !magnitude) return;` contract). */
+        fft_magnitude(NULL, mag, 4);
+        fft_magnitude(mspec, NULL, 4);
+    }
+    printf("fft_magnitude vs scalar reference (n_freqs=0,1,3,4,5,257): %s\n",
+           mag_ok ? "byte-equal" : "DIFFER");
+
+    int ok = (maxerr < 1e-3) && spec_eq && time_eq && mag_ok;
     printf(ok ? ">>> PASS\n" : ">>> FAIL\n");
     return ok ? 0 : 1;
 }

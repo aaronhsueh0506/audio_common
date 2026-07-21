@@ -166,6 +166,37 @@ void fft_magnitude(const Complex* freq, float* magnitude, int n_freqs);
 void fft_power(const Complex* freq, float* power, int n_freqs);
 
 /**
+ * Compute phase spectrum from complex spectrum (atan2f(im, re) per bin).
+ *
+ * Defined in both backends (fft_wrapper.c / fft_wrapper_ne10.c) but had no
+ * header declaration until the s4-audio-common-sweep review's hygiene fix
+ * (round-3-style: currently no caller anywhere in AEC/NR/Audio_ALG/
+ * audio_common — flagged, not removed, since deleting a public-looking pair
+ * (fft_phase/fft_from_mag_phase) is a bigger decision than adding the
+ * missing prototypes).
+ *
+ * @param freq Complex spectrum [n_freqs]
+ * @param phase Output phase (radians) [n_freqs]
+ * @param n_freqs Number of frequency bins
+ */
+void fft_phase(const Complex* freq, float* phase, int n_freqs);
+
+/**
+ * Reconstruct a complex spectrum from magnitude + phase
+ * (spectrum[k] = magnitude[k] * (cosf(phase[k]) + i*sinf(phase[k]))).
+ *
+ * Same currently-unreferenced status as fft_phase() above — see that
+ * function's doc comment.
+ *
+ * @param magnitude Input magnitude [n_freqs]
+ * @param phase Input phase (radians) [n_freqs]
+ * @param spectrum Output complex spectrum [n_freqs]
+ * @param n_freqs Number of frequency bins
+ */
+void fft_from_mag_phase(const float* magnitude, const float* phase,
+                         Complex* spectrum, int n_freqs);
+
+/**
  * Apply gain to complex spectrum (in-place)
  *
  * @param freq Complex spectrum [n_freqs]

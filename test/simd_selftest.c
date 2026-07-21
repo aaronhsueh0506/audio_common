@@ -567,6 +567,275 @@ static void test_fast_sqrt(void) {
     printf("PASS fast_sqrt_f32\n");
 }
 
+
+/* ═══════════════════ correctness: kernels 23-27 (exp/log family) ═════════
+ * s4-audio-common-sweep review: fast_math.h's exp/log/exp1_approx family had
+ * zero NEON coverage anywhere. Beyond the usual scalar-vs-NEON bit-exactness
+ * check every kernel in this file gets, these five ALSO cross-check
+ * sk_<name>_f32_scalar's per-element output against fast_math.h's ACTUAL
+ * fast_exp/fast_exp_neg/fast_log/fast_log10/exp1_approx on the SAME inputs
+ * (check_matches_fastmath below) -- simd_kernels.h deliberately does not
+ * #include fast_math.h and instead replicates its algorithm verbatim as a
+ * private helper (see that header's Style section), so this is the gate
+ * that catches any transcription drift between the two copies. */
+
+static void check_matches_fastmath(const char *label, float (*ref_fn)(float),
+                                    const float *x, const float *sk_out, int n) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        float fm = ref_fn(x[i]);
+        uint32_t fb, sb;
+        g_total_checks++;
+        memcpy(&fb, &fm, sizeof fb);
+        memcpy(&sb, &sk_out[i], sizeof sb);
+        if (fb != sb) {
+            uint32_t xb;
+            memcpy(&xb, &x[i], sizeof xb);
+            fprintf(stderr,
+                "%s vs fast_math.h MISMATCH i=%d x=%.9g(0x%08x) sk=%.9g(0x%08x) fastmath=%.9g(0x%08x)\n",
+                label, i, (double)x[i], (unsigned)xb,
+                (double)sk_out[i], (unsigned)sb, (double)fm, (unsigned)fb);
+            exit(1);
+        }
+    }
+}
+
+static void test_fast_exp(void) {
+    float x[SK_TEST_MAX_N], out_scalar[SK_TEST_MAX_N], out_simd[SK_TEST_MAX_N];
+    int ni, t;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_floats(x, n);
+            sk_fast_exp_f32_scalar(x, out_scalar, n);
+            sk_fast_exp_f32(x, out_simd, n);
+            check_bits_or_die("fast_exp_f32", n, t, out_simd, out_scalar, n);
+            check_matches_fastmath("fast_exp_f32", fast_exp, x, out_scalar, n);
+        }
+    }
+    printf("PASS fast_exp_f32\n");
+}
+
+static void test_fast_exp_neg(void) {
+    float x[SK_TEST_MAX_N], out_scalar[SK_TEST_MAX_N], out_simd[SK_TEST_MAX_N];
+    int ni, t;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_floats(x, n);
+            sk_fast_exp_neg_f32_scalar(x, out_scalar, n);
+            sk_fast_exp_neg_f32(x, out_simd, n);
+            check_bits_or_die("fast_exp_neg_f32", n, t, out_simd, out_scalar, n);
+            check_matches_fastmath("fast_exp_neg_f32", fast_exp_neg, x, out_scalar, n);
+        }
+    }
+    printf("PASS fast_exp_neg_f32\n");
+}
+
+static void test_fast_log(void) {
+    float x[SK_TEST_MAX_N], out_scalar[SK_TEST_MAX_N], out_simd[SK_TEST_MAX_N];
+    int ni, t;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_floats(x, n);
+            sk_fast_log_f32_scalar(x, out_scalar, n);
+            sk_fast_log_f32(x, out_simd, n);
+            check_bits_or_die("fast_log_f32", n, t, out_simd, out_scalar, n);
+            check_matches_fastmath("fast_log_f32", fast_log, x, out_scalar, n);
+        }
+    }
+    printf("PASS fast_log_f32\n");
+}
+
+static void test_fast_log10(void) {
+    float x[SK_TEST_MAX_N], out_scalar[SK_TEST_MAX_N], out_simd[SK_TEST_MAX_N];
+    int ni, t;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_floats(x, n);
+            sk_fast_log10_f32_scalar(x, out_scalar, n);
+            sk_fast_log10_f32(x, out_simd, n);
+            check_bits_or_die("fast_log10_f32", n, t, out_simd, out_scalar, n);
+            check_matches_fastmath("fast_log10_f32", fast_log10, x, out_scalar, n);
+        }
+    }
+    printf("PASS fast_log10_f32\n");
+}
+
+static void test_exp1_approx(void) {
+    float x[SK_TEST_MAX_N], out_scalar[SK_TEST_MAX_N], out_simd[SK_TEST_MAX_N];
+    int ni, t;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_floats(x, n);
+            sk_exp1_approx_f32_scalar(x, out_scalar, n);
+            sk_exp1_approx_f32(x, out_simd, n);
+            check_bits_or_die("exp1_approx_f32", n, t, out_simd, out_scalar, n);
+            check_matches_fastmath("exp1_approx_f32", exp1_approx, x, out_scalar, n);
+        }
+    }
+    printf("PASS exp1_approx_f32\n");
+}
+
+/* Dedicated domain-boundary/special-value sweep: every guard threshold these
+ * five functions branch on (-16, 16, 0, 0.1, 1.0, FM_EPSILON=1e-10), plus
+ * NaN/+-Inf, packed into 4-wide vectors so the boundary values sit at every
+ * lane position (not just lane 0) across both the NEON body and the scalar
+ * tail. Same three-way check (scalar==NEON, scalar==fast_math.h) as above. */
+static void test_exp_log_boundaries(void) {
+    float qnan = bits_to_float(0x7FC00000u);
+    float qnan_neg = bits_to_float(0xFFC00000u);
+    float pinf = (float)INFINITY;
+    float ninf = -(float)INFINITY;
+    float x[20] = {
+        qnan, qnan_neg, pinf, ninf,
+        -16.0f, 16.0f, bits_to_float(0xC1800001u) /* just below -16 */,
+        bits_to_float(0x41800001u) /* just above 16 */,
+        0.0f, -0.0f, 0.1f, -0.1f, 1.0f, -1.0f,
+        1e-10f, 1e-30f, 3e38f, -3e38f, 0.5f, -0.5f
+    };
+    int n = 20;
+    float out_scalar[20], out_simd[20];
+
+    sk_fast_exp_f32_scalar(x, out_scalar, n);
+    sk_fast_exp_f32(x, out_simd, n);
+    check_bits_or_die("fast_exp_f32_boundary", n, 0, out_simd, out_scalar, n);
+    check_matches_fastmath("fast_exp_f32_boundary", fast_exp, x, out_scalar, n);
+
+    sk_fast_exp_neg_f32_scalar(x, out_scalar, n);
+    sk_fast_exp_neg_f32(x, out_simd, n);
+    check_bits_or_die("fast_exp_neg_f32_boundary", n, 0, out_simd, out_scalar, n);
+    check_matches_fastmath("fast_exp_neg_f32_boundary", fast_exp_neg, x, out_scalar, n);
+
+    sk_fast_log_f32_scalar(x, out_scalar, n);
+    sk_fast_log_f32(x, out_simd, n);
+    check_bits_or_die("fast_log_f32_boundary", n, 0, out_simd, out_scalar, n);
+    check_matches_fastmath("fast_log_f32_boundary", fast_log, x, out_scalar, n);
+
+    sk_fast_log10_f32_scalar(x, out_scalar, n);
+    sk_fast_log10_f32(x, out_simd, n);
+    check_bits_or_die("fast_log10_f32_boundary", n, 0, out_simd, out_scalar, n);
+    check_matches_fastmath("fast_log10_f32_boundary", fast_log10, x, out_scalar, n);
+
+    sk_exp1_approx_f32_scalar(x, out_scalar, n);
+    sk_exp1_approx_f32(x, out_simd, n);
+    check_bits_or_die("exp1_approx_f32_boundary", n, 0, out_simd, out_scalar, n);
+    check_matches_fastmath("exp1_approx_f32_boundary", exp1_approx, x, out_scalar, n);
+
+    /* n=0 must be a total no-op -- guards against a stray unconditional
+     * table read/store before the loop guard. */
+    sk_fast_exp_f32(x, out_simd, 0);
+    sk_fast_exp_neg_f32(x, out_simd, 0);
+    sk_fast_log_f32(x, out_simd, 0);
+    sk_fast_log10_f32(x, out_simd, 0);
+    sk_exp1_approx_f32(x, out_simd, 0);
+
+    printf("PASS exp_log_boundaries\n");
+}
+
+
+/* ═══════ correctness: kernels 23/24/25/27 in-place (out==x) aliasing ═════
+ * NR/c_impl's mmse_lsa_denoiser.c calculate_gain() and spp_estimator.c
+ * spp_estimate()/spp_estimate_ex() chain sk_exp1_approx_f32/sk_fast_exp_f32/
+ * sk_fast_log_f32 (calculate_gain) and sk_fast_exp_neg_f32 (spp_estimate)
+ * back-to-back over the SAME scratch buffer (out==x) to cut per-call
+ * scratch-array footprint (review-round buffer-reuse hardening) -- see the
+ * "In-place (out==x) safety" paragraph in simd_kernels.h's kernels-23-27
+ * section header for why this is safe (each 4-lane block is fully loaded
+ * before it is stored, no cross-block state, same shape as
+ * sk_capply_gain_f32's kernel-9 out==z contract). This is the dedicated
+ * regression gate for that reliance: run each kernel with out==x on a copy
+ * of the input and compare against the SAME kernel run with separate
+ * (non-aliased) buffers, bit-for-bit -- if any of the four ever developed a
+ * cross-lane dependency (e.g. a future edit added inter-block state), this
+ * would catch it even though test_fast_exp() etc. above would not (those
+ * always use non-overlapping buffers). sk_fast_log10_f32 (kernel 26) is
+ * deliberately NOT exercised here -- no call site relies on out==x for it
+ * (see simd_kernels.h's "no restrict" contract note). */
+
+static void test_exp_log_family_inplace(void) {
+    float x[SK_TEST_MAX_N];
+    float out_sep[SK_TEST_MAX_N];
+    float buf[SK_TEST_MAX_N];
+    int ni, t;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_floats(x, n);
+
+            sk_fast_exp_f32(x, out_sep, n);
+            memcpy(buf, x, (size_t)n * sizeof(float));
+            sk_fast_exp_f32(buf, buf, n);
+            check_bits_or_die("fast_exp_f32_inplace", n, t, buf, out_sep, n);
+
+            sk_fast_exp_neg_f32(x, out_sep, n);
+            memcpy(buf, x, (size_t)n * sizeof(float));
+            sk_fast_exp_neg_f32(buf, buf, n);
+            check_bits_or_die("fast_exp_neg_f32_inplace", n, t, buf, out_sep, n);
+
+            sk_fast_log_f32(x, out_sep, n);
+            memcpy(buf, x, (size_t)n * sizeof(float));
+            sk_fast_log_f32(buf, buf, n);
+            check_bits_or_die("fast_log_f32_inplace", n, t, buf, out_sep, n);
+
+            sk_exp1_approx_f32(x, out_sep, n);
+            memcpy(buf, x, (size_t)n * sizeof(float));
+            sk_exp1_approx_f32(buf, buf, n);
+            check_bits_or_die("exp1_approx_f32_inplace", n, t, buf, out_sep, n);
+        }
+    }
+    printf("PASS exp_log_family_inplace (out==x aliasing, kernels 23/24/25/27)\n");
+}
+
+
+/* ═══════════════════════════ correctness: kernel 28 ══════════════════════
+ * sk_mcra_noise_update_f32 -- no fast_math.h ground truth to cross-check
+ * against (this mirrors an NR/c_impl call site, not a fast_math.h function),
+ * so this is a plain scalar-vs-NEON bit-exactness check, same shape as
+ * test_ema() (kernel 4) since it is structurally the same per-bin-varying-
+ * alpha EMA shape. */
+
+static void test_mcra_noise_update(void) {
+    float npsd_init[SK_TEST_MAX_N], npsd_scalar[SK_TEST_MAX_N], npsd_simd[SK_TEST_MAX_N];
+    float spp[SK_TEST_MAX_N], power[SK_TEST_MAX_N];
+    int ni, t;
+    const float alpha_d = 0.95f, bb_scale = 0.7f; /* representative NR config values */
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            fill_floats(npsd_init, n);
+            fill_floats(spp, n);
+            fill_floats(power, n);
+            memcpy(npsd_scalar, npsd_init, (size_t)n * sizeof(float));
+            memcpy(npsd_simd, npsd_init, (size_t)n * sizeof(float));
+            sk_mcra_noise_update_f32_scalar(npsd_scalar, spp, power, alpha_d, bb_scale, n);
+            sk_mcra_noise_update_f32(npsd_simd, spp, power, alpha_d, bb_scale, n);
+            check_bits_or_die("mcra_noise_update_f32", n, t, npsd_simd, npsd_scalar, n);
+        }
+    }
+    /* dedicated spp/bb_scale boundary sweep: spp in {0,1} (fully-noise vs
+     * fully-speech gating) and bb_scale in {0,1} (broadband-reset gate fully
+     * open vs disabled), the four corner combinations of the call site's own
+     * documented gating semantics. */
+    {
+        float npsd_s[8], npsd_n[8], spp8[8], power8[8];
+        int k;
+        for (k = 0; k < 8; ++k) { npsd_s[k] = npsd_n[k] = 1.0f + 0.1f * (float)k; power8[k] = 2.0f - 0.05f * (float)k; }
+        spp8[0] = 0.0f; spp8[1] = 1.0f; spp8[2] = 0.0f; spp8[3] = 1.0f;
+        spp8[4] = 0.0f; spp8[5] = 1.0f; spp8[6] = 0.0f; spp8[7] = 1.0f;
+        sk_mcra_noise_update_f32_scalar(npsd_s, spp8, power8, alpha_d, 0.0f, 4);
+        sk_mcra_noise_update_f32(npsd_n, spp8, power8, alpha_d, 0.0f, 4);
+        sk_mcra_noise_update_f32_scalar(npsd_s + 4, spp8 + 4, power8 + 4, alpha_d, 1.0f, 4);
+        sk_mcra_noise_update_f32(npsd_n + 4, spp8 + 4, power8 + 4, alpha_d, 1.0f, 4);
+        check_bits_or_die("mcra_noise_update_f32_boundary", 8, 0, npsd_n, npsd_s, 8);
+    }
+    printf("PASS mcra_noise_update_f32\n");
+}
+
+
 /* ═══════════ alignment + canary edge-case matrix (round-3 review B05) ═════
  * Finding B05's edge-case matrix, layered on top of the per-kernel
  * correctness tests above:
@@ -1118,6 +1387,116 @@ static void bench_fast_sqrt(void) {
     }
 }
 
+static void bench_fast_exp(void) {
+    float x[BENCH_N], out[BENCH_N];
+    fill_bench_floats(x, BENCH_N); /* ~[-1,1], well within the fast domain */
+    {
+        double t0, t1; int r;
+        t0 = now_ns();
+        for (r = 0; r < BENCH_REPS; ++r) { sk_fast_exp_f32_scalar(x, out, BENCH_N); g_bench_sink += out[0]; }
+        t1 = now_ns();
+        {
+            double ns_scalar = (t1 - t0) / BENCH_REPS;
+            double t2 = now_ns();
+            for (r = 0; r < BENCH_REPS; ++r) { sk_fast_exp_f32(x, out, BENCH_N); g_bench_sink += out[0]; }
+            {
+                double t3 = now_ns();
+                report_bench("fast_exp_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
+            }
+        }
+    }
+}
+
+static void bench_fast_exp_neg(void) {
+    float x[BENCH_N], out[BENCH_N];
+    int i;
+    fill_bench_floats(x, BENCH_N);
+    for (i = 0; i < BENCH_N; ++i) x[i] = fabsf(x[i]); /* SPP-shaped: non-negative */
+    {
+        double t0, t1; int r;
+        t0 = now_ns();
+        for (r = 0; r < BENCH_REPS; ++r) { sk_fast_exp_neg_f32_scalar(x, out, BENCH_N); g_bench_sink += out[0]; }
+        t1 = now_ns();
+        {
+            double ns_scalar = (t1 - t0) / BENCH_REPS;
+            double t2 = now_ns();
+            for (r = 0; r < BENCH_REPS; ++r) { sk_fast_exp_neg_f32(x, out, BENCH_N); g_bench_sink += out[0]; }
+            {
+                double t3 = now_ns();
+                report_bench("fast_exp_neg_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
+            }
+        }
+    }
+}
+
+static void bench_fast_log(void) {
+    float x[BENCH_N], out[BENCH_N];
+    int i;
+    fill_bench_floats(x, BENCH_N);
+    for (i = 0; i < BENCH_N; ++i) x[i] = x[i] * x[i] + 1e-3f; /* positive domain */
+    {
+        double t0, t1; int r;
+        t0 = now_ns();
+        for (r = 0; r < BENCH_REPS; ++r) { sk_fast_log_f32_scalar(x, out, BENCH_N); g_bench_sink += out[0]; }
+        t1 = now_ns();
+        {
+            double ns_scalar = (t1 - t0) / BENCH_REPS;
+            double t2 = now_ns();
+            for (r = 0; r < BENCH_REPS; ++r) { sk_fast_log_f32(x, out, BENCH_N); g_bench_sink += out[0]; }
+            {
+                double t3 = now_ns();
+                report_bench("fast_log_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
+            }
+        }
+    }
+}
+
+static void bench_exp1_approx(void) {
+    float x[BENCH_N], out[BENCH_N];
+    int i;
+    fill_bench_floats(x, BENCH_N);
+    for (i = 0; i < BENCH_N; ++i) x[i] = x[i] * x[i] + 1e-3f; /* SNR-ratio-shaped: positive */
+    {
+        double t0, t1; int r;
+        t0 = now_ns();
+        for (r = 0; r < BENCH_REPS; ++r) { sk_exp1_approx_f32_scalar(x, out, BENCH_N); g_bench_sink += out[0]; }
+        t1 = now_ns();
+        {
+            double ns_scalar = (t1 - t0) / BENCH_REPS;
+            double t2 = now_ns();
+            for (r = 0; r < BENCH_REPS; ++r) { sk_exp1_approx_f32(x, out, BENCH_N); g_bench_sink += out[0]; }
+            {
+                double t3 = now_ns();
+                report_bench("exp1_approx_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
+            }
+        }
+    }
+}
+
+static void bench_mcra_noise_update(void) {
+    float npsd[BENCH_N], spp[BENCH_N], power[BENCH_N];
+    int i;
+    fill_bench_floats(npsd, BENCH_N);
+    fill_bench_floats(spp, BENCH_N);
+    fill_bench_floats(power, BENCH_N);
+    for (i = 0; i < BENCH_N; ++i) { npsd[i] = fabsf(npsd[i]) + 1e-3f; spp[i] = fabsf(spp[i]); power[i] = fabsf(power[i]); }
+    {
+        double t0, t1; int r;
+        t0 = now_ns();
+        for (r = 0; r < BENCH_REPS; ++r) { sk_mcra_noise_update_f32_scalar(npsd, spp, power, 0.95f, 0.7f, BENCH_N); g_bench_sink += npsd[0]; }
+        t1 = now_ns();
+        {
+            double ns_scalar = (t1 - t0) / BENCH_REPS;
+            double t2 = now_ns();
+            for (r = 0; r < BENCH_REPS; ++r) { sk_mcra_noise_update_f32(npsd, spp, power, 0.95f, 0.7f, BENCH_N); g_bench_sink += npsd[0]; }
+            {
+                double t3 = now_ns();
+                report_bench("mcra_noise_update_f32", ns_scalar, (t3 - t2) / BENCH_REPS);
+            }
+        }
+    }
+}
+
 
 /* ═══════════════════════════════════ main ══════════════════════════════════ */
 
@@ -1132,6 +1511,16 @@ int main(void) {
     test_clip();
     test_fast_sqrt();
     test_fast_math_special_values();
+
+    printf("\n--- s4-audio-common-sweep: fast_math.h exp/log family + mcra EMA kernel ---\n");
+    test_fast_exp();
+    test_fast_exp_neg();
+    test_fast_log();
+    test_fast_log10();
+    test_exp1_approx();
+    test_exp_log_boundaries();
+    test_exp_log_family_inplace();
+    test_mcra_noise_update();
 
     printf("\n--- alignment + canary edge-case matrix (round-3 review B05) ---\n");
     test_ema_edge();
@@ -1150,6 +1539,11 @@ int main(void) {
     bench_min();
     bench_clip();
     bench_fast_sqrt();
+    bench_fast_exp();
+    bench_fast_exp_neg();
+    bench_fast_log();
+    bench_exp1_approx();
+    bench_mcra_noise_update();
 
     printf("\nALL PASS (SK_HAVE_NEON=%d)\n", SK_HAVE_NEON);
     printf("TOTAL CHECKS: %ld\n", g_total_checks);

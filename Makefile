@@ -27,9 +27,27 @@ RANLIB  ?= ranlib
 # the same stable shape across all three repos sharing this build design and
 # (b) a future use of any of them here automatically starts keying builds
 # correctly instead of silently aliasing with a build that didn't set it.
-# ?= with an explicit (possibly empty) value, not left undefined, so the
-# payload string never depends on whether the variable happens to be defined.
-CPPFLAGS      ?=
+# EXTRA_LDFLAGS/NO_STDIO/DEBUG use ?= with an explicit (possibly empty)
+# value, not left undefined, so the payload string never depends on whether
+# the variable happens to be defined.
+#
+# CPPFLAGS is different: it is also one of the six names the "Command-line
+# override rejection" foreach further below rejects a command-line/`-e`
+# override of (a Codex review finding). `?=` only ever assigns when the
+# variable's origin is still "undefined" -- if CPPFLAGS already has a value
+# from the environment, `?=` is a complete no-op (GNU Make never attempts
+# the assignment at all), so the origin never flips to "environment
+# override" under `make -e` no matter how early this line sits, and the
+# foreach's $(origin CPPFLAGS) check silently missed it (confirmed
+# empirically: `env CPPFLAGS=x make -e ...` used to sail straight through).
+# `+=` fixes this while keeping the externally-visible behavior identical:
+# appending an empty string is a no-op on the VALUE (a plain-environment
+# CPPFLAGS still folds in -- origin becomes "file", exactly like CFLAGS's
+# own `+=` below -- and still participates in CFG_SIG_PAYLOAD unchanged),
+# but `+=` is an unconditional assignment ATTEMPT, so under `-e` GNU Make's
+# origin bookkeeping now correctly flips it to "environment override",
+# which the foreach rejects.
+CPPFLAGS      +=
 EXTRA_LDFLAGS ?=
 NO_STDIO      ?= 0
 DEBUG         ?= 0
@@ -293,7 +311,31 @@ ifeq ($(BACKEND),ne10)
   LINK = $(CXX)
 endif
 
-# --- Command-line override rejection (round-4 review P1-1) ------------------
+# --- Bare-literal policy flags, defined early (Codex review: `make -e`
+# environment-override gap) --------------------------------------------------
+# FP_POLICY and FFT_WRAPPER_ALIAS_CFLAGS are both plain, dependency-free `:=`
+# literals (no reference to CFLAGS/CXXFLAGS or anything else computed above)
+# that used to be defined much further down this file, immediately ahead of
+# CFG_SIG_PAYLOAD -- each for reasons that still apply and are unaffected by
+# this move (see the "FP-contraction policy" and "Build-cache-invalidation
+# fix" comments further below: FP_POLICY's CFLAGS/CXXFLAGS append still needs
+# to happen AFTER every other CFLAGS/CXXFLAGS append, and CFG_SIG_PAYLOAD
+# still needs FFT_WRAPPER_ALIAS_CFLAGS's FINAL value -- both still true with
+# only the bare `:=` literal relocated here). Both names are ALSO listed in
+# the "Command-line override rejection" foreach directly below, and that
+# combination used to be a real gap under `make -e`, empirically confirmed:
+# `env FP_POLICY=x make -e ...` and `env FFT_WRAPPER_ALIAS_CFLAGS=x make -e
+# ...` both used to sail straight through with no error, silently dropping
+# -ffp-contract=off / -fno-strict-aliasing from a real, fully-buildable
+# archive (see the foreach's own comment for the full mechanism). Duplicating
+# only the bare literal up here -- ahead of the foreach in file order --
+# fixes it; the original site of each still holds its OTHER job unchanged, so
+# there is exactly one `:=` definition of each name in this file, just moved.
+FP_POLICY := -ffp-contract=off
+FFT_WRAPPER_ALIAS_CFLAGS := -fno-strict-aliasing
+
+# --- Command-line override rejection (round-4 review P1-1; FFT_WRAPPER_ALIAS_
+# CFLAGS added by a later Codex review, same mechanism) -----------------------
 # CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/FP_POLICY are INTERNAL: GNU Make silently
 # ignores every one of this file's own `+=`/`:=` assignments to a variable
 # that was set on the command line (`make CFLAGS=-O3`), which would strip the
@@ -301,11 +343,68 @@ endif
 # build while still producing artifacts (verified: the compile line really
 # loses -ffp-contract=off). The supported user hooks are EXTRA_CFLAGS /
 # EXTRA_LDFLAGS (folded in above, covered by CFG_SIG, policy still appended
-# after them). A plain environment CFLAGS is NOT rejected: this file's own
-# assignments fold it in normally (origin becomes "file"), the policy flags
+# after them). A plain environment value is NOT rejected: this file's own
+# assignment folds it in normally (origin becomes "file"), the policy flags
 # still land last, and the value participates in CFG_SIG -- only "command
 # line" and the -e "environment override" origins defeat the assignments.
-$(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY,\
+#
+# FFT_WRAPPER_ALIAS_CFLAGS has the exact same exposure from a different
+# angle: it is also a plain `:=`, so a command-line
+# `make BACKEND=kiss FFT_WRAPPER_ALIAS_CFLAGS=` (empty, or any value lacking
+# -fno-strict-aliasing) used to silently win over this file's own definition
+# and strip -fno-strict-aliasing from fft_wrapper.o/fft_wrapper_ne10.o's
+# target-specific CFLAGS (see the -fno-strict-aliasing block further down) --
+# CFG_SIG still keys that build into its own distinct obj/bin directory (the
+# value is folded into CFG_SIG_PAYLOAD, so it is never a stale-cache hazard),
+# but the result is a real, fully-buildable, valid-looking archive that ships
+# the known Complex*/float* and Complex*/ne10_fft_cpx_float32_t*
+# strict-aliasing UB live.
+#
+# CORRECTED UNDERSTANDING (this paragraph used to claim $(origin $(v)) below
+# is evaluated per-name at this point in the file "regardless of where each
+# name's own `:=`/`+=` happens to live" -- a second Codex review EMPIRICALLY
+# DISPROVED that in general, for the `make -e` case specifically; the claim
+# is still correct for plain "command line" origin, just not for
+# "environment override"). A plain "command line" origin IS genuinely
+# position-independent: it is resolved once, before any makefile parsing
+# begins at all, so $(origin v) reports "command line" for such a variable
+# no matter where in the file it is queried -- every command-line-override
+# case above, and every S9/S20 test in scripts/test_build_isolation.sh,
+# relies on exactly that, and it still holds. "environment override" origin
+# is NOT position-independent: GNU Make only flips a variable's origin from
+# plain "environment" to "environment override" at the point a makefile
+# assignment attempt to that SAME variable is actually parsed (and, under
+# `-e`, silently voided in the environment's favor) -- there is nothing to
+# flip before that assignment is parsed, so $(origin v) still reports merely
+# "environment" (matching neither `command` nor `override`) for any name
+# whose own assignment sits AFTER this foreach. FP_POLICY and
+# FFT_WRAPPER_ALIAS_CFLAGS both used to be defined only much further down
+# this file (see the "Bare-literal policy flags" comment directly above for
+# the fix: each name's bare `:=` literal is now duplicated-and-relocated to
+# directly above this foreach, so the origin-flip has already happened by
+# the time $(origin $(v)) is queried here, under `-e` or otherwise).
+#
+# CPPFLAGS had a THIRD, independent variant of this same class of gap,
+# despite its own assignment (`CPPFLAGS ?=` up top) already sitting well
+# before this foreach: `?=` only ever assigns when the variable's origin is
+# still "undefined" -- given an environment-original CPPFLAGS, that
+# condition is already false, so GNU Make treats the whole line as a no-op
+# and never attempts anything, meaning the origin-flip trigger (an actual
+# assignment ATTEMPT) never fires under `-e` either, no matter how early the
+# `?=` line sits (confirmed empirically the same way). Fixed by changing
+# that line from `?=` to `+=` (see its own comment up top) -- an
+# unconditional assignment attempt, same shape as CFLAGS's own `+=` lines,
+# with no behavior change to the (always-empty-by-default, currently-
+# unconsumed) value itself.
+#
+# Reusing this exact six-name foreach (rather than a separate ad hoc check
+# next to each variable's own definition) is still the pattern the
+# "Build-cache-invalidation fix" / "THE PATTERN" comment near CFG_SIG_PAYLOAD
+# calls for: any future policy flag added the same way should route through
+# here, defined early enough (bare `:=`, or unconditional `+=` -- never
+# `?=`) that its origin is already final -- under `-e` included -- by the
+# time this foreach runs.
+$(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FFT_WRAPPER_ALIAS_CFLAGS,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently drop this Makefile's own flag appends (FP policy, backend defines); use EXTRA_CFLAGS / EXTRA_LDFLAGS instead)))
 
@@ -321,6 +420,14 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY,\
 # silently re-enable contraction after this file's own flags, because
 # nothing after this line ever appends to CFLAGS/CXXFLAGS again.
 #
+# (Codex review / `make -e` gap fix: FP_POLICY's own bare `:=` literal now
+# lives earlier in this file, directly above the "Command-line override
+# rejection" foreach -- see that foreach's "Bare-literal policy flags"
+# comment for why. Only FP_POLICY's OTHER job -- appending it to CFLAGS/
+# CXXFLAGS, LAST, exactly as this whole comment describes -- still lives at
+# this position; there is exactly one `:=` definition of FP_POLICY in this
+# file, not two.)
+#
 # Policy scope: contraction must be off repo-wide, not just for code we own
 # -- a compiler-fused FMA in vendored scalar reference code (KISS, or NE10's
 # non-neonintrinsic .c/.cpp files) is exactly the build-order-dependent
@@ -335,31 +442,148 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY,\
 # for the disassembly-level verification (PASS/EXEMPT table distinguishing
 # the two) and each repo's README/CLAUDE.md for the cross-repo policy note.
 #
-# Conflict detection (round-3 review B04): a caller passing
-# EXTRA_CFLAGS=-Ofast/-ffast-math (both of which imply -ffp-contract=fast on
-# gcc/clang) or EXTRA_CFLAGS=-ffp-contract=<anything> would either directly
-# re-enable contraction or silently do so via an implied flag, despite this
-# repo's pinned policy -- rejected outright rather than allowed to land.
-# Checked against the fully-assembled $(CFLAGS) (already includes
-# EXTRA_CFLAGS folded in above, AND any CFLAGS= command-line override, since
-# a command-line-set CFLAGS is what every prior `+=` in this file appended
-# to) -- BEFORE FP_POLICY is appended below and BEFORE CFG_SIG is computed,
-# so a rejected build never creates an obj/bin directory. Using $(CFLAGS)
-# here (not a separate raw EXTRA_CFLAGS-only check) also catches
-# CXXFLAGS-only conflicts for free, since EXTRA_CFLAGS is the one hook both
-# CFLAGS and CXXFLAGS fold in identically (this Makefile has no separate
-# EXTRA_CXXFLAGS knob).
-ifneq ($(findstring -Ofast,$(CFLAGS)),)
-$(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -Ofast; this repo pins -ffp-contract=off; remove -Ofast from EXTRA_CFLAGS)
-endif
-ifneq ($(findstring -ffast-math,$(CFLAGS)),)
-$(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from EXTRA_CFLAGS)
-endif
-ifneq ($(findstring -ffp-contract=,$(CFLAGS)),)
-$(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -ffp-contract=; this repo pins -ffp-contract=off; remove -ffp-contract= from EXTRA_CFLAGS)
+# Conflict detection (round-3 review B04; widened to CXXFLAGS/CPPFLAGS by a
+# later Codex review): a caller passing EXTRA_CFLAGS=-Ofast/-ffast-math (both
+# of which imply -ffp-contract=fast on gcc/clang) or
+# EXTRA_CFLAGS=-ffp-contract=<anything> would either directly re-enable
+# contraction or silently do so via an implied flag, despite this repo's
+# pinned policy -- rejected outright rather than allowed to land.
+# Checked against the fully-assembled $(CFLAGS) $(CXXFLAGS) $(CPPFLAGS)
+# (each already includes EXTRA_CFLAGS folded in above, AND any
+# CFLAGS=/CXXFLAGS=/CPPFLAGS= command-line override, since a command-line-set
+# value is what every prior `+=` in this file appended to) -- BEFORE
+# FP_POLICY is appended below and BEFORE CFG_SIG is computed, so a rejected
+# build never creates an obj/bin directory.
+#
+# CORRECTED UNDERSTANDING (this used to check $(CFLAGS) alone, reasoning that
+# EXTRA_CFLAGS -- the one hook both CFLAGS and CXXFLAGS fold in identically --
+# made a CXXFLAGS-only conflict impossible to smuggle past a CFLAGS-only
+# check "for free". A Codex review found the gap that reasoning missed: a
+# PLAIN ENVIRONMENT CXXFLAGS (or CPPFLAGS) is deliberately allowed to fold in
+# normally by the command-line/`-e` override rejection above -- it never goes
+# through EXTRA_CFLAGS at all -- so `env CXXFLAGS=-Ofast make BACKEND=ne10
+# lib` used to sail straight through this block entirely: none of the three
+# checks below ever inspected $(CXXFLAGS), so the NE10 backend's vendored C++
+# TU, NE10_fft_generic_int32.cpp (the only C++ TU this Makefile compiles --
+# see NE10_CXXSRCS above) compiled with -Ofast fully live -- confirmed
+# empirically: the compile line showed -Ofast ahead of the
+# later -ffp-contract=off, meaning __FAST_MATH__ and every OTHER -Ofast
+# relaxation besides contraction (which the trailing flag does still turn
+# back off) were live and unchecked. The check below inspects all three
+# variables together so no combination of CFLAGS/CXXFLAGS/CPPFLAGS --
+# command-line-folded, EXTRA_CFLAGS-folded, or a plain environment value --
+# can carry any of these three patterns past this gate. This position
+# (after every CFLAGS/CXXFLAGS/CPPFLAGS append earlier in
+# this file, including the BACKEND-conditional NE10_DEFS/-isystem/kiss
+# appends, and before FP_POLICY's own append just below) is the same
+# position already relied on to see CFLAGS's fully-composed value, and is
+# equally late enough for CXXFLAGS and CPPFLAGS: CXXFLAGS's last append in
+# this file is the BACKEND-conditional block above (line ~290), and CPPFLAGS
+# is only ever assigned once, at the top of this file (`CPPFLAGS +=`) --
+# both fully resolved well before this point, with no target-specific
+# CFLAGS/CXXFLAGS append anywhere in this file happening at parse time
+# (those are recipe-scoped, see $(OWN_OBJS)/fft_wrapper*.o further below).
+# (round-9 review) $(findstring ...) does a plain SUBSTRING search over the
+# whole concatenated text, so it false-positives on any token that merely
+# CONTAINS one of these patterns as part of a larger identifier -- e.g. a
+# harmless `-DROUND9_NOTE=-Ofastness` macro definition is not the compiler
+# flag -Ofast at all, yet the old $(findstring -Ofast,...) check rejected it
+# anyway. $(filter PATTERN...,TEXT) instead splits TEXT on whitespace into
+# WORDS and matches each whole word against PATTERN (a trailing %% is a
+# single wildcard, used here for -ffp-contract=<anything>), so it only ever
+# matches a complete flag token, never a substring buried inside an
+# unrelated token.
+FP_INPUT_FLAGS := $(CFLAGS) $(CXXFLAGS) $(CPPFLAGS)
+
+# (Codex review) $(filter) directly above does whole-WORD matching against
+# GNU Make's OWN text representation of CFLAGS/CXXFLAGS/CPPFLAGS -- but Make
+# has zero concept of shell quoting. A value like EXTRA_CFLAGS="'-Ofast'" is
+# stored by Make as the literal 9-character text '-Ofast', quote characters
+# included, which is not equal to the bare word -Ofast, so $(filter) can
+# never match it -- yet when this same text later appears on an actual
+# compile recipe line and that line is handed to $(SHELL), the shell strips
+# the quote characters and the compiler genuinely receives -Ofast as a real
+# argv token. Three confirmed-live bypass shapes: EXTRA_CFLAGS="'-Ofast'"
+# (single-quoted), EXTRA_CFLAGS='"-ffast-math"' (double-quoted), and
+# EXTRA_CFLAGS="-O'f'ast" (quote-split mid-token -- the shell concatenates
+# the pieces back into -Ofast once it strips the quotes). A fourth family,
+# @response-file syntax (EXTRA_CFLAGS=@flags.rsp), is unrelated to quoting
+# but equally invisible to a plain whole-word check: many compilers treat a
+# bare @file argv token as "read more arguments from this file", which could
+# inject anything at all with zero text ever appearing in CFLAGS/
+# EXTRA_CFLAGS itself.
+#
+# Since Make cannot parse shell quoting, this block does not try to detect
+# "a quoted variant of -Ofast" specifically. Instead, the ONLY supported
+# external-input format for CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS is plain,
+# unquoted, whitespace-separated compiler argv tokens -- and ANY appearance
+# of shell quoting/escaping/expansion/response-file syntax in the combined
+# text is rejected outright, regardless of what follows it, BEFORE the
+# $(filter) exact-token conflict check below even runs, so that check only
+# ever sees guaranteed-unquoted input. (This paragraph intentionally
+# says nothing about -Ofast/-ffast-math/-ffp-contract itself: whether a
+# token IS one of those three is decided solely by the unchanged $(filter)
+# check; a harmless token that merely contains innocuous characters, e.g.
+# -DROUND9_NOTE=-Ofastness or -DTEXT=ffast-math, contains none of the
+# characters checked for below and so is untouched by this block.)
+#
+# A literal "$(" -- Make's own function/variable-reference opener, and also
+# the two-character shell command/variable-substitution opener -- cannot
+# safely be written as raw punctuation inline in a $(findstring ...) call:
+# GNU Make's parser matches parentheses while scanning a function call's
+# argument text, so an unbalanced literal "(" typed inline would confuse
+# that scan. Built instead via small helper variables (one holding a literal
+# "$" via the doubled-dollar escape, one holding a literal "(", concatenated
+# into one holding the two-char sequence) and that variable is referenced as
+# the findstring pattern -- confirmed by direct testing to parse cleanly
+# and to actually match (a raw unbalanced "(" typed inline here does NOT
+# parse cleanly; the helper-variable indirection does).
+FP_DOLLAR_CHAR      := $$
+FP_OPEN_PAREN_CHAR   := (
+FP_DOLLAR_PAREN_SEQ  := $(FP_DOLLAR_CHAR)$(FP_OPEN_PAREN_CHAR)
+
+ifneq ($(findstring ',$(FP_INPUT_FLAGS)),)
+$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a single-quote character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell quoting cannot be safely detected here by GNU Make and is rejected outright)
 endif
 
-FP_POLICY := -ffp-contract=off
+ifneq ($(findstring ",$(FP_INPUT_FLAGS)),)
+$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a double-quote character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell quoting cannot be safely detected here by GNU Make and is rejected outright)
+endif
+
+ifneq ($(findstring \,$(FP_INPUT_FLAGS)),)
+$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a backslash character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell escaping cannot be safely detected here by GNU Make and is rejected outright)
+endif
+
+ifneq ($(findstring `,$(FP_INPUT_FLAGS)),)
+$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a backtick character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell command substitution cannot be safely detected here by GNU Make and is rejected outright)
+endif
+
+ifneq ($(findstring $(FP_DOLLAR_PAREN_SEQ),$(FP_INPUT_FLAGS)),)
+$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a '$$(' sequence (command/variable substitution); this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell/make expansion cannot be safely detected here by GNU Make and is rejected outright)
+endif
+
+ifneq ($(findstring ;,$(FP_INPUT_FLAGS)),)
+$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a semicolon character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell command separators cannot be safely detected here by GNU Make and are rejected outright)
+endif
+
+ifneq ($(findstring |,$(FP_INPUT_FLAGS)),)
+$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a pipe character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell pipelines cannot be safely detected here by GNU Make and are rejected outright)
+endif
+
+ifneq ($(findstring &,$(FP_INPUT_FLAGS)),)
+$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains an ampersand character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell backgrounding/AND-lists cannot be safely detected here by GNU Make and are rejected outright)
+endif
+
+FP_RESPONSE_FILE_TOKENS := $(filter @%,$(FP_INPUT_FLAGS))
+ifneq ($(FP_RESPONSE_FILE_TOKENS),)
+$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains an @-prefixed response-file token ($(FP_RESPONSE_FILE_TOKENS)); this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- @file compiler response-file syntax cannot be safely expanded/inspected here and is rejected outright)
+endif
+
+FP_CONFLICT_FLAGS := $(filter -Ofast -ffast-math -ffp-contract=%,$(FP_INPUT_FLAGS))
+ifneq ($(FP_CONFLICT_FLAGS),)
+$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains $(FP_CONFLICT_FLAGS); this repo pins -ffp-contract=off; remove $(FP_CONFLICT_FLAGS) from CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS)
+endif
+
 CFLAGS    += $(FP_POLICY)
 CXXFLAGS  += $(FP_POLICY)
 
@@ -425,7 +649,52 @@ CXXFLAGS  += $(FP_POLICY)
 # archive member behind under the same key, and `ar rc` on the existing
 # archive would never delete that member -- see the fresh-archive recipe
 # below for the other half of that fix).
-CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) SRCS=$(sort $(OWN_SRCS) $(VENDOR_SRCS) $(VENDOR_CXXSRCS))
+#
+# Build-cache-invalidation fix: FFT_WRAPPER_ALIAS_CFLAGS. The
+# -fno-strict-aliasing escape hatch applied via target-specific CFLAGS to
+# ONLY fft_wrapper.o/fft_wrapper_ne10.o (see the two target-specific-variable
+# lines and their big rationale comment further down) used to be a bare
+# literal on those two lines, invisible to this payload -- a target-specific
+# `TARGET: CFLAGS += ...` assignment does NOT retroactively change what
+# $(CFLAGS) expanded to when THIS line was evaluated (GNU Make expands a
+# `:=` payload string immediately, at parse time; target-specific values
+# only exist within that target's own recipe/prerequisite evaluation and
+# never leak back into the global $(CFLAGS) already captured here). So
+# changing that literal (or removing it) left CFG_SIG byte-for-byte
+# unchanged, `make lib` became a silent no-op, and a keyed obj/bin directory
+# built before the flag existed could go on reusing an fft_wrapper.o
+# compiled WITHOUT it forever -- defeating the whole fix with no way to
+# detect it short of a manual clean (confirmed via an isolated test; see
+# scripts/test_build_isolation.sh S19). Fixed by extracting the flag into
+# this named variable and referencing the variable -- never a literal --
+# from the target-specific lines instead. THE PATTERN: any future policy
+# flag added to a target-specific CFLAGS/CXXFLAGS line in this Makefile must
+# follow the same shape -- name it, fold the name into CFG_SIG_PAYLOAD, then
+# reference the name (not a literal) on the target-specific line -- so it
+# can never again be invisible to the hash.
+#
+# CFG_SIG-keying alone is not sufficient by itself, though: it guarantees a
+# changed value never silently reuses a stale cached object, but does not
+# stop a command-line `FFT_WRAPPER_ALIAS_CFLAGS=` override from producing a
+# real, fully-buildable archive that ships without -fno-strict-aliasing on
+# these two TUs (a Codex review finding). This plain `:=` is therefore also
+# listed in the "Command-line override rejection" foreach further above (see
+# that comment) -- a command-line origin for this name was always rejected
+# there regardless of position, but a SECOND Codex review found `make -e`
+# environment-override was NOT actually caught, despite this comment's
+# former (now-corrected) claim to the contrary: the foreach queries $(origin
+# FFT_WRAPPER_ALIAS_CFLAGS) at ITS OWN position in the file, and this
+# variable's bare `:=` used to sit only here -- AFTER that foreach -- so the
+# origin-flip to "environment override" that `-e` triggers on an attempted
+# makefile assignment had not happened yet when the check ran. Fixed by
+# duplicating-and-relocating just the bare `:=` literal to directly above
+# the foreach itself (see the "Bare-literal policy flags" comment there for
+# the full mechanism); the CFG_SIG_PAYLOAD reference immediately below still
+# reads this name's value, now already final by construction, and there
+# remains exactly one `:=` definition of FFT_WRAPPER_ALIAS_CFLAGS in this
+# file, just relocated. A plain-environment value (no `-e`) still folds in
+# normally (origin "file") and still participates in CFG_SIG below.
+CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) SRCS=$(sort $(OWN_SRCS) $(VENDOR_SRCS) $(VENDOR_CXXSRCS)) FFT_WRAPPER_ALIAS_CFLAGS=$(FFT_WRAPPER_ALIAS_CFLAGS)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 BE_SRCS    = $(OWN_SRCS) $(VENDOR_SRCS)
@@ -449,19 +718,50 @@ ifeq ($(WERROR),1)
 $(OWN_OBJS): CFLAGS += -Werror
 endif
 
-# -fno-strict-aliasing, scoped to ONLY the object for src/fft_wrapper_ne10.c
-# (same target-specific-variable pattern as the -Werror opt-in above, just
-# unconditional and narrower -- one specific object, not a whole class of
-# objects). That TU casts `Complex*` to `ne10_fft_cpx_float32_t*` in place
-# (see the "Residual strict-aliasing caveat" comment in fft_wrapper_ne10.c
-# itself for the layout-equality proof and full rationale) -- two distinct
-# struct types, so reading through one after writing through the other is,
-# strictly, type-based-alias UB even though the layouts provably match. This
-# flag removes the TBAA assumption for this one TU only, formally sanctioning
-# what was previously just an -O2/no-LTO empirical argument; every other
-# object in this archive (including the rest of the NE10 backend) keeps the
-# default strict-aliasing behavior.
-$(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += -fno-strict-aliasing
+# -fno-strict-aliasing, scoped to ONLY the objects for src/fft_wrapper_ne10.c
+# and src/fft_wrapper.c (same target-specific-variable pattern as the
+# -Werror opt-in above, just unconditional and narrower -- two specific
+# objects, not a whole class of objects).
+#
+# The flag string itself lives in $(FFT_WRAPPER_ALIAS_CFLAGS) (defined up
+# above, ahead of CFG_SIG_PAYLOAD -- see the "Build-cache-invalidation fix"
+# comment there for the full story): a target-specific `CFLAGS +=` line is
+# invisible to CFG_SIG_PAYLOAD's earlier `:=` expansion, so the two lines
+# below reference the named variable rather than a literal, and that
+# variable's value is folded into CFG_SIG_PAYLOAD -- changing it (or this
+# variable's definition) now always lands in a fresh keyed directory instead
+# of silently reusing objects built under the old value. Follow this same
+# indirection for any future policy flag added to a target-specific CFLAGS/
+# CXXFLAGS line in this Makefile; do not hardcode a literal on the line.
+#
+# fft_wrapper_ne10.c's fft_forward/fft_inverse cast `Complex*` to
+# `ne10_fft_cpx_float32_t*` in place (see the "Residual strict-aliasing
+# caveat" comment in fft_wrapper_ne10.c itself for the layout-equality proof
+# and full rationale) -- two distinct struct types, so reading through one
+# after writing through the other is, strictly, type-based-alias UB even
+# though the layouts provably match.
+#
+# fft_wrapper.c's fft_power() (pre-existing) and fft_magnitude() (added in
+# this same optimization arc, later than fft_power) have the identical
+# exposure from the other direction: both cast a `Complex*` straight to
+# `const float*` and hand it to vld2q_f32 ("float32x4x2_t v =
+# vld2q_f32((const float*)(spectrum + k));") -- reading a `Complex` object
+# through a `float` lvalue is a type-based-alias violation just the same, a
+# `float` is not the effective type of the `Complex` struct object even
+# though every byte of the struct IS a float. (fft_apply_gain() in this same
+# file does the identical vld2q_f32/vst2q_f32 cast and rides along under
+# this same TU-wide flag; unlike fft_power it has no separate EXEMPT entry
+# in scripts/audit_fp_contract.sh because it's a pure multiply with no
+# fp-contraction angle to audit -- but the aliasing exposure from the cast
+# is the same for all three functions.) Until this line was added, this TU
+# compiled the exact same aliasing pattern as fft_wrapper_ne10.c WITHOUT the
+# escape hatch -- this closes that gap. This flag removes the TBAA
+# assumption for these two TUs only, formally sanctioning what was
+# previously just an -O2/no-LTO empirical argument; every other object in
+# this archive (including the rest of both backends) keeps the default
+# strict-aliasing behavior.
+$(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
+$(OBJ_DIR)/fft_wrapper.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 
 LIB = $(BIN_DIR)/libaudio_common.a
 

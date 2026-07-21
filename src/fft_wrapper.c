@@ -221,7 +221,27 @@ void fft_inverse_scratch(FftHandle* h, Complex* freq_in_clobbered, float* real_o
 
 void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
     if (!spectrum || !magnitude) return;
-    for (int k = 0; k < n_freqs; k++) {
+    int k = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    /* UNLIKE fft_power() just below, this TU's fft_magnitude() does NOT call
+     * fmaf() anywhere -- `re*re + im*im` is a plain separately-rounded
+     * multiply/multiply/add, and this TU builds with -ffp-contract=off (see
+     * the Makefile's FP-contraction policy), so the compiler may not fuse it
+     * either. This NEON path must therefore mirror that UNFUSED shape
+     * (vmulq_f32/vmulq_f32/vaddq_f32, never vfmaq_f32) to stay bit-identical
+     * to the scalar reference below -- do not copy fft_power()'s fused
+     * pattern here, that would silently change this function's rounding.
+     * vsqrtq_f32 is IEEE-754 correctly-rounded, matching scalar sqrtf()
+     * lane-for-lane (same argument as sk_fast_sqrt_f32's USE_STANDARD_MATH
+     * path in simd_kernels.h). */
+    for (; k + 4 <= n_freqs; k += 4) {
+        float32x4x2_t v = vld2q_f32((const float*)(spectrum + k));
+        float32x4_t re = v.val[0], im = v.val[1];
+        float32x4_t sumsq = vaddq_f32(vmulq_f32(re, re), vmulq_f32(im, im));
+        vst1q_f32(magnitude + k, vsqrtq_f32(sumsq));
+    }
+#endif
+    for (; k < n_freqs; k++) {
         float re = spectrum[k].r, im = spectrum[k].i;
         magnitude[k] = sqrtf(re * re + im * im);
     }

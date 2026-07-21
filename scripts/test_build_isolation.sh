@@ -124,6 +124,121 @@
 #         identity-less checkout is refused UNCONDITIONALLY (no hatch).
 #   S18 - interruption-safety probe: EXIT/INT/TERM all clean up the whole
 #         scratch tree, even mid-scenario (round-6 P2-1 acceptance test)
+#   S19 - FFT_WRAPPER_ALIAS_CFLAGS is CFG_SIG-keyed: build-cache-invalidation
+#         regression guard for the gap a re-review found in the round-5
+#         -fno-strict-aliasing fix (the flag was a bare literal on a
+#         target-specific CFLAGS line, invisible to CFG_SIG_PAYLOAD, so
+#         changing/removing it never forced a fresh keyed dir); asserts a
+#         real `make lib` build off the unmodified Makefile and a second
+#         real `make lib` build off a scratch clone whose Makefile copy has
+#         had ONLY the FFT_WRAPPER_ALIAS_CFLAGS definition line sed-patched
+#         to a different literal land in two different keyed obj/bin/lib
+#         paths. (A later Codex review found a command-line override of this
+#         same variable was itself unguarded -- see S20 -- so this scenario
+#         no longer proves CFG_SIG coverage via a command-line override; the
+#         sed-patched-clone shape proves the identical property without
+#         relying on the now-closed hole.)
+#   S20 - FFT_WRAPPER_ALIAS_CFLAGS command-line/environment-override
+#         rejection (Codex review): the same class of hole S9 already closed
+#         for CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/FP_POLICY existed for this
+#         variable too -- `make FFT_WRAPPER_ALIAS_CFLAGS=` (empty) or
+#         `make FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing` on the command
+#         line used to silently win over the Makefile's own definition and
+#         produce a real, buildable fft_wrapper.o/fft_wrapper_ne10.o with the
+#         known strict-aliasing UB unguarded; both must now be rejected at
+#         parse time, mirroring S9's exact assertion style
+#   S21 - `make -e` (environment-override mode) bypass of S20's own guard
+#         (second Codex review): S20 proved the command-line case; a
+#         SEPARATE gap let `env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing
+#         make -e BACKEND=kiss lib` sail straight through with NO error,
+#         because the "Command-line override rejection" foreach queried
+#         $(origin FFT_WRAPPER_ALIAS_CFLAGS) BEFORE this variable's own (only)
+#         assignment in the file -- under `-e`, GNU Make only flips a
+#         variable's origin from "environment" to "environment override" at
+#         the point a makefile assignment to it is actually parsed, so
+#         querying it earlier still reports plain "environment", which
+#         matches neither `command` nor `override` and the check silently
+#         passed. Fixed by relocating the bare `:=` literal to directly
+#         above the foreach (see the Makefile's own "Bare-literal policy
+#         flags" comment). Both the exact reported repro (non-empty hostile
+#         value) and the empty-value sibling (full parity with S20's two
+#         cases) must now be rejected at parse time under `-e`.
+#   S22 - the same `make -e` class of gap, audited across the other five
+#         names S20/S9 already cover (Codex review follow-up): FP_POLICY
+#         turned out to have the IDENTICAL shape as FFT_WRAPPER_ALIAS_CFLAGS
+#         (its own bare `:=` also lived after the foreach) and CPPFLAGS had a
+#         DIFFERENT variant (its early `?=` never actually attempts an
+#         assignment once the variable is environment-original, so the
+#         origin-flip trigger never fires under `-e` regardless of position)
+#         -- both confirmed to let `env FP_POLICY=x make -e ...` / `env
+#         CPPFLAGS=x make -e ...` sail through unguarded before this round's
+#         fix (FP_POLICY: relocated bare `:=`, same as FFT_WRAPPER_ALIAS_
+#         CFLAGS; CPPFLAGS: `?=` changed to `+=`). CFLAGS/CXXFLAGS/LDFLAGS
+#         were confirmed ALREADY correctly rejected under `-e` (each has an
+#         unconditional `+=` before the foreach) and are not re-tested here.
+#   S23 - FP-policy conflict-detection widened to CXXFLAGS/CPPFLAGS (Codex
+#         review): the round-3 B04 conflict-detection block (rejects
+#         -Ofast/-ffast-math/-ffp-contract=<anything> so a build can never
+#         silently re-enable FP contraction) used to check $(CFLAGS) alone;
+#         a PLAIN ENVIRONMENT CXXFLAGS (or CPPFLAGS) -- deliberately allowed
+#         to fold in normally by the command-line/`-e` rejection above,
+#         since it never goes through EXTRA_CFLAGS -- sailed straight past
+#         all three checks. Direct repro (confirmed BEFORE this round's
+#         Makefile fix): `env CXXFLAGS=-Ofast make BACKEND=ne10 lib` built a
+#         real archive with the NE10 backend's one C++ TU
+#         (NE10_fft_generic_int32.cpp, the only C++ TU this Makefile
+#         compiles) showing `-Ofast` on its compile line ahead of the
+#         trailing `-ffp-contract=off` -- every -Ofast relaxation OTHER than
+#         contraction (which the trailing flag still turns back off) live
+#         and unchecked. BACKEND=ne10 (not kiss) is used throughout this
+#         scenario because it is the only backend that compiles a C++ TU at
+#         all -- confirmed empirically: the identical repro against
+#         BACKEND=kiss never invokes a C++ compiler at all (0 `.cpp` compile
+#         lines), so it would not have exercised the actual consequence of
+#         the gap, only the (backend-independent) text-matching guard
+#         itself. Each of the three conflict patterns is run as a PLAIN
+#         environment CXXFLAGS override (no `-e`, no command-line
+#         assignment) against the real `lib` target (the exact reported
+#         repro), plus the CPPFLAGS sibling of the -Ofast case for
+#         completeness; all four must now FAIL, mentioning "FP policy
+#         conflict". A later (round-9) Codex review found the widened
+#         checks themselves used $(findstring), a plain SUBSTRING search,
+#         so a harmless token that merely CONTAINS one of the three
+#         patterns (e.g. `-DROUND9_NOTE=-Ofastness`) was incorrectly
+#         rejected too; the fix moved to $(filter), which only matches
+#         whole flag words, and S23 gained a positive-case test asserting
+#         that exact repro now SUCCEEDS.
+#   S23b - quote/escape/response-file bypass of the FP-policy conflict gate
+#          itself (Codex review): $(filter) in the Makefile's exact-token
+#          check does whole-WORD matching against GNU Make's OWN text
+#          representation of CFLAGS/CXXFLAGS/CPPFLAGS -- but Make has zero
+#          concept of shell quoting. EXTRA_CFLAGS="'-Ofast'" is stored by
+#          Make as the literal 9-character text '-Ofast' (quote characters
+#          included), which never equals the bare word -Ofast, so $(filter)
+#          could never match it -- yet on the actual compile recipe line,
+#          handed to $(SHELL), the shell strips the quotes and the compiler
+#          genuinely receives -Ofast. Confirmed-live bypass shapes (all BEFORE
+#          this round's Makefile fix): EXTRA_CFLAGS="'-Ofast'" (single-
+#          quoted), EXTRA_CFLAGS='"-ffast-math"' (double-quoted),
+#          EXTRA_CFLAGS="-O'f'ast" (quote-split mid-token, shell concatenates
+#          the pieces back into -Ofast once quotes are stripped), and
+#          EXTRA_CFLAGS=@flags.rsp (a bare @file argv token many compilers
+#          treat as "read more arguments from this file" -- unrelated to
+#          quoting, but equally invisible to a plain-token check, and able to
+#          inject anything with zero text ever appearing in CFLAGS/
+#          EXTRA_CFLAGS itself). The fix adds a new rejection block, run
+#          BEFORE the exact-token check, that rejects outright any of:
+#          a single quote, a double quote, a backslash, a backtick, a
+#          `$(` sequence, a semicolon, a pipe, an ampersand, or any whole
+#          token starting with `@` -- appearing anywhere in the combined
+#          CFLAGS/CXXFLAGS/CPPFLAGS text, each with its own $(error ...)
+#          naming the specific construct found. All four bypass shapes
+#          above must now FAIL, each mentioning the specific forbidden
+#          construct (not just a generic failure); a positive control
+#          (EXTRA_CFLAGS=-DROUND9_NOTE=-Ofastness, the plain unquoted token
+#          from S23's own round-9 regression, plus the sibling
+#          -DTEXT=ffast-math token) must still SUCCEED, since neither
+#          contains any of the newly-forbidden characters.
 # S6 (Audio_ALG/pipelines consumer-resolution parity) is a later wave and is
 # intentionally NOT covered here.
 #
@@ -2122,6 +2237,455 @@ run_s18_mode() {
 run_s18_mode exit "" 0
 run_s18_mode term TERM 143
 run_s18_mode intr INT 130
+
+echo "############################################################"
+echo "# S19: FFT_WRAPPER_ALIAS_CFLAGS is CFG_SIG-keyed (build-cache-"
+echo "# invalidation regression guard)"
+echo "############################################################"
+# Guards exactly the gap a re-review found in the round-5 -fno-strict-
+# aliasing fix: that flag used to be a bare literal on the two
+# fft_wrapper.o/fft_wrapper_ne10.o target-specific `CFLAGS +=` lines
+# (Makefile, just below CFG_SIG_PAYLOAD), and a target-specific variable
+# assignment does NOT retroactively change what $(CFLAGS) expanded to when
+# CFG_SIG_PAYLOAD (a `:=`, expanded immediately at parse time) was computed
+# -- so the flag was invisible to CFG_SIG. Changing it (or removing it) left
+# CFG_SIG byte-for-byte identical, `make lib` became a silent no-op, and a
+# keyed obj/bin directory created before the flag existed could go on
+# reusing an fft_wrapper.o compiled WITHOUT it forever. The fix extracted
+# the flag into a named variable, $(FFT_WRAPPER_ALIAS_CFLAGS), defined
+# ahead of CFG_SIG_PAYLOAD and folded into it, with the two target-specific
+# lines now referencing the variable instead of a literal (see the
+# Makefile's own "Build-cache-invalidation fix" comment right above
+# CFG_SIG_PAYLOAD). This scenario is the permanent guard against that exact
+# gap reopening.
+#
+# A later Codex review found this scenario's ORIGINAL shape was itself
+# normalizing a real hole: it proved the point via a `make
+# FFT_WRAPPER_ALIAS_CFLAGS=<other value>` command-line override, but this
+# variable was a plain `:=` with no override-rejection -- so that same
+# command line didn't just prove CFG_SIG's keying, it ALSO silently replaced
+# the Makefile's own -fno-strict-aliasing value for real, and (e.g.) `make
+# BACKEND=kiss FFT_WRAPPER_ALIAS_CFLAGS=` produced a real, buildable
+# fft_wrapper.o shipping the known Complex*/float* strict-aliasing UB
+# unguarded, in a fully valid-looking archive. The Makefile fix adds
+# FFT_WRAPPER_ALIAS_CFLAGS as a 6th name to the same "Command-line override
+# rejection" foreach that already covers CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/
+# FP_POLICY (S9 above), so that exact command line now hard-$(error)s at
+# parse time -- see S20 below, which proves the rejection directly -- and
+# this scenario can no longer use it to prove CFG_SIG coverage.
+#
+# Rewritten instead to prove the identical CFG_SIG-keying property WITHOUT a
+# command-line override: one real `make lib` runs off the unmodified
+# Makefile at $AC_DIR; the other runs off a full scratch clone of the SAME
+# worktree (adopt_worktree_clone -- VPATH/includes/sources need the whole
+# tree, not just the Makefile) whose Makefile COPY has had ONLY the
+# FFT_WRAPPER_ALIAS_CFLAGS definition line sed-patched, in place, to a
+# different literal -- a real edit to that clone's own file, the same shape
+# S17g already uses to edit a cloned Makefile's COMMON_SRCS line. Both
+# builds share the SAME scratch OBJ_ROOT/BIN_ROOT, so the comparison below
+# isolates the CFG_SIG effect of the changed literal, not an incidental
+# root-path difference (same discipline S9 uses for its own baseline-vs-
+# EXTRA_CFLAGS comparison). (Manually reverting the Makefile fix and
+# re-running this exact scenario reproduces the original bug: both builds
+# then land in the SAME keyed dir.) Runs entirely under a scratch
+# OBJ_ROOT/BIN_ROOT and a scratch clone directory, like every other
+# tamper/probe scenario in this suite -- the real obj/, bin/, and Makefile
+# are never touched.
+cd "$AC_DIR"
+mkscratch s19
+S19_CLONE="$SCRATCH_ROOT/s19/clone"
+adopt_worktree_clone "$AC_DIR" "$S19_CLONE"
+
+S19_CHANGED_FLAGS="-fno-strict-aliasing -fwrapv"
+sed -i.s19bak "s|^FFT_WRAPPER_ALIAS_CFLAGS := -fno-strict-aliasing\$|FFT_WRAPPER_ALIAS_CFLAGS := $S19_CHANGED_FLAGS|" "$S19_CLONE/Makefile"
+rm -f "$S19_CLONE/Makefile.s19bak"
+grep -q "^FFT_WRAPPER_ALIAS_CFLAGS := $S19_CHANGED_FLAGS\$" "$S19_CLONE/Makefile" || \
+  fail "S19: Makefile seam edit did not land (FFT_WRAPPER_ALIAS_CFLAGS definition line changed shape?)"
+
+S19_OBJ_ROOT="$SCRATCH_ROOT/s19/obj"
+S19_BIN_ROOT="$SCRATCH_ROOT/s19/bin"
+
+s19_base_objdir="$(make -C "$AC_DIR" -s BACKEND=kiss OBJ_ROOT="$S19_OBJ_ROOT" BIN_ROOT="$S19_BIN_ROOT" print-obj-dir)"
+s19_base_lib="$(make -C "$AC_DIR" -s BACKEND=kiss OBJ_ROOT="$S19_OBJ_ROOT" BIN_ROOT="$S19_BIN_ROOT" print-lib-path)"
+if make -C "$AC_DIR" -s BACKEND=kiss OBJ_ROOT="$S19_OBJ_ROOT" BIN_ROOT="$S19_BIN_ROOT" lib >"$SCRATCH_ROOT/s19/build_base.log" 2>&1; then
+  pass "S19: baseline build (real, unmodified Makefile, default FFT_WRAPPER_ALIAS_CFLAGS) succeeds"
+else
+  fail "S19: baseline build (real, unmodified Makefile) FAILED"
+  cat "$SCRATCH_ROOT/s19/build_base.log" >&2
+fi
+
+s19_changed_objdir="$(make -C "$S19_CLONE" -s BACKEND=kiss OBJ_ROOT="$S19_OBJ_ROOT" BIN_ROOT="$S19_BIN_ROOT" print-obj-dir)"
+s19_changed_lib="$(make -C "$S19_CLONE" -s BACKEND=kiss OBJ_ROOT="$S19_OBJ_ROOT" BIN_ROOT="$S19_BIN_ROOT" print-lib-path)"
+if make -C "$S19_CLONE" -s BACKEND=kiss OBJ_ROOT="$S19_OBJ_ROOT" BIN_ROOT="$S19_BIN_ROOT" lib >"$SCRATCH_ROOT/s19/build_changed.log" 2>&1; then
+  pass "S19: changed-FFT_WRAPPER_ALIAS_CFLAGS build (scratch clone, sed-patched Makefile literal -- NOT a command-line override) succeeds"
+else
+  fail "S19: changed-FFT_WRAPPER_ALIAS_CFLAGS build (scratch clone) FAILED"
+  cat "$SCRATCH_ROOT/s19/build_changed.log" >&2
+fi
+
+[ -n "$s19_base_objdir" ] && [ -n "$s19_changed_objdir" ] && [ "$s19_base_objdir" != "$s19_changed_objdir" ] && \
+  pass "S19: changing FFT_WRAPPER_ALIAS_CFLAGS (via the scratch clone's sed-patched Makefile) lands in a DIFFERENT keyed obj dir (CFG_SIG sees the change)" \
+  || fail "S19: FFT_WRAPPER_ALIAS_CFLAGS change did NOT change the keyed obj dir ($s19_base_objdir vs $s19_changed_objdir) -- CFG_SIG is blind to this knob again"
+
+[ -n "$s19_base_lib" ] && [ -n "$s19_changed_lib" ] && [ "$s19_base_lib" != "$s19_changed_lib" ] && \
+  pass "S19: ...and the two builds' print-lib-path archives differ too" \
+  || fail "S19: FFT_WRAPPER_ALIAS_CFLAGS change did NOT change print-lib-path ($s19_base_lib vs $s19_changed_lib)"
+
+if [ -f "$s19_base_lib" ] && [ -f "$s19_changed_lib" ]; then
+  pass "S19: both configs' archives actually exist on disk (real builds, not just path queries)"
+else
+  fail "S19: expected BOTH archives to exist (base=$s19_base_lib exists=$([ -f "$s19_base_lib" ] && echo yes || echo no); changed=$s19_changed_lib exists=$([ -f "$s19_changed_lib" ] && echo yes || echo no))"
+fi
+
+# BACKEND=kiss is forced on both sides above, so the member name is always
+# fft_wrapper.o (not the fft_wrapper_ne10.o alternative).
+ar -t "$s19_changed_lib" 2>/dev/null | grep -q '^fft_wrapper\.o$' && \
+  pass "S19: changed-config archive contains fft_wrapper.o (the object the alias flag targets)" \
+  || fail "S19: changed-config archive missing fft_wrapper.o"
+
+echo "############################################################"
+echo "# S20: FFT_WRAPPER_ALIAS_CFLAGS command-line override rejection"
+echo "# (Codex review)"
+echo "############################################################"
+# Direct negative-test companion to the Makefile fix S19 above now relies on:
+# FFT_WRAPPER_ALIAS_CFLAGS was added as a 6th name to the SAME "Command-line
+# override rejection" foreach that already covers CFLAGS/CXXFLAGS/CPPFLAGS/
+# LDFLAGS/FP_POLICY (S9 above) -- reusing that exact established mechanism,
+# not a parallel/different rejection style. Mirrors S9's own assertion
+# shape/rigor exactly: each override must FAIL at parse time (before any
+# obj/bin dir is even created), with the same "cannot be overridden" message
+# S9 checks for. Two cases, both real command-line overrides, both with a
+# scratch OBJ_ROOT/BIN_ROOT: an EMPTY value (silently drops
+# -fno-strict-aliasing entirely -- the exact Codex finding) and an explicitly
+# hostile `-fstrict-aliasing` value (re-enables strict aliasing outright).
+cd "$AC_DIR"
+mkscratch s20
+S20_OBJ_ROOT="$SCRATCH_ROOT/s20/obj"
+S20_BIN_ROOT="$SCRATCH_ROOT/s20/bin"
+
+for pair in "FFT_WRAPPER_ALIAS_CFLAGS=" "FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing"; do
+  ov_var="${pair%%=*}"
+  ov_val="${pair#*=}"
+  S20_LOG="$SCRATCH_ROOT/s20/log_$(printf '%s' "$ov_val" | tr -c 'A-Za-z0-9' '_')"
+  if make "$ov_var=$ov_val" OBJ_ROOT="$S20_OBJ_ROOT" BIN_ROOT="$S20_BIN_ROOT" print-obj-dir >"$S20_LOG" 2>&1; then
+    fail "S20: make $ov_var=$ov_val print-obj-dir unexpectedly SUCCEEDED (must be rejected at parse time)"
+  else
+    if grep -q "cannot be overridden" "$S20_LOG"; then
+      pass "S20: make $ov_var=$ov_val print-obj-dir correctly FAILS, mentioning 'cannot be overridden'"
+    else
+      fail "S20: make $ov_var=$ov_val print-obj-dir failed but WITHOUT the expected 'cannot be overridden' message"
+      cat "$S20_LOG" >&2
+    fi
+  fi
+done
+
+echo "############################################################"
+echo "# S21: FFT_WRAPPER_ALIAS_CFLAGS \`make -e\` (environment-override mode)"
+echo "# bypass of S20's own guard (second Codex review)"
+echo "############################################################"
+# S20 above proved the COMMAND-LINE case is rejected. A SEPARATE gap let a
+# \`make -e\` ENVIRONMENT override sail through with no error at all: GNU
+# Make only flips $(origin FFT_WRAPPER_ALIAS_CFLAGS) from plain
+# "environment" to "environment override" at the point a makefile assignment
+# to that same name is actually PARSED under -e; the "Command-line override
+# rejection" foreach used to query that origin BEFORE this variable's own
+# (only) assignment in the file, so it always saw the pre-flip "environment"
+# origin, matching neither \`command\` nor \`override\`, and silently passed.
+# Direct repro (confirmed BEFORE the Makefile fix, this exact command):
+#   env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing make -e BACKEND=kiss lib
+# used to build a real, fully-buildable fft_wrapper.o with "-fstrict-
+# aliasing" on the compile line and NO "-fno-strict-aliasing" anywhere -- the
+# known Complex*/float* strict-aliasing UB shipping live. Fixed in the
+# Makefile by relocating the bare FFT_WRAPPER_ALIAS_CFLAGS \`:=\` literal to
+# directly above the foreach (see its "Bare-literal policy flags" comment).
+# Two cases below, mirroring S20's own two cases exactly, but each run
+# through \`env NAME=value make -e ...\` -- an actual ENVIRONMENT override,
+# NOT a command-line one (\`make -e NAME=value\` on the command line would
+# just be a command-line assignment, already covered by S20): the exact
+# reported hostile non-empty value, and the empty-value sibling for full
+# parity with S20.
+cd "$AC_DIR"
+mkscratch s21
+S21_OBJ_ROOT="$SCRATCH_ROOT/s21/obj"
+S21_BIN_ROOT="$SCRATCH_ROOT/s21/bin"
+
+for pair in "FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing" "FFT_WRAPPER_ALIAS_CFLAGS="; do
+  ov_var="${pair%%=*}"
+  ov_val="${pair#*=}"
+  S21_LOG="$SCRATCH_ROOT/s21/log_$(printf '%s' "$ov_val" | tr -c 'A-Za-z0-9' '_')"
+  if env "$ov_var=$ov_val" make -e BACKEND=kiss OBJ_ROOT="$S21_OBJ_ROOT" BIN_ROOT="$S21_BIN_ROOT" print-obj-dir >"$S21_LOG" 2>&1; then
+    fail "S21: env $ov_var=$ov_val make -e print-obj-dir unexpectedly SUCCEEDED (must be rejected at parse time)"
+  else
+    if grep -q "cannot be overridden" "$S21_LOG"; then
+      pass "S21: env $ov_var=$ov_val make -e print-obj-dir correctly FAILS, mentioning 'cannot be overridden'"
+    else
+      fail "S21: env $ov_var=$ov_val make -e print-obj-dir failed but WITHOUT the expected 'cannot be overridden' message"
+      cat "$S21_LOG" >&2
+    fi
+  fi
+done
+
+# Direct end-to-end confirmation of the exact reported repro, one level
+# closer to reality than print-obj-dir: a real \`lib\` build must ALSO be
+# rejected the same way (not just the print-* introspection targets).
+S21_LIB_LOG="$SCRATCH_ROOT/s21/log_lib_e2e"
+if env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing make -e BACKEND=kiss OBJ_ROOT="$S21_OBJ_ROOT" BIN_ROOT="$S21_BIN_ROOT" lib >"$S21_LIB_LOG" 2>&1; then
+  fail "S21: env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing make -e BACKEND=kiss lib unexpectedly SUCCEEDED (the exact Codex repro must now fail)"
+else
+  if grep -q "cannot be overridden" "$S21_LIB_LOG"; then
+    pass "S21: the exact reported repro (env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing make -e BACKEND=kiss lib) correctly FAILS, mentioning 'cannot be overridden'"
+  else
+    fail "S21: the exact reported repro failed but WITHOUT the expected 'cannot be overridden' message"
+    cat "$S21_LIB_LOG" >&2
+  fi
+fi
+
+echo "############################################################"
+echo "# S22: make -e environment-override rejection audit for the other"
+echo "# five names (Codex review follow-up: FP_POLICY/CPPFLAGS also gapped)"
+echo "############################################################"
+# Auditing S21's fix prompted checking whether ANY of the other five names
+# in the same foreach (CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/FP_POLICY) had a
+# latent version of the identical \`make -e\` gap. CFLAGS/CXXFLAGS/LDFLAGS
+# did NOT (each has an unconditional \`+=\` before the foreach, so -e's
+# origin-flip had already happened by the time the foreach ran) -- confirmed
+# empirically, not re-tested here (S9 above already covers their
+# command-line rejection). FP_POLICY and CPPFLAGS DID:
+#   - FP_POLICY had the IDENTICAL shape as FFT_WRAPPER_ALIAS_CFLAGS: its own
+#     bare \`:=\` used to live only after the foreach (immediately ahead of
+#     its \`CFLAGS/CXXFLAGS +=\` appends), so \`env FP_POLICY=x make -e ...\`
+#     used to sail through -- a real build silently losing -ffp-contract=off
+#     entirely. Fixed the same way: bare \`:=\` relocated above the foreach.
+#   - CPPFLAGS had a DIFFERENT variant: its \`?=\` (well before the foreach)
+#     only ever assigns when the variable's origin is still "undefined" --
+#     given an environment-original value, that's already false, so the
+#     line is a complete no-op and the origin-flip trigger (an actual
+#     assignment ATTEMPT) never fires under -e, no matter how early the line
+#     sits. Fixed by changing \`?=\` to \`+=\` (an unconditional attempt, same
+#     shape as CFLAGS's own lines).
+# Both cases below run through \`env NAME=value make -e ...\`, mirroring
+# S21/S20's assertion style; CPPFLAGS/FP_POLICY are not consumed by any
+# compile recipe today, so print-obj-dir (not a real \`lib\` build) is the
+# right-sized check here, same as S9's own style for these
+# introspection-only probes.
+cd "$AC_DIR"
+mkscratch s22
+S22_OBJ_ROOT="$SCRATCH_ROOT/s22/obj"
+S22_BIN_ROOT="$SCRATCH_ROOT/s22/bin"
+
+for pair in "FP_POLICY=-ffp-contract=fast" "FP_POLICY=" "CPPFLAGS=-DS22_POISON" "CPPFLAGS="; do
+  ov_var="${pair%%=*}"
+  ov_val="${pair#*=}"
+  S22_LOG="$SCRATCH_ROOT/s22/log_${ov_var}_$(printf '%s' "$ov_val" | tr -c 'A-Za-z0-9' '_')"
+  if env "$ov_var=$ov_val" make -e OBJ_ROOT="$S22_OBJ_ROOT" BIN_ROOT="$S22_BIN_ROOT" print-obj-dir >"$S22_LOG" 2>&1; then
+    fail "S22: env $ov_var=$ov_val make -e print-obj-dir unexpectedly SUCCEEDED (must be rejected at parse time)"
+  else
+    if grep -q "cannot be overridden" "$S22_LOG"; then
+      pass "S22: env $ov_var=$ov_val make -e print-obj-dir correctly FAILS, mentioning 'cannot be overridden'"
+    else
+      fail "S22: env $ov_var=$ov_val make -e print-obj-dir failed but WITHOUT the expected 'cannot be overridden' message"
+      cat "$S22_LOG" >&2
+    fi
+  fi
+done
+
+echo "############################################################"
+echo "# S23: FP policy conflict detection widened to CXXFLAGS/CPPFLAGS"
+echo "# (Codex review)"
+echo "############################################################"
+# Direct negative-test companion to the Makefile's "FP policy conflict"
+# widening: the round-3 B04 conflict-detection block (rejects
+# -Ofast/-ffast-math/-ffp-contract=<anything>, since each would re-enable FP
+# contraction this repo pins off) used to check $(CFLAGS) alone. A PLAIN
+# ENVIRONMENT CXXFLAGS (or CPPFLAGS) -- deliberately allowed to fold in
+# normally by the command-line/`-e` override rejection (S9/S22 above),
+# since it never goes through EXTRA_CFLAGS at all -- smuggled every one of
+# these three patterns straight past the old CFLAGS-only checks. Direct
+# repro (confirmed BEFORE this round's Makefile fix, this exact command):
+#   env CXXFLAGS=-Ofast make BACKEND=ne10 lib
+# built a real archive with the NE10 backend's one C++ TU
+# (NE10_fft_generic_int32.cpp -- see NE10_CXXSRCS in the Makefile, the only
+# C++ TU this Makefile compiles) showing "-Ofast" on its compile line ahead
+# of the trailing "-ffp-contract=off" -- every -Ofast relaxation OTHER than
+# contraction (which the trailing flag does still turn back off) live and
+# unchecked.
+#
+# BACKEND=ne10 (never kiss) throughout this scenario: confirmed empirically
+# that this matters, not assumed -- the identical repro against BACKEND=kiss
+# never invokes a C++ compiler at all (0 `.cpp` compile lines in its
+# output, since VENDOR_CXXSRCS is only ever non-empty for BACKEND=ne10), so
+# a kiss-backend version of this scenario would exercise only the
+# (backend-independent) text-matching guard itself, never the actual
+# real-world consequence the Codex review reported.
+#
+# Each case below is a genuine PLAIN ENVIRONMENT override (`env NAME=value
+# make BACKEND=ne10 ...`, no `-e`, no command-line assignment) against the
+# real `lib` target -- the exact reported repro shape, not just an
+# introspection target -- with a scratch OBJ_ROOT/BIN_ROOT so a (correctly)
+# rejected build never touches the real obj/bin trees. Three CXXFLAGS cases
+# cover all three conflict patterns; the fourth is the CPPFLAGS sibling of
+# the -Ofast case, for completeness (the fix checks CFLAGS/CXXFLAGS/CPPFLAGS
+# together, so any one of the three carrying a plain environment value must
+# be caught the same way).
+cd "$AC_DIR"
+mkscratch s23
+S23_OBJ_ROOT="$SCRATCH_ROOT/s23/obj"
+S23_BIN_ROOT="$SCRATCH_ROOT/s23/bin"
+
+for pair in "CXXFLAGS=-Ofast" "CXXFLAGS=-ffast-math" "CXXFLAGS=-ffp-contract=fast" "CPPFLAGS=-Ofast"; do
+  ov_var="${pair%%=*}"
+  ov_val="${pair#*=}"
+  S23_LOG="$SCRATCH_ROOT/s23/log_${ov_var}_$(printf '%s' "$ov_val" | tr -c 'A-Za-z0-9' '_')"
+  if env "$ov_var=$ov_val" make BACKEND=ne10 OBJ_ROOT="$S23_OBJ_ROOT" BIN_ROOT="$S23_BIN_ROOT" lib >"$S23_LOG" 2>&1; then
+    fail "S23: env $ov_var=$ov_val make BACKEND=ne10 lib unexpectedly SUCCEEDED (must be rejected as an FP policy conflict)"
+  else
+    if grep -q "FP policy conflict" "$S23_LOG"; then
+      pass "S23: env $ov_var=$ov_val make BACKEND=ne10 lib correctly FAILS, mentioning 'FP policy conflict'"
+    else
+      fail "S23: env $ov_var=$ov_val make BACKEND=ne10 lib failed but WITHOUT the expected 'FP policy conflict' message"
+      cat "$S23_LOG" >&2
+    fi
+  fi
+done
+
+# Positive control, mirroring S9's own EXTRA_CFLAGS positive-control shape:
+# a LEGITIMATE plain-environment CXXFLAGS value that does NOT match any of
+# the three conflict patterns must still fold in normally (the fix must
+# reject only the specific conflicting patterns, not CXXFLAGS overrides in
+# general) -- and, being folded into CFG_SIG, must land in a DIFFERENT
+# keyed dir than the plain baseline.
+baseline_ne10_objdir="$(make -s BACKEND=ne10 OBJ_ROOT="$S23_OBJ_ROOT" BIN_ROOT="$S23_BIN_ROOT" print-obj-dir)"
+wextra_ne10_objdir="$(env CXXFLAGS=-Wextra make -s BACKEND=ne10 OBJ_ROOT="$S23_OBJ_ROOT" BIN_ROOT="$S23_BIN_ROOT" print-obj-dir)"
+[ -n "$wextra_ne10_objdir" ] && [ "$wextra_ne10_objdir" != "$baseline_ne10_objdir" ] && \
+  pass "S23: env CXXFLAGS=-Wextra make BACKEND=ne10 print-obj-dir (non-conflicting) succeeds and lands in a different keyed dir than the plain baseline" \
+  || fail "S23: env CXXFLAGS=-Wextra make BACKEND=ne10 print-obj-dir did NOT differ from the plain baseline ($baseline_ne10_objdir vs $wextra_ne10_objdir)"
+
+S23_WEXTRA_LIB_LOG="$SCRATCH_ROOT/s23/log_wextra_lib_e2e"
+if env CXXFLAGS=-Wextra make BACKEND=ne10 OBJ_ROOT="$S23_OBJ_ROOT" BIN_ROOT="$S23_BIN_ROOT" lib >"$S23_WEXTRA_LIB_LOG" 2>&1; then
+  pass "S23: env CXXFLAGS=-Wextra make BACKEND=ne10 lib (non-conflicting, real e2e build) succeeds"
+else
+  fail "S23: env CXXFLAGS=-Wextra make BACKEND=ne10 lib (non-conflicting) unexpectedly FAILED"
+  cat "$S23_WEXTRA_LIB_LOG" >&2
+fi
+
+# Round-9 Codex review: the conflict-detection guard above used to be three
+# $(findstring PATTERN,TEXT) checks, and $(findstring) does a plain
+# SUBSTRING search over the whole concatenated text -- so it false-positived
+# on any token that merely CONTAINS one of these patterns as part of a
+# larger identifier, never mind that it isn't the compiler flag at all.
+# Direct repro (confirmed BEFORE this round's fix):
+#   env CXXFLAGS='-DROUND9_NOTE=-Ofastness' make -s BACKEND=ne10 print-obj-dir
+# used to fail with "FP policy conflict: ... contains -Ofast" even though
+# `-DROUND9_NOTE=-Ofastness` is a single, entirely harmless preprocessor
+# macro definition token that merely happens to contain the substring
+# "-Ofast" inside a larger identifier -- not the compiler flag -Ofast. The
+# fix replaced $(findstring) with $(filter), which splits its TEXT argument
+# on whitespace into WORDS and matches each whole word against the given
+# patterns, so a substring buried inside an unrelated token can never match.
+S23_ROUND9_NOTE_LOG="$SCRATCH_ROOT/s23/log_round9_note"
+if env CXXFLAGS='-DROUND9_NOTE=-Ofastness' make -s BACKEND=ne10 OBJ_ROOT="$S23_OBJ_ROOT" BIN_ROOT="$S23_BIN_ROOT" print-obj-dir >"$S23_ROUND9_NOTE_LOG" 2>&1; then
+  pass "S23: env CXXFLAGS='-DROUND9_NOTE=-Ofastness' make BACKEND=ne10 print-obj-dir (substring-only, non-conflicting) succeeds (round-9 false-positive fix)"
+else
+  fail "S23: env CXXFLAGS='-DROUND9_NOTE=-Ofastness' make BACKEND=ne10 print-obj-dir unexpectedly FAILED (round-9 substring false-positive regressed)"
+  cat "$S23_ROUND9_NOTE_LOG" >&2
+fi
+
+echo "############################################################"
+echo "# S23b: quote/escape/response-file bypass of the FP-policy"
+echo "# conflict gate itself (Codex review)"
+echo "############################################################"
+# See the header comment (search "S23b") for the full writeup. In short: the
+# exact-token $(filter) check above matches GNU Make's OWN text
+# representation of CFLAGS/CXXFLAGS/CPPFLAGS -- but Make has zero concept of
+# shell quoting, so a value the shell will unquote at compile-recipe time
+# (e.g. EXTRA_CFLAGS="'-Ofast'", stored by Make as the literal 9-character
+# text '-Ofast', quote characters included) never equals the bare word
+# -Ofast in Make's text and so could never be caught by $(filter) -- yet on
+# the actual compile recipe line the shell strips the quotes and the
+# compiler gets a real, live -Ofast. Each case below is a genuine PLAIN
+# ENVIRONMENT EXTRA_CFLAGS override (no `-e`, no command-line assignment)
+# against a cheap introspection target, with scratch OBJ_ROOT/BIN_ROOT so a
+# (correctly) rejected build never touches the real obj/bin trees -- same
+# discipline as S20/S21/S22 above. Each rejection must mention "FP policy
+# conflict" (the shared marker every FP-policy failure emits) AND the
+# specific forbidden construct named in the block's own $(error ...), so a
+# generic/unrelated failure can never be mistaken for the fix working.
+cd "$AC_DIR"
+mkscratch s23b
+S23B_OBJ_ROOT="$SCRATCH_ROOT/s23b/obj"
+S23B_BIN_ROOT="$SCRATCH_ROOT/s23b/bin"
+
+S23B_LOG_1="$SCRATCH_ROOT/s23b/log_single_quoted"
+if env EXTRA_CFLAGS="'-Ofast'" make BACKEND=kiss OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_1" 2>&1; then
+  fail "S23b: env EXTRA_CFLAGS=\"'-Ofast'\" (single-quoted) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
+else
+  if grep -q "FP policy conflict" "$S23B_LOG_1" && grep -q "single-quote" "$S23B_LOG_1"; then
+    pass "S23b: env EXTRA_CFLAGS=\"'-Ofast'\" (single-quoted) print-obj-dir correctly FAILS, identifying the single-quote character"
+  else
+    fail "S23b: env EXTRA_CFLAGS=\"'-Ofast'\" (single-quoted) print-obj-dir failed but did NOT identify the single-quote character specifically"
+    cat "$S23B_LOG_1" >&2
+  fi
+fi
+
+S23B_LOG_2="$SCRATCH_ROOT/s23b/log_double_quoted"
+if env EXTRA_CFLAGS='"-ffast-math"' make BACKEND=kiss OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_2" 2>&1; then
+  fail "S23b: env EXTRA_CFLAGS='\"-ffast-math\"' (double-quoted) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
+else
+  if grep -q "FP policy conflict" "$S23B_LOG_2" && grep -q "double-quote" "$S23B_LOG_2"; then
+    pass "S23b: env EXTRA_CFLAGS='\"-ffast-math\"' (double-quoted) print-obj-dir correctly FAILS, identifying the double-quote character"
+  else
+    fail "S23b: env EXTRA_CFLAGS='\"-ffast-math\"' (double-quoted) print-obj-dir failed but did NOT identify the double-quote character specifically"
+    cat "$S23B_LOG_2" >&2
+  fi
+fi
+
+S23B_LOG_3="$SCRATCH_ROOT/s23b/log_quote_split"
+if env EXTRA_CFLAGS="-O'f'ast" make BACKEND=kiss OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_3" 2>&1; then
+  fail "S23b: env EXTRA_CFLAGS=\"-O'f'ast\" (quote-split mid-token) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
+else
+  if grep -q "FP policy conflict" "$S23B_LOG_3" && grep -q "single-quote" "$S23B_LOG_3"; then
+    pass "S23b: env EXTRA_CFLAGS=\"-O'f'ast\" (quote-split mid-token) print-obj-dir correctly FAILS, identifying the single-quote character"
+  else
+    fail "S23b: env EXTRA_CFLAGS=\"-O'f'ast\" (quote-split mid-token) print-obj-dir failed but did NOT identify the single-quote character specifically"
+    cat "$S23B_LOG_3" >&2
+  fi
+fi
+
+S23B_LOG_4="$SCRATCH_ROOT/s23b/log_response_file"
+if env EXTRA_CFLAGS='@flags.rsp' make BACKEND=kiss OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_4" 2>&1; then
+  fail "S23b: env EXTRA_CFLAGS='@flags.rsp' (response-file) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
+else
+  if grep -q "FP policy conflict" "$S23B_LOG_4" && grep -q "response-file" "$S23B_LOG_4"; then
+    pass "S23b: env EXTRA_CFLAGS='@flags.rsp' (response-file) print-obj-dir correctly FAILS, identifying the @-prefixed response-file token"
+  else
+    fail "S23b: env EXTRA_CFLAGS='@flags.rsp' (response-file) print-obj-dir failed but did NOT identify the response-file token specifically"
+    cat "$S23B_LOG_4" >&2
+  fi
+fi
+
+# Positive controls: both are real, harmless, UNQUOTED tokens that contain
+# none of the newly-forbidden characters, so the new quote/escape/
+# response-file block must leave them alone entirely -- only the unchanged
+# exact-token $(filter) check further down governs whether a token IS
+# -Ofast/-ffast-math/-ffp-contract=<x>, and neither of these is. The first
+# is S23's own round-9 regression token (here via EXTRA_CFLAGS specifically,
+# the exact hook this bypass came in through); the second is its CFLAGS-
+# widening sibling from the same regression family.
+S23B_LOG_P1="$SCRATCH_ROOT/s23b/log_positive_round9_note"
+if env EXTRA_CFLAGS=-DROUND9_NOTE=-Ofastness make -s BACKEND=kiss OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_P1" 2>&1; then
+  pass "S23b: env EXTRA_CFLAGS=-DROUND9_NOTE=-Ofastness print-obj-dir (positive control, no forbidden characters) succeeds"
+else
+  fail "S23b: env EXTRA_CFLAGS=-DROUND9_NOTE=-Ofastness print-obj-dir unexpectedly FAILED (quote/escape gate false-positived on a harmless token)"
+  cat "$S23B_LOG_P1" >&2
+fi
+
+S23B_LOG_P2="$SCRATCH_ROOT/s23b/log_positive_dtext"
+if env EXTRA_CFLAGS=-DTEXT=ffast-math make -s BACKEND=kiss OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_P2" 2>&1; then
+  pass "S23b: env EXTRA_CFLAGS=-DTEXT=ffast-math print-obj-dir (positive control, no forbidden characters) succeeds"
+else
+  fail "S23b: env EXTRA_CFLAGS=-DTEXT=ffast-math print-obj-dir unexpectedly FAILED (quote/escape gate false-positived on a harmless token)"
+  cat "$S23B_LOG_P2" >&2
+fi
 
 echo "############################################################"
 echo "# Final integrity guards"
