@@ -239,6 +239,74 @@
 #          from S23's own round-9 regression, plus the sibling
 #          -DTEXT=ffast-math token) must still SUCCEED, since neither
 #          contains any of the newly-forbidden characters.
+#          UPDATE (allow-list redesign round): the 9-item deny-list this
+#          scenario describes has been replaced by a character-class
+#          ALLOW-list (S24 below has the full writeup and the new bypass
+#          shapes that motivated it -- bare glob characters, tilde, and real
+#          shell redirection/process-substitution, none of which the old
+#          deny-list caught). Only the single-quote deny-list entry survives
+#          (for a structural reason: the allow-list's own $(shell) call
+#          needs it excluded first to safely single-quote-embed the rest of
+#          the text) -- S23b's four assertions above still pass unmodified
+#          in intent (every bypass shape must still FAIL, identifying the
+#          responsible character), but the double-quote and response-file
+#          cases now check for the allow-list's generic "outside the allowed
+#          set" wording plus the specific character shown, instead of the
+#          old dedicated "double-quote character" / "response-file token"
+#          wording, since those two dedicated deny-list entries no longer
+#          exist as separate checks.
+# S24 - allow-list bypass shapes NOT caught by the old 9-item deny-list
+#       (this round's audit): bare glob characters (*, ?, [, ]), tilde (~),
+#       and -- most seriously -- real shell redirection (>, <) and process
+#       substitution (<(...)), none of which are Make's own syntax, so the
+#       old deny-list (built entirely from Make-visible constructs) never
+#       had a chance to catch them; a recipe line containing an unbanned '>'
+#       or '<', if ever actually executed by a real shell (not a dry run),
+#       silently redirects the compiler invocation's stdout/stdin to an
+#       arbitrary path. Each must now FAIL under the character-class
+#       allow-list, identifying the specific disallowed character(s). Also
+#       covers: a positive control confirming Make-native $(...)-expansion
+#       (`env R11_FLAG=-Ofast make -n EXTRA_CFLAGS=${R11_FLAG} lib`-style)
+#       is still correctly rejected via the EXACT-TOKEN $(filter) check (a
+#       distinct code path from the character allow-list -- ${VAR} is
+#       resolved by GNU Make itself before either check runs, landing the
+#       literal word -Ofast in FP_INPUT_FLAGS, which $(filter) catches but a
+#       character-class check alone would not, since -Ofast's own characters
+#       are all individually allowed); and the newly-discovered
+#       command-line/`-e` override bypass of the FP-policy check's OWN
+#       internal variables (FP_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/
+#       FP_CONFLICT_FLAGS/FP_ALLOWED_CHARS_RE -- SHELL_SAFE_ALLOWLIST_RC is
+#       this round's rename of what used to be FP_ALLOWLIST_RC, see S25),
+#       found live while implementing this redesign and closed the same way
+#       S20/S21/S22 close it for FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS.
+# S25 - link-flags (LDFLAGS/EXTRA_LDFLAGS) character-safety coverage (Codex
+#       review): S24's allow-list only ever validated FP_INPUT_FLAGS
+#       (CFLAGS/CXXFLAGS/CPPFLAGS) -- LDFLAGS (built from a plain `-lm`
+#       literal plus whatever EXTRA_LDFLAGS folds in) was never inspected at
+#       all, despite being embedded in every real link recipe exactly the
+#       same way CFLAGS/CXXFLAGS are embedded in every compile recipe.
+#       Confirmed live BEFORE this round's fix: `make selftest
+#       EXTRA_LDFLAGS=';echo LINK_FLAG_INJECTION'` passed every check
+#       untouched and produced a real link recipe line with the payload
+#       sitting live and unfiltered after `-lm`. Fixed by introducing
+#       SHELL_SAFE_INPUT_FLAGS (= FP_INPUT_FLAGS + the fully-assembled
+#       LDFLAGS) as the input to the two CHARACTER-safety checks (the
+#       single-quote pre-check and the allow-list itself, now renamed
+#       FP_ALLOWLIST_RC -> SHELL_SAFE_ALLOWLIST_RC / FP_DISALLOWED_CHARS ->
+#       SHELL_SAFE_DISALLOWED_CHARS to match), while FP_CONFLICT_FLAGS (the
+#       separate -Ofast/-ffast-math/-ffp-contract=% exact-token check) stays
+#       scoped to FP_INPUT_FLAGS alone -- those flags are FP-semantic and
+#       meaningless as link flags. S25 replicates the exact S24 negative
+#       matrix (injection semicolon, glob-star, glob-question,
+#       glob-brackets, tilde, redirect-out, redirect-in, process-subst)
+#       against EXTRA_LDFLAGS instead of EXTRA_CFLAGS, adds a positive
+#       control (a real rpath/library-path link flag this project's own
+#       ZERO_HEAP_LDFLAGS-style comment anticipates, confirmed to actually
+#       link and run), and extends the command-line/`-e` override-rejection
+#       matrix to the two new/renamed internal variables
+#       (SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC), this time via an
+#       EXTRA_LDFLAGS payload specifically (S24's own matrix already covers
+#       FP_INPUT_FLAGS/FP_CONFLICT_FLAGS via EXTRA_CFLAGS).
 # S6 (Audio_ALG/pipelines consumer-resolution parity) is a later wave and is
 # intentionally NOT covered here.
 #
@@ -2631,7 +2699,12 @@ S23B_LOG_2="$SCRATCH_ROOT/s23b/log_double_quoted"
 if env EXTRA_CFLAGS='"-ffast-math"' make BACKEND=kiss OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_2" 2>&1; then
   fail "S23b: env EXTRA_CFLAGS='\"-ffast-math\"' (double-quoted) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
 else
-  if grep -q "FP policy conflict" "$S23B_LOG_2" && grep -q "double-quote" "$S23B_LOG_2"; then
+  # round-N allow-list redesign: the double-quote character is now caught by
+  # the character-class allow-list (S24 below), not a dedicated deny-list
+  # entry -- the message names the offending character generically
+  # ("outside the allowed set ... found: \"...\""), literally containing a
+  # double-quote inside the quoted report for this specific input.
+  if grep -q "FP policy conflict" "$S23B_LOG_2" && grep -q "outside the allowed set" "$S23B_LOG_2" && grep -qF 'found: """' "$S23B_LOG_2"; then
     pass "S23b: env EXTRA_CFLAGS='\"-ffast-math\"' (double-quoted) print-obj-dir correctly FAILS, identifying the double-quote character"
   else
     fail "S23b: env EXTRA_CFLAGS='\"-ffast-math\"' (double-quoted) print-obj-dir failed but did NOT identify the double-quote character specifically"
@@ -2643,6 +2716,11 @@ S23B_LOG_3="$SCRATCH_ROOT/s23b/log_quote_split"
 if env EXTRA_CFLAGS="-O'f'ast" make BACKEND=kiss OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_3" 2>&1; then
   fail "S23b: env EXTRA_CFLAGS=\"-O'f'ast\" (quote-split mid-token) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
 else
+  # The single quote here is still caught by the ONE surviving pure-Make
+  # $(findstring) check (see the Makefile's own comment on why that one
+  # check alone still needs to exist and run first) -- so this message still
+  # says "single-quote character" verbatim, unlike the double-quote/
+  # response-file cases above/below which now go through the allow-list.
   if grep -q "FP policy conflict" "$S23B_LOG_3" && grep -q "single-quote" "$S23B_LOG_3"; then
     pass "S23b: env EXTRA_CFLAGS=\"-O'f'ast\" (quote-split mid-token) print-obj-dir correctly FAILS, identifying the single-quote character"
   else
@@ -2655,7 +2733,9 @@ S23B_LOG_4="$SCRATCH_ROOT/s23b/log_response_file"
 if env EXTRA_CFLAGS='@flags.rsp' make BACKEND=kiss OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_4" 2>&1; then
   fail "S23b: env EXTRA_CFLAGS='@flags.rsp' (response-file) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
 else
-  if grep -q "FP policy conflict" "$S23B_LOG_4" && grep -q "response-file" "$S23B_LOG_4"; then
+  # '@' is now caught by the character-class allow-list (it is simply not in
+  # the allowed set), not a dedicated @-response-file deny-list entry.
+  if grep -q "FP policy conflict" "$S23B_LOG_4" && grep -q "outside the allowed set" "$S23B_LOG_4" && grep -qF 'found: "@"' "$S23B_LOG_4"; then
     pass "S23b: env EXTRA_CFLAGS='@flags.rsp' (response-file) print-obj-dir correctly FAILS, identifying the @-prefixed response-file token"
   else
     fail "S23b: env EXTRA_CFLAGS='@flags.rsp' (response-file) print-obj-dir failed but did NOT identify the response-file token specifically"
@@ -2686,6 +2766,254 @@ else
   fail "S23b: env EXTRA_CFLAGS=-DTEXT=ffast-math print-obj-dir unexpectedly FAILED (quote/escape gate false-positived on a harmless token)"
   cat "$S23B_LOG_P2" >&2
 fi
+
+echo "############################################################"
+echo "# S24: FP-policy allow-list -- bypass shapes the OLD 9-item"
+echo "# deny-list never caught, plus the exact-token filter's own"
+echo "# distinct code path, plus the FP-policy check's OWN internal"
+echo "# variables"
+echo "############################################################"
+# See the header comment (search "S24") for the full writeup. Every negative
+# case below is a real, live bypass of the OLD deny-list (verified BEFORE
+# this round's allow-list fix: none of these characters/constructs were
+# checked for at all), each now REJECTED by the character-class allow-list.
+# Same discipline as S20/S21/S22/S23b: scratch OBJ_ROOT/BIN_ROOT so a
+# (correctly) rejected build never touches the real obj/bin trees.
+cd "$AC_DIR"
+mkscratch s24
+S24_OBJ_ROOT="$SCRATCH_ROOT/s24/obj"
+S24_BIN_ROOT="$SCRATCH_ROOT/s24/bin"
+
+# helper: run one EXTRA_CFLAGS negative case against the allow-list and
+# assert both that it FAILS and that the specific character(s) named in
+# $2 appear in the reported disallowed-character set.
+s24_check_rejected() {
+  local label="$1" flag_value="$2" expect_chars="$3" log
+  log="$SCRATCH_ROOT/s24/log_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_')"
+  if env EXTRA_CFLAGS="$flag_value" make BACKEND=kiss OBJ_ROOT="$S24_OBJ_ROOT" BIN_ROOT="$S24_BIN_ROOT" print-obj-dir >"$log" 2>&1; then
+    fail "S24: EXTRA_CFLAGS='$flag_value' ($label) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
+  elif grep -q "FP policy conflict" "$log" && grep -q "outside the allowed set" "$log" && grep -qF "found: \"$expect_chars\"" "$log"; then
+    pass "S24: EXTRA_CFLAGS='$flag_value' ($label) print-obj-dir correctly FAILS, identifying \"$expect_chars\""
+  else
+    fail "S24: EXTRA_CFLAGS='$flag_value' ($label) print-obj-dir failed but did NOT identify \"$expect_chars\" specifically"
+    cat "$log" >&2
+  fi
+}
+
+s24_check_rejected "glob-star"        '-O*t'          '*'
+s24_check_rejected "glob-question"    '-Ofas?'        '?'
+s24_check_rejected "glob-brackets"    '-Ofas[t]'      '[]'
+s24_check_rejected "tilde"            '~/pwned'       '~'
+s24_check_rejected "redirect-out"     '-I>/tmp/evil'  '>'
+s24_check_rejected "redirect-in"      '-I</etc/passwd' '<'
+s24_check_rejected "process-subst"    '<(echo hi)'    '()<'
+
+# Positive control (Codex review, distinct code path): a Make-native
+# ${VAR}-style expansion still must be rejected via the EXACT-TOKEN
+# $(filter) check, not the character allow-list -- GNU Make treats ${...}
+# identically to $(...) and resolves it to R11_FLAG's value (-Ofast) before
+# either FP-policy check ever runs, so the resulting FP_INPUT_FLAGS text is
+# the plain, clean, ALL-ALLOWED-CHARACTERS token "-Ofast" -- the character
+# allow-list has nothing to catch here (every character in "-Ofast" is
+# individually permitted); only the unchanged FP_CONFLICT_FLAGS $(filter)
+# check can still reject it. This is the literal repro from the review
+# (`env R11_FLAG=-Ofast make -n EXTRA_CFLAGS=${R11_FLAG} lib`), adapted to
+# actually exercise MAKE's own ${...} resolution rather than the invoking
+# shell's: R11_FLAG must be `export`-ed as a real shell variable first (a
+# bare `env VAR=x cmd ${VAR}` does NOT make VAR visible to the CURRENT
+# shell's own expansion of ${VAR} in that same command line -- confirmed
+# directly; ${VAR} would either expand empty or (under `set -u`, as this
+# script runs with) abort the whole suite with "unbound variable") --
+# and 'EXTRA_CFLAGS=${R11_FLAG}' must be SINGLE-QUOTED on make's own
+# command line so the invoking shell does NOT resolve ${R11_FLAG} itself,
+# leaving the literal text for GNU MAKE to resolve (Make auto-imports every
+# environment variable, so R11_FLAG is visible to it once exported).
+# (Deliberately -n, a dry run -- the FP-policy checks run at Makefile parse
+# time, before any target executes, so a dry run alone still exercises this
+# path.) A future change to the exact-token filter logic that broke this
+# path would NOT be caught by any of the character-class tests above, so
+# this gets its own dedicated regression test.
+export R11_FLAG=-Ofast
+S24_LOG_R11="$SCRATCH_ROOT/s24/log_r11_dollar_brace"
+if make -n BACKEND=kiss OBJ_ROOT="$S24_OBJ_ROOT" BIN_ROOT="$S24_BIN_ROOT" 'EXTRA_CFLAGS=${R11_FLAG}' lib >"$S24_LOG_R11" 2>&1; then
+  fail "S24: R11_FLAG=-Ofast (exported) make -n EXTRA_CFLAGS=\${R11_FLAG} lib unexpectedly SUCCEEDED (must be rejected via the exact-token filter)"
+else
+  if grep -q "FP policy conflict" "$S24_LOG_R11" && grep -q -- "-Ofast" "$S24_LOG_R11" && ! grep -q "outside the allowed set" "$S24_LOG_R11"; then
+    pass "S24: R11_FLAG=-Ofast (exported) make -n EXTRA_CFLAGS=\${R11_FLAG} lib correctly FAILS via the exact-token \$(filter) check (not the character allow-list)"
+  else
+    fail "S24: R11_FLAG=-Ofast (exported) make -n EXTRA_CFLAGS=\${R11_FLAG} lib failed but not via the expected exact-token filter path"
+    cat "$S24_LOG_R11" >&2
+  fi
+fi
+unset R11_FLAG
+
+# Newly-discovered (this round, while implementing the allow-list): the
+# FP-policy check's own INTERNAL variables (FP_INPUT_FLAGS/
+# SHELL_SAFE_ALLOWLIST_RC/FP_CONFLICT_FLAGS/FP_ALLOWED_CHARS_RE --
+# SHELL_SAFE_ALLOWLIST_RC is this round's rename of what was FP_ALLOWLIST_RC
+# when this test was first written, broadened by the later S25 fix to also
+# gate LDFLAGS content) were themselves overridable from the command line /
+# under `-e`, silently defeating every check above while the REAL CFLAGS/
+# CXXFLAGS/CPPFLAGS used in actual compile recipes still carried the
+# dangerous content -- reproduced against BOTH this round's allow-list AND
+# the prior (unmodified) deny-list it replaces, so this is a pre-existing
+# gap, not a regression. Closed the same way S20/S21/S22 close it for
+# FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS -- each of the four names must now be
+# rejected, both as a plain command-line override and under `-e`. payload is
+# the EXTRA_CFLAGS value that would (absent the override) be caught by the
+# check the override under test defeats: FP_INPUT_FLAGS/
+# SHELL_SAFE_ALLOWLIST_RC/FP_ALLOWED_CHARS_RE gate the CHARACTER allow-list,
+# so a semicolon payload exercises that path; FP_CONFLICT_FLAGS gates the
+# SEPARATE -Ofast/-ffast-math/-ffp-contract= exact-token filter, so it needs
+# an all-allowed-characters payload that is still a real conflict ("-Ofast"
+# itself) -- a semicolon payload there would be caught by the (untouched)
+# allow-list first and never actually exercise the FP_CONFLICT_FLAGS-
+# specific override path at all. (S25 below repeats the SHELL_SAFE_INPUT_
+# FLAGS/SHELL_SAFE_ALLOWLIST_RC pair of this same matrix once more via an
+# EXTRA_LDFLAGS payload, since that is the specific vector S25 exists to
+# close.)
+s24_check_override_rejected() {
+  local varname="$1" varvalue="$2" payload="$3" use_dash_e="$4" log
+  log="$SCRATCH_ROOT/s24/log_override_$(printf '%s' "$varname" | tr -c 'A-Za-z0-9' '_')_$use_dash_e"
+  if [ "$use_dash_e" = "dashe" ]; then
+    if env "$varname=$varvalue" make -e BACKEND=kiss OBJ_ROOT="$S24_OBJ_ROOT" BIN_ROOT="$S24_BIN_ROOT" EXTRA_CFLAGS="$payload" print-obj-dir >"$log" 2>&1; then
+      fail "S24: env $varname=$varvalue make -e print-obj-dir unexpectedly SUCCEEDED (must be rejected: overriding $varname must not defeat the FP-policy checks)"
+    elif grep -q "cannot be overridden" "$log" && grep -q "$varname" "$log"; then
+      pass "S24: env $varname=$varvalue make -e print-obj-dir correctly FAILS, mentioning '$varname cannot be overridden'"
+    else
+      fail "S24: env $varname=$varvalue make -e print-obj-dir failed but did NOT mention '$varname cannot be overridden'"
+      cat "$log" >&2
+    fi
+  else
+    if make BACKEND=kiss OBJ_ROOT="$S24_OBJ_ROOT" BIN_ROOT="$S24_BIN_ROOT" EXTRA_CFLAGS="$payload" "$varname=$varvalue" print-obj-dir >"$log" 2>&1; then
+      fail "S24: make $varname=$varvalue print-obj-dir unexpectedly SUCCEEDED (must be rejected: overriding $varname must not defeat the FP-policy checks)"
+    elif grep -q "cannot be overridden" "$log" && grep -q "$varname" "$log"; then
+      pass "S24: make $varname=$varvalue print-obj-dir correctly FAILS, mentioning '$varname cannot be overridden'"
+    else
+      fail "S24: make $varname=$varvalue print-obj-dir failed but did NOT mention '$varname cannot be overridden'"
+      cat "$log" >&2
+    fi
+  fi
+}
+s24_check_override_rejected "FP_INPUT_FLAGS"         "clean" '-O2;rm' cmdline
+s24_check_override_rejected "SHELL_SAFE_ALLOWLIST_RC" "0"     '-O2;rm' cmdline
+s24_check_override_rejected "FP_ALLOWED_CHARS_RE"    ".*"    '-O2;rm' cmdline
+s24_check_override_rejected "FP_CONFLICT_FLAGS"      ""      '-Ofast' cmdline
+s24_check_override_rejected "FP_INPUT_FLAGS"         "clean" '-O2;rm' dashe
+s24_check_override_rejected "SHELL_SAFE_ALLOWLIST_RC" "0"     '-O2;rm' dashe
+s24_check_override_rejected "FP_ALLOWED_CHARS_RE"    ".*"    '-O2;rm' dashe
+s24_check_override_rejected "FP_CONFLICT_FLAGS"      ""      '-Ofast' dashe
+
+echo "############################################################"
+echo "# S25: link-flags (LDFLAGS/EXTRA_LDFLAGS) character-safety coverage"
+echo "############################################################"
+# See the header comment (search "S25") for the full writeup. Before this
+# round's fix, LDFLAGS/EXTRA_LDFLAGS were not covered by the character-class
+# allow-list at all -- only FP_INPUT_FLAGS (CFLAGS/CXXFLAGS/CPPFLAGS) was
+# checked -- even though LDFLAGS is embedded in every real link recipe
+# ($(LINK) ... $(LDFLAGS)) the exact same way CFLAGS is embedded in every
+# compile recipe. Same discipline as S20-S24: scratch OBJ_ROOT/BIN_ROOT so a
+# (correctly) rejected build never touches the real obj/bin trees.
+cd "$AC_DIR"
+mkscratch s25
+S25_OBJ_ROOT="$SCRATCH_ROOT/s25/obj"
+S25_BIN_ROOT="$SCRATCH_ROOT/s25/bin"
+
+# helper: run one EXTRA_LDFLAGS negative case against the allow-list and
+# assert both that it FAILS and that the specific character(s) named in
+# $2 appear in the reported disallowed-character set. Mirrors S24's
+# s24_check_rejected exactly, just aimed at EXTRA_LDFLAGS instead of
+# EXTRA_CFLAGS.
+s25_check_rejected() {
+  local label="$1" flag_value="$2" expect_chars="$3" log
+  log="$SCRATCH_ROOT/s25/log_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_')"
+  if env EXTRA_LDFLAGS="$flag_value" make BACKEND=kiss OBJ_ROOT="$S25_OBJ_ROOT" BIN_ROOT="$S25_BIN_ROOT" print-obj-dir >"$log" 2>&1; then
+    fail "S25: EXTRA_LDFLAGS='$flag_value' ($label) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
+  elif grep -q "FP policy conflict" "$log" && grep -q "outside the allowed set" "$log" && grep -qF "found: \"$expect_chars\"" "$log"; then
+    pass "S25: EXTRA_LDFLAGS='$flag_value' ($label) print-obj-dir correctly FAILS, identifying \"$expect_chars\""
+  else
+    fail "S25: EXTRA_LDFLAGS='$flag_value' ($label) print-obj-dir failed but did NOT identify \"$expect_chars\" specifically"
+    cat "$log" >&2
+  fi
+}
+
+# The literal reported repro (Codex review): a semicolon payload via
+# EXTRA_LDFLAGS, dry-run-confirmed BEFORE this round's fix to sail through
+# untouched and land live in a real link recipe (`make -n selftest
+# EXTRA_LDFLAGS=';echo LINK_FLAG_INJECTION'` showed the payload verbatim,
+# unfiltered, after `-lm`, on the actual `cc -o ... $(LDFLAGS)` line).
+s25_check_rejected "injection-semicolon" ';echo LINK_FLAG_INJECTION' ';'
+
+# Same glob/tilde/redirect/process-substitution matrix S24 runs for
+# EXTRA_CFLAGS, replicated verbatim for EXTRA_LDFLAGS.
+s25_check_rejected "glob-star"        '-L*t'          '*'
+s25_check_rejected "glob-question"    '-Lfas?'        '?'
+s25_check_rejected "glob-brackets"    '-Lfas[t]'      '[]'
+s25_check_rejected "tilde"            '~/pwned'       '~'
+s25_check_rejected "redirect-out"     '-lm>/tmp/evil'  '>'
+s25_check_rejected "redirect-in"      '-lm</etc/passwd' '<'
+s25_check_rejected "process-subst"    '<(echo hi)'    '()<'
+
+# Positive control: a real link flag this project's own Makefile comments
+# anticipate a consumer needing (the "-Wl,-rpath,dir / -Wa,--option
+# pass-through flags" example the allow-list's own char-set comment gives,
+# and the same rpath/library-path SHAPE this Makefile's own ZERO_HEAP_LDFLAGS
+# uses for its zero-heap test target -- see `-L$(BIN_DIR) ... -Wl,-rpath,...`
+# there) must still pass the character check AND actually link and run.
+# `@loader_path` itself (ZERO_HEAP_LDFLAGS's own literal rpath target on
+# macOS) is deliberately NOT reused here -- it is not something a caller
+# would ever pass through EXTRA_LDFLAGS (it's this Makefile's own
+# platform-conditional literal, appended directly in two target-specific
+# recipes, never folded through LDFLAGS/EXTRA_LDFLAGS at all) and its `@`
+# character sits outside the allowed set anyway; a plain filesystem rpath
+# path (no `@`) is the realistic EXTRA_LDFLAGS use case this control checks.
+S25_POS_LOG="$SCRATCH_ROOT/s25/log_positive_rpath"
+if env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=kiss OBJ_ROOT="$S25_OBJ_ROOT" BIN_ROOT="$S25_BIN_ROOT" selftest >"$S25_POS_LOG" 2>&1; then
+  if grep -q "^TOTAL CHECKS: 17723487$" "$S25_POS_LOG" && grep -q "^ALL PASS" "$S25_POS_LOG"; then
+    pass "S25: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, real rpath/library-path link flag) builds AND runs selftest to completion, same TOTAL CHECKS as every other backend/config in this suite"
+  else
+    fail "S25: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' selftest succeeded but did not report the expected ALL PASS/TOTAL CHECKS"
+    cat "$S25_POS_LOG" >&2
+  fi
+else
+  fail "S25: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, legitimate link flag) unexpectedly FAILED"
+  cat "$S25_POS_LOG" >&2
+fi
+
+# Command-line/`-e` override-rejection for the two variables this round's
+# fix introduces/renames (SHELL_SAFE_INPUT_FLAGS is new; SHELL_SAFE_
+# ALLOWLIST_RC is FP_ALLOWLIST_RC's rename) -- S24 already covers both via
+# an EXTRA_CFLAGS payload; this repeats it via EXTRA_LDFLAGS specifically,
+# since that is the exact vector this round's fix exists to close (an
+# override here must not be able to let an EXTRA_LDFLAGS injection payload
+# back through).
+s25_check_override_rejected() {
+  local varname="$1" varvalue="$2" payload="$3" use_dash_e="$4" log
+  log="$SCRATCH_ROOT/s25/log_override_$(printf '%s' "$varname" | tr -c 'A-Za-z0-9' '_')_$use_dash_e"
+  if [ "$use_dash_e" = "dashe" ]; then
+    if env "$varname=$varvalue" make -e BACKEND=kiss OBJ_ROOT="$S25_OBJ_ROOT" BIN_ROOT="$S25_BIN_ROOT" EXTRA_LDFLAGS="$payload" print-obj-dir >"$log" 2>&1; then
+      fail "S25: env $varname=$varvalue make -e print-obj-dir (EXTRA_LDFLAGS payload) unexpectedly SUCCEEDED (must be rejected: overriding $varname must not defeat the link-flags character-safety check)"
+    elif grep -q "cannot be overridden" "$log" && grep -q "$varname" "$log"; then
+      pass "S25: env $varname=$varvalue make -e print-obj-dir (EXTRA_LDFLAGS payload) correctly FAILS, mentioning '$varname cannot be overridden'"
+    else
+      fail "S25: env $varname=$varvalue make -e print-obj-dir (EXTRA_LDFLAGS payload) failed but did NOT mention '$varname cannot be overridden'"
+      cat "$log" >&2
+    fi
+  else
+    if make BACKEND=kiss OBJ_ROOT="$S25_OBJ_ROOT" BIN_ROOT="$S25_BIN_ROOT" EXTRA_LDFLAGS="$payload" "$varname=$varvalue" print-obj-dir >"$log" 2>&1; then
+      fail "S25: make $varname=$varvalue print-obj-dir (EXTRA_LDFLAGS payload) unexpectedly SUCCEEDED (must be rejected: overriding $varname must not defeat the link-flags character-safety check)"
+    elif grep -q "cannot be overridden" "$log" && grep -q "$varname" "$log"; then
+      pass "S25: make $varname=$varvalue print-obj-dir (EXTRA_LDFLAGS payload) correctly FAILS, mentioning '$varname cannot be overridden'"
+    else
+      fail "S25: make $varname=$varvalue print-obj-dir (EXTRA_LDFLAGS payload) failed but did NOT mention '$varname cannot be overridden'"
+      cat "$log" >&2
+    fi
+  fi
+}
+s25_check_override_rejected "SHELL_SAFE_INPUT_FLAGS"  "clean" ';rm' cmdline
+s25_check_override_rejected "SHELL_SAFE_ALLOWLIST_RC" "0"     ';rm' cmdline
+s25_check_override_rejected "SHELL_SAFE_INPUT_FLAGS"  "clean" ';rm' dashe
+s25_check_override_rejected "SHELL_SAFE_ALLOWLIST_RC" "0"     ';rm' dashe
 
 echo "############################################################"
 echo "# Final integrity guards"

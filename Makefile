@@ -331,8 +331,18 @@ endif
 # only the bare literal up here -- ahead of the foreach in file order --
 # fixes it; the original site of each still holds its OTHER job unchanged, so
 # there is exactly one `:=` definition of each name in this file, just moved.
+#
+# FP_ALLOWED_CHARS_RE (added alongside the FP-policy allow-list redesign,
+# same review) is a THIRD bare, dependency-free `:=` literal with the exact
+# same shape and the exact same `make -e` exposure -- it lives here, fully
+# relocated (not merely duplicated: this is its ONLY definition in the file,
+# since unlike FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS it has no second job at any
+# other line), so its origin is already final by the time the foreach below
+# queries it. The regex it holds is documented in full where it is actually
+# used (the FP-policy allow-list block, further below).
 FP_POLICY := -ffp-contract=off
 FFT_WRAPPER_ALIAS_CFLAGS := -fno-strict-aliasing
+FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 
 # --- Command-line override rejection (round-4 review P1-1; FFT_WRAPPER_ALIAS_
 # CFLAGS added by a later Codex review, same mechanism) -----------------------
@@ -397,14 +407,30 @@ FFT_WRAPPER_ALIAS_CFLAGS := -fno-strict-aliasing
 # with no behavior change to the (always-empty-by-default, currently-
 # unconsumed) value itself.
 #
-# Reusing this exact six-name foreach (rather than a separate ad hoc check
-# next to each variable's own definition) is still the pattern the
-# "Build-cache-invalidation fix" / "THE PATTERN" comment near CFG_SIG_PAYLOAD
-# calls for: any future policy flag added the same way should route through
-# here, defined early enough (bare `:=`, or unconditional `+=` -- never
-# `?=`) that its origin is already final -- under `-e` included -- by the
-# time this foreach runs.
-$(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FFT_WRAPPER_ALIAS_CFLAGS,\
+# Reusing this exact foreach (rather than a separate ad hoc check next to
+# each variable's own definition) is still the pattern the "Build-cache-
+# invalidation fix" / "THE PATTERN" comment near CFG_SIG_PAYLOAD calls for:
+# any future policy flag added the same way should route through here,
+# defined early enough (bare `:=`, or unconditional `+=` -- never `?=`) that
+# its origin is already final -- under `-e` included -- by the time this
+# foreach runs. FP_ALLOWED_CHARS_RE (the FP-policy allow-list's character
+# class, added alongside this same review) is the newest member: a fourth
+# bare, dependency-free `:=` literal with the identical exposure, now
+# defined directly above per the "Bare-literal policy flags" comment. A
+# command-line/`-e` override of FP_ALLOWED_CHARS_RE could otherwise widen the
+# allowed character set (e.g. to `.*`, matching anything) and silently
+# neuter the whole allow-list below -- this foreach closes that off the same
+# way it already closes the FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS cases.
+# (FP_INPUT_FLAGS/SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/
+# FP_CONFLICT_FLAGS -- the FP-policy/shell-safety checks' OTHER four internal
+# variables -- are NOT bare literals like this one; each is computed from the
+# fully-assembled CFLAGS/CXXFLAGS/CPPFLAGS (SHELL_SAFE_INPUT_FLAGS/
+# SHELL_SAFE_ALLOWLIST_RC also fold in the fully-assembled LDFLAGS -- see the
+# "link-flags character-safety coverage" comment further below) and so cannot
+# be relocated earlier the way this one was. They have their own,
+# separately-positioned override-rejection foreach immediately after their
+# own definitions further below -- see that block's comment.)
+$(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FFT_WRAPPER_ALIAS_CFLAGS FP_ALLOWED_CHARS_RE,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently drop this Makefile's own flag appends (FP policy, backend defines); use EXTRA_CFLAGS / EXTRA_LDFLAGS instead)))
 
@@ -495,94 +521,200 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FFT_WRAPPER_ALIAS_CFLAGS,
 # unrelated token.
 FP_INPUT_FLAGS := $(CFLAGS) $(CXXFLAGS) $(CPPFLAGS)
 
-# (Codex review) $(filter) directly above does whole-WORD matching against
-# GNU Make's OWN text representation of CFLAGS/CXXFLAGS/CPPFLAGS -- but Make
-# has zero concept of shell quoting. A value like EXTRA_CFLAGS="'-Ofast'" is
-# stored by Make as the literal 9-character text '-Ofast', quote characters
-# included, which is not equal to the bare word -Ofast, so $(filter) can
-# never match it -- yet when this same text later appears on an actual
-# compile recipe line and that line is handed to $(SHELL), the shell strips
-# the quote characters and the compiler genuinely receives -Ofast as a real
-# argv token. Three confirmed-live bypass shapes: EXTRA_CFLAGS="'-Ofast'"
-# (single-quoted), EXTRA_CFLAGS='"-ffast-math"' (double-quoted), and
-# EXTRA_CFLAGS="-O'f'ast" (quote-split mid-token -- the shell concatenates
-# the pieces back into -Ofast once it strips the quotes). A fourth family,
-# @response-file syntax (EXTRA_CFLAGS=@flags.rsp), is unrelated to quoting
-# but equally invisible to a plain whole-word check: many compilers treat a
-# bare @file argv token as "read more arguments from this file", which could
-# inject anything at all with zero text ever appearing in CFLAGS/
-# EXTRA_CFLAGS itself.
+# --- link-flags character-safety coverage (Codex review: the allow-list
+# redesign below originally validated FP_INPUT_FLAGS only -- CFLAGS/CXXFLAGS/
+# CPPFLAGS -- leaving LDFLAGS (built from a plain `-lm` literal plus whatever
+# EXTRA_LDFLAGS folds in, see the `LDFLAGS += $(EXTRA_LDFLAGS)` line near the
+# top of this file) completely unchecked, even though LDFLAGS is embedded in
+# every real link recipe below ($(LINK) ... $(LDFLAGS)) exactly the same way
+# CFLAGS/CXXFLAGS are embedded in every compile recipe. Confirmed empirically:
+# `make selftest EXTRA_LDFLAGS=';echo LINK_FLAG_INJECTION'` passed every check
+# below untouched and produced a real link recipe line with the shell
+# metacharacter payload sitting live and unfiltered after the `-lm` -- the
+# exact same class of exposure the allow-list below exists to close for
+# CFLAGS/CXXFLAGS/CPPFLAGS, just left open on this one variable. Fixed by
+# introducing this union: the two checks that only care about CHARACTER
+# safety (the single-quote pre-check and the allow-list itself, immediately
+# below) now run against SHELL_SAFE_INPUT_FLAGS instead of FP_INPUT_FLAGS
+# directly, so LDFLAGS/EXTRA_LDFLAGS content goes through the exact same
+# grep-based gate with no separate/duplicated $(shell) invocation. The
+# FP-semantic conflict check (FP_CONFLICT_FLAGS, further below --
+# -Ofast/-ffast-math/-ffp-contract=% are meaningless as LINK flags, not just
+# unnecessary to check there) stays scoped to FP_INPUT_FLAGS alone, unchanged.
+SHELL_SAFE_INPUT_FLAGS := $(FP_INPUT_FLAGS) $(LDFLAGS)
+
+# (Codex review, SUPERSEDED by the allow-list redesign below -- kept only as
+# the historical motivation) $(filter) directly above does whole-WORD
+# matching against GNU Make's OWN text representation of CFLAGS/CXXFLAGS/
+# CPPFLAGS -- but Make has zero concept of shell quoting. A value like
+# EXTRA_CFLAGS="'-Ofast'" is stored by Make as the literal 9-character text
+# '-Ofast', quote characters included, which is not equal to the bare word
+# -Ofast, so $(filter) can never match it -- yet when this same text later
+# appears on an actual compile recipe line and that line is handed to
+# $(SHELL), the shell strips the quote characters and the compiler genuinely
+# receives -Ofast as a real argv token. This was originally patched with a
+# hand-picked, 9-item DENY-list (single quote, double quote, backslash,
+# backtick, a literal "$(" sequence, semicolon, pipe, ampersand, and an
+# @-prefixed response-file token) rejecting exactly the shell-quoting/
+# escaping/expansion/response-file constructs known at the time to make
+# $(filter)'s exact-token check unreliable.
 #
-# Since Make cannot parse shell quoting, this block does not try to detect
-# "a quoted variant of -Ofast" specifically. Instead, the ONLY supported
-# external-input format for CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS is plain,
-# unquoted, whitespace-separated compiler argv tokens -- and ANY appearance
-# of shell quoting/escaping/expansion/response-file syntax in the combined
-# text is rejected outright, regardless of what follows it, BEFORE the
-# $(filter) exact-token conflict check below even runs, so that check only
-# ever sees guaranteed-unquoted input. (This paragraph intentionally
-# says nothing about -Ofast/-ffast-math/-ffp-contract itself: whether a
-# token IS one of those three is decided solely by the unchanged $(filter)
-# check; a harmless token that merely contains innocuous characters, e.g.
-# -DROUND9_NOTE=-Ofastness or -DTEXT=ffast-math, contains none of the
-# characters checked for below and so is untouched by this block.)
+# A deny-list of this shape is structurally unable to keep up: a live audit
+# (this round) found the 9-item list does NOT catch bare glob characters
+# (*, ?, [, ]), tilde (~), or -- most seriously -- real shell REDIRECTION
+# (>, <) or process substitution (<(...)): none of these are Make's own
+# syntax, so Make cannot pre-resolve or reject them the way it happens to
+# catch ${VAR}-style expansions (GNU Make treats ${...} identically to
+# $(...) and resolves it itself before any check runs -- a different,
+# unrelated mechanism from the deny-list). If a recipe line containing an
+# unbanned '>' or '<' is ever actually executed by a real shell (not a dry
+# run), it silently redirects the compiler invocation's own stdout/stdin to
+# an arbitrary path -- a real, unconditional risk, independent of any
+# -Ofast/-ffast-math/-ffp-contract semantics, and worse than the deny-list's
+# original threat model. Separately, direct testing (this round) confirms
+# the old "$(" entry was likely DEAD CODE for well-formed input all along:
+# `make ... 'CFLAGS=-O2 $(shell echo INJECTED)'` lets GNU Make's OWN parser
+# resolve the well-formed $(...) reference at command-line-parsing time --
+# "INJECTED" lands in CFLAGS as plain text, no literal "$(" substring ever
+# reaches the check -- while an UNBALANCED `$(unbalanced` (no closing paren)
+# makes Make itself abort with its own "unterminated variable reference.
+# Stop." before any makefile-level check runs at all. Either way the
+# findstring-based "$(" check never actually fires for the cases it was
+# meant to catch.
 #
-# A literal "$(" -- Make's own function/variable-reference opener, and also
-# the two-character shell command/variable-substitution opener -- cannot
-# safely be written as raw punctuation inline in a $(findstring ...) call:
-# GNU Make's parser matches parentheses while scanning a function call's
-# argument text, so an unbalanced literal "(" typed inline would confuse
-# that scan. Built instead via small helper variables (one holding a literal
-# "$" via the doubled-dollar escape, one holding a literal "(", concatenated
-# into one holding the two-char sequence) and that variable is referenced as
-# the findstring pattern -- confirmed by direct testing to parse cleanly
-# and to actually match (a raw unbalanced "(" typed inline here does NOT
-# parse cleanly; the helper-variable indirection does).
-FP_DOLLAR_CHAR      := $$
-FP_OPEN_PAREN_CHAR   := (
-FP_DOLLAR_PAREN_SEQ  := $(FP_DOLLAR_CHAR)$(FP_OPEN_PAREN_CHAR)
-
-ifneq ($(findstring ',$(FP_INPUT_FLAGS)),)
-$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a single-quote character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell quoting cannot be safely detected here by GNU Make and is rejected outright)
+# REDESIGN: replace the character-by-character DENY-list with a single
+# ALLOW-list covering the input as a whole. GNU Make has no native regex/
+# character-class function, so this necessarily shells out to `grep -E` --
+# a $(shell ...) call, the same technique this file already uses for
+# CFG_SIG's cksum computation below. Embedding untrusted, Make-supplied text
+# inside a constructed shell command is exactly the kind of thing that can
+# reintroduce the very problem being fixed if done carelessly, so the
+# embedding strategy is deliberately narrow and was verified directly (not
+# assumed): SHELL_SAFE_INPUT_FLAGS (CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS,
+# fully-assembled -- see the "link-flags character-safety coverage" comment
+# above for why LDFLAGS is folded in here too) is embedded SINGLE-QUOTED in
+# the shell command text below (`printf '%s' '$(SHELL_SAFE_INPUT_FLAGS)' |
+# ...`). Inside a single-quoted POSIX shell string, EVERY character is
+# literal except a single quote itself -- double quote, backslash, backtick,
+# "$(", semicolon, pipe, and ampersand are all completely inert there
+# (confirmed directly: `sh -c "printf '%s' '-O2 \`id\`' | grep ..."` does NOT
+# execute `id`). So the ONLY character that can break this embedding is a
+# literal single quote in SHELL_SAFE_INPUT_FLAGS itself (which would close
+# the quoted string early and hand whatever follows to the shell as live
+# syntax) -- which is why the single-quote check below is the ONE survivor
+# from the old 9-item deny-list, kept for this entirely different, structural
+# reason (safe shell-embedding), not merely because it's also a disallowed
+# character (the allow-list below would reject it either way). It MUST run
+# first, and MUST stay a pure $(findstring) check with zero shell
+# involvement, so it can gate the shell-embedding step that follows it.
+ifneq ($(findstring ',$(SHELL_SAFE_INPUT_FLAGS)),)
+$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/EXTRA_CFLAGS/EXTRA_LDFLAGS contains a single-quote character; this repo requires plain, unquoted, whitespace-separated compiler/linker argv tokens built only from the allowed character set (see the allow-list below) -- a single quote specifically must be rejected by this Make-native check BEFORE the allow-list's own $(shell) call can safely single-quote-embed the rest of the text)
 endif
 
-ifneq ($(findstring ",$(FP_INPUT_FLAGS)),)
-$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a double-quote character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell quoting cannot be safely detected here by GNU Make and is rejected outright)
-endif
-
-ifneq ($(findstring \,$(FP_INPUT_FLAGS)),)
-$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a backslash character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell escaping cannot be safely detected here by GNU Make and is rejected outright)
-endif
-
-ifneq ($(findstring `,$(FP_INPUT_FLAGS)),)
-$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a backtick character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell command substitution cannot be safely detected here by GNU Make and is rejected outright)
-endif
-
-ifneq ($(findstring $(FP_DOLLAR_PAREN_SEQ),$(FP_INPUT_FLAGS)),)
-$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a '$$(' sequence (command/variable substitution); this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell/make expansion cannot be safely detected here by GNU Make and is rejected outright)
-endif
-
-ifneq ($(findstring ;,$(FP_INPUT_FLAGS)),)
-$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a semicolon character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell command separators cannot be safely detected here by GNU Make and are rejected outright)
-endif
-
-ifneq ($(findstring |,$(FP_INPUT_FLAGS)),)
-$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains a pipe character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell pipelines cannot be safely detected here by GNU Make and are rejected outright)
-endif
-
-ifneq ($(findstring &,$(FP_INPUT_FLAGS)),)
-$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains an ampersand character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- shell backgrounding/AND-lists cannot be safely detected here by GNU Make and are rejected outright)
-endif
-
-FP_RESPONSE_FILE_TOKENS := $(filter @%,$(FP_INPUT_FLAGS))
-ifneq ($(FP_RESPONSE_FILE_TOKENS),)
-$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains an @-prefixed response-file token ($(FP_RESPONSE_FILE_TOKENS)); this repo requires plain, unquoted, whitespace-separated compiler argv tokens -- @file compiler response-file syntax cannot be safely expanded/inspected here and is rejected outright)
+# The allow-list itself. Allowed set: letters, digits, underscore, dot,
+# slash, equals, comma, plus, minus -- plus space (the token SEPARATOR
+# between flags; SHELL_SAFE_INPUT_FLAGS is always multiple whitespace-joined
+# tokens, never a single one, so space must be permitted even though it is
+# not part of any individual flag's own character set). Chosen by auditing
+# every legitimate flag this Makefile's OWN invocations actually use before
+# finalizing it: -O0/-O2/-O3, -Wall/-Wextra, -std=gnu99, -Iinclude,
+# -isystem lib/ne10/inc (letters/digits, and slash/dot for the path),
+# -DNE10_ENABLE_DSP, -DNE10_DSP_RFFT_SCALING, -DSIMD_KERNELS_FORCE_SCALAR,
+# -DPAR_PROBE, -DFFT_NE10_FORCE_C (letters/digits/underscore),
+# -DROUND9_NOTE=-Ofastness / -DTEXT=ffast-math (equals, hyphen) --
+# every one of these tokens is built ONLY from this set. Comma and plus are
+# included for headroom beyond this Makefile's current own usage (e.g.
+# -Wl,-rpath,dir / -Wa,--option pass-through flags a consumer might
+# legitimately need), on the same audit basis: neither character appears
+# anywhere in this Makefile's own flags today, so including them cannot
+# regress anything currently working, and both are inert to the shell
+# (unlike the characters actually excluded below).
+#
+# LC_ALL=C avoids any locale-dependent surprises in the [A-Za-z0-9...]
+# ranges (verified identical under C locale on this host's BSD grep/tr; the
+# same invocation is expected to behave identically under GNU grep/tr on a
+# Linux host, since POSIX bracket-expression ranges are locale-defined by
+# design and C locale pins them to the unambiguous ASCII ordering on both).
+#
+# Every one of the FORMER 9-item deny-list's targets (single quote, double
+# quote, backslash, backtick, a literal "$(", semicolon, pipe, ampersand,
+# @-response-file) is a character NOT in this allowed set, so all of them
+# are rejected by construction now -- confirmed by re-running every one of
+# that deny-list's own negative test cases in
+# scripts/test_build_isolation.sh (S23b) after removing the 8 that are now
+# redundant; only the single-quote check above survives, for the shell-
+# embedding reason given there, not because the allow-list fails to cover
+# it (a lone single quote is ALSO rejected by the allow-list on its own).
+#
+# FP_ALLOWED_CHARS_RE itself is NOT defined here -- it is a bare, early
+# `:=` literal (see the "Bare-literal policy flags" / "Command-line override
+# rejection" comments near the top of this file, where it is protected
+# against a command-line/`-e` override the exact same way FP_POLICY/
+# FFT_WRAPPER_ALIAS_CFLAGS are). Only referenced here.
+SHELL_SAFE_ALLOWLIST_RC := $(shell printf '%s' '$(SHELL_SAFE_INPUT_FLAGS)' | LC_ALL=C grep -Eq '$(FP_ALLOWED_CHARS_RE)'; echo $$?)
+ifneq ($(SHELL_SAFE_ALLOWLIST_RC),0)
+# Diagnostic-only second $(shell) call (only ever runs on the already-doomed
+# error path above, never on a passing build): deletes every ALLOWED
+# character from the same single-quote-embedded text, leaving only the
+# disallowed ones, then dedupes/sorts them into a short, stable string --
+# so the $(error ...) below names the SPECIFIC offending character(s)
+# (e.g. ">" or "~" or "*") instead of a generic "invalid format" message.
+SHELL_SAFE_DISALLOWED_CHARS := $(shell printf '%s' '$(SHELL_SAFE_INPUT_FLAGS)' | LC_ALL=C tr -d 'A-Za-z0-9_./=,+ -' | fold -w1 | LC_ALL=C sort -u | tr -d '\n')
+$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/EXTRA_CFLAGS/EXTRA_LDFLAGS contains a character outside the allowed set [A-Za-z0-9_./=,+- ] (letters/digits/underscore/dot/slash/equals/comma/plus/minus, plus space as the token separator) -- disallowed character(s) found: "$(SHELL_SAFE_DISALLOWED_CHARS)"; this repo requires plain, unquoted, whitespace-separated compiler/linker argv tokens built only from that set -- remove/replace the disallowed character(s) shown above in CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/EXTRA_CFLAGS/EXTRA_LDFLAGS)
 endif
 
 FP_CONFLICT_FLAGS := $(filter -Ofast -ffast-math -ffp-contract=%,$(FP_INPUT_FLAGS))
 ifneq ($(FP_CONFLICT_FLAGS),)
 $(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains $(FP_CONFLICT_FLAGS); this repo pins -ffp-contract=off; remove $(FP_CONFLICT_FLAGS) from CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS)
 endif
+
+# Command-line/`-e` override rejection for the FP-policy/shell-safety checks'
+# remaining FOUR internal variables (found live for the original three, this
+# same review, while implementing the allow-list above; SHELL_SAFE_INPUT_FLAGS/
+# SHELL_SAFE_ALLOWLIST_RC added, same treatment, by the later Codex review that
+# widened the character-safety check to LDFLAGS -- see the "link-flags
+# character-safety coverage" comment above): FP_INPUT_FLAGS/
+# SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/FP_CONFLICT_FLAGS are each
+# computed from the fully-assembled CFLAGS/CXXFLAGS/CPPFLAGS (SHELL_SAFE_
+# INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC also fold in the fully-assembled
+# LDFLAGS; SHELL_SAFE_ALLOWLIST_RC via a $(shell) call keyed off
+# SHELL_SAFE_INPUT_FLAGS) -- unlike FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS/
+# FP_ALLOWED_CHARS_RE above, none of the four is a bare, dependency-free
+# literal, so none can be relocated earlier to ride in the six/seven-name
+# foreach near the top of this file (that foreach's own comment explains why
+# bare-literal-and-early is required for the `-e` case). But confirmed
+# empirically (this round, for the original three; re-confirmed for the two
+# new ones the same way) to have the EXACT SAME command-line-override
+# exposure as every name in that foreach: e.g. `make ...
+# EXTRA_LDFLAGS=';echo INJECTED' SHELL_SAFE_ALLOWLIST_RC=0` (or the
+# equivalent with SHELL_SAFE_INPUT_FLAGS=<anything clean>, FP_INPUT_FLAGS=
+# <anything clean>, or FP_CONFLICT_FLAGS=) silently wins over this file's own
+# computed value and turns every ifneq/$(error) gate above into a complete
+# no-op -- while the REAL $(CFLAGS)/$(CXXFLAGS)/$(CPPFLAGS)/$(LDFLAGS) used in
+# every actual compile/link recipe still carry the dangerous, unvalidated
+# content unmodified. Reproduced against BOTH this round's allow-list AND the
+# prior (unmodified) 9-item deny-list it replaces, so this is a PRE-EXISTING
+# gap this round's audit happened to surface, not a regression introduced by
+# the redesign. Fixed the same way as the `-e` gap elsewhere in this file,
+# mirrored for a LATE-computed (not early-literal) variable: the
+# override-rejection check must itself run AFTER the variable's own real
+# assignment (never before), so the origin-flip -- for both plain "command
+# line" and, under `-e`, "environment override" -- has already happened by
+# the time $(origin ...) is queried here. This is why this second foreach
+# sits HERE, immediately after FP_CONFLICT_FLAGS (the last of the four to be
+# assigned), rather than folded into the earlier foreach (which runs too
+# early in the file for any of these four to have been assigned yet, so
+# $(origin ...) would still read "environment" rather than "environment
+# override" under `-e`, exactly the gap that foreach's own history describes
+# for FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS before they were relocated).
+# SHELL_SAFE_DISALLOWED_CHARS (like the old FP_DISALLOWED_CHARS before it) is
+# deliberately NOT included here: it is pure diagnostic text folded into the
+# $(error ...) message on the failure path only, never a condition any ifneq
+# tests, so overriding it cannot bypass anything -- at worst it would garble
+# the reported character list on a build that was going to fail anyway.
+$(foreach v,FP_INPUT_FLAGS SHELL_SAFE_INPUT_FLAGS SHELL_SAFE_ALLOWLIST_RC FP_CONFLICT_FLAGS,\
+  $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
+    $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently defeat the FP-policy/shell-safety allow-list/conflict checks above, leaving the real CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS content unvalidated; this variable is internal to those checks and has no supported external use)))
 
 CFLAGS    += $(FP_POLICY)
 CXXFLAGS  += $(FP_POLICY)

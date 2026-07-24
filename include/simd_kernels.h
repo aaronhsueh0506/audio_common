@@ -184,6 +184,9 @@
 #include <math.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>        /* memcpy -- the legal Complex<->float[8] byte
+                             * reinterpretation used by sk__cquad_load/
+                             * sk__cquad_store below (see that comment) */
 
 #include "fft_wrapper.h"   /* Complex { float r; float i; } (interleaved AoS) */
 
@@ -193,6 +196,58 @@
 #else
 #define SK_HAVE_NEON 0
 #endif
+
+/* SK_STATIC_ASSERT -- portable compile-time assert, C99/C11/C++11 alike.
+ *
+ * This header documents itself as C99-compatible (the `extern "C"` guard
+ * just below is for C++ consumers that still build it in C++ mode, not just
+ * C11+). The bare C11 keyword `_Static_assert` is NOT available in strict
+ * C99 (it is a C11 extension -- diagnosed under `-std=c99 -pedantic-errors`)
+ * and, spelled with the leading underscore, is ALSO rejected under
+ * `-std=c++17 -pedantic-errors` (C++'s spelling is the lowercase
+ * `static_assert`, no underscore -- the identifier `_Static_assert` has no
+ * special meaning to a C++ compiler at all). Route to whichever spelling the
+ * including TU's language mode actually provides, with a strict-C99
+ * fallback that gets equivalent enforcement strength (a hard compile
+ * failure, with the condition spelled out via the array-size violation)
+ * from a language feature C99 does have: a `typedef` naming a `char` array
+ * whose size is `-1` (illegal) when `cond` is false. The typedef's name
+ * must be unique per use site or two calls on different lines collide as a
+ * redefinition, hence the __LINE__-based two-level token paste. */
+#if defined(__cplusplus)
+#  define SK_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#  define SK_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#else
+#  define SK__STATIC_ASSERT_CONCAT_(a, b) a##b
+#  define SK__STATIC_ASSERT_CONCAT(a, b) SK__STATIC_ASSERT_CONCAT_(a, b)
+#  define SK_STATIC_ASSERT(cond, msg) \
+       typedef char SK__STATIC_ASSERT_CONCAT(sk_static_assert_line_, \
+                                              __LINE__)[(cond) ? 1 : -1]
+#endif
+
+/* The sk_c*_f32 NEON kernels below (kernels 9/10 here, and the wider family
+ * in AEC/c_impl's aec_simd_kernels.h, which #includes this file and reuses
+ * sk__cquad_load/sk__cquad_store directly rather than redefining them) all
+ * assume `Complex` is exactly two contiguous, unpadded floats {r, i} --
+ * that's the layout every memcpy-based sk__cquad_load/sk__cquad_store
+ * quad-load/store below silently depends on (see the "Complex-quad NEON
+ * load/store" section further down for why this goes through memcpy +
+ * vld1q_f32/vst1q_f32 + vuzpq_f32/vzipq_f32 instead of vld2q_f32/vst2q_f32
+ * directly). Pin the assumption here, once, next to the `Complex` include,
+ * so a future ABI-changing edit to that struct (an added field, reordered
+ * members, explicit padding/alignment) fails to COMPILE instead of silently
+ * reintroducing a misaligned/wrong-stride NEON access everywhere this header
+ * is included. */
+SK_STATIC_ASSERT(sizeof(Complex) == 2 * sizeof(float),
+               "Complex must be exactly two floats {r,i} (8 bytes, no "
+               "padding) -- the sk_c*_f32 NEON kernels' memcpy-based "
+               "quad-load/store layout depends on this");
+SK_STATIC_ASSERT(offsetof(Complex, r) == 0 &&
+               offsetof(Complex, i) == sizeof(float),
+               "Complex.r/.i must sit at byte offsets 0/4 in that order "
+               "(interleaved AoS) -- the sk_c*_f32 NEON kernels' memcpy-based "
+               "quad-load/store assumes this exact layout");
 
 #ifdef __cplusplus
 extern "C" {
@@ -271,6 +326,125 @@ static inline void sk_ema_f32(float *state, const float *x,
 }
 #endif
 
+/* ═══════════════════ Complex-quad NEON load/store (legal aliasing) ═════════
+ * sk__cquad_load / sk__cquad_store — the ONLY sanctioned way any kernel in
+ * this file (or in AEC/c_impl's aec_simd_kernels.h, which #includes this
+ * header and calls these two directly rather than redefining them) may move
+ * 4 lanes of `Complex` through NEON registers.
+ *
+ * Why this exists: the previous code here cast a `const Complex*`/`Complex*`
+ * (interleaved {r,i} AoS — see fft_wrapper.h) straight to
+ * `(const float *)`/`(float *)` and handed that to vld2q_f32/vst2q_f32
+ * directly. AEC/c_impl's aec_simd_kernels.h used to do that exact same cast
+ * at its own many call sites too; it no longer does — that file now
+ * `#include`s this header and calls sk__cquad_load/sk__cquad_store directly
+ * (see above) instead of casting on its own, so it inherited this fix rather
+ * than needing a separate one. Reading/writing a `Complex` object through a
+ * `float` lvalue that way is a type-based-aliasing violation (C11 6.5p7):
+ * every byte of the struct IS a float, but `float` is
+ * not the EFFECTIVE TYPE of a `Complex` object, so the compiler is entitled
+ * to assume a `Complex*` and a `float*` never alias — true UB even though it
+ * happens to produce the intended codegen today, at -O2, on every toolchain
+ * this project currently builds with (the exact class of exposure this
+ * repo's Makefile already documents and carries a target-specific
+ * -fno-strict-aliasing override for on fft_wrapper.c/fft_wrapper_ne10.c —
+ * see FFT_WRAPPER_ALIAS_CFLAGS there). These two kernel FUNCTIONS live in a
+ * header with no .c file of their own in audio_common, so that Makefile-level
+ * fix cannot reach them; fixing the aliasing at the SOURCE instead, once,
+ * here, fixes every consumer (AEC/c_impl's aec3_post.c, Audio_ALG/pipelines'
+ * audio_pipeline.c, and aec_simd_kernels.h's own many call sites) without any
+ * Makefile change in any of those repos.
+ *
+ * The legal fix, in two steps:
+ *   1. memcpy 4 Complex elements (8 floats, 32 bytes) into/out of a plain
+ *      `float[8]` stack scratch array. memcpy is defined over
+ *      `unsigned char` and carries no notion of the source's or
+ *      destination's declared type across the copy, so copying the bytes of
+ *      a `Complex[4]` into a `float[8]` this way is a legal
+ *      byte-reinterpretation between two unrelated types — unlike a pointer
+ *      cast, which asks the compiler to treat the SAME memory as two
+ *      different effective types AT ONCE.
+ *   2. Deinterleave/interleave that scratch array's 8 floats using PLAIN
+ *      single-register vld1q_f32/vst1q_f32 (2 each, never vld2q_f32/
+ *      vst2q_f32) plus a register-only vuzpq_f32/vzipq_f32 shuffle. This
+ *      step is NOT what the obvious first attempt does (see below) — it is
+ *      the part that had to be discovered empirically.
+ *
+ * The obvious first attempt — memcpy into `float[8]`, then call
+ * vld2q_f32/vst2q_f32 directly against that scratch array (the same
+ * multi-register load/store used before, just now against a legally-typed
+ * buffer) — was tried FIRST and rejected by the disassembly check this file's
+ * bit-exactness contract demands: `objdump -d` of a standalone probe TU
+ * (Apple clang 17, arm64, -O2 AND -O3, -fno-stack-protector to rule that out
+ * as a confound) showed the memcpy was NOT eliminated — the compiler emits a
+ * genuine load-from-source into a temporary, a real store into the scratch
+ * array, THEN a separate `ld2.4s` reading that scratch array back (and the
+ * mirror image on the store side: `st2.4s` into scratch, then a real
+ * load-and-store out to the destination). vld2q_f32/vst2q_f32 lower to an
+ * opaque multi-register memory intrinsic
+ * (`llvm.aarch64.neon.ld2`/`.st2.v4f32.p0`) that LLVM's memcpy-forwarding
+ * optimizations (memcpyopt/DSE/GVN) do not appear to look through — the
+ * store into scratch and the intrinsic's own read of scratch never get
+ * fused, so the round-trip through the stack survives at -O2 AND -O3,
+ * unconditionally. That failed verification is exactly why this comment
+ * exists instead of a two-line vld2q_f32(scratch)/vst2q_f32(scratch)
+ * wrapper, and exactly the scenario this project's own review process
+ * requires falling back from (a Makefile-level -fno-strict-aliasing escape
+ * hatch, the FFT_WRAPPER_ALIAS_CFLAGS pattern) UNLESS a working alternative
+ * is found — which the shape below is.
+ *
+ * The shape actually used swaps vld2q_f32/vst2q_f32 for vld1q_f32/
+ * vst1q_f32 (ordinary single-vector loads/stores, which DO lower to plain
+ * LLVM `load`/`store` IR, not an opaque intrinsic) plus a register-only
+ * uzp/zip shuffle to do the deinterleave/interleave arithmetic that ld2/st2
+ * would otherwise have done in the memory unit:
+ *   - load:  lo = vld1q_f32(scratch), hi = vld1q_f32(scratch+4); the pair
+ *     (lo, hi) is exactly [r0,i0,r1,i1] and [r2,i2,r3,i3]. vuzpq_f32(lo, hi)
+ *     deinterleaves EVEN/ODD lanes across the (lo,hi) pair, giving
+ *     val[0]=[r0,r1,r2,r3] (the same real vector vld2q_f32 would have
+ *     produced) and val[1]=[i0,i1,i2,i3] (same imaginary vector) — verified
+ *     both by hand (NEON vuzpq_f32 semantics) and by a standalone
+ *     correctness probe (4-element load + round-trip store, both -O0 and
+ *     -O2, values compared field-by-field).
+ *   - store: the inverse, vzipq_f32(v.val[0], v.val[1]) re-interleaves the
+ *     real/imag vectors back into [r0,i0,r1,i1] / [r2,i2,r3,i3] pairs, two
+ *     plain vst1q_f32 calls write those into the scratch array in the
+ *     correct interleaved order, then memcpy carries the final bytes out.
+ * Because vld1q_f32/vst1q_f32 are ordinary loads/stores, LLVM's optimizer
+ * DOES fold the memcpy away entirely on this toolchain: the verified
+ * disassembly of both real kernels below (`objdump -d` of a standalone probe
+ * TU including this exact header and calling sk_capply_gain_f32/sk_cadd_f32,
+ * Apple clang 17/arm64, -O2) shows the 4-lane loop body loads the 32 bytes
+ * DIRECTLY from the source pointer (`ldp q0,q1,[src]`), deinterleaves in
+ * registers (`uzp1.4s`/`uzp2.4s`), computes, re-interleaves
+ * (`zip2.4s`), and stores DIRECTLY to the destination pointer (a
+ * `st2`+`str` pair) — no stack scratch traffic survives anywhere in the
+ * loop. This is genuinely equivalent work to ld2/st2 (same deinterleave/
+ * interleave semantics, same bit-exact numeric result — the shuffle
+ * instructions only ever move bits, they perform no arithmetic), just
+ * composed from instructions LLVM is willing to reason about across the
+ * memcpy boundary. NOT assumed: re-verify by disassembly any time this
+ * helper or its call sites change materially. */
+#if SK_HAVE_NEON
+static inline float32x4x2_t sk__cquad_load(const Complex *p) {
+    float scratch[8];
+    memcpy(scratch, p, sizeof(scratch));
+    {
+        float32x4_t lo = vld1q_f32(scratch);
+        float32x4_t hi = vld1q_f32(scratch + 4);
+        return vuzpq_f32(lo, hi); /* val[0]=r's, val[1]=i's */
+    }
+}
+
+static inline void sk__cquad_store(Complex *p, float32x4x2_t v) {
+    float32x4x2_t z = vzipq_f32(v.val[0], v.val[1]); /* re-interleave r/i */
+    float scratch[8];
+    vst1q_f32(scratch, z.val[0]);
+    vst1q_f32(scratch + 4, z.val[1]);
+    memcpy(p, scratch, sizeof(scratch));
+}
+#endif /* SK_HAVE_NEON */
+
 /* ═══════════════════════════════ kernel 9 ══════════════════════════════════
  * sk_capply_gain_f32 — out[i] = z[i] * g[i] (real gain applied to both
  * components). Supports out == z (in-place): each iteration fully loads
@@ -292,12 +466,12 @@ static inline void sk_capply_gain_f32(Complex *out, const Complex *z,
                                        const float *g, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        float32x4x2_t zv = vld2q_f32((const float *)(z + i));
+        float32x4x2_t zv = sk__cquad_load(z + i);
         float32x4_t gv = vld1q_f32(g + i);
         float32x4x2_t rv;
         rv.val[0] = vmulq_f32(zv.val[0], gv);
         rv.val[1] = vmulq_f32(zv.val[1], gv);
-        vst2q_f32((float *)(out + i), rv);
+        sk__cquad_store(out + i, rv);
     }
     for (; i < n; ++i) {
         out[i].r = z[i].r * g[i];
@@ -328,12 +502,12 @@ static inline void sk_cadd_f32(Complex *out, const Complex *a,
                                 const Complex *b, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        float32x4x2_t av = vld2q_f32((const float *)(a + i));
-        float32x4x2_t bv = vld2q_f32((const float *)(b + i));
+        float32x4x2_t av = sk__cquad_load(a + i);
+        float32x4x2_t bv = sk__cquad_load(b + i);
         float32x4x2_t rv;
         rv.val[0] = vaddq_f32(av.val[0], bv.val[0]);
         rv.val[1] = vaddq_f32(av.val[1], bv.val[1]);
-        vst2q_f32((float *)(out + i), rv);
+        sk__cquad_store(out + i, rv);
     }
     for (; i < n; ++i) {
         out[i].r = a[i].r + b[i].r;

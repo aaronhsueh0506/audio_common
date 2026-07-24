@@ -179,6 +179,32 @@ static void check_bits_or_die(const char *kernel, int n, int trial,
  * pairwise-sum-family kernels' tests, all of which moved to
  * AEC/c_impl/test/simd_selftest_aec.c along with their kernels. */
 
+/* check_complex_bits_or_die -- the Complex-typed sibling of check_bits_or_die,
+ * used by the kernel 9/10 (sk_capply_gain_f32/sk_cadd_f32) tests below. Every
+ * one of those call sites used to cast its `Complex *` buffers straight to
+ * `(const float *)` and hand that to check_bits_or_die directly -- a canary/
+ * reference test doing the exact Complex*->float* type-based-aliasing cast
+ * pattern the surrounding review exists to remove from the real NEON kernels
+ * (see simd_kernels.h's sk__cquad_load/sk__cquad_store comment) would be an
+ * odd inconsistency, even though (unlike a NEON vld2q_f32/vst2q_f32 call) the
+ * old cast here was never actually dereferenced as a `float` lvalue -- only
+ * ever fed to memcpy via address-of-subscript, which C11 6.5.3.2p3 defines as
+ * pure pointer arithmetic, not a load. Fixed the same way as the real
+ * kernels: memcpy the two Complex buffers' bytes into genuine local `float`
+ * objects first, then delegate to check_bits_or_die on those -- no
+ * Complex*->float* pointer cast anywhere in this file's kernel-9/10 tests
+ * after this point. `n_elems` is a Complex-element count (bounded by
+ * SK_TEST_MAX_N/EDGE_MAX_N at every call site in this file, both aliases for
+ * the same constant); the scratch arrays are sized for the worst case. */
+static void check_complex_bits_or_die(const char *kernel, int n, int trial,
+                                       const Complex *simd, const Complex *scalar,
+                                       int n_elems) {
+    float simd_f[SK_TEST_MAX_N * 2], scalar_f[SK_TEST_MAX_N * 2];
+    memcpy(simd_f, simd, (size_t)n_elems * sizeof(Complex));
+    memcpy(scalar_f, scalar, (size_t)n_elems * sizeof(Complex));
+    check_bits_or_die(kernel, n, trial, simd_f, scalar_f, 2 * n_elems);
+}
+
 /* ═══════════ pinned special-value contract (re-review R07) ═══════════════
  * fast_math.h's header comment documents an exact "Special-value contract
  * table" for fast_exp/fast_log/fast_sqrt (NaN/+-Inf/0/negative -> exact
@@ -344,7 +370,7 @@ static void test_capply_gain(void) {
             fill_floats(g, n);
             sk_capply_gain_f32_scalar(out_scalar, z, g, n);
             sk_capply_gain_f32(out_simd, z, g, n);
-            check_bits_or_die("capply_gain_f32", n, t, (const float *)out_simd, (const float *)out_scalar, 2 * n);
+            check_complex_bits_or_die("capply_gain_f32", n, t, out_simd, out_scalar, n);
         }
     }
     /* dedicated in-place check: out == z */
@@ -358,7 +384,7 @@ static void test_capply_gain(void) {
         memcpy(buf_simd, orig, (size_t)n * sizeof(Complex));
         sk_capply_gain_f32_scalar(buf_scalar, buf_scalar, g2, n);
         sk_capply_gain_f32(buf_simd, buf_simd, g2, n);
-        check_bits_or_die("capply_gain_f32_inplace", n, 0, (const float *)buf_simd, (const float *)buf_scalar, 2 * n);
+        check_complex_bits_or_die("capply_gain_f32_inplace", n, 0, buf_simd, buf_scalar, n);
     }
     printf("PASS capply_gain_f32\n");
 }
@@ -377,7 +403,7 @@ static void test_cadd(void) {
             fill_complex(b, n);
             sk_cadd_f32_scalar(out_scalar, a, b, n);
             sk_cadd_f32(out_simd, a, b, n);
-            check_bits_or_die("cadd_f32", n, t, (const float *)out_simd, (const float *)out_scalar, 2 * n);
+            check_complex_bits_or_die("cadd_f32", n, t, out_simd, out_scalar, n);
         }
     }
     printf("PASS cadd_f32\n");
@@ -942,15 +968,39 @@ static void edge_check_canary_f(const char *label, const float *arena, int len,
 }
 
 /* Complex-array counterparts: Complex is {float r; float i;} contiguous
- * (fft_wrapper.h), so a Complex arena is just a float arena with every
- * length/offset doubled -- reuses the float helpers above instead of
- * duplicating the canary logic for a second type. */
+ * (fft_wrapper.h), so a Complex arena's bytes are laid out exactly like a
+ * float arena of twice the length -- but this iterates NATIVELY over each
+ * Complex element's `.r`/`.i` struct-member lvalues instead of reinterpreting
+ * the whole arena through a Complex*->float* pointer cast (which would repeat,
+ * in a canary test of all places, the exact type-based-aliasing cast pattern
+ * this same review removed from the real NEON kernels -- see
+ * simd_kernels.h's sk__cquad_load/sk__cquad_store comment). len/win_lo/
+ * win_len here are Complex-element counts throughout (no doubling: each
+ * element contributes its own two field checks directly). */
 static void edge_fill_canary_c(Complex *arena, int len) {
-    edge_fill_canary_f((float *)arena, len * 2);
+    int i;
+    float c = edge_canary_float();
+    for (i = 0; i < len; ++i) { arena[i].r = c; arena[i].i = c; }
 }
 static void edge_check_canary_c(const char *label, const Complex *arena, int len,
                                  int win_lo, int win_len) {
-    edge_check_canary_f(label, (const float *)arena, len * 2, win_lo * 2, win_len * 2);
+    int i;
+    uint32_t want = EDGE_CANARY_BITS;
+    int win_hi = win_lo + win_len;
+    for (i = 0; i < len; ++i) {
+        uint32_t got_r, got_i;
+        if (i >= win_lo && i < win_hi) continue; /* payload window, not guarded */
+        g_total_checks += 2;
+        memcpy(&got_r, &arena[i].r, sizeof got_r);
+        memcpy(&got_i, &arena[i].i, sizeof got_i);
+        if (got_r != want || got_i != want) {
+            fprintf(stderr,
+                "CANARY VIOLATION %s: arena[%d]={r=0x%08x,i=0x%08x} (want canary 0x%08x) "
+                "-- out-of-bounds access, payload window=[%d,%d)\n",
+                label, i, (unsigned)got_r, (unsigned)got_i, (unsigned)want, win_lo, win_hi);
+            exit(1);
+        }
+    }
 }
 
 /* Derives the (input-role, output-role) element offsets for the matrix's
@@ -1030,9 +1080,9 @@ static void test_capply_gain_edge(void) {
                 sk_capply_gain_f32_scalar(out_scalar_arena + out_off, z_arena + in_off, g_arena, n);
                 sk_capply_gain_f32(out_simd_arena + out_off, z_arena + in_off, g_arena, n);
 
-                check_bits_or_die("capply_gain_f32_edge", n, form * 100 + o,
-                                   (const float *)(out_simd_arena + out_off),
-                                   (const float *)(out_scalar_arena + out_off), 2 * n);
+                check_complex_bits_or_die("capply_gain_f32_edge", n, form * 100 + o,
+                                           out_simd_arena + out_off,
+                                           out_scalar_arena + out_off, n);
                 edge_check_canary_c("capply_gain_f32_edge:z", z_arena, EDGE_ARENA_LEN, in_off, n);
                 edge_check_canary_c("capply_gain_f32_edge:out_scalar", out_scalar_arena, EDGE_ARENA_LEN, out_off, n);
                 edge_check_canary_c("capply_gain_f32_edge:out_simd", out_simd_arena, EDGE_ARENA_LEN, out_off, n);
@@ -1067,9 +1117,9 @@ static void test_cadd_edge(void) {
                 sk_cadd_f32_scalar(out_scalar_arena + out_off, a_arena + in_off, b_arena, n);
                 sk_cadd_f32(out_simd_arena + out_off, a_arena + in_off, b_arena, n);
 
-                check_bits_or_die("cadd_f32_edge", n, form * 100 + o,
-                                   (const float *)(out_simd_arena + out_off),
-                                   (const float *)(out_scalar_arena + out_off), 2 * n);
+                check_complex_bits_or_die("cadd_f32_edge", n, form * 100 + o,
+                                           out_simd_arena + out_off,
+                                           out_scalar_arena + out_off, n);
                 edge_check_canary_c("cadd_f32_edge:a", a_arena, EDGE_ARENA_LEN, in_off, n);
                 edge_check_canary_c("cadd_f32_edge:b", b_arena, EDGE_ARENA_LEN, 0, n);
                 edge_check_canary_c("cadd_f32_edge:out_scalar", out_scalar_arena, EDGE_ARENA_LEN, out_off, n);
