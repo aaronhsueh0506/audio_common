@@ -850,10 +850,10 @@ ifeq ($(WERROR),1)
 $(OWN_OBJS): CFLAGS += -Werror
 endif
 
-# -fno-strict-aliasing, scoped to ONLY the objects for src/fft_wrapper_ne10.c
-# and src/fft_wrapper.c (same target-specific-variable pattern as the
-# -Werror opt-in above, just unconditional and narrower -- two specific
-# objects, not a whole class of objects).
+# -fno-strict-aliasing, scoped to the objects for src/fft_wrapper_ne10.c and
+# src/fft_wrapper.c, plus the header-only SIMD selftest that instantiates
+# sk__cquad_load/store. Production AEC/pipeline consumers carry the same
+# policy in their own Makefiles.
 #
 # The flag string itself lives in $(FFT_WRAPPER_ALIAS_CFLAGS) (defined up
 # above, ahead of CFG_SIG_PAYLOAD -- see the "Build-cache-invalidation fix"
@@ -1001,7 +1001,7 @@ selftest: $(LIB) | _cfg_guard
 	# scalar reference loops (e.g. sk_ema_f32_scalar) into `fmla` at -O2,
 	# which would then mismatch the deliberately-unfused NEON intrinics
 	# path (see include/simd_kernels.h's FMA-discipline doc comment).
-	$(CC) $(CFLAGS) -ffp-contract=off -MD -MP -c -o $(OBJ_DIR)/simd_selftest.o test/simd_selftest.c
+	$(CC) $(CFLAGS) $(FFT_WRAPPER_ALIAS_CFLAGS) -ffp-contract=off -MD -MP -c -o $(OBJ_DIR)/simd_selftest.o test/simd_selftest.c
 	$(CC) -o $(BIN_DIR)/simd_selftest $(OBJ_DIR)/simd_selftest.o -lm
 	@echo "--- audio_common SIMD kernel selftest [$(BACKEND)] ---"
 	@$(BIN_DIR)/simd_selftest
