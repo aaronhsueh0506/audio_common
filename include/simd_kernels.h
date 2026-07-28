@@ -184,6 +184,9 @@
 #include <math.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>        /* memcpy -- the legal Complex<->float[8] byte
+                             * reinterpretation used by sk__cquad_load/
+                             * sk__cquad_store below (see that comment) */
 
 #include "fft_wrapper.h"   /* Complex { float r; float i; } (interleaved AoS) */
 
@@ -227,21 +230,23 @@
  * in AEC/c_impl's aec_simd_kernels.h, which #includes this file and reuses
  * sk__cquad_load/sk__cquad_store directly rather than redefining them) all
  * assume `Complex` is exactly two contiguous, unpadded floats {r, i} --
- * that's the layout every sk__cquad_load/sk__cquad_store quad-load/store
- * below depends on. Pin the assumption here, once, next to the `Complex`
- * include,
+ * that's the layout every memcpy-based sk__cquad_load/sk__cquad_store
+ * quad-load/store below silently depends on (see the "Complex-quad NEON
+ * load/store" section further down for why this goes through memcpy +
+ * vld1q_f32/vst1q_f32 + vuzpq_f32/vzipq_f32 instead of vld2q_f32/vst2q_f32
+ * directly). Pin the assumption here, once, next to the `Complex` include,
  * so a future ABI-changing edit to that struct (an added field, reordered
  * members, explicit padding/alignment) fails to COMPILE instead of silently
  * reintroducing a misaligned/wrong-stride NEON access everywhere this header
  * is included. */
 SK_STATIC_ASSERT(sizeof(Complex) == 2 * sizeof(float),
                "Complex must be exactly two floats {r,i} (8 bytes, no "
-               "padding) -- the sk_c*_f32 NEON kernels' "
+               "padding) -- the sk_c*_f32 NEON kernels' memcpy-based "
                "quad-load/store layout depends on this");
 SK_STATIC_ASSERT(offsetof(Complex, r) == 0 &&
                offsetof(Complex, i) == sizeof(float),
                "Complex.r/.i must sit at byte offsets 0/4 in that order "
-               "(interleaved AoS) -- the sk_c*_f32 NEON kernels' "
+               "(interleaved AoS) -- the sk_c*_f32 NEON kernels' memcpy-based "
                "quad-load/store assumes this exact layout");
 
 #ifdef __cplusplus
@@ -321,23 +326,11 @@ static inline void sk_ema_f32(float *state, const float *x,
 }
 #endif
 
-/* ═══════════════════ Complex-quad NEON load/store ════════════════
+/* ═══════════════════ Complex-quad NEON load/store (legal aliasing) ═════════
  * sk__cquad_load / sk__cquad_store — the ONLY sanctioned way any kernel in
  * this file (or in AEC/c_impl's aec_simd_kernels.h, which #includes this
  * header and calls these two directly rather than redefining them) may move
  * 4 lanes of `Complex` through NEON registers.
- *
- * CURRENT POLICY: use the native vld2q_f32/vst2q_f32 structure operations.
- * Every translation unit that instantiates these helpers MUST compile with
- * -fno-strict-aliasing; AEC, audio_common's SIMD selftest, and Audio_ALG's
- * pipeline Makefiles scope that flag to the affected objects and include it
- * in their configuration identity. The layout assertions above guard the
- * required two-float interleaved ABI. Do not add a caller without extending
- * the corresponding Makefile object list.
- *
- * The discussion below records why the superseded memcpy+vld1+uzp/zip
- * implementation was originally introduced and why it is now replaced for
- * Cortex-A73 performance. It is historical context, not the current code.
  *
  * Why this exists: the previous code here cast a `const Complex*`/`Complex*`
  * (interleaved {r,i} AoS — see fft_wrapper.h) straight to
@@ -393,11 +386,14 @@ static inline void sk_ema_f32(float *state, const float *x,
  * optimizations (memcpyopt/DSE/GVN) do not appear to look through — the
  * store into scratch and the intrinsic's own read of scratch never get
  * fused, so the round-trip through the stack survives at -O2 AND -O3,
- * unconditionally. That failed verification motivated the superseded
- * vld1+uzp/zip implementation. The current implementation instead uses the
- * Makefile-level -fno-strict-aliasing escape hatch described above.
+ * unconditionally. That failed verification is exactly why this comment
+ * exists instead of a two-line vld2q_f32(scratch)/vst2q_f32(scratch)
+ * wrapper, and exactly the scenario this project's own review process
+ * requires falling back from (a Makefile-level -fno-strict-aliasing escape
+ * hatch, the FFT_WRAPPER_ALIAS_CFLAGS pattern) UNLESS a working alternative
+ * is found — which the shape below is.
  *
- * The superseded shape swapped vld2q_f32/vst2q_f32 for vld1q_f32/
+ * The shape actually used swaps vld2q_f32/vst2q_f32 for vld1q_f32/
  * vst1q_f32 (ordinary single-vector loads/stores, which DO lower to plain
  * LLVM `load`/`store` IR, not an opaque intrinsic) plus a register-only
  * uzp/zip shuffle to do the deinterleave/interleave arithmetic that ld2/st2
@@ -431,11 +427,21 @@ static inline void sk_ema_f32(float *state, const float *x,
  * helper or its call sites change materially. */
 #if SK_HAVE_NEON
 static inline float32x4x2_t sk__cquad_load(const Complex *p) {
-    return vld2q_f32((const float *)(const void *)p);
+    float scratch[8];
+    memcpy(scratch, p, sizeof(scratch));
+    {
+        float32x4_t lo = vld1q_f32(scratch);
+        float32x4_t hi = vld1q_f32(scratch + 4);
+        return vuzpq_f32(lo, hi); /* val[0]=r's, val[1]=i's */
+    }
 }
 
 static inline void sk__cquad_store(Complex *p, float32x4x2_t v) {
-    vst2q_f32((float *)(void *)p, v);
+    float32x4x2_t z = vzipq_f32(v.val[0], v.val[1]); /* re-interleave r/i */
+    float scratch[8];
+    vst1q_f32(scratch, z.val[0]);
+    vst1q_f32(scratch + 4, z.val[1]);
+    memcpy(p, scratch, sizeof(scratch));
 }
 #endif /* SK_HAVE_NEON */
 
