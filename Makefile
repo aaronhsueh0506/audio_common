@@ -1001,7 +1001,9 @@ selftest: $(LIB) | _cfg_guard
 	# scalar reference loops (e.g. sk_ema_f32_scalar) into `fmla` at -O2,
 	# which would then mismatch the deliberately-unfused NEON intrinics
 	# path (see include/simd_kernels.h's FMA-discipline doc comment).
-	$(CC) $(CFLAGS) -ffp-contract=off -MD -MP -c -o $(OBJ_DIR)/simd_selftest.o test/simd_selftest.c
+	# Keep strict aliasing explicit: simd_kernels.h is consumed by external
+	# board builds which must not depend on this Makefile's per-TU exceptions.
+	$(CC) $(CFLAGS) -ffp-contract=off -fstrict-aliasing -MD -MP -c -o $(OBJ_DIR)/simd_selftest.o test/simd_selftest.c
 	$(CC) -o $(BIN_DIR)/simd_selftest $(OBJ_DIR)/simd_selftest.o -lm
 	@echo "--- audio_common SIMD kernel selftest [$(BACKEND)] ---"
 	@$(BIN_DIR)/simd_selftest
