@@ -14,7 +14,8 @@
 #include <math.h>
 #include <stddef.h>   /* offsetof — F11 layout proof below */
 
-#if defined(__ARM_NEON) && defined(__aarch64__)
+#if defined(__ARM_NEON) && defined(__aarch64__) && \
+    !defined(SIMD_KERNELS_FORCE_SCALAR)
 #include <arm_neon.h>
 #endif
 
@@ -72,15 +73,7 @@ _Static_assert(offsetof(Complex, r) == offsetof(ne10_fft_cpx_float32_t, r),
 _Static_assert(offsetof(Complex, i) == offsetof(ne10_fft_cpx_float32_t, i),
                "Complex/ne10_fft_cpx_float32_t .i offset mismatch");
 
-/* --- F11: FFT_NE10_FORCE_C build knob -------------------------------------
- * SIMD_KERNELS_FORCE_SCALAR (simd_kernels.h) forces the header-only SIMD
- * kernels to their scalar reference path, but it has no effect on NE10's
- * FFT: this TU calls the `_neon`-suffixed kernels directly (see the header
- * comment above), so there was previously no way to get an NE10-backend
- * build (correct twiddle/config layout, correct archive, etc.) that still
- * runs the FFT itself through NE10's plain-C scalar kernels for an
- * apples-to-apples NEON-vs-C comparison. Define -DFFT_NE10_FORCE_C (e.g.
- * `make BACKEND=ne10 selftest EXTRA_CFLAGS=-DFFT_NE10_FORCE_C`) to route
+/* SIMD_KERNELS_FORCE_SCALAR is the single C-level dispatch switch. It routes
  * every call site below through ne10_fft_r2c_1d_float32_c /
  * ne10_fft_c2r_1d_float32_c instead. Both variants are always compiled into
  * the archive (NE10_rfft_float32.c, which defines the _c versions, is
@@ -88,7 +81,7 @@ _Static_assert(offsetof(Complex, i) == offsetof(ne10_fft_cpx_float32_t, i),
  * is NOT gated out when this macro is undefined), so this is a pure
  * dispatch switch with zero effect on the archive's file list or on the
  * BACKEND=kiss build (this macro only exists in this NE10-only TU). */
-#if defined(FFT_NE10_FORCE_C)
+#if defined(SIMD_KERNELS_FORCE_SCALAR)
 #define NE10_R2C_1D_FLOAT32 ne10_fft_r2c_1d_float32_c
 #define NE10_C2R_1D_FLOAT32 ne10_fft_c2r_1d_float32_c
 #else
@@ -342,7 +335,8 @@ void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
     if (!spectrum || !magnitude) return;
 
     int k = 0;
-#if defined(__ARM_NEON) && defined(__aarch64__)
+#if defined(__ARM_NEON) && defined(__aarch64__) && \
+    !defined(SIMD_KERNELS_FORCE_SCALAR)
     /* UNLIKE fft_power() just below, this TU's fft_magnitude() does NOT call
      * fmaf() anywhere -- `re*re + im*im` is a plain separately-rounded
      * multiply/multiply/add, and this TU builds with -ffp-contract=off, so
@@ -370,7 +364,8 @@ void fft_power(const Complex* spectrum, float* power, int n_freqs) {
     if (!spectrum || !power) return;
 
     int k = 0;
-#if defined(__ARM_NEON) && defined(__aarch64__)
+#if defined(__ARM_NEON) && defined(__aarch64__) && \
+    !defined(SIMD_KERNELS_FORCE_SCALAR)
     /* Verified via `objdump -d` on the CURRENT build (no -ffp-contract=off
      * on this TU): clang contracts `re*re + im*im` into
      *   fmul s1, im, im
@@ -416,7 +411,8 @@ void fft_apply_gain(Complex* spectrum, const float* gain, int n_freqs) {
     if (!spectrum || !gain) return;
 
     int k = 0;
-#if defined(__ARM_NEON) && defined(__aarch64__)
+#if defined(__ARM_NEON) && defined(__aarch64__) && \
+    !defined(SIMD_KERNELS_FORCE_SCALAR)
     /* Pure multiplies, no add -- nothing for fp-contraction to fuse either
      * way, so this NEON path is a plain deinterleave/vmulq/reinterleave. */
     for (; k + 4 <= n_freqs; k += 4) {

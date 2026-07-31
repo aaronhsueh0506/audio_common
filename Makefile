@@ -140,6 +140,23 @@ ATTEST_STAMP ?=
 # string if the real assignment comes later in the file).
 WERROR ?= 0
 
+# One project-wide switch for every optional SIMD path.  SIMD=1 is the
+# production default; SIMD=0 keeps the selected FFT backend/configuration but
+# dispatches both our kernels and the NE10 wrapper through their scalar C
+# implementations.  `SIMD` is the only public build-time switch.
+SIMD ?= 1
+ifneq ($(words $(SIMD)),1)
+$(error SIMD must be exactly 0 or 1, got '$(SIMD)')
+endif
+ifneq ($(filter-out 0 1,$(SIMD)),)
+$(error SIMD must be exactly 0 or 1, got '$(SIMD)')
+endif
+ifeq ($(SIMD),0)
+SIMD_CFLAGS := -DSIMD_KERNELS_FORCE_SCALAR
+else
+SIMD_CFLAGS :=
+endif
+
 # FFT backend selection:
 #   - explicit `make BACKEND=kiss|ne10` always wins (policy: host/reference
 #     builds -> kiss, embedded deliverable -> ne10; single main branch).
@@ -178,11 +195,12 @@ CFLAGS  += -Wall -Wextra -O2 -std=gnu99 -Iinclude
 CXXFLAGS+= -O2 -isystem lib/ne10/inc -isystem lib/ne10/common -isystem lib/ne10/modules
 LDFLAGS += -lm
 
-# EXTRA_CFLAGS hook: lets callers inject extra defines/flags (e.g.
-# `make selftest EXTRA_CFLAGS=-DSIMD_KERNELS_FORCE_SCALAR`) into every
-# compiled TU without editing this file.
+# EXTRA_CFLAGS lets callers inject unrelated project defines/flags into every
+# compiled TU.  SIMD selection intentionally goes through `SIMD=0|1` only.
 CFLAGS  += $(EXTRA_CFLAGS)
 CXXFLAGS+= $(EXTRA_CFLAGS)
+CFLAGS  += $(SIMD_CFLAGS)
+CXXFLAGS+= $(SIMD_CFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
 
 # Per-backend, per-config-signature object AND binary dir (CFG_SIG is
@@ -208,7 +226,7 @@ OBJ_DIR = $(OBJ_ROOT)/$(BACKEND)-$(CFG_SIG)
 BIN_DIR = $(BIN_ROOT)/$(BACKEND)-$(CFG_SIG)
 
 # Backend-independent shared DSP sources (always in the archive).
-COMMON_SRCS = src/hpf.c
+COMMON_SRCS = src/hpf.c src/audio_pre_gain.c src/audio_resampler.c
 
 ifeq ($(BACKEND),ne10)
   # NE10 source footprint (review F16): fft_wrapper_ne10.c only ever calls the
@@ -619,8 +637,8 @@ endif
 # every legitimate flag this Makefile's OWN invocations actually use before
 # finalizing it: -O0/-O2/-O3, -Wall/-Wextra, -std=gnu99, -Iinclude,
 # -isystem lib/ne10/inc (letters/digits, and slash/dot for the path),
-# -DNE10_ENABLE_DSP, -DNE10_DSP_RFFT_SCALING, -DSIMD_KERNELS_FORCE_SCALAR,
-# -DPAR_PROBE, -DFFT_NE10_FORCE_C (letters/digits/underscore),
+# -DNE10_ENABLE_DSP, -DNE10_DSP_RFFT_SCALING, -DPAR_PROBE
+# (letters/digits/underscore),
 # -DROUND9_NOTE=-Ofastness / -DTEXT=ffast-math (equals, hyphen) --
 # every one of these tokens is built ONLY from this set. Comma and plus are
 # included for headroom beyond this Makefile's current own usage (e.g.
@@ -826,7 +844,7 @@ CXXFLAGS  += $(FP_POLICY)
 # remains exactly one `:=` definition of FFT_WRAPPER_ALIAS_CFLAGS in this
 # file, just relocated. A plain-environment value (no `-e`) still folds in
 # normally (origin "file") and still participates in CFG_SIG below.
-CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) SRCS=$(sort $(OWN_SRCS) $(VENDOR_SRCS) $(VENDOR_CXXSRCS)) FFT_WRAPPER_ALIAS_CFLAGS=$(FFT_WRAPPER_ALIAS_CFLAGS)
+CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) SRCS=$(sort $(OWN_SRCS) $(VENDOR_SRCS) $(VENDOR_CXXSRCS)) FFT_WRAPPER_ALIAS_CFLAGS=$(FFT_WRAPPER_ALIAS_CFLAGS)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 BE_SRCS    = $(OWN_SRCS) $(VENDOR_SRCS)
@@ -897,7 +915,7 @@ $(OBJ_DIR)/fft_wrapper.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path _cfg_guard
+.PHONY: all lib selftest test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path _cfg_guard
 all: lib
 
 lib: $(LIB)
@@ -1004,9 +1022,19 @@ selftest: $(LIB) | _cfg_guard
 	# Keep strict aliasing explicit: simd_kernels.h is consumed by external
 	# board builds which must not depend on this Makefile's per-TU exceptions.
 	$(CC) $(CFLAGS) -ffp-contract=off -fstrict-aliasing -MD -MP -c -o $(OBJ_DIR)/simd_selftest.o test/simd_selftest.c
-	$(CC) -o $(BIN_DIR)/simd_selftest $(OBJ_DIR)/simd_selftest.o -lm
+	$(CC) $(LDFLAGS) -o $(BIN_DIR)/simd_selftest $(OBJ_DIR)/simd_selftest.o
 	@echo "--- audio_common SIMD kernel selftest [$(BACKEND)] ---"
 	@$(BIN_DIR)/simd_selftest
+	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_audio_utilities.o test/test_audio_utilities.c
+	$(LINK) -o $(BIN_DIR)/test_audio_utilities $(OBJ_DIR)/test_audio_utilities.o $(LIB) $(LDFLAGS)
+	@echo "--- audio_common pre-gain/resampler test [$(BACKEND)] ---"
+	@$(BIN_DIR)/test_audio_utilities
+
+test_audio_utils: $(LIB) | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_audio_utilities.o test/test_audio_utilities.c
+	$(LINK) -o $(BIN_DIR)/test_audio_utilities $(OBJ_DIR)/test_audio_utilities.o $(LIB) $(LDFLAGS)
+	@echo "--- audio_common pre-gain/resampler test [$(BACKEND)] ---"
+	@$(BIN_DIR)/test_audio_utilities
 
 # test_pool: pool-contract negative tests (F07 alignment guards, F14 HPF
 # domain validation). Same shape as selftest -- links against the same $(LIB)
@@ -1108,11 +1136,9 @@ endif
 
 # test_ne10_force_c (F11): builds test/test_ne10_c_parity.c TWICE -- once
 # against the normal NE10 backend (calls the `_neon`-suffixed kernels) and
-# once with EXTRA_CFLAGS=-DFFT_NE10_FORCE_C (fft_wrapper_ne10.c routes every
-# FFT call through NE10's `_c` scalar kernels instead -- see that file's
-# FFT_NE10_FORCE_C block) -- then diffs the two runs' dumped outputs.
-# NE10-specific (the FFT_NE10_FORCE_C knob only exists in
-# src/fft_wrapper_ne10.c): BACKEND=ne10 is forced in both sub-makes below
+# once with SIMD=0 (fft_wrapper_ne10.c routes every FFT call through NE10's
+# `_c` scalar kernels instead) -- then diffs the two runs' dumped outputs.
+# NE10-specific: BACKEND=ne10 is forced in both sub-makes below
 # regardless of how this invocation of `make` itself resolved BACKEND, and
 # nothing here touches a BACKEND=kiss build.
 #
@@ -1134,8 +1160,8 @@ endif
 test_ne10_force_c:
 	@$(MAKE) BACKEND=ne10 _ne10_parity_bin
 	@bd_neon="$$($(MAKE) -s --no-print-directory BACKEND=ne10 print-bin-dir)"; \
-	 $(MAKE) BACKEND=ne10 EXTRA_CFLAGS=-DFFT_NE10_FORCE_C _ne10_parity_bin; \
-	 bd_c="$$($(MAKE) -s --no-print-directory BACKEND=ne10 EXTRA_CFLAGS=-DFFT_NE10_FORCE_C print-bin-dir)"; \
+	 $(MAKE) BACKEND=ne10 SIMD=0 _ne10_parity_bin; \
+	 bd_c="$$($(MAKE) -s --no-print-directory BACKEND=ne10 SIMD=0 print-bin-dir)"; \
 	 if [ "$$bd_neon" = "$$bd_c" ]; then \
 	   echo "FATAL: test_ne10_force_c: NEON and forced-C variants resolved to the SAME bin dir ($$bd_neon) -- CFG_SIG did not separate them" >&2; \
 	   exit 1; \
@@ -1151,7 +1177,7 @@ test_ne10_force_c:
 # _ne10_parity_bin: internal plumbing target invoked (via $(MAKE) BACKEND=ne10
 # [EXTRA_CFLAGS=...] _ne10_parity_bin) by test_ne10_force_c above; same shape
 # as test_pool/test_wav/etc. Because BIN_DIR is now CFG_SIG-keyed, the two
-# sub-make invocations (plain NE10 vs EXTRA_CFLAGS=-DFFT_NE10_FORCE_C) each
+# sub-make invocations (plain NE10 vs SIMD=0) each
 # land in their OWN bin/ne10-<sig>/test_ne10_c_parity -- no cp-to-rename
 # dance is needed any more to keep one variant's binary from being clobbered
 # by the other's rebuild (round-3 review B01).

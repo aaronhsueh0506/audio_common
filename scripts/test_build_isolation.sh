@@ -831,19 +831,19 @@ mtime_after="$(mtime "$ne10_lib")"
   pass "S4: normal ne10 archive byte-identical + mtime-untouched after forced-C run (scratch-redirected)" \
   || fail "S4: normal ne10 archive CHANGED by the forced-C sub-make (sha $sha_before -> $sha_after, mtime $mtime_before -> $mtime_after)"
 
-normal_lib_scratch="$(make -s BACKEND=ne10 OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" print-lib-path)"
-forcedc_lib="$(make -s BACKEND=ne10 EXTRA_CFLAGS=-DFFT_NE10_FORCE_C OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" print-lib-path)"
+normal_lib_scratch="$(make -s BACKEND=ne10 SIMD=1 OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" print-lib-path)"
+forcedc_lib="$(make -s BACKEND=ne10 SIMD=0 OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" print-lib-path)"
 [ "$forcedc_lib" != "$normal_lib_scratch" ] && pass "S4: forced-C archive lives at a different keyed path than the normal ne10 build (both under the SAME scratch roots)" \
   || fail "S4: forced-C archive path COLLIDES with the normal ne10 path ($forcedc_lib)"
 [ -f "$forcedc_lib" ] && pass "S4: forced-C archive exists on disk" || fail "S4: forced-C archive missing"
 
-forcedc_objdir="$(make -s BACKEND=ne10 EXTRA_CFLAGS=-DFFT_NE10_FORCE_C OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" print-obj-dir)"
-normal_objdir="$(make -s BACKEND=ne10 OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" print-obj-dir)"
+forcedc_objdir="$(make -s BACKEND=ne10 SIMD=0 OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" print-obj-dir)"
+normal_objdir="$(make -s BACKEND=ne10 SIMD=1 OBJ_ROOT="$S4_OBJ_ROOT" BIN_ROOT="$S4_BIN_ROOT" print-obj-dir)"
 if [ -f "$forcedc_objdir/fft_wrapper_ne10.o" ] && [ -f "$normal_objdir/fft_wrapper_ne10.o" ]; then
   s1="$(file_sha "$forcedc_objdir/fft_wrapper_ne10.o")"
   s2="$(file_sha "$normal_objdir/fft_wrapper_ne10.o")"
-  [ "$s1" != "$s2" ] && pass "S4: forced-C fft_wrapper_ne10.o differs from the normal build's (FFT_NE10_FORCE_C took effect)" \
-    || fail "S4: forced-C object is BYTE-IDENTICAL to the normal build's (FFT_NE10_FORCE_C not taking effect?)"
+  [ "$s1" != "$s2" ] && pass "S4: SIMD=0 fft_wrapper_ne10.o differs from the SIMD=1 build's" \
+    || fail "S4: SIMD=0 object is BYTE-IDENTICAL to the SIMD=1 build's (switch did not take effect?)"
 else
   fail "S4: missing fft_wrapper_ne10.o in one of the two obj dirs ($forcedc_objdir or $normal_objdir)"
 fi

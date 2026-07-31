@@ -3,8 +3,8 @@
  *
  * This TU is built TWICE by the `test_ne10_force_c` Makefile target: once
  * against the normal NE10 backend (calls the `_neon` kernels) and once with
- * -DFFT_NE10_FORCE_C (fft_wrapper_ne10.c routes every call through the `_c`
- * scalar kernels instead -- see that file's FFT_NE10_FORCE_C block). Both
+ * SIMD=0 (fft_wrapper_ne10.c routes every call through the `_c` scalar
+ * kernels instead). Both
  * runs exercise the exact same fixed test vectors (impulse + a deterministic
  * PRNG signal) at nfft in {256, 512, 1024} and dump forward-spectrum +
  * inverse-output raw float32 bytes to the file named by argv[1]. A separate
@@ -17,7 +17,7 @@
  * The PRNG is a fixed, hand-rolled LCG (not libc rand()) specifically so the
  * "random" vector is bit-identical across both builds/platforms -- libc
  * rand() is not required to produce the same sequence across libc versions
- * or even across -DFFT_NE10_FORCE_C vs. not (different translation but same
+ * or even across SIMD=0 vs. SIMD=1 (different translation but same
  * libc here, so it would probably be fine, but there is no reason to depend
  * on that when a 2-line LCG removes the dependency entirely).
  */

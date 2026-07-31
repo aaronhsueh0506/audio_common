@@ -5,7 +5,7 @@
  * builds with a single plain `cc` invocation regardless of BACKEND. Reads
  * the two raw float32 dump files produced by two separate builds of
  * test_ne10_c_parity.c (one linked against the normal NE10 `_neon` kernels,
- * one against -DFFT_NE10_FORCE_C's `_c` kernels) and reports the max
+ * one against SIMD=0's `_c` kernels) and reports the max
  * absolute and max relative difference between them.
  *
  * The two dumps are NOT expected to be bit-identical -- the `_neon` and `_c`

@@ -913,7 +913,7 @@ static void test_mcra_noise_update(void) {
  * below, same as the rest of this file -- this satisfies the review's
  * forced-scalar/forced-NEON comparison ask for this file's kernels (the
  * NE10 FFT kernel side of that same ask is covered by audio_common's
- * FFT_NE10_FORCE_C knob, exercised via `make test_ne10_force_c`, not by
+ * SIMD=0 switch, exercised via `make test_ne10_force_c`, not by
  * this file). */
 
 #define EDGE_GUARD 32           /* guaranteed guard elements each side of the

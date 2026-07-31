@@ -8,8 +8,10 @@ One copy of the shared DSP code for every consumer repo (AEC, NR, Audio_ALG):
 | KISS FFT | `lib/kiss_fft/` | portable reference backend |
 | NE10 | `lib/ne10/` | whole, **unmodified** NE10 DSP module (C + NEON kernels) |
 | fast_math | `include/fast_math.h` | header-only LUT/Taylor approximations |
-| simd_kernels | `include/simd_kernels.h` | header-only **bit-exact** NEON/scalar per-bin kernels (complex magnitude, complex MAC / filter W-updates, EMA, gain apply, min/clip, pairwise sums, fast_sqrt, fast_exp/fast_exp_neg/fast_log/fast_log10/exp1_approx, mcra per-bin-varying-alpha noise update). Every kernel has an always-compiled scalar twin; the AArch64 NEON body replicates the scalar op sequence lane-for-lane (strict FMA discipline, no estimate instructions). `SIMD_KERNELS_FORCE_SCALAR` forces the fallback; consumer TUs must build with `-ffp-contract=off` (see the header's doc comment). `make selftest` runs the bitwise NEON-vs-scalar check (the exp/log family is additionally cross-checked bit-for-bit against fast_math.h's own implementation, which this header privately replicates rather than includes) |
+| simd_kernels | `include/simd_kernels.h` | header-only **bit-exact** NEON/scalar per-bin kernels (complex magnitude, complex MAC / filter W-updates, EMA, gain apply, min/clip, pairwise sums, fast_sqrt, fast_exp/fast_exp_neg/fast_log/fast_log10/exp1_approx, mcra per-bin-varying-alpha noise update). Every kernel has an always-compiled scalar twin; the AArch64 NEON body replicates the scalar op sequence lane-for-lane (strict FMA discipline, no estimate instructions). Use the Makefile's `SIMD=0` switch to select every scalar fallback; consumer TUs must build with `-ffp-contract=off` (see the header's doc comment). `make selftest` runs the bitwise NEON-vs-scalar check (the exp/log family is additionally cross-checked bit-for-bit against fast_math.h's own implementation, which this header privately replicates rather than includes) |
 | HPF | `include/hpf.h`, `src/hpf.c` | biquad high-pass (f32, DF2-transposed), `hpf_create`/`hpf_get_mem_size`+`hpf_init` API — shared by platform code AND AEC's mic path |
+| pre-gain | `include/audio_pre_gain.h`, `src/audio_pre_gain.c` | amplitude-dB (`10^(dB/20)`) input gain, heap/static lifecycle, in-place-safe, AArch64 NEON/scalar |
+| resampler | `include/audio_resampler.h`, `src/audio_resampler.c` | streaming rational polyphase float32 resampler; only 8/16/24/32/48 kHz, 1–8 interleaved channels, heap/static lifecycle, block-boundary-identical state |
 
 ## Build
 
@@ -17,7 +19,9 @@ One copy of the shared DSP code for every consumer repo (AEC, NR, Audio_ALG):
 make               # backend auto-detected from the compiler (ARM NEON -> ne10, else kiss)
 make BACKEND=kiss  # force portable KISS backend
 make BACKEND=ne10  # force NE10 backend (ARM NEON)
+make SIMD=0        # keep the backend/grid but force every optional SIMD path to scalar
 make selftest      # round-trip + static==heap byte-equality check
+make test_audio_utils  # pre-gain + all supported resample-rate pairs
 ```
 
 Output: `bin/<backend>-<config-hash>/libaudio_common.a` (round-3 review B01:
@@ -27,6 +31,35 @@ stomp each other's archive). Run `make print-lib-path` (same flags as your
 build) to get this build's exact archive path, or `make publish` for a stable
 `dist/<backend>/current/` handoff path. Consumers add `-I<here>/include` and
 link the archive for their chosen backend.
+
+## Pre-gain and resampling
+
+`AudioPreGain` takes amplitude dB, converts it once, and applies no clipping:
+
+```c
+AudioPreGain *gain = audio_pre_gain_create(-6.0f);
+audio_pre_gain_process(gain, input, output, sample_count); /* in-place is OK */
+audio_pre_gain_destroy(gain);
+```
+
+`AudioResampler` accepts only 8000, 16000, 24000, 32000, and 48000 Hz.
+Samples are interleaved float32 frames and the object must remain alive across
+streaming blocks:
+
+```c
+AudioResampler *rs = audio_resampler_create(48000, 16000, 4);
+int capacity = audio_resampler_output_bound(rs, input_frames);
+int consumed, produced;
+audio_resampler_process(
+    rs, input_4ch, input_frames, output_4ch, capacity,
+    &consumed, &produced);
+audio_resampler_destroy(rs);
+```
+
+Use the `get_mem_size`/`init` APIs for caller-owned aligned memory. Unequal-rate
+input and output must not overlap; equal-rate conversion is an exact `memmove`
+pass-through. `audio_resampler_reset()` clears streaming history, so do not
+call it at ordinary chunk boundaries.
 
 Backend policy: desktop/CI builds use KISS (bit-reproducible reference); embedded
 builds pass `BACKEND=ne10`. Backend is a build knob, not a branch property — every

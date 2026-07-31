@@ -23,7 +23,8 @@
 #include <string.h>
 #include <math.h>
 
-#if defined(__ARM_NEON) && defined(__aarch64__)
+#if defined(__ARM_NEON) && defined(__aarch64__) && \
+    !defined(SIMD_KERNELS_FORCE_SCALAR)
 #include <arm_neon.h>
 #endif
 
@@ -222,7 +223,8 @@ void fft_inverse_scratch(FftHandle* h, Complex* freq_in_clobbered, float* real_o
 void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
     if (!spectrum || !magnitude) return;
     int k = 0;
-#if defined(__ARM_NEON) && defined(__aarch64__)
+#if defined(__ARM_NEON) && defined(__aarch64__) && \
+    !defined(SIMD_KERNELS_FORCE_SCALAR)
     /* UNLIKE fft_power() just below, this TU's fft_magnitude() does NOT call
      * fmaf() anywhere -- `re*re + im*im` is a plain separately-rounded
      * multiply/multiply/add, and this TU builds with -ffp-contract=off (see
@@ -250,7 +252,8 @@ void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
 void fft_power(const Complex* spectrum, float* power, int n_freqs) {
     if (!spectrum || !power) return;
     int k = 0;
-#if defined(__ARM_NEON) && defined(__aarch64__)
+#if defined(__ARM_NEON) && defined(__aarch64__) && \
+    !defined(SIMD_KERNELS_FORCE_SCALAR)
     /* Verified via `objdump -d` on the CURRENT build (no -ffp-contract=off
      * on this TU): clang contracts `re*re + im*im` into
      *   fmul s1, im, im
@@ -291,7 +294,8 @@ void fft_from_mag_phase(const float* magnitude, const float* phase,
 void fft_apply_gain(Complex* spectrum, const float* gain, int n_freqs) {
     if (!spectrum || !gain) return;
     int k = 0;
-#if defined(__ARM_NEON) && defined(__aarch64__)
+#if defined(__ARM_NEON) && defined(__aarch64__) && \
+    !defined(SIMD_KERNELS_FORCE_SCALAR)
     /* Pure multiplies, no add -- nothing for fp-contraction to fuse either
      * way, so this NEON path is a plain deinterleave/vmulq/reinterleave. */
     for (; k + 4 <= n_freqs; k += 4) {
