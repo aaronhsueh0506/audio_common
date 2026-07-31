@@ -2105,7 +2105,7 @@ echo "--- S17g: BUILD-RELEVANT untracked source (tracked Makefile edit wires it 
 S17G_CLONE="$SCRATCH_ROOT/s17/clone_g"
 adopt_worktree_clone "$AC_DIR" "$S17G_CLONE"
 echo "int s17g_probe_symbol(void) { return 17; }" > "$S17G_CLONE/src/s17g_probe.c"
-sed -i.s17gbak 's|^COMMON_SRCS = src/hpf.c$|COMMON_SRCS = src/hpf.c src/s17g_probe.c|' "$S17G_CLONE/Makefile"
+sed -i.s17gbak '/^COMMON_SRCS[[:space:]]*=/ s|$| src/s17g_probe.c|' "$S17G_CLONE/Makefile"
 rm -f "$S17G_CLONE/Makefile.s17gbak"
 grep -q 's17g_probe\.c' "$S17G_CLONE/Makefile" || fail "S17g: Makefile seam edit did not land (COMMON_SRCS line changed shape?)"
 
