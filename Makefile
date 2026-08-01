@@ -179,7 +179,7 @@ endif
 # unconditionally, before any target is selected), corrupting the captured
 # value.
 ifeq ($(filter print-%,$(MAKECMDGOALS)),)
-$(info audio_common: FFT backend = $(BACKEND))
+$(info audio_common: FFT backend = $(BACKEND) -- switch with `make BACKEND=kiss` or `make BACKEND=ne10`)
 endif
 
 # gnu99 (not strict c99): the vendored NE10 headers use the GNU asm("label")
