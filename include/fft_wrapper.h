@@ -105,19 +105,30 @@ int fft_get_n_freqs(const FftHandle* handle);
  * Forward FFT: real input -> complex output
  *
  * @param handle FFT handle
- * @param time_in Real input [fft_size]
- * @param freq_out Complex output [n_freqs]
+ * @param time_in Real input [fft_size] -- must not alias freq_out
+ * @param freq_out Complex output [n_freqs] -- must not alias time_in
+ *
+ * `restrict`: every call site across AEC/NR/Audio_ALG/audio_common passes
+ * distinct, non-overlapping buffers (audited); this lets the compiler
+ * auto-vectorize the copy/scale loops it otherwise can't prove safe.
+ * Overlapping buffers are undefined behavior -- use fft_forward_scratch()
+ * (below) if you need an in-place-style call on a scratch buffer.
  */
-void fft_forward(FftHandle* handle, const float* time_in, Complex* freq_out);
+void fft_forward(FftHandle* handle, const float* restrict time_in,
+                 Complex* restrict freq_out);
 
 /**
  * Inverse FFT: complex input -> real output
  *
  * @param handle FFT handle
- * @param freq_in Complex input [n_freqs]
- * @param time_out Real output [fft_size]
+ * @param freq_in Complex input [n_freqs] -- must not alias time_out
+ * @param time_out Real output [fft_size] -- must not alias freq_in
+ *
+ * `restrict`: see fft_forward()'s doc comment above -- same audited
+ * no-aliasing guarantee at every call site.
  */
-void fft_inverse(FftHandle* handle, const Complex* freq_in, float* time_out);
+void fft_inverse(FftHandle* handle, const Complex* restrict freq_in,
+                 float* restrict time_out);
 
 /**
  * Forward FFT: real input -> complex output, input clobber PERMITTED.

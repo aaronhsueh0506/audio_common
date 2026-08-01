@@ -17,6 +17,8 @@
 #if defined(__ARM_NEON) && defined(__aarch64__) && \
     !defined(SIMD_KERNELS_FORCE_SCALAR)
 #include <arm_neon.h>
+#include "simd_kernels.h"   /* sk__cquad_load/sk__cquad_store: may_alias-safe
+                             * vld2q_f32/vst2q_f32, see simd_kernels.h */
 #endif
 
 /* --- F11: compile-time proof that Complex and ne10_fft_cpx_float32_t are
@@ -266,7 +268,7 @@ int fft_get_n_freqs(const FftHandle* h) {
     return h ? h->n_freqs : 0;
 }
 
-void fft_forward(FftHandle* h, const float* real_in, Complex* complex_out) {
+void fft_forward(FftHandle* h, const float* restrict real_in, Complex* restrict complex_out) {
     if (!h || !real_in || !complex_out) return;
 
     // Copy input to work buffer (NE10 R2C may modify input; real_in is the
@@ -283,7 +285,7 @@ void fft_forward(FftHandle* h, const float* real_in, Complex* complex_out) {
     NE10_R2C_1D_FLOAT32((ne10_fft_cpx_float32_t*)complex_out, h->real_buf, h->r2c_cfg);
 }
 
-void fft_inverse(FftHandle* h, const Complex* complex_in, float* real_out) {
+void fft_inverse(FftHandle* h, const Complex* restrict complex_in, float* restrict real_out) {
     if (!h || !complex_in || !real_out) return;
 
     // Copy n_freqs bins to work buffer (NE10 C2R may modify input; complex_in
@@ -347,7 +349,7 @@ void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
      * (identical in both backends). vsqrtq_f32 is IEEE-754 correctly-rounded,
      * matching scalar sqrtf() lane-for-lane. */
     for (; k + 4 <= n_freqs; k += 4) {
-        float32x4x2_t v = vld2q_f32((const float*)(spectrum + k));
+        float32x4x2_t v = sk__cquad_load(spectrum + k);
         float32x4_t re = v.val[0], im = v.val[1];
         float32x4_t sumsq = vaddq_f32(vmulq_f32(re, re), vmulq_f32(im, im));
         vst1q_f32(magnitude + k, vsqrtq_f32(sumsq));
@@ -376,7 +378,7 @@ void fft_power(const Complex* spectrum, float* power, int n_freqs) {
      * path mirrors the same fused/unfused shape lane-for-lane (im*im via
      * vmulq_f32, then vfmaq_f32(that, re, re)). */
     for (; k + 4 <= n_freqs; k += 4) {
-        float32x4x2_t v = vld2q_f32((const float*)(spectrum + k));
+        float32x4x2_t v = sk__cquad_load(spectrum + k);
         float32x4_t re = v.val[0], im = v.val[1];
         float32x4_t p = vfmaq_f32(vmulq_f32(im, im), re, re);
         vst1q_f32(power + k, p);
@@ -416,12 +418,12 @@ void fft_apply_gain(Complex* spectrum, const float* gain, int n_freqs) {
     /* Pure multiplies, no add -- nothing for fp-contraction to fuse either
      * way, so this NEON path is a plain deinterleave/vmulq/reinterleave. */
     for (; k + 4 <= n_freqs; k += 4) {
-        float32x4x2_t v = vld2q_f32((const float*)(spectrum + k));
+        float32x4x2_t v = sk__cquad_load(spectrum + k);
         float32x4_t g = vld1q_f32(gain + k);
         float32x4x2_t r;
         r.val[0] = vmulq_f32(v.val[0], g);
         r.val[1] = vmulq_f32(v.val[1], g);
-        vst2q_f32((float*)(spectrum + k), r);
+        sk__cquad_store(spectrum + k, r);
     }
 #endif
     for (; k < n_freqs; k++) {
