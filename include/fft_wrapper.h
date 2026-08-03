@@ -180,11 +180,10 @@ void fft_power(const Complex* freq, float* power, int n_freqs);
  * Compute phase spectrum from complex spectrum (atan2f(im, re) per bin).
  *
  * Defined in both backends (fft_wrapper.c / fft_wrapper_ne10.c) but had no
- * header declaration until the s4-audio-common-sweep review's hygiene fix
- * (round-3-style: currently no caller anywhere in AEC/NR/Audio_ALG/
- * audio_common — flagged, not removed, since deleting a public-looking pair
+ * header declaration -- currently no caller anywhere in AEC/NR/Audio_ALG/
+ * audio_common. Flagged, not removed, since deleting a public-looking pair
  * (fft_phase/fft_from_mag_phase) is a bigger decision than adding the
- * missing prototypes).
+ * missing prototypes.
  *
  * @param freq Complex spectrum [n_freqs]
  * @param phase Output phase (radians) [n_freqs]
