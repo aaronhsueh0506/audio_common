@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# audit_fp_contract.sh — FP-contraction policy verification (round-3 review B04).
+# audit_fp_contract.sh — FP-contraction policy verification.
 #
 # The unified policy (audio_common/NR/c_impl/AEC/c_impl/Audio_ALG/pipelines
 # Makefiles, all four): EVERY TU those Makefiles compile — our own sources
@@ -59,8 +59,7 @@
 #      audited, not exempted. (Empirically: this object carried 36
 #      fmla-class instructions built WITHOUT -ffp-contract=off, and 0 with
 #      it — the single most convincing before/after data point for this
-#      whole change; see the round-3 B04 report for the full before/after
-#      table across every object in this list.)
+#      whole change.)
 #
 # The AEC repo's own aec_simd_kernels.h — explicit vfmaq_f32 intrinsics
 # consumed by AEC's TUs — is the same EXEMPT category as case 1 above, by
@@ -159,7 +158,7 @@ count_fma() {
     disas "$1" | grep -icE "$FMA_RE" || true
 }
 
-# --- Audit list (round-3 review B04) ----------------------------------------
+# --- Audit list ---------------------------------------------------------
 # One row per TU: "repo|backend-scope|object|class|note"
 #   repo:  AC (audio_common) | NR
 #   scope: both | kiss | ne10  (which BACKEND(s) this object is even compiled under)

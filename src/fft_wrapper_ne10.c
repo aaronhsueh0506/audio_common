@@ -102,7 +102,7 @@ _Static_assert(offsetof(Complex, i) == offsetof(ne10_fft_cpx_float32_t, i),
 #error "NE10 backend requires compile-time NEON (__ARM_NEON && __aarch64__)"
 #endif
 
-/* --- P0003 (re-review R05): fft_size whitelist ----------------------------
+/* fft_size whitelist --------------------------------------------------------
  * All three public entry points below (fft_create/fft_get_mem_size/fft_init)
  * used to accept ANY positive power of two, including tiny ones (1/2/4/8)
  * that fall into ne10_fft_init_r2c_float32_ext's pre-P0003 nfft<16

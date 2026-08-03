@@ -82,8 +82,7 @@
  *       rounding, no float32 path) -- NR's historical behavior, also
  *       saturated into int16_t range.
  *
- * Writer hardening (external re-review finding R01, PCM16 quantization +
- * RIFF-size arithmetic -- fixed in place, not preserved as a "quirk"):
+ * PCM16 quantization and RIFF-size validation:
  *   - Undefined behavior at the +-1.0f boundary: the pre-fix AEC-style
  *     quantizer cast `scaled +- 0.5f` directly to int16_t; for
  *     sample==+1.0f that's (int16_t)32768.5f, an out-of-range

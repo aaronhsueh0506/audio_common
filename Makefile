@@ -484,7 +484,7 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FFT_WRAPPER_ALIAS_CFLAGS 
 # not compiler-chosen contraction of a plain `a*b+c` expression, and
 # -ffp-contract only controls the latter. See scripts/audit_fp_contract.sh
 # for the disassembly-level verification (PASS/EXEMPT table distinguishing
-# the two) and each repo's README/CLAUDE.md for the cross-repo policy note.
+# the two) and each repo's README for the cross-repo policy note.
 #
 # Conflict detection (widened to CXXFLAGS/CPPFLAGS as well): a caller
 # passing EXTRA_CFLAGS=-Ofast/-ffast-math (both

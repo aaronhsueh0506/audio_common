@@ -1,6 +1,5 @@
 #!/bin/sh
-# run_selftest_ubsan.sh - UBSan probe for test/simd_selftest.c
-# (round-3 review B05, item 5).
+# run_selftest_ubsan.sh - UBSan probe for test/simd_selftest.c.
 #
 # Standalone script rather than a new Makefile target: this repo's Makefile
 # is being reworked concurrently by another task, so wiring a target in

@@ -30,7 +30,7 @@
                              * vld2q_f32/vst2q_f32, see simd_kernels.h */
 #endif
 
-/* --- P0003 (re-review R05): fft_size whitelist ----------------------------
+/* fft_size whitelist --------------------------------------------------------
  * Mirrors fft_wrapper_ne10.c's fft_size_in_range: [16, 8192], power of two.
  * KISS's own arithmetic here already runs through the checked ck_* helpers
  * (mem_align.h) in 64-bit size_t, so it does not share the NE10 backend's

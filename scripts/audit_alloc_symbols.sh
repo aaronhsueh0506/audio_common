@@ -22,8 +22,8 @@
 # Usage:
 #   scripts/audit_alloc_symbols.sh <path-to-binary> [<path-to-binary> ...]
 #
-# Example (bin/ is now keyed bin/<backend>-<config-hash>/ — round-3 review
-# B01; resolve the exact path for your flags with `make print-bin-dir` /
+# Example (bin/ is keyed bin/<backend>-<config-hash>/; resolve the exact
+# path for your flags with `make print-bin-dir` /
 # `make print-lib-path`, or use `dist/<backend>/current/` after `make
 # publish`):
 #   scripts/audit_alloc_symbols.sh "$(make -s BACKEND=ne10 print-lib-path)"

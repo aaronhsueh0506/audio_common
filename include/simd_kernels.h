@@ -30,7 +30,7 @@
  * equality for those kernels — only that NaN inputs don't corrupt unrelated
  * lanes/output.
  *
- * ───────────────────── Contract summary (re-review R07) ──────────────────
+ * ───────────────────── Contract summary ─────────────────────────────────
  * Stated once, plainly, as the one-paragraph version of the two blocks
  * above: every kernel here is scalar-reference bit-exact for FINITE inputs,
  * full stop, no exceptions, gated by simd_selftest.c's exit(1)-on-mismatch
@@ -50,8 +50,8 @@
  * selection implementation-defined) while still both correctly producing
  * *a* NaN. aec_simd_kernels.h's own selftest (simd_selftest_aec.c) has a
  * real classified gate for exactly that "both sides say NaN, payloads
- * differ" case (bit-exact / both-NaN-payload-unspecified / HARD FAIL,
- * re-review R07) — see that file's header comment for the full contract and
+ * differ" case (bit-exact / both-NaN-payload-unspecified / HARD FAIL) — see
+ * that file's header comment for the full contract and
  * the empirical result (100% of its historical mismatches are the in-contract
  * both-NaN case, 0% are a genuine finite-vs-NaN divergence).
  *
@@ -162,8 +162,8 @@
  * 23/24/25/27, documented at their definitions below); otherwise pointers
  * are assumed non-aliasing.
  *
- * Round-3 review B05 (extended by the NR/c_impl calculate_gain()/
- * spp_estimate() scratch-buffer-reuse review): only the alias forms actually
+ * Only the alias forms exercised by the self-test and the NR scratch-buffer
+ * reuse paths are
  * exercised by simd_selftest.c's matrix are contractually supported --
  * sk_capply_gain_f32's literal out == z (dedicated in-place check in
  * test_capply_gain()), plus sk_fast_exp_f32/sk_fast_exp_neg_f32/

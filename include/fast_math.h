@@ -126,12 +126,12 @@ static inline float exp1_approx(float v) {
  * every possible float bit pattern; only the finite-domain results need to
  * match (and are what the parity/regression gates actually check).
  *
- * ───────────────── Special-value contract table (re-review R07) ──────────
+ * ───────────────── Special-value contract table ─────────────────────────
  * Plain statement of the above as a lookup table, one row per non-finite or
  * boundary input, both build modes side by side. Every "fast_*" entry below
  * is measured and pinned by test/simd_selftest.c's dedicated special-value
  * asserts (not just asserted in this comment) -- see that file's "pinned
- * special-value contract (re-review R07)" section. Bit patterns are this
+ * special-value contract" section. Bit patterns are this
  * toolchain's IEEE-754 binary32 (Apple clang 17, arm64, -ffp-contract=off);
  * they follow deterministically from the source below, not from any
  * platform-specific rounding mode.
