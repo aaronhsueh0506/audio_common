@@ -35,7 +35,7 @@
 /* ═══════════════════════════════ config ═══════════════════════════════ */
 
 #define SK_TEST_MAX_N 512
-/* Round-3 review B05: extended to n=0 (must be a zero-read/zero-write no-op,
+/* Extended to n=0 (must be a zero-read/zero-write no-op,
  * see the canary section below) plus the COMPLETE 1..17 run (every kernel's
  * 4-lane NEON/scalar-tail boundary crossed at every possible remainder, not
  * just a sparse sample) -- on top of the original hand-picked lane/leaf/
@@ -136,14 +136,14 @@ static void fill_bench_complex(Complex *a, int n) {
 }
 
 /* ═══════════════════════════ mismatch reporting ═══════════════════════════
- * g_total_checks (round-3 review B05): a running count of individual
+ * g_total_checks: a running count of individual
  * bit-pattern comparisons actually performed, incremented at each of the
  * few chokepoints every check funnels through (check_bits_or_die,
  * check_scalar_bits_or_die, the special-value asserts, and the new canary
  * checks below) -- so main()'s final printout is a real, reproducible
  * "how much did this run actually verify" number instead of a hand count,
- * and the review's requested before/after totals are just two runs of the
- * same binary at two points in this file's history. */
+ * and comparing it before and after a change is just two runs of the
+ * same binary at two points in this file's history, not a hand-wavy claim. */
 
 static long g_total_checks = 0;
 
@@ -862,8 +862,8 @@ static void test_mcra_noise_update(void) {
 }
 
 
-/* ═══════════ alignment + canary edge-case matrix (round-3 review B05) ═════
- * Finding B05's edge-case matrix, layered on top of the per-kernel
+/* ═══════════ alignment + canary edge-case matrix ═══════════════════════════
+ * This edge-case matrix, layered on top of the per-kernel
  * correctness tests above:
  *
  *   - n=0: every test above already runs it (see the extended N_LIST). For
@@ -1572,7 +1572,7 @@ int main(void) {
     test_exp_log_family_inplace();
     test_mcra_noise_update();
 
-    printf("\n--- alignment + canary edge-case matrix (round-3 review B05) ---\n");
+    printf("\n--- alignment + canary edge-case matrix ---\n");
     test_ema_edge();
     test_capply_gain_edge();
     test_cadd_edge();

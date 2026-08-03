@@ -12,7 +12,7 @@
  * freed/NULL FILE*). Every well-formed input must parse exactly as it did
  * before the F06 hardening pass.
  *
- * Also covers the writer's finalize path (B08, re-review round-3):
+ * Also covers the writer's finalize path (B08):
  * wav_finalize_write()'s checked fseek/fwrite/fclose failure paths, via a
  * funopen()/fopencookie()-backed injectable-failure FILE* (see the section
  * above main() below) -- RLIMIT_FSIZE (used for the plain wav_write_float
@@ -20,19 +20,18 @@
  * fwrite failure at finalize time specifically. That fake-stream backend is
  * BSD/macOS funopen() or glibc fopencookie(); on any other platform the
  * injectable-failure test group is skipped with a clear SKIP message
- * instead of failing to compile/link (round-4 review P2-3) -- everything
+ * instead of failing to compile/link -- everything
  * else in this file is portable C99/POSIX and still runs there.
  *
  * Also covers wav_open_write()'s fail-fast argument/header-field validation
- * and wav_finalize_write()'s pathological-size abandon path (round-4 review
- * P1-3).
+ * and wav_finalize_write()'s pathological-size abandon path.
  *
  * Plain assert-and-report harness, same shape as test_pool_contract.c: no
  * external framework, every failure prints and flips a global fail flag,
  * main() reports ALL PASS / FAIL at the end so one bad check doesn't hide
  * the rest.
  */
-/* Must precede every #include (round-4 review P2-3): glibc's fopencookie()/
+/* Must precede every #include: glibc's fopencookie()/
  * off64_t/cookie_io_functions_t are only declared behind _GNU_SOURCE, and
  * that has to be visible before <stdio.h> is first pulled in by ANY header
  * below (including wav_io.h itself). __linux__ is a compiler-predefined
@@ -820,7 +819,7 @@ static void test_write_error_on_short_write(void) {
  * A FILE* backed by caller-supplied read/write/seek/close callbacks instead
  * of a real fd/file lets each of the three be made to fail independently
  * and on demand. Two such APIs exist, with different callback signatures,
- * and neither is portable C99/POSIX-base (round-4 review P2-3):
+ * and neither is portable C99/POSIX-base:
  *   - funopen(3) on BSD/macOS.
  *   - fopencookie(3) (a cookie_io_functions_t of read/write/seek/close
  *     function pointers) on glibc.
@@ -958,8 +957,8 @@ static void test_finalize_write_injectable_failures(void) {
 #if !HAVE_FAKE_STREAM
     fprintf(stderr,
             "SKIP: wav_finalize_write() injectable-failure coverage -- "
-            "no funopen()/fopencookie() fake-stream backend on this platform "
-            "(round-4 review P2-3)\n");
+            "no funopen()/fopencookie() fake-stream backend on this "
+            "platform\n");
     return;
 #else
     char* path = NULL;
@@ -1032,7 +1031,7 @@ static void test_finalize_write_injectable_failures(void) {
 #endif /* HAVE_FAKE_STREAM */
 }
 
-/* ═════════ round-4 review P1-3: wav_open_write / wav_finalize_write ════════
+/* ═════════ wav_open_write / wav_finalize_write ═════════════════════════════
  * negative-argument and pathological-size coverage.
  */
 

@@ -1,7 +1,7 @@
 /*
  * atomic_symlink_swap -- atomic publish-time filesystem helpers.
  *
- * Mode 1 (round-5 review P2: publish's `current` handoff swap):
+ * Mode 1 (publish's `current` handoff swap):
  *
  *   swapln <link-target> <link-path>
  *
@@ -17,7 +17,7 @@
  * not have, and the previous rm+mv fallback left a window with no `current`
  * at all and went destructive on ANY mv failure).
  *
- * Mode 2 (round-6 review P2: one-event-one-file ATTEST install):
+ * Mode 2 (one-event-one-file ATTEST install):
  *
  *   swapln --excl-install <src-file> <dst-path>
  *

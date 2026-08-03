@@ -93,7 +93,7 @@
  *     final int16_t narrowing. The float rounding arithmetic itself is
  *     unchanged (still `sample*32768.0f`, then +-0.5f before truncating):
  *     verified bit-identical over this repo's regression corpus and its
- *     byte-exact anchor renders (re-review round-3, B08). That is NOT the
+ *     byte-exact anchor renders. That is NOT the
  *     same claim as "bit-identical for every |sample| < 1 input" -- a value
  *     arbitrarily close to +-1.0f (e.g. nextafterf(1.0f, 0.0f), |sample| <
  *     1 by definition) can still push the `scaled +- 0.5f` accumulator past
@@ -468,13 +468,13 @@ static inline void wav_close_read(WavReader* r) {
  * @param sample_rate Sample rate
  * @param channels Number of channels (usually 1)
  * @return Writer handle, or NULL on error -- including invalid arguments
- *         (NULL path, sample_rate <= 0, channels <= 0, round-4 review P1-3)
+ *         (NULL path, sample_rate <= 0, channels <= 0)
  *         and a header-field range that would not fit the on-disk WAV
  *         fields (block_align > 0xFFFF or byte_rate > 0xFFFFFFFF, mirroring
  *         wav_finalize_write's pathological-size checks -- see below)
  */
 static inline WavWriter* wav_open_write(const char* path, int sample_rate, int channels) {
-    // Fail fast on invalid arguments (round-4 review P1-3), before ever
+    // Fail fast on invalid arguments, before ever
     // touching the filesystem.
     if (!path || sample_rate <= 0 || channels <= 0) return NULL;
 
@@ -496,8 +496,8 @@ static inline WavWriter* wav_open_write(const char* path, int sample_rate, int c
 #endif
     int sample_bytes = is_float ? 4 : 2;
 
-    // Mirrors wav_finalize_write's pathological-size abandon checks (round-4
-    // review P1-3): reject up front, matching the same block_align/byte_rate
+    // Mirrors wav_finalize_write's pathological-size abandon checks: reject
+    // up front, matching the same block_align/byte_rate
     // bounds the finalize path enforces on close, instead of writing a
     // placeholder header for a WavWriter that could never finalize a valid
     // one anyway.
@@ -657,7 +657,7 @@ static inline int wav_finalize_write(WavWriter* w) {
 
     int sample_bytes = w->info.is_float ? 4 : 2;
 
-    /* Checked multiply (round-4 review P1-3): per_sample is tiny in every
+    /* Checked multiply: per_sample is tiny in every
      * real build (channels <=8 by convention in this codebase's readers,
      * sample_bytes is 2 or 4), so in practice this can only actually reject
      * a hand-built WavWriter/WavInfo outside wav_open_write (which now
@@ -674,7 +674,7 @@ static inline int wav_finalize_write(WavWriter* w) {
         // would wrap before it could even be range-checked. Abandon the
         // file (fclose + free) instead of finalizing from wrapped values.
         // Same "always report failure" contract as the range-check abandon
-        // path just below (round-4 review P1-3): the on-disk placeholder
+        // path just below: the on-disk placeholder
         // header is stale/incomplete by design here, regardless of whether
         // fclose itself happens to also succeed.
         fclose(w->fp);
@@ -700,7 +700,7 @@ static inline int wav_finalize_write(WavWriter* w) {
         // Pathological size (never hit by any real capture) -- would
         // silently truncate a WAV header field. Abandon the file instead
         // of writing a corrupt header. This path ALWAYS reports failure
-        // (round-4 review P1-3, fixing a prior bug here: a clean fclose on
+        // (fixing a prior bug here: a clean fclose on
         // this abandon path used to make this return 0/success, silently
         // contradicting this function's own @return doc, which already
         // promised -1 for exactly this path) -- the file is abandoned with

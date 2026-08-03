@@ -20,7 +20,7 @@ CXX     ?= c++
 AR      ?= ar
 RANLIB  ?= ranlib
 
-# CFG_SIG payload-coverage placeholders (round-3 review B01). CPPFLAGS/
+# CFG_SIG payload-coverage placeholders. CPPFLAGS/
 # EXTRA_LDFLAGS/NO_STDIO/DEBUG are not consumed by this particular Makefile
 # today, but the CFG_SIG payload (see "Hash-keyed object directory" below)
 # unconditionally includes all of them so that (a) the payload string has
@@ -33,7 +33,7 @@ RANLIB  ?= ranlib
 #
 # CPPFLAGS is different: it is also one of the six names the "Command-line
 # override rejection" foreach further below rejects a command-line/`-e`
-# override of (a Codex review finding). `?=` only ever assigns when the
+# override of it. `?=` only ever assigns when the
 # variable's origin is still "undefined" -- if CPPFLAGS already has a value
 # from the environment, `?=` is a complete no-op (GNU Make never attempts
 # the assignment at all), so the origin never flips to "environment
@@ -53,24 +53,24 @@ NO_STDIO      ?= 0
 DEBUG         ?= 0
 
 # TOOLCHAIN_CHECK=0 skips the CC/CXX -dumpmachine target-coherence guard in
-# _cfg_guard below (round-4 review P1-2). Participates in CFG_SIG, so a
+# _cfg_guard below. Participates in CFG_SIG, so a
 # guard-skipped build can never alias a guarded one.
 TOOLCHAIN_CHECK ?= 1
 
-# DIST_ROOT (round-5 review P1): where `make publish` writes its release
+# DIST_ROOT: where `make publish` writes its release
 # tree (default: dist/ in this directory). A legitimate override channel --
 # the isolation test scripts publish into a throwaway mktemp directory so
 # they can exercise publish/republish/tamper scenarios without ever touching
 # (let alone deleting) the REAL dist/ releases. Deliberately NOT in CFG_SIG:
 # it changes where a release is copied, never what is built.
 #
-# HOSTCC (round-5 review P2): compiles the tiny atomic-symlink-swap helper
+# HOSTCC: compiles the tiny atomic-symlink-swap helper
 # (tools/atomic_symlink_swap.c) AT PUBLISH TIME. This must be a compiler
 # whose output runs on the BUILD HOST -- never $(CC), which may be a cross
 # compiler targeting the board. Not in CFG_SIG: publish-time tooling only,
 # never part of any built artifact.
 #
-# OBJ_ROOT / BIN_ROOT (round-6 review P1): where the keyed obj/bin trees
+# OBJ_ROOT / BIN_ROOT: where the keyed obj/bin trees
 # live (defaults: obj/ and bin/ in this directory -- the default expansion
 # is byte-identical to the previous hardcoded paths). Same rationale as
 # DIST_ROOT: a placement knob, never a build-content knob, so deliberately
@@ -79,7 +79,7 @@ TOOLCHAIN_CHECK ?= 1
 # against a scratch-directory build of the real worktree, so the REAL
 # obj/ and bin/ artifacts are never modified -- not even transiently.
 #
-# ALLOW_DIRTY_PUBLISH (round-6 review P2, scope narrowed in round-7):
+# ALLOW_DIRTY_PUBLISH:
 # `make publish` REFUSES by default when this checkout has uncommitted
 # TRACKED changes (`git status --porcelain -uno` non-empty) or is not a git
 # checkout at all (commit unknown) -- a release whose ATTEST provenance
@@ -88,11 +88,11 @@ TOOLCHAIN_CHECK ?= 1
 # is recorded in the attestation together with a sha256 of
 # `git diff --binary HEAD` so the deviation itself is traceable. It covers
 # TRACKED changes only -- untracked files have their own dimension below
-# (round-7 review: the tracked diff hash says nothing about untracked
+# (the tracked diff hash says nothing about untracked
 # bytes, so lumping the two under one flag let two different untracked
 # source states publish with identical provenance).
 #
-# ALLOW_UNTRACKED_PUBLISH (round-7 review): publish also REFUSES by default
+# ALLOW_UNTRACKED_PUBLISH: publish also REFUSES by default
 # when the checkout contains ANY untracked, non-ignored file (`git ls-files
 # --others --exclude-standard` non-empty; gitignored build output is
 # excluded by design and never part of this provenance) -- an untracked
@@ -112,7 +112,7 @@ TOOLCHAIN_CHECK ?= 1
 # neither knob admits it (provenance is impossible). Neither knob is in
 # CFG_SIG: they never change what is built, only whether publish proceeds.
 #
-# ATTEST_STAMP (round-6 review P2, TEST-ONLY): overrides the UTC timestamp
+# ATTEST_STAMP (TEST-ONLY): overrides the UTC timestamp
 # embedded in the attestation FILENAME so the isolation tests can
 # deterministically force same-second publish collisions and prove the
 # no-clobber retry path. Never use it on a real publish -- though note a
@@ -171,7 +171,7 @@ ifeq ($(origin BACKEND),undefined)
     BACKEND := kiss
   endif
 endif
-# Gated on MAKECMDGOALS (round-3 review B01, parse purity for query targets):
+# Gated on MAKECMDGOALS (parse purity for query targets):
 # print-bin-dir/print-obj-dir/print-lib-path are consumed programmatically by
 # other Makefiles' recipes (`ac="$$(make -s ... print-lib-path)"`) and by
 # scripts; their stdout must be ONLY the path, nothing else. A bare `make
@@ -209,8 +209,8 @@ LDFLAGS += $(EXTRA_LDFLAGS)
 # in EXTRA_CFLAGS/WERROR/etc. each land in their own directory automatically
 # -- nothing is ever wiped to "switch" between them, and two such builds
 # (e.g. one per backend) can run concurrently in this same tree without
-# stomping each other's objects OR each other's final archive (round-3
-# review B01: BIN_DIR used to be per-backend only, `bin/$(BACKEND)`, so an
+# stomping each other's objects OR each other's final archive (BIN_DIR
+# used to be per-backend only, `bin/$(BACKEND)`, so an
 # ne10 build after a kiss build -- or a stale mtime from a differently-flagged
 # same-backend build -- could silently deliver the WRONG archive to whatever
 # last happened to write that flat path; test_ne10_force_c's forced-C rebuild
@@ -315,7 +315,7 @@ else
   CFLAGS  += -isystem lib/kiss_fft
 endif
 
-# Link driver (round-4 review P1-2: declared HERE, before CFG_SIG, so it can
+# Link driver (declared HERE, before CFG_SIG, so it can
 # participate in the payload below -- it used to live after CFG_SIG, where a
 # command-line LINK= override changed the produced binaries without changing
 # their keyed directory). The NE10 archive contains a C++ TU
@@ -329,7 +329,7 @@ ifeq ($(BACKEND),ne10)
   LINK = $(CXX)
 endif
 
-# --- Bare-literal policy flags, defined early (Codex review: `make -e`
+# --- Bare-literal policy flags, defined early (`make -e`
 # environment-override gap) --------------------------------------------------
 # FP_POLICY and FFT_WRAPPER_ALIAS_CFLAGS are both plain, dependency-free `:=`
 # literals (no reference to CFLAGS/CXXFLAGS or anything else computed above)
@@ -350,8 +350,8 @@ endif
 # fixes it; the original site of each still holds its OTHER job unchanged, so
 # there is exactly one `:=` definition of each name in this file, just moved.
 #
-# FP_ALLOWED_CHARS_RE (added alongside the FP-policy allow-list redesign,
-# same review) is a THIRD bare, dependency-free `:=` literal with the exact
+# FP_ALLOWED_CHARS_RE (added alongside the FP-policy allow-list redesign)
+# is a THIRD bare, dependency-free `:=` literal with the exact
 # same shape and the exact same `make -e` exposure -- it lives here, fully
 # relocated (not merely duplicated: this is its ONLY definition in the file,
 # since unlike FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS it has no second job at any
@@ -362,8 +362,8 @@ FP_POLICY := -ffp-contract=off
 FFT_WRAPPER_ALIAS_CFLAGS := -fno-strict-aliasing
 FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 
-# --- Command-line override rejection (round-4 review P1-1; FFT_WRAPPER_ALIAS_
-# CFLAGS added by a later Codex review, same mechanism) -----------------------
+# --- Command-line override rejection (FFT_WRAPPER_ALIAS_
+# CFLAGS added later, same mechanism) -----------------------
 # CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/FP_POLICY are INTERNAL: GNU Make silently
 # ignores every one of this file's own `+=`/`:=` assignments to a variable
 # that was set on the command line (`make CFLAGS=-O3`), which would strip the
@@ -390,8 +390,8 @@ FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 #
 # CORRECTED UNDERSTANDING (this paragraph used to claim $(origin $(v)) below
 # is evaluated per-name at this point in the file "regardless of where each
-# name's own `:=`/`+=` happens to live" -- a second Codex review EMPIRICALLY
-# DISPROVED that in general, for the `make -e` case specifically; the claim
+# name's own `:=`/`+=` happens to live" -- this was EMPIRICALLY
+# DISPROVED in general, for the `make -e` case specifically; the claim
 # is still correct for plain "command line" origin, just not for
 # "environment override"). A plain "command line" origin IS genuinely
 # position-independent: it is resolved once, before any makefile parsing
@@ -432,7 +432,7 @@ FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 # defined early enough (bare `:=`, or unconditional `+=` -- never `?=`) that
 # its origin is already final -- under `-e` included -- by the time this
 # foreach runs. FP_ALLOWED_CHARS_RE (the FP-policy allow-list's character
-# class, added alongside this same review) is the newest member: a fourth
+# class, added alongside the same allow-list redesign) is the newest member: a fourth
 # bare, dependency-free `:=` literal with the identical exposure, now
 # defined directly above per the "Bare-literal policy flags" comment. A
 # command-line/`-e` override of FP_ALLOWED_CHARS_RE could otherwise widen the
@@ -452,8 +452,8 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FFT_WRAPPER_ALIAS_CFLAGS 
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently drop this Makefile's own flag appends (FP policy, backend defines); use EXTRA_CFLAGS / EXTRA_LDFLAGS instead)))
 
-# --- FP-contraction policy: unified across all four repos (round-3 review
-# B04). Every TU THIS Makefile compiles -- our own sources AND the vendored
+# --- FP-contraction policy: unified across all four repos. Every TU THIS
+# Makefile compiles -- our own sources AND the vendored
 # KISS/NE10 C and C++ TUs alike -- builds with -ffp-contract=off, positioned
 # so nothing can override it: appended here, AFTER every prior CFLAGS/
 # CXXFLAGS append in this file (base flags, EXTRA_CFLAGS, and the
@@ -464,7 +464,7 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FFT_WRAPPER_ALIAS_CFLAGS 
 # silently re-enable contraction after this file's own flags, because
 # nothing after this line ever appends to CFLAGS/CXXFLAGS again.
 #
-# (Codex review / `make -e` gap fix: FP_POLICY's own bare `:=` literal now
+# (`make -e` gap fix: FP_POLICY's own bare `:=` literal now
 # lives earlier in this file, directly above the "Command-line override
 # rejection" foreach -- see that foreach's "Bare-literal policy flags"
 # comment for why. Only FP_POLICY's OTHER job -- appending it to CFLAGS/
@@ -486,8 +486,8 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FFT_WRAPPER_ALIAS_CFLAGS 
 # for the disassembly-level verification (PASS/EXEMPT table distinguishing
 # the two) and each repo's README/CLAUDE.md for the cross-repo policy note.
 #
-# Conflict detection (round-3 review B04; widened to CXXFLAGS/CPPFLAGS by a
-# later Codex review): a caller passing EXTRA_CFLAGS=-Ofast/-ffast-math (both
+# Conflict detection (widened to CXXFLAGS/CPPFLAGS as well): a caller
+# passing EXTRA_CFLAGS=-Ofast/-ffast-math (both
 # of which imply -ffp-contract=fast on gcc/clang) or
 # EXTRA_CFLAGS=-ffp-contract=<anything> would either directly re-enable
 # contraction or silently do so via an implied flag, despite this repo's
@@ -502,7 +502,7 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FFT_WRAPPER_ALIAS_CFLAGS 
 # CORRECTED UNDERSTANDING (this used to check $(CFLAGS) alone, reasoning that
 # EXTRA_CFLAGS -- the one hook both CFLAGS and CXXFLAGS fold in identically --
 # made a CXXFLAGS-only conflict impossible to smuggle past a CFLAGS-only
-# check "for free". A Codex review found the gap that reasoning missed: a
+# check "for free". That reasoning missed a gap: a
 # PLAIN ENVIRONMENT CXXFLAGS (or CPPFLAGS) is deliberately allowed to fold in
 # normally by the command-line/`-e` override rejection above -- it never goes
 # through EXTRA_CFLAGS at all -- so `env CXXFLAGS=-Ofast make BACKEND=ne10
@@ -527,7 +527,7 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FFT_WRAPPER_ALIAS_CFLAGS 
 # both fully resolved well before this point, with no target-specific
 # CFLAGS/CXXFLAGS append anywhere in this file happening at parse time
 # (those are recipe-scoped, see $(OWN_OBJS)/fft_wrapper*.o further below).
-# (round-9 review) $(findstring ...) does a plain SUBSTRING search over the
+# $(findstring ...) does a plain SUBSTRING search over the
 # whole concatenated text, so it false-positives on any token that merely
 # CONTAINS one of these patterns as part of a larger identifier -- e.g. a
 # harmless `-DROUND9_NOTE=-Ofastness` macro definition is not the compiler
@@ -539,7 +539,7 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FFT_WRAPPER_ALIAS_CFLAGS 
 # unrelated token.
 FP_INPUT_FLAGS := $(CFLAGS) $(CXXFLAGS) $(CPPFLAGS)
 
-# --- link-flags character-safety coverage (Codex review: the allow-list
+# --- link-flags character-safety coverage (the allow-list
 # redesign below originally validated FP_INPUT_FLAGS only -- CFLAGS/CXXFLAGS/
 # CPPFLAGS -- leaving LDFLAGS (built from a plain `-lm` literal plus whatever
 # EXTRA_LDFLAGS folds in, see the `LDFLAGS += $(EXTRA_LDFLAGS)` line near the
@@ -561,8 +561,8 @@ FP_INPUT_FLAGS := $(CFLAGS) $(CXXFLAGS) $(CPPFLAGS)
 # unnecessary to check there) stays scoped to FP_INPUT_FLAGS alone, unchanged.
 SHELL_SAFE_INPUT_FLAGS := $(FP_INPUT_FLAGS) $(LDFLAGS)
 
-# (Codex review, SUPERSEDED by the allow-list redesign below -- kept only as
-# the historical motivation) $(filter) directly above does whole-WORD
+# (SUPERSEDED by the allow-list redesign below -- kept only as
+# historical motivation) $(filter) directly above does whole-WORD
 # matching against GNU Make's OWN text representation of CFLAGS/CXXFLAGS/
 # CPPFLAGS -- but Make has zero concept of shell quoting. A value like
 # EXTRA_CFLAGS="'-Ofast'" is stored by Make as the literal 9-character text
@@ -577,8 +577,8 @@ SHELL_SAFE_INPUT_FLAGS := $(FP_INPUT_FLAGS) $(LDFLAGS)
 # escaping/expansion/response-file constructs known at the time to make
 # $(filter)'s exact-token check unreliable.
 #
-# A deny-list of this shape is structurally unable to keep up: a live audit
-# (this round) found the 9-item list does NOT catch bare glob characters
+# A deny-list of this shape is structurally unable to keep up: auditing it
+# found the 9-item list does NOT catch bare glob characters
 # (*, ?, [, ]), tilde (~), or -- most seriously -- real shell REDIRECTION
 # (>, <) or process substitution (<(...)): none of these are Make's own
 # syntax, so Make cannot pre-resolve or reject them the way it happens to
@@ -589,7 +589,7 @@ SHELL_SAFE_INPUT_FLAGS := $(FP_INPUT_FLAGS) $(LDFLAGS)
 # run), it silently redirects the compiler invocation's own stdout/stdin to
 # an arbitrary path -- a real, unconditional risk, independent of any
 # -Ofast/-ffast-math/-ffp-contract semantics, and worse than the deny-list's
-# original threat model. Separately, direct testing (this round) confirms
+# original threat model. Separately, direct testing confirms
 # the old "$(" entry was likely DEAD CODE for well-formed input all along:
 # `make ... 'CFLAGS=-O2 $(shell echo INJECTED)'` lets GNU Make's OWN parser
 # resolve the well-formed $(...) reference at command-line-parsing time --
@@ -687,10 +687,10 @@ $(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains $(FP_
 endif
 
 # Command-line/`-e` override rejection for the FP-policy/shell-safety checks'
-# remaining FOUR internal variables (found live for the original three, this
-# same review, while implementing the allow-list above; SHELL_SAFE_INPUT_FLAGS/
-# SHELL_SAFE_ALLOWLIST_RC added, same treatment, by the later Codex review that
-# widened the character-safety check to LDFLAGS -- see the "link-flags
+# remaining FOUR internal variables (found live for the original three while
+# implementing the allow-list above; SHELL_SAFE_INPUT_FLAGS/
+# SHELL_SAFE_ALLOWLIST_RC added, same treatment, when the character-safety
+# check was widened to LDFLAGS -- see the "link-flags
 # character-safety coverage" comment above): FP_INPUT_FLAGS/
 # SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/FP_CONFLICT_FLAGS are each
 # computed from the fully-assembled CFLAGS/CXXFLAGS/CPPFLAGS (SHELL_SAFE_
@@ -701,7 +701,7 @@ endif
 # literal, so none can be relocated earlier to ride in the six/seven-name
 # foreach near the top of this file (that foreach's own comment explains why
 # bare-literal-and-early is required for the `-e` case). But confirmed
-# empirically (this round, for the original three; re-confirmed for the two
+# empirically (for the original three; re-confirmed for the two
 # new ones the same way) to have the EXACT SAME command-line-override
 # exposure as every name in that foreach: e.g. `make ...
 # EXTRA_LDFLAGS=';echo INJECTED' SHELL_SAFE_ALLOWLIST_RC=0` (or the
@@ -710,9 +710,9 @@ endif
 # computed value and turns every ifneq/$(error) gate above into a complete
 # no-op -- while the REAL $(CFLAGS)/$(CXXFLAGS)/$(CPPFLAGS)/$(LDFLAGS) used in
 # every actual compile/link recipe still carry the dangerous, unvalidated
-# content unmodified. Reproduced against BOTH this round's allow-list AND the
+# content unmodified. Reproduced against BOTH the current allow-list AND the
 # prior (unmodified) 9-item deny-list it replaces, so this is a PRE-EXISTING
-# gap this round's audit happened to surface, not a regression introduced by
+# gap the audit happened to surface, not a regression introduced by
 # the redesign. Fixed the same way as the `-e` gap elsewhere in this file,
 # mirrored for a LATE-computed (not early-literal) variable: the
 # override-rejection check must itself run AFTER the variable's own real
@@ -738,7 +738,7 @@ CFLAGS    += $(FP_POLICY)
 CXXFLAGS  += $(FP_POLICY)
 
 # --- Hash-keyed object/binary directory + full-coverage CFG_SIG ------------
-# obj/$(BACKEND)-<sig> and (round-3 review B01) bin/$(BACKEND)-<sig> isolate
+# obj/$(BACKEND)-<sig> and bin/$(BACKEND)-<sig> isolate
 # every distinct build configuration from every other one -- not just
 # BACKEND, but the exact compiler invocation that produces every object AND
 # the exact archive that invocation produces. CFG_SIG_PAYLOAD is the single
@@ -746,7 +746,7 @@ CXXFLAGS  += $(FP_POLICY)
 # the collision-guard manifest content (see the _cfg_guard target below) --
 # one string, two consumers, so the two can never drift apart.
 #
-# Payload coverage (USER-MANDATED, round-3 review B01): CC CXX AR RANLIB
+# Payload coverage (USER-MANDATED): CC CXX AR RANLIB
 # CFLAGS CXXFLAGS CPPFLAGS LDFLAGS EXTRA_CFLAGS EXTRA_LDFLAGS BACKEND WERROR
 # NO_STDIO DEBUG -- every variable that can affect what a build produces,
 # even ones this particular Makefile doesn't branch on today (CPPFLAGS/
@@ -790,10 +790,10 @@ CXXFLAGS  += $(FP_POLICY)
 # computes the hash. On stdin it prints "<checksum> <byte-count>" with no
 # filename field (verified on macOS's BSD cksum), so `cut -d' ' -f1` isolates
 # just the checksum.
-# Round-4 review additions to the payload: LINK (P2-1 -- the link driver
+# Additional payload coverage: LINK (the link driver
 # affects every produced binary, and a command-line LINK= override is
 # legitimate for exotic toolchains, so it must key the build), TOOLCHAIN_CHECK
-# (the guard-skip knob must not alias a guarded build), and SRCS (P1-4 -- the
+# (the guard-skip knob must not alias a guarded build), and SRCS (the
 # SORTED source list, so ADDING or REMOVING a source file lands in a fresh
 # keyed directory; without it, a removed .c left its stale .o AND its stale
 # archive member behind under the same key, and `ar rc` on the existing
@@ -827,10 +827,10 @@ CXXFLAGS  += $(FP_POLICY)
 # changed value never silently reuses a stale cached object, but does not
 # stop a command-line `FFT_WRAPPER_ALIAS_CFLAGS=` override from producing a
 # real, fully-buildable archive that ships without -fno-strict-aliasing on
-# these two TUs (a Codex review finding). This plain `:=` is therefore also
+# these two TUs. This plain `:=` is therefore also
 # listed in the "Command-line override rejection" foreach further above (see
 # that comment) -- a command-line origin for this name was always rejected
-# there regardless of position, but a SECOND Codex review found `make -e`
+# there regardless of position, but `make -e`
 # environment-override was NOT actually caught, despite this comment's
 # former (now-corrected) claim to the contrary: the foreach queries $(origin
 # FFT_WRAPPER_ALIAS_CFLAGS) at ITS OWN position in the file, and this
@@ -981,7 +981,7 @@ _cfg_guard:
 	  fi; \
 	done
 
-# Fresh-archive discipline (round-4 review P1-4): the archive is always built
+# Fresh-archive discipline: the archive is always built
 # from scratch into a temp file and renamed into place -- NEVER `ar rc` onto
 # an existing archive, which only ever ADDS/REPLACES members and would leave
 # a removed source's stale .o member in the delivered archive forever. The
@@ -991,8 +991,8 @@ _cfg_guard:
 # source list keys to a fresh directory in the first place).
 # One chained shell line, NOT one recipe line per step: the temp name embeds
 # the shell's PID ($$$$ -> $$) so two same-config processes racing this rule
-# (e.g. a plain build and a publish that started before taking its lock,
-# round-5 review P2) each write their OWN temp and the final mv is an atomic
+# (e.g. a plain build and a publish that started before taking its lock)
+# each write their OWN temp and the final mv is an atomic
 # last-writer-wins -- and each recipe LINE runs in a fresh shell with a fresh
 # PID, so the steps must share one line to share one temp name.
 $(LIB): $(BE_OBJS) | _cfg_guard
@@ -1149,7 +1149,7 @@ endif
 # two sub-makes automatically land in two DIFFERENT bin/ne10-<sig>/
 # directories -- the second sub-make's archive/objects are a real fresh
 # build, not a stale reuse of the first's, with nothing needing to be wiped
-# in between, and (round-3 review B01, the actual bug this rewrite fixes)
+# in between, and (the actual bug this rewrite fixes)
 # the FORCED-C sub-make's rebuild of libaudio_common.a can never overwrite
 # the normal NEON build's archive, because the two now live in different
 # directories instead of the same flat bin/ne10/.
@@ -1180,12 +1180,12 @@ test_ne10_force_c:
 # sub-make invocations (plain NE10 vs SIMD=0) each
 # land in their OWN bin/ne10-<sig>/test_ne10_c_parity -- no cp-to-rename
 # dance is needed any more to keep one variant's binary from being clobbered
-# by the other's rebuild (round-3 review B01).
+# by the other's rebuild.
 _ne10_parity_bin: $(LIB) | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_ne10_c_parity.o test/test_ne10_c_parity.c
 	$(LINK) -o $(BIN_DIR)/test_ne10_c_parity $(OBJ_DIR)/test_ne10_c_parity.o $(LIB) $(LDFLAGS)
 
-# --- Query targets (round-3 review B01) -------------------------------------
+# --- Query targets -----------------------------------------------------------
 # Consumers (AEC/NR Makefiles, docs_smoke.sh, scripts) resolve THIS build's
 # actual output paths at recipe time instead of hardcoding
 # bin/<backend>/libaudio_common.a -- e.g.
@@ -1205,7 +1205,7 @@ print-lib-path:
 	@echo $(abspath $(LIB))
 
 # --- publish v4: immutable, content-addressed release under $(DIST_ROOT) ---
-# (round-3 B01 -> round-4 P2-2 -> round-5 P2.) Layout per backend:
+# Layout per backend:
 #
 #   $(DIST_ROOT)/<backend>/<cfg_sig>-<content12>/
 #       <artifacts...>     immutable after first publish
@@ -1219,14 +1219,14 @@ print-lib-path:
 #                          carrying event_id/git_commit (FULL 40-hex OID)/
 #                          git_dirty/date_utc/allow_dirty_publish -- "which
 #                          checkout published this" lives here, not in
-#                          MANIFEST. Round-6: installed via the helper's
+#                          MANIFEST. Installed via the helper's
 #                          --excl-install mode (write-temp + link(2), the
 #                          atomic no-clobber equivalent of O_CREAT|O_EXCL);
 #                          a name collision (same second, same commit)
 #                          regenerates the event id with the next <seq> and
 #                          retries -- an existing attestation is NEVER
-#                          overwritten (round-5 used mv -f, so same-second
-#                          republishes silently clobbered the prior record).
+#                          overwritten (a bare mv -f used to let same-second
+#                          republishes silently clobber the prior record).
 #                          Attestations are UNSIGNED: they provide
 #                          traceability, not authenticity -- anyone with
 #                          filesystem access could forge one, so do not
@@ -1242,8 +1242,8 @@ print-lib-path:
 # in an existing release dir is ever modified or deleted (ATTEST/ gains
 # files; artifacts/MANIFEST never change after first publish).
 #
-# Dirty/untracked policy (round-6 P2, split into two dimensions by
-# round-7): publish FATALs by default when this checkout (a) has
+# Dirty/untracked policy (split into two dimensions): publish FATALs by
+# default when this checkout (a) has
 # uncommitted TRACKED changes (`git status --porcelain -uno` non-empty),
 # (b) contains ANY untracked, non-ignored file (`git ls-files --others
 # --exclude-standard` non-empty), or (c) has no git identity at all.
@@ -1255,7 +1255,7 @@ print-lib-path:
 # ALLOW_UNTRACKED_PUBLISH=1 admits untracked files and records
 # untracked_tree_sha256 over sorted fixed-field records (see the knob
 # comment up top for the exact encoding and its fail-closed I/O
-# semantics -- round-7: the tracked diff hash says nothing about
+# semantics -- the tracked diff hash says nothing about
 # untracked bytes, so two different untracked source states must not
 # share a provenance record). An untracked path that is neither a regular
 # file nor a symlink (an embedded git checkout, a fifo, ...) cannot be
@@ -1265,10 +1265,10 @@ print-lib-path:
 # time with $(HOSTCC), never the possibly-cross $(CC)): symlink to a
 # PID-suffixed temp + rename(2), which never follows symlinks -- truly
 # atomic on macOS AND GNU/Linux, with no missing-`current` window and no
-# destructive fallback (round-5: `mv -fT` doesn't exist on BSD/macOS, and
+# destructive fallback (`mv -fT` doesn't exist on BSD/macOS, and
 # the previous rm+mv fallback both left a window and fired on ANY mv error).
 #
-# Locking (round-5): `publish` is a DRIVER that takes the per-backend mkdir
+# Locking: `publish` is a DRIVER that takes the per-backend mkdir
 # lock FIRST and only then recursively builds+stages via _publish_impl -- so
 # two concurrent same-config publishes can no longer race each other's
 # object/archive writes during the prerequisite build (the previous shape
@@ -1280,13 +1280,13 @@ DIST_BACKEND_DIR  = $(DIST_ROOT)/$(BACKEND)
 DIST_LOCK         = $(DIST_ROOT)/.lock.$(BACKEND)
 
 .PHONY: publish _publish_impl
-# Dry-run guard (round-6 review P2-3, -t tightened by round-7): this
+# Dry-run guard: this
 # recipe mentions $(MAKE), so GNU make executes it for real under -n/-q/-t
 # (all three share that rule) -- which used to mkdir $(DIST_ROOT)
 # persistently and take/release the real publish lock on every dry run.
 # The word-scan below detects those flags in MAKEFLAGS and branches:
-#   -t  prints a one-line note and exits 0 WITHOUT recursing (round-7:
-#       recursing let standard touch semantics bump the mtimes of hpf.o
+#   -t  prints a one-line note and exits 0 WITHOUT recursing (recursing
+#       let standard touch semantics bump the mtimes of hpf.o
 #       and the delivered archive -- real writes. publish is a phony
 #       ACTION, not a build product; touching its artifact prerequisites
 #       without attesting would fabricate state, so touch mode is an
@@ -1352,7 +1352,7 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	if [ "$$commit" = "unknown" ]; then \
 	  echo "FATAL: publish refused -- audio_common has no git identity here (not a git checkout)." >&2; \
 	  echo "  Without an identity the attestation cannot name the source state OR enumerate untracked" >&2; \
-	  echo "  content, so NO escape hatch admits this (round-7: ALLOW_DIRTY_PUBLISH used to). Publish" >&2; \
+	  echo "  content, so NO escape hatch admits this (ALLOW_DIRTY_PUBLISH used to). Publish" >&2; \
 	  echo "  from a real checkout or a scratch clone with a disposable commit instead." >&2; \
 	  exit 1; \
 	fi; \
@@ -1459,14 +1459,14 @@ clean:
 	# $(OBJ_DIR)/$(BIN_DIR) for whatever BACKEND/config this invocation
 	# happens to resolve to -- a bare `make clean` (no BACKEND=) used to
 	# leave other configs' stale builds sitting untouched. Uses the
-	# OBJ_ROOT/BIN_ROOT knobs (round-6) so `clean` with an override scrubs
-	# THAT tree, never the real obj/ and bin/. dist/ is NOT removed by clean
-	# (round-3 review B01): published releases are meant to survive a
+	# OBJ_ROOT/BIN_ROOT knobs so `clean` with an override scrubs
+	# THAT tree, never the real obj/ and bin/. dist/ is NOT removed by clean:
+	# published releases are meant to survive a
 	# dev-tree clean; `rm -rf dist/` is a manual, deliberate action, not
 	# part of the normal edit/build/clean loop.
 	rm -rf $(OBJ_ROOT) $(BIN_ROOT)
 
-# --- Header dependency tracking (round-3 review B01, build hygiene) --------
+# --- Header dependency tracking (build hygiene) -----------------------------
 # Every compile line above passes -MD -MP, which emits a $(OBJ_DIR)/<name>.d
 # GNU-Make fragment per object, listing every header that object's TU pulled
 # in -- INCLUDING vendored NE10/KISS headers reached via -isystem (-MD, not
