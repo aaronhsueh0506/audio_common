@@ -3,7 +3,7 @@
  * included by BOTH test_wav_io.c (default WAV_IO_WRITER_AEC, via the
  * canonical wav_io.h's own unset-knob default) and
  * test_wav_writer_nr_style.c (which #defines WAV_IO_WRITER_STYLE to
- * WAV_IO_WRITER_NR before including wav_io.h) -- external re-review finding
+ * WAV_IO_WRITER_NR before including wav_io.h) -- shared writer regression
  * R01 regression coverage for the PCM16 quantizer's undefined behavior at
  * the +-1.0f boundary (AEC style specifically: `(int16_t)32768.5f` is an
  * out-of-range float-to-integer conversion, reproduced under UBSan) and the

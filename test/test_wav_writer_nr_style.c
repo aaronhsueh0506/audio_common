@@ -1,6 +1,6 @@
 /*
  * test_wav_writer_nr_style.c - runs the shared writer special-values corpus
- * (external re-review finding R01) against WAV_IO_WRITER_NR instead of the
+ * shared writer regression against WAV_IO_WRITER_NR instead of the
  * default WAV_IO_WRITER_AEC that test_wav_io.c exercises.
  *
  * WAV_IO_WRITER_STYLE is a compile-time knob (see wav_io.h's file header

@@ -1,5 +1,5 @@
 /*
- * test_wav_writer_ubsan.c - UBSan probe for external re-review finding R01.
+ * test_wav_writer_ubsan.c - UBSan probe for the WAV writer bounds contract.
  *
  * Pre-fix, the AEC-style PCM16 quantizer in wav_write_float cast
  * `scaled +- 0.5f` straight to int16_t; for sample==+1.0f that's

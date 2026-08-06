@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# test_build_isolation.sh — round-3/4/5/6/7 review build-isolation regression
+# test_build_isolation.sh — regression/4/5/6/7 review build-isolation regression
 # suite.
 #
 # Exercises the CFG_SIG-keyed obj/bin directory design (audio_common's own
 # Makefile, plus the two-phase AC_LIB consumer resolution in AEC/c_impl and
-# NR/c_impl) against every failure mode the round-3 B01 finding described,
-# the round-4 review's command-line override rejection / fresh-archive
+# NR/c_impl) against every failure mode the regression B01 finding described,
+# the regression review's command-line override rejection / fresh-archive
 # stale-member removal / publish v3 content-addressing / CC-CXX toolchain
-# guard, the round-5 review's publish v4 redesign (throwaway DIST_ROOT=,
+# guard, the regression review's publish v4 redesign (throwaway DIST_ROOT=,
 # lock-FIRST publish driver, deterministic MANIFEST/append-only ATTEST
-# split, rename(2)-atomic `current` swap), the round-6 review:
+# split, rename(2)-atomic `current` swap), the regression review:
 #
 #   - P1: OBJ_ROOT=/BIN_ROOT= placement knobs, so every throwaway/tamper
 #     scenario in THIS script can drive a scratch-directory build of the
@@ -29,7 +29,7 @@
 #   - P2 (dirty policy): publish FATALs by default on a dirty/no-git-identity
 #     checkout; ALLOW_DIRTY_PUBLISH=1 is the recorded escape hatch.
 #
-# ...and now the round-7 review:
+# ...and now the regression review:
 #
 #   - P1a (S8): the knob-neutrality check no longer walks the real obj dir
 #     wholesale with `for o in "$real_kiss_objdir"/*.o` -- a prior
@@ -75,41 +75,41 @@
 #
 # Scenario index:
 #   S1  - A->B->A + -O0/-O3 delivered-object repro
-#   S2  - same-second kiss<->ne10 switching (round-7: inside a scratch clone)
+#   S2  - same-second kiss<->ne10 switching (regression: inside a scratch clone)
 #   S3  - parallel differing-config builds
 #   S4  - test_ne10_force_c isolation
-#   S5  - consumer correctness, drives AEC (round-7: inside scratch clones of
+#   S5  - consumer correctness, drives AEC (regression: inside scratch clones of
 #         BOTH audio_common and AEC)
 #   S7p - producer-publish (v4 content-addressed dist/ layout; throwaway
 #         DIST_ROOT=)
-#   S8  - CFG_SIG collision guard (round-6: scratch-side, real obj/
-#         untouched; round-7: knob-neutrality re-done as an archive-member
+#   S8  - CFG_SIG collision guard (regression: scratch-side, real obj/
+#         untouched; regression: knob-neutrality re-done as an archive-member
 #         comparison, not a real-obj-dir glob)
-#   S9  - command-line override rejection (round-4 P1-1)
-#   S10 - archive freshness / stale-member removal (round-4 P1-4; round-6:
+#   S9  - command-line override rejection (regression P1-1)
+#   S10 - archive freshness / stale-member removal (regression P1-4; regression:
 #         scratch-side, deterministic backdate, real archive untouched)
 #   S11 - publish immutability / content-addressing, in three parts:
 #           S11a - in-tree republish (throwaway DIST_ROOT): byte-verified
-#                  republish, ATTEST/ growth (round-6: no sleep -- the
+#                  republish, ATTEST/ growth (regression: no sleep -- the
 #                  <NNN> suffix disambiguates a same-second republish)
 #           S11b - MANIFEST tamper detection
 #           S11c - content-change publish, exercised in a throwaway sandbox
 #                  copy of the tree (never in $AC_DIR)
-#   S12 - toolchain coherence guard (round-4 P1-2; round-7: scratch-side
+#   S12 - toolchain coherence guard (regression P1-2; regression: scratch-side
 #         OBJ_ROOT/BIN_ROOT, was leaking into the real obj/ every run)
 #   S13 - atomic `current` symlink swap hammer + --excl-install no-clobber
-#         mode (round-5 P2; round-6 adds the --excl-install checks)
+#         mode (regression P2; regression adds the --excl-install checks)
 #   S14 - lock-before-build: a concurrent publish loser builds nothing
-#         (round-5 P1; round-6: scratch OBJ_ROOT/BIN_ROOT)
-#   S15 - `make -n`/`-q`/`-t publish` zero-write assertions (round-6 P2-3;
-#         round-7: pre-recorded artifact snapshot compared unchanged after
+#         (regression P1; regression: scratch OBJ_ROOT/BIN_ROOT)
+#   S15 - `make -n`/`-q`/`-t publish` zero-write assertions (regression P2-3;
+#         regression: pre-recorded artifact snapshot compared unchanged after
 #         each of -n/-q/-t, and -t's rc=0 + no-op-note text are asserted);
 #         S15b COMBINED flags (-nt/-tq/-nq/-nqt) against a deliberately
 #         STALE scratch archive (t is checked FIRST in the driver -- a
 #         recursing -nt used to let real touch semantics through)
-#   S16 - ATTEST uniqueness under forced same-second collisions (round-6 P2-2)
-#   S17 - dirty-checkout publish policy (round-6 P2), now via
-#         `adopt_worktree_clone()` (round-7 P1b), PLUS (round-7 P2a) the
+#   S16 - ATTEST uniqueness under forced same-second collisions (regression P2-2)
+#   S17 - dirty-checkout publish policy (regression P2), now via
+#         `adopt_worktree_clone()` (regression P1b), PLUS (regression P2a) the
 #         untracked-file dimension: S17d clean+untracked default-refused/
 #         ALLOW_DIRTY_PUBLISH-alone-still-refused/both-succeeds; S17e
 #         re-publish with different untracked bytes -> different
@@ -123,9 +123,9 @@
 #         refusal; S17k a chmod alone changes the hash; S17l an
 #         identity-less checkout is refused UNCONDITIONALLY (no hatch).
 #   S18 - interruption-safety probe: EXIT/INT/TERM all clean up the whole
-#         scratch tree, even mid-scenario (round-6 P2-1 acceptance test)
+#         scratch tree, even mid-scenario (regression P2-1 acceptance test)
 #   S19 - FFT_WRAPPER_ALIAS_CFLAGS is CFG_SIG-keyed: build-cache-invalidation
-#         regression guard for the gap a re-review found in the round-5
+#         regression guard for the gap a regression found in the regression
 #         -fno-strict-aliasing fix (the flag was a bare literal on a
 #         target-specific CFLAGS line, invisible to CFG_SIG_PAYLOAD, so
 #         changing/removing it never forced a fresh keyed dir); asserts a
@@ -133,13 +133,13 @@
 #         real `make lib` build off a scratch clone whose Makefile copy has
 #         had ONLY the FFT_WRAPPER_ALIAS_CFLAGS definition line sed-patched
 #         to a different literal land in two different keyed obj/bin/lib
-#         paths. (A later Codex review found a command-line override of this
+#         paths. (A later regression coverage found a command-line override of this
 #         same variable was itself unguarded -- see S20 -- so this scenario
 #         no longer proves CFG_SIG coverage via a command-line override; the
 #         sed-patched-clone shape proves the identical property without
 #         relying on the now-closed hole.)
 #   S20 - FFT_WRAPPER_ALIAS_CFLAGS command-line/environment-override
-#         rejection (Codex review): the same class of hole S9 already closed
+#         rejection (regression coverage): the same class of hole S9 already closed
 #         for CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/FP_POLICY existed for this
 #         variable too -- `make FFT_WRAPPER_ALIAS_CFLAGS=` (empty) or
 #         `make FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing` on the command
@@ -148,7 +148,7 @@
 #         known strict-aliasing UB unguarded; both must now be rejected at
 #         parse time, mirroring S9's exact assertion style
 #   S21 - `make -e` (environment-override mode) bypass of S20's own guard
-#         (second Codex review): S20 proved the command-line case; a
+#         (follow-up regression): S20 proved the command-line case; a
 #         SEPARATE gap let `env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing
 #         make -e BACKEND=kiss lib` sail straight through with NO error,
 #         because the "Command-line override rejection" foreach queried
@@ -164,7 +164,7 @@
 #         value) and the empty-value sibling (full parity with S20's two
 #         cases) must now be rejected at parse time under `-e`.
 #   S22 - the same `make -e` class of gap, audited across the other five
-#         names S20/S9 already cover (Codex review follow-up): FP_POLICY
+#         names S20/S9 already cover (follow-up regression): FP_POLICY
 #         turned out to have the IDENTICAL shape as FFT_WRAPPER_ALIAS_CFLAGS
 #         (its own bare `:=` also lived after the foreach) and CPPFLAGS had a
 #         DIFFERENT variant (its early `?=` never actually attempts an
@@ -176,8 +176,8 @@
 #         CFLAGS; CPPFLAGS: `?=` changed to `+=`). CFLAGS/CXXFLAGS/LDFLAGS
 #         were confirmed ALREADY correctly rejected under `-e` (each has an
 #         unconditional `+=` before the foreach) and are not re-tested here.
-#   S23 - FP-policy conflict-detection widened to CXXFLAGS/CPPFLAGS (Codex
-#         review): the round-3 B04 conflict-detection block (rejects
+#   S23 - FP-policy conflict-detection widened to CXXFLAGS/CPPFLAGS (regression
+#         review): the regression B04 conflict-detection block (rejects
 #         -Ofast/-ffast-math/-ffp-contract=<anything> so a build can never
 #         silently re-enable FP contraction) used to check $(CFLAGS) alone;
 #         a PLAIN ENVIRONMENT CXXFLAGS (or CPPFLAGS) -- deliberately allowed
@@ -201,7 +201,7 @@
 #         assignment) against the real `lib` target (the exact reported
 #         repro), plus the CPPFLAGS sibling of the -Ofast case for
 #         completeness; all four must now FAIL, mentioning "FP policy
-#         conflict". A later (round-9) Codex review found the widened
+#         conflict". A later (regression) regression coverage found the widened
 #         checks themselves used $(findstring), a plain SUBSTRING search,
 #         so a harmless token that merely CONTAINS one of the three
 #         patterns (e.g. `-DROUND9_NOTE=-Ofastness`) was incorrectly
@@ -209,7 +209,7 @@
 #         whole flag words, and S23 gained a positive-case test asserting
 #         that exact repro now SUCCEEDS.
 #   S23b - quote/escape/response-file bypass of the FP-policy conflict gate
-#          itself (Codex review): $(filter) in the Makefile's exact-token
+#          itself (regression coverage): $(filter) in the Makefile's exact-token
 #          check does whole-WORD matching against GNU Make's OWN text
 #          representation of CFLAGS/CXXFLAGS/CPPFLAGS -- but Make has zero
 #          concept of shell quoting. EXTRA_CFLAGS="'-Ofast'" is stored by
@@ -236,7 +236,7 @@
 #          above must now FAIL, each mentioning the specific forbidden
 #          construct (not just a generic failure); a positive control
 #          (EXTRA_CFLAGS=-DROUND9_NOTE=-Ofastness, the plain unquoted token
-#          from S23's own round-9 regression, plus the sibling
+#          from S23's own regression regression, plus the sibling
 #          -DTEXT=ffast-math token) must still SUCCEED, since neither
 #          contains any of the newly-forbidden characters.
 #          UPDATE (allow-list redesign round): the 9-item deny-list this
@@ -279,7 +279,7 @@
 #       this round's rename of what used to be FP_ALLOWLIST_RC, see S25),
 #       found live while implementing this redesign and closed the same way
 #       S20/S21/S22 close it for FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS.
-# S25 - link-flags (LDFLAGS/EXTRA_LDFLAGS) character-safety coverage (Codex
+# S25 - link-flags (LDFLAGS/EXTRA_LDFLAGS) character-safety coverage (regression
 #       review): S24's allow-list only ever validated FP_INPUT_FLAGS
 #       (CFLAGS/CXXFLAGS/CPPFLAGS) -- LDFLAGS (built from a plain `-lm`
 #       literal plus whatever EXTRA_LDFLAGS folds in) was never inspected at
@@ -310,12 +310,12 @@
 # S6 (Audio_ALG/pipelines consumer-resolution parity) is a later wave and is
 # intentionally NOT covered here.
 #
-# Round-7 safety contract (supersedes the round-6 version of this comment):
+# Round-7 safety contract (supersedes the regression version of this comment):
 #   - ONE scratch root for the entire run: SCRATCH_ROOT="$(mktemp -d)",
 #     removed by a single EXIT trap. Every temp file/dir this script uses is
 #     a FIXED path under "$SCRATCH_ROOT/<scenario>/...", created inline with
 #     `mkdir -p` -- never inside a `$(...)` command substitution (that was
-#     the round-6 P2-1 bug: registering cleanup state from inside a subshell
+#     the regression P2-1 bug: registering cleanup state from inside a subshell
 #     silently drops it). `rm -rf "$SCRATCH_ROOT"` on exit collects
 #     EVERYTHING, including anything a child `make`'s own mktemp calls
 #     create, because TMPDIR is exported pointing inside the scratch root.
@@ -328,7 +328,7 @@
 #     process that actually acquired it.
 #   - Real obj/ and bin/ (this repo's own, default-rooted) only EVER see the
 #     NORMAL kiss/ne10 configs that S1/S3's real-tree assertions depend on
-#     (S2 and S5, round-6's other two real-tree normal-config builders, now
+#     (S2 and S5, regression's other two real-tree normal-config builders, now
 #     run inside scratch clones instead -- see below). Every throwaway/probe
 #     config (S1's -O0/-O3, S3's -DPAR_PROBE, S4's forced-C variant, S9's
 #     EXTRA_CFLAGS probe, S12's toolchain-shim probes, S14's
@@ -343,7 +343,7 @@
 #     digest of the real dist/ (absent, or a full manifest of paths + sha256
 #     + mtime) is captured at the very start and re-checked at the very end.
 #   - No git-tracked file, in $AC_DIR OR the AEC repo, is EVER touched --
-#     not its content, not even its mtime (round-7 removes the round-6
+#     not its content, not even its mtime (regression removes the regression
 #     allowance for a handful of mtime-only touches on real tracked sources
 #     entirely). Every mtime bump this script performs to force a recompile
 #     probe (hpf.c, fast_math.h, wav_io.h, NE10_dsp.h, ...) now happens
@@ -357,7 +357,7 @@
 #     OR mtime-affecting metadata would still have to leave `git status
 #     --porcelain`/`git diff` themselves unchanged to pass, which a content
 #     change cannot do.
-#   - No `sleep` anywhere. Every place the round-5 script used `sleep 1` to
+#   - No `sleep` anywhere. Every place the regression script used `sleep 1` to
 #     force a source's mtime strictly past some artifact's mtime is replaced
 #     with a deterministic BSD `touch -r <artifact> -A 01 <source>` bump
 #     (source mtime := artifact's CURRENT mtime + 1s) -- immune to whichever
@@ -403,12 +403,12 @@ AEC_REPO_DIR="$(cd "$AC_DIR/../AEC" && pwd)"
 AEC_DIR="$(cd "$AEC_REPO_DIR/c_impl" && pwd)"
 NR_DIR="$(cd "$AC_DIR/../NR/c_impl" && pwd)"
 
-# --- round-6 review P2-1: single scratch root, single trap ------------------
+# --- regression review P2-1: single scratch root, single trap ------------------
 SCRATCH_ROOT="$(mktemp -d)"
 # SUITE_LOCK_HELD must exist (as "0") before ANYTHING that could exit through
 # cleanup() runs -- including the ISOL_INTERRUPT_PROBE early-return branch
 # immediately below, which (being a probe CHILD, not a real suite run) never
-# reaches the round-7 mutex block that would otherwise set this to "1" --
+# reaches the regression mutex block that would otherwise set this to "1" --
 # `set -u` would otherwise fault on cleanup()'s own reference to it.
 SUITE_LOCK_HELD=0
 SUITE_LOCK=""
@@ -424,7 +424,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # --- S18 interruption probe: MUST be checked early, before any suite logic --
-# (round-6 review P2-1 acceptance test), and BEFORE the mktemp-shim setup
+# (regression review P2-1 acceptance test), and BEFORE the mktemp-shim setup
 # below: probe mode's `set +e` (see the comment inside the branch) needs to
 # take effect before ANY further command runs in this process, since a
 # signal can arrive during the shim's own file writes just as easily as
@@ -442,7 +442,7 @@ trap 'exit 143' TERM
 # spawned it), which is what lands this SCRATCH_ROOT inside the parent's
 # chosen probe TMPDIR in the first place.
 if [ -n "${ISOL_INTERRUPT_PROBE:-}" ]; then
-  # `set +e` for the rest of probe mode (round-6 review, found while
+  # `set +e` for the rest of probe mode (regression review, found while
   # validating THIS script): with `errexit` still active, a SIGTERM/SIGINT
   # that arrives while this process is blocked in a syscall (opening the
   # fifo, or the `read` below) can surface as EINTR turning into that
@@ -483,7 +483,7 @@ if [ -n "${ISOL_INTERRUPT_PROBE:-}" ]; then
   exit 0
 fi
 
-# --- round-7 review P2b: cross-suite mutex -----------------------------------
+# --- regression review P2b: cross-suite mutex -----------------------------------
 # Placed immediately after the ISOL_INTERRUPT_PROBE early-return above (so a
 # probe CHILD -- itself a full re-invocation of this script, spawned by S18 --
 # never reaches this and never contends for the lock its own PARENT already
@@ -569,18 +569,18 @@ mkscratch() { mkdir -p "$SCRATCH_ROOT/$1"; }
 # also fold in ar's per-member timestamp/mode header fields).
 member_sha() { ar -p "$1" "$2" | shasum -a 256 | awk '{print $1}'; }
 file_sha()   { shasum -a 256 "$1" | awk '{print $1}'; }
-# Fractional seconds (round-6: replaces whole-second `stat -f %m`) -- two
+# Fractional seconds (regression: replaces whole-second `stat -f %m`) -- two
 # genuinely separate real writes are distinguishable without an artificial
 # delay. GNU fallback loses the fractional part (not exercised on this host).
 mtime()      { stat -f '%Fm' "$1" 2>/dev/null || stat -c %Y "$1"; }
 
-# Tree-state hash (round-6 review): status --porcelain ALONE misses a content
+# Tree-state hash (regression review): status --porcelain ALONE misses a content
 # edit to an already-dirty file, so this also folds in `diff --binary HEAD`.
 tree_state_hash() {
   { git -C "$1" status --porcelain; git -C "$1" diff --binary HEAD; } 2>/dev/null | shasum -a 256 | awk '{print $1}'
 }
 
-# adopt_worktree_clone <src-repo-dir> <clone-dir> (round-7 review P1b) --
+# adopt_worktree_clone <src-repo-dir> <clone-dir> (regression review P1b) --
 # clone <src-repo-dir> (fully read-only on the source -- the explicitly
 # allowed exception to "no mutating git commands against real repos"), then
 # overlay every currently-MODIFIED TRACKED file on top and adopt them as ONE
@@ -589,14 +589,14 @@ tree_state_hash() {
 # uncommitted) worktree content. A plain `git clone` alone only reproduces
 # the source's last COMMIT -- it transfers committed objects, never
 # uncommitted working-tree bytes -- so a bare clone would carry the OLD
-# Makefile instead of the round-7 one under test. The clone is a disposable
+# Makefile instead of the regression one under test. The clone is a disposable
 # git repository living entirely under $SCRATCH_ROOT, destroyed by the EXIT
 # trap; its own history never touches the source repo's .git in any way (a
 # distinct clone, never pushed/fetched back).
 #
 # Round-7 fix (P1b, the actual finding): the commit is CONDITIONAL -- `git
 # add -A`, then commit only if `git diff --cached --quiet --exit-code` says
-# something is actually staged. The round-6 shape committed unconditionally,
+# something is actually staged. The regression shape committed unconditionally,
 # so at a clean tip (no local modifications relative to HEAD) the empty
 # commit exited 1 and `set -e` killed the whole suite. Modelled on the
 # Audio_ALG/pipelines suite's (correct) version of this same helper.
@@ -615,13 +615,13 @@ adopt_worktree_clone() {
   fi
 }
 
-# Real-tree final guard (round-7 review P3): per-file "path sha256 mtime"
+# Real-tree final guard (regression review P3): per-file "path sha256 mtime"
 # snapshot of everything under the real obj/ and bin/, plus a separate
 # top-level keyed-directory listing -- captured in S1 below, the moment this
 # suite's own intentional real-tree normal-config builds (kiss + ne10) are
 # done, and re-verified at the very end: every snapshotted file must still
 # be sha+mtime identical; a genuinely NEW directory is allowed (INFO/WARN,
-# not FAIL -- but after the round-7 S12 fix there should be none), while a
+# not FAIL -- but after the regression S12 fix there should be none), while a
 # new file inside an ALREADY-snapshotted directory is a FAIL.
 real_tree_snapshot() {
   ( cd "$AC_DIR" && for root in obj bin; do
@@ -638,7 +638,7 @@ real_tree_dirs() {
     done )
 }
 
-# Real dist/ sentinel (round-6 review, standing guard): absent stays absent;
+# Real dist/ sentinel (regression review, standing guard): absent stays absent;
 # otherwise a full path list + per-file sha256 + per-file (name, mtime).
 real_dist_sentinel() {
   if [ ! -e "$AC_DIR/dist" ]; then
@@ -676,7 +676,7 @@ mtime_kiss_1="$(mtime "$kiss_lib")"
 ne10_lib="$(make -s BACKEND=ne10 print-lib-path)"
 make -s BACKEND=ne10 lib >/dev/null
 
-# round-7 review P3: final-guard snapshot, taken NOW -- both of the real-tree
+# regression review P3: final-guard snapshot, taken NOW -- both of the real-tree
 # normal-config builds this suite intends (kiss above, ne10 just now) are
 # done; every later real-tree `make ... lib` in this suite re-targets one of
 # these same two already-built configs and must be a pure no-op against
@@ -712,7 +712,7 @@ ar -t "$ne10_lib" | grep -q '^kiss_fft\.o$' && fail "S1: ne10 archive unexpected
 # config's compiled object be delivered under the other's archive member
 # (the actual B01 bug: mtime staleness across differing flag sets).
 #
-# round-6 review P1: -O0/-O3 are throwaway probe configs, not one of the
+# regression review P1: -O0/-O3 are throwaway probe configs, not one of the
 # normal kiss/ne10 configs the rest of this repo's real obj/bin is meant to
 # hold -- so this builds under a scratch OBJ_ROOT=/BIN_ROOT= instead. Every
 # print-* query below is resolved against that SAME scratch root pair.
@@ -741,10 +741,10 @@ else
 fi
 
 echo "############################################################"
-echo "# S2: same-second kiss<->ne10 switching (round-7: scratch clone)"
+echo "# S2: same-second kiss<->ne10 switching (regression: scratch clone)"
 echo "############################################################"
-# round-7 review P2b: this scenario used to `touch` the REAL tree's
-# src/hpf.c (mtime-only, but round-7 removes even that allowance -- no real
+# regression review P2b: this scenario used to `touch` the REAL tree's
+# src/hpf.c (mtime-only, but regression removes even that allowance -- no real
 # tracked file is touched any more, period). The whole scenario now runs
 # inside a disposable clone of $AC_DIR under scratch; the clone's own obj/
 # and bin/ (default-rooted, clone-relative) ARE the scratch space, so no
@@ -769,7 +769,7 @@ echo "############################################################"
 echo "# S3: parallel differing-config builds"
 echo "############################################################"
 mkscratch s3
-# round-6 review P1: the ne10+PAR_PROBE side is a throwaway probe config ->
+# regression review P1: the ne10+PAR_PROBE side is a throwaway probe config ->
 # scratch OBJ_ROOT/BIN_ROOT. The plain kiss side stays in the real tree (this
 # half is exactly the normal-config concurrency this scenario exists to
 # verify).
@@ -807,7 +807,7 @@ make -s BACKEND=ne10 lib >/dev/null
 sha_before="$(file_sha "$ne10_lib")"
 mtime_before="$(mtime "$ne10_lib")"
 
-# round-6 review P1: test_ne10_force_c's own internal NEON+forced-C sub-makes
+# regression review P1: test_ne10_force_c's own internal NEON+forced-C sub-makes
 # are throwaway diagnostic builds, never one of the real tree's normal
 # configs -- run the WHOLE invocation under a scratch OBJ_ROOT/BIN_ROOT (both
 # of its internal sub-makes inherit these, being ordinary command-line
@@ -849,9 +849,9 @@ else
 fi
 
 echo "############################################################"
-echo "# S5: consumer correctness (drives AEC; round-7: scratch clones)"
+echo "# S5: consumer correctness (drives AEC; regression: scratch clones)"
 echo "############################################################"
-# round-7 review P2b: this scenario used to build in the REAL AEC repo and
+# regression review P2b: this scenario used to build in the REAL AEC repo and
 # mtime-touch REAL tracked audio_common sources (hpf.c, fast_math.h,
 # wav_io.h, NE10_dsp.h). It now runs against a disposable clone of EACH
 # repo: an audio_common clone (the producer whose sources get the mtime
@@ -863,7 +863,7 @@ echo "############################################################"
 # already threads through) -- AEC's `$(AC_LIB): FORCE` rule re-invokes
 # `$(MAKE) -C $(AC_DIR) ... lib` using that invocation's own AC_DIR, and if
 # it were left to its wildcard default it would fall back to the REAL
-# audio_common (reintroducing exactly the real-tree writes this round-7
+# audio_common (reintroducing exactly the real-tree writes this regression
 # change removes). A command-line AC_DIR= does propagate to that recursive
 # sub-make (command-line-origin variables travel via MAKEFLAGS), but it is
 # passed explicitly on every call here anyway -- an invocation this
@@ -894,8 +894,8 @@ aecwav="$bindir_kiss/aec_wav"
 [ -f "$aecwav" ] && pass "S5: aec_wav built" || fail "S5: aec_wav missing after initial build"
 mtime_1="$(mtime "$aecwav")"
 
-# Backdate aec_wav (round-6 review, found while validating THIS script;
-# round-7: aec_wav is now the AEC CLONE's own build artifact, so this
+# Backdate aec_wav (regression review, found while validating THIS script;
+# regression: aec_wav is now the AEC CLONE's own build artifact, so this
 # backdate no longer touches anything real at all): GNU Make
 # 3.81's own prerequisite-newer-than-target check truncates to whole
 # seconds, so aec_wav's relink decision (against $(AC_LIB)'s freshly
@@ -914,7 +914,7 @@ mtime_1="$(mtime "$aecwav")"
 # own touch).
 backdate_aecwav() { touch -A -0500 "$aecwav"; }
 
-# no-op rebuild -> NOT relinked. No sleep needed (round-6): nothing is
+# no-op rebuild -> NOT relinked. No sleep needed (regression): nothing is
 # touched here, so aec_wav's mtime cannot change regardless of how much
 # wall-clock time elapses between the two `make` calls.
 make -s BACKEND=kiss all AC_LIB="$ac_kiss" AC_DIR="$S5_AC_CLONE" >/dev/null
@@ -927,7 +927,7 @@ mtime_2="$(mtime "$aecwav")"
 # its COMPILER INVOCATION, not file content) does not change from a source
 # edit, so its archive path stays the same -- only its mtime should advance.
 #
-# round-6 review: deterministic strictly-newer bump replaces `sleep 1; touch
+# regression review: deterministic strictly-newer bump replaces `sleep 1; touch
 # hpf.c`. Resolve hpf.o's path FIRST (it already exists from earlier
 # scenarios), then set hpf.c's mtime to hpf_o's CURRENT mtime + 1s via BSD
 # `touch -r/-A` -- this guarantees make ITSELF sees the source as newer than
@@ -951,12 +951,12 @@ mtime_2="$(mtime "$aecwav")"
 # signal for "did the archive (and therefore hpf.o) actually rebuild".
 ac_objdir="$(make -s -C "$S5_AC_CLONE" BACKEND=kiss print-obj-dir)"
 hpf_o="$ac_objdir/hpf.o"
-# Backdate the CLONE's kiss archive before forcing the recompile (round-7,
+# Backdate the CLONE's kiss archive before forcing the recompile (regression,
 # found while validating the clone conversion -- reproduced empirically):
 # the +1s hpf.c bump reliably makes make recompile hpf.o, but the fresh
 # hpf.o's wall-clock "now" mtime can land in the very SAME whole second as
 # the archive's own prior build -- in the clone everything above ran
-# back-to-back within one second, unlike the round-6 real-tree version
+# back-to-back within one second, unlike the regression real-tree version
 # where the archive came from S1/S2 many seconds earlier -- and GNU Make
 # 3.81's whole-second dependency check then skips the re-archive entirely
 # (hpf.o rebuilt, archive stale, no echo line). Same fix as S11c's sandbox:
@@ -1054,15 +1054,15 @@ echo "# S7p: producer-publish (v4 layout; throwaway DIST_ROOT)"
 echo "############################################################"
 cd "$AC_DIR"
 mkscratch s7p
-# round-6: ALLOW_DIRTY_PUBLISH=1 on every publish call in this script -- a
+# regression: ALLOW_DIRTY_PUBLISH=1 on every publish call in this script -- a
 # dev tree is legitimately dirty (these very review changes are
 # uncommitted), and the policy itself is exercised on purpose in S17.
-# round-7: ALLOW_UNTRACKED_PUBLISH=1 rides along on every one of those same
+# regression: ALLOW_UNTRACKED_PUBLISH=1 rides along on every one of those same
 # calls (EXCEPT S17's own policy sub-cases, which deliberately test each
 # knob in isolation) -- the untracked dimension is a NEW default refusal,
 # and a dev tree can legitimately carry untracked files that have nothing
 # to do with what each of these scenarios is actually testing. DIST_ROOT
-# stays a throwaway scratch path (round-5 review P1): the real dist/ is
+# stays a throwaway scratch path (regression review P1): the real dist/ is
 # never read, written, or removed.
 S7P_DIST="$SCRATCH_ROOT/s7p/dist"
 
@@ -1086,7 +1086,7 @@ else
   pass "S7p: kiss MANIFEST has NO git_commit=/git_dirty=/date_utc= line (v4 deterministic MANIFEST)"
 fi
 if grep -q "^ar=" "$manifest_path" && grep -q "^ranlib=" "$manifest_path" && grep -q "^link=" "$manifest_path"; then
-  pass "S7p: kiss MANIFEST has ar=/ranlib=/link= lines (round-4 P2-2 fields)"
+  pass "S7p: kiss MANIFEST has ar=/ranlib=/link= lines (regression P2-2 fields)"
 else
   fail "S7p: kiss MANIFEST missing one of ar=/ranlib=/link= lines"
 fi
@@ -1157,7 +1157,7 @@ done < <(grep -E '^[0-9a-f]{64}  ' "$S7P_DIST/kiss/$final_target/MANIFEST.txt")
   || fail "S7p: final current release's MANIFEST does not match its own files"
 
 echo "############################################################"
-echo "# S8: CFG_SIG collision guard (round-6: scratch-side)"
+echo "# S8: CFG_SIG collision guard (regression: scratch-side)"
 echo "############################################################"
 cd "$AC_DIR"
 mkscratch s8
@@ -1166,7 +1166,7 @@ S8_BIN_ROOT="$SCRATCH_ROOT/s8/bin"
 
 # Fresh scratch build of the REAL worktree's normal kiss config -- exercises
 # the CURRENT (possibly-uncommitted) Makefile without ever touching the real
-# obj/ tree (round-6 review P1: the round-5 script mutated the REAL obj dir
+# obj/ tree (regression review P1: the regression script mutated the REAL obj dir
 # here -- the actual finding this rewrite fixes).
 make -s BACKEND=kiss OBJ_ROOT="$S8_OBJ_ROOT" BIN_ROOT="$S8_BIN_ROOT" lib >/dev/null
 s8_objdir="$(make -s BACKEND=kiss OBJ_ROOT="$S8_OBJ_ROOT" BIN_ROOT="$S8_BIN_ROOT" print-obj-dir)"
@@ -1201,7 +1201,7 @@ real_manifest_mtime_after="$(mtime "$real_manifest")"
 # wall-clock times) differ byte-for-byte even though every member is
 # content-identical.
 #
-# round-7 review P1a: the old check globbed the REAL obj dir (`for o in
+# regression review P1a: the old check globbed the REAL obj dir (`for o in
 # "$real_kiss_objdir"/*.o`) and demanded a scratch counterpart for every
 # object found -- but the real obj dir can legitimately carry EXTRA test
 # objects (test_wav_io.o, test_wav_writer_ubsan.o, ... from a prior `make
@@ -1233,7 +1233,7 @@ done < <(ar -t "$real_kiss_lib")
   || fail "S8: ar -t member name-lists differ between scratch and real kiss archive"
 
 echo "############################################################"
-echo "# S9: command-line override rejection (round-4 review P1-1)"
+echo "# S9: command-line override rejection (regression review P1-1)"
 echo "############################################################"
 cd "$AC_DIR"
 mkscratch s9
@@ -1277,7 +1277,7 @@ extra_objdir="$(make -s EXTRA_CFLAGS=-DS9_PROBE OBJ_ROOT="$S9_OBJ_ROOT" BIN_ROOT
   || fail "S9: EXTRA_CFLAGS=-DS9_PROBE print-obj-dir did NOT differ from the plain baseline ($baseline_objdir vs $extra_objdir)"
 
 echo "############################################################"
-echo "# S10: archive freshness -- stale-member removal (round-6: scratch-side)"
+echo "# S10: archive freshness -- stale-member removal (regression: scratch-side)"
 echo "############################################################"
 cd "$AC_DIR"
 mkscratch s10
@@ -1307,7 +1307,7 @@ ar -t "$kiss_lib" | grep -q '^s10_foreign\.o$' && pass "S10: foreign object succ
 # `ar rc` onto the existing archive -- so the foreign member must be GONE
 # afterward, while hpf.o (a real, current source) must still be present.
 #
-# round-6 review: deterministic re-archive trigger replaces `sleep 1; touch
+# regression review: deterministic re-archive trigger replaces `sleep 1; touch
 # src/hpf.c`. Backdate the SCRATCH archive itself to a fixed date well in
 # the past -- older than every one of its member .o files (all built just
 # now, real "current" mtimes) -- so make's own dependency check ($(LIB):
@@ -1340,7 +1340,7 @@ real_lib_mtime_after="$(mtime "$real_kiss_lib")"
 
 echo "############################################################"
 echo "# S11: publish immutability / content-addressing"
-echo "# (round-4 review P2-2 -> round-5 v4 semantics -> round-6 P2-2 ATTEST)"
+echo "# (regression review P2-2 -> regression v4 semantics -> regression P2-2 ATTEST)"
 echo "############################################################"
 cd "$AC_DIR"
 
@@ -1399,10 +1399,10 @@ echo "$commit1" | grep -Eq '^[0-9a-f]{40}$' && pass "S11a: git_commit= is a full
 
 snap_before="$(release_snapshot "$S11A_DIST/kiss/$id1")"
 
-# round-6 review: no sleep. The one-event-one-file ATTEST install
+# regression review: no sleep. The one-event-one-file ATTEST install
 # (--excl-install + retry-with-next-<NNN>) disambiguates a same-second
 # republish via the numeric suffix instead of requiring a distinct
-# <utcstamp> -- the round-5 version of this scenario needed `sleep 1` here
+# <utcstamp> -- the regression version of this scenario needed `sleep 1` here
 # so the two publishes landed in different UTC seconds; that dependency is
 # gone (S16 stress-tests the same-second case directly, forcing 20 publishes
 # into ONE literal second via ATTEST_STAMP=).
@@ -1463,7 +1463,7 @@ mkdir -p "$SANDBOX"
 tar -c -C "$AC_DIR" --exclude obj --exclude bin --exclude dist --exclude .git . | tar -x -C "$SANDBOX"
 S11C_DIST="$SCRATCH_ROOT/s11c/dist"
 
-# round-7: the tar copy has no .git (excluded above), and "no git identity"
+# regression: the tar copy has no .git (excluded above), and "no git identity"
 # is on its way to becoming an UNCONDITIONAL publish refusal (no escape
 # hatch admits it) -- so the sandbox gets its own REAL, disposable git
 # identity: `git init` + one commit, entirely inside $SCRATCH_ROOT (same
@@ -1482,7 +1482,7 @@ sid1="$(readlink "$S11C_DIST/kiss/current" || true)"
 [ -n "$sid1" ] && pass "S11c: sandbox publish #1 -- current resolves ($sid1)" \
   || fail "S11c: sandbox publish #1 -- current symlink broken or missing"
 
-# round-6 review: resolve the sandbox's OWN hpf.o AND archive paths before
+# regression review: resolve the sandbox's OWN hpf.o AND archive paths before
 # the edit. Force hpf.c's mtime to hpf.o's CURRENT mtime + 1s (BSD
 # touch -r/-A) right after appending the real content change below, exactly
 # as S5 does -- needed so make recompiles hpf.o at all (GNU Make 3.81
@@ -1533,12 +1533,12 @@ HPF_SHA_AFTER_S11="$(file_sha "$AC_DIR/src/hpf.c")"
   || fail "S11c: the REAL repo's src/hpf.c CHANGED during S11 (sandbox isolation failed)"
 
 echo "############################################################"
-echo "# S12: toolchain coherence guard (round-4 review P1-2; round-7:"
+echo "# S12: toolchain coherence guard (regression review P1-2; regression:"
 echo "#      scratch OBJ_ROOT/BIN_ROOT)"
 echo "############################################################"
 cd "$AC_DIR"
 mkscratch s12
-# round-7 review P2b: the three shim builds below used to build into the
+# regression review P2b: the three shim builds below used to build into the
 # REAL obj/bin -- and the shim's scratch path lands in CFG_SIG (CXX= is in
 # the payload, and $SCRATCH_ROOT is fresh every run), so EVERY run of this
 # suite minted a brand-new orphan keyed directory pair in the real obj/+bin/
@@ -1588,7 +1588,7 @@ fi
 
 echo "############################################################"
 echo "# S13: atomic \`current\` symlink swap hammer + --excl-install"
-echo "# (round-5 review P2; round-6 adds the --excl-install checks)"
+echo "# (regression review P2; regression adds the --excl-install checks)"
 echo "############################################################"
 mkscratch s13
 cc -O2 -o "$SCRATCH_ROOT/s13/swapln" "$AC_DIR/tools/atomic_symlink_swap.c"
@@ -1654,7 +1654,7 @@ else
   fail "S13: final current does NOT resolve to relA or relB ($s13_final)"
 fi
 
-echo "--- S13: --excl-install no-clobber mode (round-6 review P2-2) --------"
+echo "--- S13: --excl-install no-clobber mode (regression review P2-2) --------"
 echo "hello-v1" > "$SCRATCH_ROOT/s13/src_v1.txt"
 echo "hello-v2-should-not-land" > "$SCRATCH_ROOT/s13/src_v2.txt"
 rc1=0
@@ -1675,12 +1675,12 @@ leftover_tmp="${leftover_tmp:-0}"
 
 echo "############################################################"
 echo "# S14: lock-before-build -- a concurrent publish loser builds nothing"
-echo "#       (round-5 review P1; round-6: scratch OBJ_ROOT/BIN_ROOT)"
+echo "#       (regression review P1; regression: scratch OBJ_ROOT/BIN_ROOT)"
 echo "############################################################"
 cd "$AC_DIR"
 mkscratch s14
 S14_DIST="$SCRATCH_ROOT/s14/dist"
-# round-6 review P1: one shared scratch OBJ_ROOT/BIN_ROOT pair for BOTH
+# regression review P1: one shared scratch OBJ_ROOT/BIN_ROOT pair for BOTH
 # racers -- the lock still serialises the winner's build (this is exactly
 # what the scenario tests), and the real obj/bin never see this throwaway
 # -DS14_LOCK_PROBE config either way.
@@ -1740,15 +1740,15 @@ stage_leftovers="$(find "$S14_DIST/kiss" -maxdepth 1 -name '.stage.*' 2>/dev/nul
   || fail "S14: $stage_leftovers .stage.* leftover(s) under $S14_DIST/kiss/"
 
 echo "############################################################"
-echo "# S15: make -n/-q/-t publish zero-write (round-6 P2-3; round-7 P3)"
+echo "# S15: make -n/-q/-t publish zero-write (regression P2-3; regression P3)"
 echo "############################################################"
 cd "$AC_DIR"
 mkscratch s15
-# round-7 review P3: on top of the "no paths created" checks, each of
+# regression review P3: on top of the "no paths created" checks, each of
 # -n/-q/-t must also leave an ALREADY-EXISTING delivered artifact byte- and
 # mtime-untouched -- `-t` (touch mode) is exactly the flag whose standard
 # semantics WOULD bump artifact mtimes if the publish driver recursed under
-# it (the round-6 shape did; round-7's driver makes -t a one-line no-op note
+# it (the regression shape did; regression's driver makes -t a one-line no-op note
 # + exit 0 without recursion, asserted below). The reference artifact is the
 # REAL, default-rooted $be archive built by S1 -- the strongest thing this
 # suite owns to protect. All three modes are ZERO-WRITE.
@@ -1789,7 +1789,7 @@ for be in kiss ne10; do
     pass "S15[$be]: make -q publish is zero-write against the existing normal $be archive (size+mtime+sha unchanged)" \
     || fail "S15[$be]: make -q publish CHANGED the normal $be archive"
 
-  # round-7: -t must exit 0 AND print the explicit no-op note (the driver
+  # regression: -t must exit 0 AND print the explicit no-op note (the driver
   # no longer recurses under -t at all -- see the Makefile's dry-run guard).
   rc=0
   make -t BACKEND="$be" DIST_ROOT="$S15_DIST" OBJ_ROOT="$S15_OBJ" BIN_ROOT="$S15_BIN" publish >"$S15_LOG.t" 2>&1 || rc=$?
@@ -1832,7 +1832,7 @@ done
 
 echo "############################################################"
 echo "# S16: ATTEST uniqueness under forced same-second collisions"
-echo "#       (round-6 review P2-2)"
+echo "#       (regression review P2-2)"
 echo "############################################################"
 cd "$AC_DIR"
 mkscratch s16
@@ -1895,11 +1895,11 @@ else
 fi
 
 echo "############################################################"
-echo "# S17: dirty-checkout publish policy (round-6 review P2)"
+echo "# S17: dirty-checkout publish policy (regression review P2)"
 echo "############################################################"
 mkscratch s17
 S17_CLONE="$SCRATCH_ROOT/s17/clone"
-# round-7 review P1b: what used to be S17's own inline clone+overlay+
+# regression review P1b: what used to be S17's own inline clone+overlay+
 # UNCONDITIONAL commit (which exited 1 on a clean tip -- nothing staged --
 # and killed the suite under `set -e`) is now the shared
 # adopt_worktree_clone() helper, whose commit is conditional. See the
@@ -1915,7 +1915,7 @@ S17_DIST="$SCRATCH_ROOT/s17/dist"
 # attest_from_log(): the publish recipe's own success line ends with
 # "(attested: <name>)" -- extracting the exact attest filename from THIS
 # invocation's own log is unambiguous regardless of which release dir it
-# landed in, unlike `find ATTEST -name 'attest-*.txt' | head -1` (round-6
+# landed in, unlike `find ATTEST -name 'attest-*.txt' | head -1` (regression
 # review, found while validating THIS script: a comment-only edit to hpf.c
 # -- see S17b below -- produces byte-identical object code, so a
 # deterministic archiver correctly reuses the SAME content-addressed release
@@ -1984,7 +1984,7 @@ else
   fail "S17c: attestation ($attest_c) does not match the expected dirty-publish shape"
 fi
 
-# --- round-7 review P2a: untracked-file policy (S17d-S17h) -------------------
+# --- regression review P2a: untracked-file policy (S17d-S17h) -------------------
 # The untracked dimension is SEPARATE from the tracked-dirty one:
 # ALLOW_DIRTY_PUBLISH covers tracked changes only (`git status --porcelain
 # -uno`), ALLOW_UNTRACKED_PUBLISH covers untracked files, and the
@@ -2250,7 +2250,7 @@ else
 fi
 
 echo "############################################################"
-echo "# S18: interruption-safety probe (round-6 review P2-1 acceptance)"
+echo "# S18: interruption-safety probe (regression review P2-1 acceptance)"
 echo "############################################################"
 mkscratch s18
 cat > "$SCRATCH_ROOT/s18/sigreset_exec.c" <<'EOF'
@@ -2310,7 +2310,7 @@ echo "############################################################"
 echo "# S19: FFT_WRAPPER_ALIAS_CFLAGS is CFG_SIG-keyed (build-cache-"
 echo "# invalidation regression guard)"
 echo "############################################################"
-# Guards exactly the gap a re-review found in the round-5 -fno-strict-
+# Guards exactly the gap a regression found in the regression -fno-strict-
 # aliasing fix: that flag used to be a bare literal on the two
 # fft_wrapper.o/fft_wrapper_ne10.o target-specific `CFLAGS +=` lines
 # (Makefile, just below CFG_SIG_PAYLOAD), and a target-specific variable
@@ -2327,7 +2327,7 @@ echo "############################################################"
 # CFG_SIG_PAYLOAD). This scenario is the permanent guard against that exact
 # gap reopening.
 #
-# A later Codex review found this scenario's ORIGINAL shape was itself
+# A later regression coverage found this scenario's ORIGINAL shape was itself
 # normalizing a real hole: it proved the point via a `make
 # FFT_WRAPPER_ALIAS_CFLAGS=<other value>` command-line override, but this
 # variable was a plain `:=` with no override-rejection -- so that same
@@ -2413,7 +2413,7 @@ ar -t "$s19_changed_lib" 2>/dev/null | grep -q '^fft_wrapper\.o$' && \
 
 echo "############################################################"
 echo "# S20: FFT_WRAPPER_ALIAS_CFLAGS command-line override rejection"
-echo "# (Codex review)"
+echo "# (regression coverage)"
 echo "############################################################"
 # Direct negative-test companion to the Makefile fix S19 above now relies on:
 # FFT_WRAPPER_ALIAS_CFLAGS was added as a 6th name to the SAME "Command-line
@@ -2424,7 +2424,7 @@ echo "############################################################"
 # obj/bin dir is even created), with the same "cannot be overridden" message
 # S9 checks for. Two cases, both real command-line overrides, both with a
 # scratch OBJ_ROOT/BIN_ROOT: an EMPTY value (silently drops
-# -fno-strict-aliasing entirely -- the exact Codex finding) and an explicitly
+# -fno-strict-aliasing entirely -- the exact regression) and an explicitly
 # hostile `-fstrict-aliasing` value (re-enables strict aliasing outright).
 cd "$AC_DIR"
 mkscratch s20
@@ -2449,7 +2449,7 @@ done
 
 echo "############################################################"
 echo "# S21: FFT_WRAPPER_ALIAS_CFLAGS \`make -e\` (environment-override mode)"
-echo "# bypass of S20's own guard (second Codex review)"
+echo "# bypass of S20's own guard (follow-up regression)"
 echo "############################################################"
 # S20 above proved the COMMAND-LINE case is rejected. A SEPARATE gap let a
 # \`make -e\` ENVIRONMENT override sail through with no error at all: GNU
@@ -2498,7 +2498,7 @@ done
 # rejected the same way (not just the print-* introspection targets).
 S21_LIB_LOG="$SCRATCH_ROOT/s21/log_lib_e2e"
 if env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing make -e BACKEND=kiss OBJ_ROOT="$S21_OBJ_ROOT" BIN_ROOT="$S21_BIN_ROOT" lib >"$S21_LIB_LOG" 2>&1; then
-  fail "S21: env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing make -e BACKEND=kiss lib unexpectedly SUCCEEDED (the exact Codex repro must now fail)"
+  fail "S21: env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing make -e BACKEND=kiss lib unexpectedly SUCCEEDED (the exact regression reproducer must now fail)"
 else
   if grep -q "cannot be overridden" "$S21_LIB_LOG"; then
     pass "S21: the exact reported repro (env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing make -e BACKEND=kiss lib) correctly FAILS, mentioning 'cannot be overridden'"
@@ -2510,7 +2510,7 @@ fi
 
 echo "############################################################"
 echo "# S22: make -e environment-override rejection audit for the other"
-echo "# five names (Codex review follow-up: FP_POLICY/CPPFLAGS also gapped)"
+echo "# five names (follow-up regression: FP_POLICY/CPPFLAGS also gapped)"
 echo "############################################################"
 # Auditing S21's fix prompted checking whether ANY of the other five names
 # in the same foreach (CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/FP_POLICY) had a
@@ -2559,10 +2559,10 @@ done
 
 echo "############################################################"
 echo "# S23: FP policy conflict detection widened to CXXFLAGS/CPPFLAGS"
-echo "# (Codex review)"
+echo "# (regression coverage)"
 echo "############################################################"
 # Direct negative-test companion to the Makefile's "FP policy conflict"
-# widening: the round-3 B04 conflict-detection block (rejects
+# widening: the regression B04 conflict-detection block (rejects
 # -Ofast/-ffast-math/-ffp-contract=<anything>, since each would re-enable FP
 # contraction this repo pins off) used to check $(CFLAGS) alone. A PLAIN
 # ENVIRONMENT CXXFLAGS (or CPPFLAGS) -- deliberately allowed to fold in
@@ -2584,7 +2584,7 @@ echo "############################################################"
 # output, since VENDOR_CXXSRCS is only ever non-empty for BACKEND=ne10), so
 # a kiss-backend version of this scenario would exercise only the
 # (backend-independent) text-matching guard itself, never the actual
-# real-world consequence the Codex review reported.
+# real-world consequence the regression coverage reported.
 #
 # Each case below is a genuine PLAIN ENVIRONMENT override (`env NAME=value
 # make BACKEND=ne10 ...`, no `-e`, no command-line assignment) against the
@@ -2636,7 +2636,7 @@ else
   cat "$S23_WEXTRA_LIB_LOG" >&2
 fi
 
-# Round-9 Codex review: the conflict-detection guard above used to be three
+# Round-9 regression coverage: the conflict-detection guard above used to be three
 # $(findstring PATTERN,TEXT) checks, and $(findstring) does a plain
 # SUBSTRING search over the whole concatenated text -- so it false-positived
 # on any token that merely CONTAINS one of these patterns as part of a
@@ -2652,15 +2652,15 @@ fi
 # patterns, so a substring buried inside an unrelated token can never match.
 S23_ROUND9_NOTE_LOG="$SCRATCH_ROOT/s23/log_round9_note"
 if env CXXFLAGS='-DROUND9_NOTE=-Ofastness' make -s BACKEND=ne10 OBJ_ROOT="$S23_OBJ_ROOT" BIN_ROOT="$S23_BIN_ROOT" print-obj-dir >"$S23_ROUND9_NOTE_LOG" 2>&1; then
-  pass "S23: env CXXFLAGS='-DROUND9_NOTE=-Ofastness' make BACKEND=ne10 print-obj-dir (substring-only, non-conflicting) succeeds (round-9 false-positive fix)"
+  pass "S23: env CXXFLAGS='-DROUND9_NOTE=-Ofastness' make BACKEND=ne10 print-obj-dir (substring-only, non-conflicting) succeeds (regression false-positive fix)"
 else
-  fail "S23: env CXXFLAGS='-DROUND9_NOTE=-Ofastness' make BACKEND=ne10 print-obj-dir unexpectedly FAILED (round-9 substring false-positive regressed)"
+  fail "S23: env CXXFLAGS='-DROUND9_NOTE=-Ofastness' make BACKEND=ne10 print-obj-dir unexpectedly FAILED (regression substring false-positive regressed)"
   cat "$S23_ROUND9_NOTE_LOG" >&2
 fi
 
 echo "############################################################"
 echo "# S23b: quote/escape/response-file bypass of the FP-policy"
-echo "# conflict gate itself (Codex review)"
+echo "# conflict gate itself (regression coverage)"
 echo "############################################################"
 # See the header comment (search "S23b") for the full writeup. In short: the
 # exact-token $(filter) check above matches GNU Make's OWN text
@@ -2748,7 +2748,7 @@ fi
 # response-file block must leave them alone entirely -- only the unchanged
 # exact-token $(filter) check further down governs whether a token IS
 # -Ofast/-ffast-math/-ffp-contract=<x>, and neither of these is. The first
-# is S23's own round-9 regression token (here via EXTRA_CFLAGS specifically,
+# is S23's own regression regression token (here via EXTRA_CFLAGS specifically,
 # the exact hook this bypass came in through); the second is its CFLAGS-
 # widening sibling from the same regression family.
 S23B_LOG_P1="$SCRATCH_ROOT/s23b/log_positive_round9_note"
@@ -2808,7 +2808,7 @@ s24_check_rejected "redirect-out"     '-I>/tmp/evil'  '>'
 s24_check_rejected "redirect-in"      '-I</etc/passwd' '<'
 s24_check_rejected "process-subst"    '<(echo hi)'    '()<'
 
-# Positive control (Codex review, distinct code path): a Make-native
+# Positive control (regression coverage, distinct code path): a Make-native
 # ${VAR}-style expansion still must be rejected via the EXACT-TOKEN
 # $(filter) check, not the character allow-list -- GNU Make treats ${...}
 # identically to $(...) and resolves it to R11_FLAG's value (-Ofast) before
@@ -2937,7 +2937,7 @@ s25_check_rejected() {
   fi
 }
 
-# The literal reported repro (Codex review): a semicolon payload via
+# The literal reported repro (regression coverage): a semicolon payload via
 # EXTRA_LDFLAGS, dry-run-confirmed BEFORE this round's fix to sail through
 # untouched and land live in a real link recipe (`make -n selftest
 # EXTRA_LDFLAGS=';echo LINK_FLAG_INJECTION'` showed the payload verbatim,
@@ -3030,7 +3030,7 @@ REAL_DIST_AFTER="$(real_dist_sentinel)"
 [ "$REAL_DIST_BEFORE" = "$REAL_DIST_AFTER" ] && pass "integrity: real \$AC_DIR/dist sentinel unchanged (absent stays absent, or byte+mtime identical)" \
   || fail "integrity: real \$AC_DIR/dist sentinel CHANGED during this run"
 
-# round-7 review P3: final-guard re-check against the snapshot taken in S1
+# regression review P3: final-guard re-check against the snapshot taken in S1
 # (right after this suite's LAST intentional real-tree build). Every file
 # that existed then must still be sha+mtime identical now; a directory
 # created after the snapshot is allowed but reported (WARN/INFO -- after the
@@ -3049,7 +3049,7 @@ fi
 
 fg_new_dirs="$(comm -13 <(printf '%s\n' "$FINAL_GUARD_DIRS_BEFORE" | LC_ALL=C sort) <(printf '%s\n' "$FINAL_GUARD_DIRS_AFTER" | LC_ALL=C sort) | grep . || true)"
 if [ -n "$fg_new_dirs" ]; then
-  echo "  WARN: final-guard: new keyed director(ies) appeared under the real obj/+bin/ during this run (allowed, but unexpected after the round-7 S12 fix):"
+  echo "  WARN: final-guard: new keyed director(ies) appeared under the real obj/+bin/ during this run (allowed, but unexpected after the regression S12 fix):"
   printf '%s\n' "$fg_new_dirs" | sed 's/^/    INFO: new dir /'
 fi
 

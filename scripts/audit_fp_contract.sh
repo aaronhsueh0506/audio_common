@@ -65,7 +65,7 @@
 # consumed by AEC's TUs — is the same EXEMPT category as case 1 above, by
 # the same rule (explicit source-level fusion request); it is not in this
 # script's audit list (AEC's own scalar-vs-kernel-header split is documented
-# in AEC/c_impl's own README/CLAUDE.md), but the rule is identical: an
+# in AEC/c_impl's README and docs/development_guide.md), but the rule is identical: an
 # EXEMPT TU is one with a grep-confirmed explicit fma()/fmaf()/vfmaq_f32-
 # family call in its own source, nothing else qualifies.
 #

@@ -106,7 +106,7 @@ static void test_fft_size_boundary(void) {
     free(pool);
 }
 
-/* P0003 (re-review R05, external-memory size/init boundary): fft_get_mem_size /
+/* External-memory size/init boundary: fft_get_mem_size /
  * fft_create / fft_init must whitelist fft_size to powers of two in [16, 8192]
  * on BOTH backends -- rejecting (0 / NULL):
  *   - other positive powers of two (1/2/4/8) that, pre-P0003, reached NE10's

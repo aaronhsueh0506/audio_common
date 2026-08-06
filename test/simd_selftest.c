@@ -205,7 +205,7 @@ static void check_complex_bits_or_die(const char *kernel, int n, int trial,
     check_bits_or_die(kernel, n, trial, simd_f, scalar_f, 2 * n_elems);
 }
 
-/* ═══════════ pinned special-value contract (re-review R07) ═══════════════
+/* ═════════════════ pinned special-value contract ═════════════════════════
  * fast_math.h's header comment documents an exact "Special-value contract
  * table" for fast_exp/fast_log/fast_sqrt (NaN/+-Inf/0/negative -> exact
  * deterministic float). These two helpers plus test_fast_math_special_values

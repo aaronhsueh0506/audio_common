@@ -39,7 +39,7 @@
  * extension in gnu99 mode (verified), so this needs no negative-array-size
  * fallback.
  *
- * Residual strict-aliasing caveat (review R06): Complex and
+ * Strict-aliasing contract: Complex and
  * ne10_fft_cpx_float32_t are still DISTINCT struct types, so this is layout
  * compatibility, not type compatibility -- the C standard does not
  * guarantee that reading through one struct type after writing through the

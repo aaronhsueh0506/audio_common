@@ -1,5 +1,5 @@
 #!/bin/sh
-# audit_alloc_symbols.sh - allocator-symbol provenance aid (review F16).
+# audit_alloc_symbols.sh - allocator-symbol provenance aid.
 #
 # Given a binary (static archive .a, object .o, or linked executable/dylib),
 # reports every reference to the four heap-allocator entry points
@@ -37,7 +37,7 @@
 # e.g. a custom allocator or the zero_heap_hook.c interposer -- worth a
 # second look if seen somewhere unexpected).
 #
-# Not wired into `make` on purpose (per review F16 scope) -- this is a
+# Not wired into `make` on purpose -- this is a
 # manual audit aid, run by hand against whatever binary you're strict-build
 # auditing that day.
 

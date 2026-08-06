@@ -755,7 +755,7 @@ NE10_INLINE void ne10_mixed_radix_c2r_butterfly_float32_c (
  * hands it to @ref ne10_fft_init_r2c_float32_ext. This is the exact `memneeded` expression
  * @ref ne10_fft_alloc_r2c_float32 itself uses -- extracted here so both paths size the config identically.
  *
- * P0003 (re-review R05, external-memory size/init boundary): every term below is computed in
+ * P0003 (external-memory size/init boundary): every term below is computed in
  * `ne10_uint32_t` (32-bit) arithmetic, so a huge nfft can silently wrap this sum to a small,
  * deceptively "valid" value before it ever reaches a caller's (correctly 64-bit, saturating) size_t
  * bookkeeping -- e.g. nfft=2^28 previously wrapped to 1,342,177,968 and nfft=2^30 to 1,073,742,512,
@@ -803,7 +803,7 @@ ne10_uint32_t ne10_fft_r2c_mem_size_float32 (ne10_int32_t nfft)
  * nfft are bit-identical by construction. This function never frees `mem` -- the caller owns that memory
  * either way, on both success and failure.
  *
- * P0003 (re-review R05, external-memory size/init boundary): this function used to take no `mem_size`
+ * P0003 (external-memory size/init boundary): this function used to take no `mem_size`
  * at all -- a caller-carved pool region was handed over with no way for this function to confirm it was
  * actually big enough for `nfft`, and a too-small `mem` would have its trailing fields (r_twiddles_neon /
  * r_factors_neon / r_super_twiddles_neon, carved past the end of the caller's actual allocation) written
@@ -854,7 +854,7 @@ ne10_fft_r2c_cfg_float32_t ne10_fft_init_r2c_float32_ext (void *mem, ne10_uint32
 
     // factors and twiddles for rfft C
     //
-    // P0003 amendment (re-review round-3 B07): this call's result used to be
+    // P0003 amendment (factorization guard): this call's result used to be
     // discarded outright, and the nfft/4 call below returned the partially-
     // initialised, non-NULL `st` on failure instead of NULL -- a caller had
     // no way to distinguish that from a fully-initialised config. Both calls
@@ -937,7 +937,7 @@ ne10_fft_r2c_cfg_float32_t ne10_fft_init_r2c_float32_ext (void *mem, ne10_uint32
  * @ref ne10_fft_r2c_mem_size_float32 followed by a call into it -- see that function for the one twiddle
  * code path both this and the external-memory entry point share.
  *
- * P0003 (re-review R05): passes the `memneeded` it just computed through as @ref
+ * P0003: passes the `memneeded` it just computed through as @ref
  * ne10_fft_init_r2c_float32_ext's new `mem_size` parameter -- this malloc() path always hands over
  * exactly the size it allocated, so the bounds check inside always passes for a valid nfft here; a
  * memneeded==0 (nfft outside the whitelisted range) still fails via NE10_MALLOC(0) or the callee's own

@@ -1,181 +1,18 @@
 /**
- * simd_kernels.h - shared NEON/scalar bit-exact DSP micro-kernels.
+ * Shared scalar/NEON float32 DSP micro-kernels.
  *
- * A small per-bin kernel library the AEC/NR float32 C code can call instead
- * of hand-rolled scalar loops, so the same vectorized building blocks are
- * reused everywhere instead of re-deriving them per call site.
+ * For finite inputs every NEON entry point must be byte-identical to its
+ * scalar reference. Ordered compare/select kernels also match scalar NaN
+ * branching; pure arithmetic guarantees NaN classification but not payload
+ * identity. Tests classify payload-only differences separately.
  *
- * ─────────────────────────── Bit-exactness contract ──────────────────────
- * For every kernel, `sk_<name>(...)` (NEON, when available) MUST produce a
- * byte-identical result to `sk_<name>_scalar(...)` for every input (NaN
- * payload bits excepted — NaN is out of scope, see below). This is a hard
- * requirement, not a tolerance: downstream regression gates `cmp` two WAV
- * files, so any drift anywhere breaks the gate.
+ * Preserve scalar operation order and compile including translation units
+ * with -ffp-contract=off. Explicit fmaf calls stay fused; ordinary mul/add
+ * stays separate. Reciprocal/sqrt estimates and reassociation are forbidden.
+ * SIMD_KERNELS_FORCE_SCALAR selects the fallback implementation.
  *
- * NaN caveat, precisely: for the compare+select kernels (sk_min_f32,
- * sk_clip_f32, sk_fast_sqrt_f32, sk_fast_exp_f32, sk_fast_exp_neg_f32,
- * sk_fast_log_f32, sk_fast_log10_f32, sk_exp1_approx_f32) NaN is actually
- * deterministic and IS verified bit-exact scalar-vs-NEON (see
- * simd_selftest.c's dedicated NaN blocks) — every IEEE ordered comparison
- * (<, <=, >, >=) is false for NaN, on both the scalar FPU and NEON, so the
- * "select" always lands on the same documented branch (fast_sqrt/fast_exp/
- * fast_log: the domain-edge constant fast_math.h documents; min/clip:
- * whichever operand the ternary/mask falls through to) in both paths.
- * "NaN is out of scope" applies to the pure-arithmetic kernels (sk_ema_f32,
- * sk_cadd_f32, sk_sq_scale_f32, sk_capply_gain_f32, sk_mcra_noise_update_f32):
- * a NaN operand propagates through +/- correctly-rounded arithmetic with no
- * compare/select involved, and while AArch64 scalar and NEON FP units are
- * architecturally the same IEEE-754 hardware (so payload propagation should
- * in practice agree), this file does not assert or test that payload-bit
- * equality for those kernels — only that NaN inputs don't corrupt unrelated
- * lanes/output.
- *
- * ───────────────────── Contract summary ─────────────────────────────────
- * Stated once, plainly, as the one-paragraph version of the two blocks
- * above: every kernel here is scalar-reference bit-exact for FINITE inputs,
- * full stop, no exceptions, gated by simd_selftest.c's exit(1)-on-mismatch
- * finite corpus. For a NaN input, the per-lane contract is "NaN in -> NaN
- * out, payload unspecified" for the pure-arithmetic kernels, and "matches
- * whatever branch the scalar reference's own compare+select ternary takes on
- * that NaN" for the guarded kernels (sk_min_f32/sk_clip_f32/
- * sk_fast_sqrt_f32) — which this file's kernels satisfy not just as a
- * behavioural claim but bit-for-bit, verified by simd_selftest.c's dedicated
- * NaN blocks, because every guard here is a single ordered compare with at
- * most one NaN operand in play. This header has no multi-NaN-operand
- * REDUCTION kernel (no pairwise-sum tree, no fmaf-chained accumulator that
- * folds several independent NaN-carrying inputs together) — those live in
- * AEC/c_impl's aec_simd_kernels.h, where a NaN can arrive from two different
- * operands into the same fmaf/add and scalar vs. NEON may legitimately
- * disagree on WHICH NaN's payload survives (C leaves multi-NaN payload
- * selection implementation-defined) while still both correctly producing
- * *a* NaN. aec_simd_kernels.h's own selftest (simd_selftest_aec.c) has a
- * real classified gate for exactly that "both sides say NaN, payloads
- * differ" case (bit-exact / both-NaN-payload-unspecified / HARD FAIL) — see
- * that file's header comment for the full contract and
- * the empirical result (100% of its historical mismatches are the in-contract
- * both-NaN case, 0% are a genuine finite-vs-NaN divergence).
- *
- * This is achievable because AArch64 NEON per-lane vaddq_f32/vmulq_f32/
- * vdivq_f32/vsqrtq_f32/vfmaq_f32 are IEEE-754 binary32 correctly-rounded
- * operations — the exact same rounding the scalar FPU ops use. Given that,
- * bit-exactness reduces to one rule: **replicate the scalar operation
- * SEQUENCE (which ops are fused, which are separate, and in what order)
- * lane-for-lane**. Concretely:
- *
- *   1. No estimate instructions anywhere (vrsqrteq_f32, vrecpeq_f32, and
- *      their Newton-refinement companions are NEVER used in this file —
- *      every reciprocal/sqrt/divide is the exact vdivq_f32/vsqrtq_f32).
- *   2. No reassociation: if the scalar source computes `a*b + c*d` as two
- *      separate rounded multiplies followed by a separate rounded add, the
- *      NEON path issues `vmulq_f32`, `vmulq_f32`, `vaddq_f32` — never a
- *      single `vfmaq_f32`. Conversely, where the scalar source explicitly
- *      calls `fmaf(x, y, z)`, the NEON path uses `vfmaq_f32` (fusing y*x+z
- *      in one rounding step), because that's what the scalar reference
- *      itself does.
- *   3. Every NEON kernel's scalar tail (the `n % 4` leftover elements) calls
- *      the exact same static per-element helper the `_scalar` entry point
- *      uses — so the tail is bit-identical to the fully-scalar path *by
- *      construction*, not by re-derivation.
- *
- * ────────────────────────────── FMA discipline ────────────────────────────
- * Empirically verified on this toolchain (Apple clang 17, arm64): a plain
- * scalar C loop shaped `state[i] = alpha*state[i] + beta*x[i];` gets
- * auto-vectorized *and auto-fused into `fmla`* at `-O2` WITHOUT
- * `-ffp-contract=off` — while two separate `vmulq_f32`/`vaddq_f32`
- * intrinsic calls never get fused by the compiler regardless of the
- * contract setting (intrinsics lower to fixed instruction selections, not
- * generic contraction-eligible IR). That means the "plain mul/add, do NOT
- * fuse" scalar reference kernels below are only correct references when
- * compiled with `-ffp-contract=off` — the same flag AEC/NR's own c_impl
- * builds already mandate. **Any TU that includes this header, or otherwise
- * reproduces these expression shapes, MUST compile with
- * `-ffp-contract=off`.**
- *
- *   Uses explicit fmaf()/vfmaq_f32 (mirrors an explicit `fmaf(...)` call in
- *   the AEC/NR source — always fused, with or without -ffp-contract, since
- *   an explicit fmaf() call requests FMA directly rather than relying on
- *   contraction of separate ops):
- *     - the cabs_np/cmag2_np magnitude helper's `ratio*ratio + 1.0f` term
- *       (kernels 1, 2, 3, 5's internal magnitude computation)
- *     - sk_cmac_np_f32          (kernel 6)
- *     - sk_wupdate_nlms_f32's grad = err * conj(X) term (kernel 7)
- *     - sk_wupdate_kf_f32's final W += K_scaled * error_spec term (kernel 8)
- *
- *   Uses separate mul then add, NEVER fused (mirrors the source NOT calling
- *   fmaf for that particular step — needs -ffp-contract=off to stay this
- *   way):
- *     - sk_ema_f32                                   (kernel 4)
- *     - sk_ema_cmag2_f32's outer alpha*state+beta*mag2 combine (kernel 5)
- *     - sk_wupdate_nlms_f32's final W += mu_eff*grad combine   (kernel 7)
- *     - sk_wupdate_kf_f32's K = mu*conj(X) and K *= mu_scale steps
- *       (kernel 8)
- *     - sk_sq_scale_f32                              (kernel 11)
- *     - sk_fast_exp_f32 / sk_fast_exp_neg_f32's Taylor expansion and
- *       sk_fast_log_f32 / sk_fast_log10_f32's Taylor expansion (kernels
- *       23-26) — fast_math.h's fast_exp/fast_log never call fmaf, so
- *       neither do these
- *     - sk_exp1_approx_f32's three branch formulas               (kernel 27)
- *     - sk_mcra_noise_update_f32                                  (kernel 28)
- *
- * ───────────────────────── min/clip: compare+select, not min/max ─────────
- * Empirically verified: AArch64 `vminq_f32(-0.0f, +0.0f)` returns -0.0f,
- * while the plain C ternary `(a < b) ? a : b` (a=-0.0f, b=+0.0f) returns
- * +0.0f, because IEEE `<` treats -0 and +0 as equal so the ternary falls
- * through to `b`. The hardware vector min/max instructions do NOT agree
- * with a naive ternary at a signed-zero tie. Since the self-test's
- * special-value pool includes ±0.0f, `sk_min_f32` / `sk_clip_f32` are
- * therefore implemented with compare+select (`vcltq_f32`/`vcgtq_f32` +
- * `vbslq_f32`), which reproduces the ternary's bit pattern exactly in every
- * case, instead of `vminq_f32`/`vmaxq_f32`. (The larger/smaller-of-two-
- * absolute-values step inside cabs_np/cmag2_np is NOT at risk: vabsq_f32
- * clears the sign bit first, so both operands to that particular max/min
- * are always +0.0 or positive, and a max/min tie between two bit-identical
- * non-negative values returns that same bit pattern regardless of which
- * hardware convention is used.)
- *
- * ────────────────────────────── Force-scalar knob ─────────────────────────
- * Define `SIMD_KERNELS_FORCE_SCALAR` (e.g. `-DSIMD_KERNELS_FORCE_SCALAR`)
- * to make every `sk_<name>` entry point just call `sk_<name>_scalar`, even
- * on an AArch64/NEON build. This validates that the non-NEON fallback path
- * compiles and runs on NEON-capable hardware too. `SK_HAVE_NEON` is 1 when
- * the NEON bodies are compiled in, 0 otherwise.
- *
- * ───────────────────────────────── Style ──────────────────────────────────
- * Header-only, C99, static inline (same convention as fast_math.h). Only
- * fft_wrapper.h (for `Complex`) plus <math.h>/<stdint.h>/<stddef.h> (and
- * <arm_neon.h> under the NEON guard) are included — no dependency on
- * fast_math.h itself, so this header's bit-exactness cannot be silently
- * altered by an unrelated `USE_STANDARD_MATH` toggle defined by some other
- * translation unit that happens to link into the same program. Where a
- * kernel mirrors a fast_math.h function (fast_sqrt, clip_f, min_f, fast_exp,
- * fast_exp_neg, fast_log, fast_log10, exp1_approx), its exact algorithm is
- * replicated verbatim as a private per-element helper instead of calling
- * fast_math.h directly — see the per-kernel comments. This DOES include
- * mirroring fast_math.h's own `USE_STANDARD_MATH` build-mode switch (a
- * separate `#ifdef USE_STANDARD_MATH` inside this header, not a dependency
- * on the other one) so a call site converted from a bare fast_math.h call to
- * the matching sk_ kernel behaves identically in both build modes.
- *
- * No `restrict` anywhere: callers may pass overlapping buffers only when
- * explicitly documented as supporting it (e.g. sk_capply_gain_f32's
- * out == z in-place case, and the exp/log family's out == x case, kernels
- * 23/24/25/27, documented at their definitions below); otherwise pointers
- * are assumed non-aliasing.
- *
- * Only the alias forms exercised by the self-test and the NR scratch-buffer
- * reuse paths are
- * exercised by simd_selftest.c's matrix are contractually supported --
- * sk_capply_gain_f32's literal out == z (dedicated in-place check in
- * test_capply_gain()), plus sk_fast_exp_f32/sk_fast_exp_neg_f32/
- * sk_fast_log_f32/sk_exp1_approx_f32's literal out == x (dedicated in-place
- * check in test_exp_log_family_inplace()). sk_fast_log10_f32 shares the
- * identical per-block load-then-store shape but has no call site relying on
- * it yet and no dedicated in-place selftest, so out == x for it is NOT
- * contractually supported until one is added. Every other kernel's edge-case
- * matrix uses NON-overlapping buffers at every offset combination it tests;
- * partial overlap (out == z + k / out == x + k for any nonzero k) is neither
- * documented nor tested anywhere in this file and is unsupported, even if it
- * happens to work today on some input.
+ * Exact in-place aliasing is supported only where a kernel documents it;
+ * partial overlap is unsupported.
  */
 
 #ifndef SIMD_KERNELS_H
@@ -324,56 +161,10 @@ static inline void sk_ema_f32(float *state, const float *x,
 }
 #endif
 
-/* ═══════════════════ Complex-quad NEON load/store (legal aliasing) ═════════
- * sk__cquad_load / sk__cquad_store — the ONLY sanctioned way any kernel in
- * this file (or in AEC/c_impl's aec_simd_kernels.h, which #includes this
- * header and calls these two directly rather than redefining them) may move
- * 4 lanes of `Complex` through NEON registers.
- *
- * AArch64 GCC/Clang use their documented `may_alias` type attribute for the
- * float view passed to vld2q_f32/vst2q_f32.  Such accesses are treated like
- * character-type accesses for alias analysis, so correctness does not depend
- * on a consumer Makefile supplying -fno-strict-aliasing.  This is important
- * for board integrations that compile this header outside the four repository
- * Makefiles.  The compiler still owns register allocation for the native
- * structure intrinsic (and therefore emits its required consecutive register
- * pair).  Other compilers retain the portable memcpy+vld1+uzp/zip fallback
- * documented below.
- *
- * Why this exists: the previous code here cast a `const Complex*`/`Complex*`
- * (interleaved {r,i} AoS — see fft_wrapper.h) straight to
- * `(const float *)`/`(float *)` and handed that to vld2q_f32/vst2q_f32
- * directly. AEC/c_impl's aec_simd_kernels.h used to do that exact same cast
- * at its own many call sites too; it no longer does — that file now
- * `#include`s this header and calls sk__cquad_load/sk__cquad_store directly
- * (see above) instead of casting on its own, so it inherited this fix rather
- * than needing a separate one. Reading/writing a `Complex` object through a
- * `float` lvalue that way is a type-based-aliasing violation (C11 6.5p7):
- * every byte of the struct IS a float, but `float` is
- * not the EFFECTIVE TYPE of a `Complex` object, so the compiler is entitled
- * to assume a `Complex*` and a `float*` never alias — true UB even though it
- * happens to produce the intended codegen today, at -O2, on every toolchain
- * this project currently builds with (the exact class of exposure this
- * repo's Makefile already documents and carries a target-specific
- * -fno-strict-aliasing override for on fft_wrapper.c/fft_wrapper_ne10.c —
- * see FFT_WRAPPER_ALIAS_CFLAGS there). These two kernel FUNCTIONS live in a
- * header with no .c file of their own in audio_common, so that Makefile-level
- * fix cannot reach them; fixing the aliasing at the SOURCE instead, once,
- * here, fixes every consumer (AEC/c_impl's aec3_post.c, Audio_ALG/pipelines'
- * audio_pipeline.c, and aec_simd_kernels.h's own many call sites) without any
- * Makefile change in any of those repos.
- *
- * The GCC/Clang path therefore uses a local `may_alias` float typedef.  It
- * makes this one byte-compatible view explicit to the compiler while keeping
- * the native vld2q_f32/vst2q_f32 operations and their efficient ld2/st2
- * lowering.  This is a source-level contract: callers remain correct under
- * normal `-fstrict-aliasing`, including callers built outside this repository.
- *
- * A compiler without that extension uses the fully portable fallback:
- * memcpy four Complex values into a real float array, use ordinary vld1/vst1
- * plus register-only uzp/zip, then memcpy back.  It may be slower, but never
- * relies on an incompatible lvalue type.  Re-check generated code whenever
- * either path or its call sites changes materially. */
+/* ═══════════════════ Complex-quad NEON load/store ════════════════════════
+ * These helpers are the only supported way to move Complex arrays through
+ * NEON. GCC/Clang use a may_alias float view so strict-aliasing remains valid;
+ * other compilers use a portable memcpy plus register unzip/zip fallback. */
 #if SK_HAVE_NEON
 static inline float32x4x2_t sk__cquad_load(const Complex *p) {
 #if defined(__GNUC__) || defined(__clang__)
@@ -643,78 +434,14 @@ static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
 }
 #endif
 
-/* ═══════════════════ kernels 23-27: fast_math.h exp/log family ════════════
- * Array-kernel NEON twins for fast_math.h's fast_exp/fast_exp_neg/fast_log/
- * fast_log10/exp1_approx — added per the s4-audio-common-sweep review
- * (fast_math.h had zero NEON coverage anywhere, and these five functions sit
- * in NR's hottest per-bin loops: spp_estimator.c's fast_exp_neg, mmse_lsa_
- * denoiser.c's calculate_gain, mcra_noise_estimator.c's per-hop hi-freq
- * flatness loop). Per this header's own "no dependency on fast_math.h" rule
- * (see the Style section above), the table/constants/algorithm are
- * replicated verbatim as private SK_-prefixed helpers below rather than
- * included from fast_math.h — keep them in sync with fast_math.h if that
- * implementation ever moves. Validated against the REAL fast_math.h
- * (fast_exp/fast_exp_neg/fast_log/fast_log10/exp1_approx) bit-for-bit over
- * tens of thousands of random + curated-boundary values by
- * test/simd_selftest.c's test_fast_exp()/test_fast_exp_neg()/test_fast_log()/
- * test_fast_log10()/test_exp1_approx().
- *
- * Memory-safety note (table gather): fast_exp's exp_int_table lookup has no
- * native NEON gather on this target, so the NEON path does 4 scalar table
- * reads assembled into a vector (see sk__fast_exp_vec below). The table
- * index is derived from an internally range-clamped copy of the input
- * (vminq_f32/vmaxq_f32 to [-16,16]) so the gather is ALWAYS in-bounds
- * (index in [0,32]) regardless of the real, unclamped input — including
- * NaN and any out-of-[-16,16]-domain finite value whose result will be
- * overridden by the domain-edge select afterward anyway (same "compute
- * unconditionally, then select" shape as sk_fast_sqrt_f32 above, kernel 15).
- * NaN specifically: vminq_f32/vmaxq_f32 (NOT vminnmq_f32/vmaxnmq_f32) are
- * ordinary NaN-propagating IEEE FMIN/FMAX, so a NaN input stays NaN through
- * the clamp and vrndmq_f32 (floor); AArch64's FCVTZS (float-to-signed-int
- * convert, `vcvtq_s32_f32`) is architecturally defined to return 0 for a NaN
- * source (ARMv8 ARM, not implementation-defined), so the resulting table
- * index for a NaN lane is exactly SK_EXP_TABLE_OFFSET (16) — safely
- * in-bounds — confirmed empirically on this toolchain, not just asserted
- * from the architecture reference. Without the clamp, a huge finite input
- * (e.g. 1e30f) would FCVTZS-saturate to INT32_MAX/INT32_MIN and then
- * overflow signed int on the `+ SK_EXP_TABLE_OFFSET` add (UB) before ever
- * indexing the table — the clamp is load-bearing for that case, confirmed
- * empirically too (see the review's validation notes). The scalar reference
- * never hits either hazard: its two domain guards (`!(x>=-16.0f)` /
- * `x>16.0f`) return early, before the `(int)floorf(x)` line, for every
- * input that isn't already in [-16,16].
- *
- * FMA discipline: fast_math.h's fast_exp/fast_log never call fmaf() at any
- * step, so none of these kernels do either — every combine below is a
- * separate vmulq_f32/vaddq_f32/vsubq_f32, matching the "separate mul then
- * add, never fused" list in the file header comment. Requires
- * -ffp-contract=off on the including TU, same as every other kernel here.
- *
- * USE_STANDARD_MATH: mirrors fast_math.h's toggle (bare expf/logf/log10f/
- * powf calls, no domain-edge constants). There is no native vectorized
- * transcendental on this target, so under USE_STANDARD_MATH the "NEON" entry
- * points below just call the scalar loop — same honest fallback shape as
- * every other `#if SK_HAVE_NEON ... #else scalar ... #endif` kernel when
- * there is genuinely nothing to vectorize.
- *
- * In-place (out==x) safety (NR/c_impl calculate_gain()/spp_estimate()
- * scratch-buffer-reuse review): sk_fast_exp_f32 (23), sk_fast_exp_neg_f32
- * (24), sk_fast_log_f32 (25), and sk_exp1_approx_f32 (27) all SUPPORT
- * out==x. Every NEON body below processes one 4-lane block per iteration by
- * fully loading it (vld1q_f32) into registers, computing entirely from
- * those registers (no further memory reads), and only THEN storing
- * (vst1q_f32) that same block back — no iteration reads a lane any other
- * iteration writes, so aliasing the output onto the exact same input
- * pointer is safe (the same reasoning as sk_capply_gain_f32's existing
- * out==z contract, kernel 9, above). The scalar tail (and the
- * USE_STANDARD_MATH / non-NEON scalar-only fallback) is the same
- * read-into-a-value-then-write-out[i] shape per element, so it agrees.
- * sk_fast_log10_f32 (26) shares the identical shape but is NOT covered by a
- * dedicated in-place selftest (no call site needs it yet) -- see the "no
- * restrict" contract note near the top of this file. This is exercised by
- * simd_selftest.c's test_exp_log_family_inplace(). Partial-offset aliasing
- * (out == x + k, k != 0) remains unsupported for all five, same as
- * everywhere else in this file. */
+/* ═══════════════════ kernels 23-27: exp/log family ═══════════════════════
+ * Vector equivalents of fast_math.h. Constants and operation order must stay
+ * synchronized with that implementation. The exponential table index is
+ * computed from an internally clamped [-16,16] value, keeping every gather
+ * in bounds even when the final lane result is selected by a domain guard.
+ * No operation is fused. Exact out==x use is supported except where a kernel
+ * explicitly documents otherwise; partial overlap is unsupported.
+ * USE_STANDARD_MATH falls back to scalar libm calls. */
 
 #define SK_FM_LN2      0.693147180559945f
 #define SK_FM_LOG10E   0.4342944819032518f
@@ -1082,39 +809,11 @@ static inline void sk_exp1_approx_f32(const float *x, float *out, int n) {
 #endif /* SK_HAVE_NEON && !USE_STANDARD_MATH */
 
 /* ═══════════════════════════════ kernel 28 ═════════════════════════════════
- * sk_mcra_noise_update_f32 — verbatim shape of NR/c_impl/src/
- * mcra_noise_estimator.c's per-hop, per-bin noise-PSD update (mcra_update(),
- * ~line 605-612):
- *
- *   su = spp[i] * bb_scale;
- *   tilde_alpha_d = alpha_d + (1.0f - alpha_d) * su;
- *   noise_psd[i] = tilde_alpha_d*noise_psd[i] + (1.0f-tilde_alpha_d)*power[i];
- *
- * A per-bin-VARYING-alpha EMA (tilde_alpha_d depends on spp[i], unlike
- * kernel 4's sk_ema_f32 which takes a single scalar alpha for the whole
- * call) -- added per the s4-audio-common-sweep review. Per that review's
- * independent-verifier correction, this is a FUSED, single-purpose kernel
- * matching the call site's exact shape (alpha_d, bb_scale scalars; spp,
- * power, noise_psd arrays) rather than a generic "alpha-array" primitive:
- * the fused form needs no extra n_freqs-sized scratch buffer for a
- * precomputed tilde_alpha_d array, so it doesn't grow NR's static-memory
- * pool budget the way a generic two-array-weight kernel would, matching
- * this file's existing "verbatim kernel per call site" convention (see
- * sk_ema_cmag2_f32/sk_n2_track_f32/sk_n2_initial_track_f32 in AEC's
- * aec_simd_kernels.h for the same pattern). NOT wired into NR's call site by
- * this change -- NR is a sibling repo built separately; this kernel is
- * added and validated here in isolation (test/simd_selftest.c) so it is
- * ready for that call site to adopt in NR's own review pass.
- *
- * No fmaf anywhere: the source computes `alpha_d + (1-alpha_d)*su` and
- * `tilde*noise_psd + (1-tilde)*power` as separate rounded multiplies then
- * separate rounded adds (no fmaf call at either line), so this kernel must
- * not fuse either -- same -ffp-contract=off requirement as every other
- * kernel in this file. `(1.0f - alpha_d)` is loop-invariant in the source
- * (alpha_d is a per-call scalar, re-evaluated identically every iteration)
- * so hoisting it out of the loop here changes nothing bit-wise -- same
- * `vdupq_n_f32`-once-before-the-loop pattern sk_ema_f32 (kernel 4) already
- * uses for its own scalar alpha/beta. */
+ * Fused MCRA noise update with a per-bin alpha:
+ *   su = spp[i] * bb_scale
+ *   a  = alpha_d + (1-alpha_d) * su
+ *   noise[i] = a*noise[i] + (1-a)*power[i]
+ * The source uses separate rounded multiply/add operations; do not use FMA. */
 
 static inline void sk_mcra_noise_update_f32_scalar(float *noise_psd,
                                                      const float *spp,
