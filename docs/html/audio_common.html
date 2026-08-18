@@ -29,7 +29,7 @@ pre code{background:none;padding:0}
 <h2>概要</h2>
 <p><code>audio_common</code> 是 AEC / NR / Audio_ALG pipelines 共用的 DSP 底層,與 Audio_ALG 同層的獨立 repo(引用時 <code>-I audio_common/include</code> + 連結 <code>libaudio_common.a</code>)。本頁聚焦 <code>FftHandle</code> 契約與零 heap 慣例;其餘模組(fast_math、simd_kernels、HPF、pre-gain、resampler、wav_io)列於檔案節。</p>
 <ul>
-<li><b>一個公開 API、兩個後端</b>:KISS(可攜參考、bit-reproducible、host/CI 用)與 NE10(ARM NEON、嵌入式用)。後端是 build 旋鈕(<code>make BACKEND=kiss|ne10</code>)不是分支屬性。<b>NE10 與 KISS 輸出不逐位元相同</b>;所有 vs-Python parity 保證僅限 KISS。同一後端下 heap 與 static 路徑 byte-equal(selftest 實測)。</li>
+<li><b>一個公開 API、兩個後端</b>:KISS(可攜參考、bit-reproducible、host/CI 用)與 NE10(ARM NEON、嵌入式用)。後端是 build 旋鈕(<code>make BACKEND=kiss|ne10</code>)不是分支屬性;不明示 <code>BACKEND=</code> 時依編譯目標自動偵測(<code>__ARM_NEON</code>/<code>__aarch64__</code>)→ 有 NEON 選 <b>NE10</b>,否則退回 KISS。<b>2026-08-18 起在 NEON 目標上這使自動偵測預設變成 NE10</b>(之前預設 KISS);KISS 仍是需要逐位元可重現時的明示可攜參考後端,交付/交叉編譯建議永遠明示 <code>BACKEND=</code>。<b>NE10 與 KISS 輸出不逐位元相同</b>;所有 vs-Python parity 保證僅限 KISS。同一後端下 heap 與 static 路徑 byte-equal(selftest 實測)。</li>
 <li><b>FP 政策</b>:<code>-ffp-contract=off</code> 是四 repo 統一政策,每個 Makefile 把它放在 CFLAGS 最後且在 parse 期擋掉 <code>-ffast-math</code>/<code>-Ofast</code>/自帶 <code>-ffp-contract</code> 的覆寫;<code>scripts/audit_fp_contract.sh</code> 用反組譯證明無自動 FMA。</li>
 <li><b>float32 全面政策</b>:production 路徑全 f32(唯一例外:KISS 在 plan 期以 double 算 twiddle;NE10 後端連 init 都無 double)。</li>
 </ul>

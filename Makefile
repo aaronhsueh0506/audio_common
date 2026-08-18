@@ -3,9 +3,11 @@
 # One copy of the FFT layer for every consumer repo (AEC, NR, Audio_ALG). Consumers
 # add `-I audio_common/include` and link the backend they want:
 #
-#   FFT backend policy:
-#     make BACKEND=kiss      -> portable KISS FFT   (default; bit-reproducible reference)
-#     make BACKEND=ne10      -> ARM NEON NE10 FFT   (embedded target; NE10_DSP_RFFT_SCALING on)
+#   FFT backend policy (no BACKEND given -> auto-detected from the compiler
+#   target: NE10 when ARM NEON is available, else KISS; explicit BACKEND=
+#   always overrides the auto-detect):
+#     make BACKEND=ne10      -> ARM NEON NE10 FFT   (embedded deliverable; NE10_DSP_RFFT_SCALING on)
+#     make BACKEND=kiss      -> portable KISS FFT   (bit-reproducible reference backend)
 #
 # Both backends expose the SAME public API (fft_wrapper.h): a heap path
 # (fft_create/fft_destroy) and a static-memory path (fft_get_mem_size/fft_init),
