@@ -160,18 +160,30 @@ void fft_forward(FftHandle* h, const float* restrict real_in, Complex* restrict 
 
     int n = h->fft_size;
 
+    /* Staging buffers must be read out of the handle ONCE. A store through
+     * h->fft_in[] could, for all the compiler can prove, land on the
+     * FftHandle's own fft_in/fft_out members, forcing a re-load of the
+     * pointer on every element and blocking vectorization of the interleaved
+     * store below. Both buffers are carved once (fft_create/fft_init) and
+     * never reassigned during a transform, so the loads are loop-invariant.
+     * Plain values, not `restrict`: the parameter-level restrict already
+     * supplies the caller-buffer no-alias facts, and qualifying these changes
+     * no generated instruction. */
+    kiss_fft_cpx* fin  = h->fft_in;
+    kiss_fft_cpx* fout = h->fft_out;
+
     /* Copy real input to complex buffer (imaginary = 0) */
     for (int i = 0; i < n; i++) {
-        h->fft_in[i].r = real_in[i];
-        h->fft_in[i].i = 0.0f;
+        fin[i].r = real_in[i];
+        fin[i].i = 0.0f;
     }
 
-    kiss_fft(h->fft_cfg, h->fft_in, h->fft_out);
+    kiss_fft(h->fft_cfg, fin, fout);
 
     /* Copy first n_freqs bins to output */
     for (int k = 0; k < h->n_freqs; k++) {
-        complex_out[k].r = h->fft_out[k].r;
-        complex_out[k].i = h->fft_out[k].i;
+        complex_out[k].r = fout[k].r;
+        complex_out[k].i = fout[k].i;
     }
 }
 
@@ -183,22 +195,27 @@ void fft_inverse(FftHandle* h, const Complex* restrict complex_in, float* restri
     int n = h->fft_size;
     int n_freqs = h->n_freqs;
 
+    /* Loop-invariant staging pointers -- see fft_forward() above for why the
+     * handle members cannot stay in the loop bodies. */
+    kiss_fft_cpx* fin  = h->fft_in;
+    kiss_fft_cpx* fout = h->fft_out;
+
     /* Reconstruct full spectrum with conjugate symmetry: X[k] = conj(X[N-k]) */
     for (int k = 0; k < n_freqs; k++) {
-        h->fft_in[k].r = complex_in[k].r;
-        h->fft_in[k].i = complex_in[k].i;
+        fin[k].r = complex_in[k].r;
+        fin[k].i = complex_in[k].i;
     }
     for (int k = 1; k < n_freqs - 1; k++) {
-        h->fft_in[n - k].r =  complex_in[k].r;
-        h->fft_in[n - k].i = -complex_in[k].i;  /* Conjugate */
+        fin[n - k].r =  complex_in[k].r;
+        fin[n - k].i = -complex_in[k].i;  /* Conjugate */
     }
 
-    kiss_fft(h->ifft_cfg, h->fft_in, h->fft_out);
+    kiss_fft(h->ifft_cfg, fin, fout);
 
     /* KISS FFT doesn't scale, so divide by N (numpy irfft convention) */
     float scale = 1.0f / (float)n;
     for (int i = 0; i < n; i++) {
-        real_out[i] = h->fft_out[i].r * scale;
+        real_out[i] = fout[i].r * scale;
     }
 }
 
