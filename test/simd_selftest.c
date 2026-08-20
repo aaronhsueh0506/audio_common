@@ -1295,6 +1295,83 @@ static void fill_pcm_floats(float *a, int n) {
     for (i = 0; i < n; ++i) a[i] = gen_pcm_float();
 }
 
+static void test_cmag_edge(void) {
+    Complex *cx = (Complex *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(Complex));
+    float *out_s = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *out_v = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    int ni, form, o;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (form = 0; form < EDGE_FORM_COUNT; ++form) {
+            for (o = 1; o <= EDGE_OFFSET_MAX; ++o) {
+                int in_off, out_off;
+                edge_offsets_for_form(form, o, &in_off, &out_off);
+
+                edge_fill_canary_c(cx, EDGE_ARENA_LEN);
+                edge_fill_canary_f(out_s, EDGE_ARENA_LEN);
+                edge_fill_canary_f(out_v, EDGE_ARENA_LEN);
+                fill_complex(cx + in_off, n);
+                sk_cmag_f32_scalar(out_s + out_off, cx + in_off, n, 1e-8f);
+                sk_cmag_f32(out_v + out_off, cx + in_off, n, 1e-8f);
+                check_bits_or_die("cmag_edge", n, form * 100 + o,
+                                   out_v + out_off, out_s + out_off, n);
+                edge_check_canary_c("cmag_edge:x", cx, EDGE_ARENA_LEN, in_off, n);
+                edge_check_canary_f("cmag_edge:out_s", out_s, EDGE_ARENA_LEN, out_off, n);
+                edge_check_canary_f("cmag_edge:out_v", out_v, EDGE_ARENA_LEN, out_off, n);
+            }
+        }
+    }
+    free(cx); free(out_s); free(out_v);
+    printf("PASS cmag_edge (n=0..17+existing x offset 1..15 x 3 forms, "
+           "canary-guarded)\n");
+}
+
+static void test_asym_ema_edge(void) {
+    float *st_s = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *st_v = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *drive = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *seed = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    int ni, form, o, k, fell = 0, rose = 0;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (form = 0; form < EDGE_FORM_COUNT; ++form) {
+            for (o = 1; o <= EDGE_OFFSET_MAX; ++o) {
+                int in_off, out_off;
+                edge_offsets_for_form(form, o, &in_off, &out_off);
+                edge_fill_canary_f(drive, EDGE_ARENA_LEN);
+                edge_fill_canary_f(st_s, EDGE_ARENA_LEN);
+                edge_fill_canary_f(st_v, EDGE_ARENA_LEN);
+                fill_floats(drive + in_off, n);
+                fill_floats(seed, n);
+                memcpy(st_s + out_off, seed, (size_t)n * sizeof(float));
+                memcpy(st_v + out_off, seed, (size_t)n * sizeof(float));
+                for (k = 0; k < n; ++k) {
+                    if (drive[in_off + k] < seed[k]) fell++; else rose++;
+                }
+                sk_asym_ema_f32_scalar(st_s + out_off, drive + in_off, n,
+                                        0.999f, 0.97f);
+                sk_asym_ema_f32(st_v + out_off, drive + in_off, n,
+                                 0.999f, 0.97f);
+                check_bits_or_die("asym_ema_edge", n, form * 100 + o,
+                                   st_v + out_off, st_s + out_off, n);
+                edge_check_canary_f("asym_ema_edge:x", drive, EDGE_ARENA_LEN, in_off, n);
+                edge_check_canary_f("asym_ema_edge:s_s", st_s, EDGE_ARENA_LEN, out_off, n);
+                edge_check_canary_f("asym_ema_edge:s_v", st_v, EDGE_ARENA_LEN, out_off, n);
+            }
+        }
+    }
+    /* Both directions must have been exercised, or the compare+select is
+     * only half tested and a wrong-way branch would pass. */
+    if (fell == 0 || rose == 0) {
+        fprintf(stderr, "FATAL asym_ema_edge: only one direction driven "
+                "(fell=%d rose=%d) -- the select is not proven\n", fell, rose);
+        exit(1);
+    }
+    free(st_s); free(st_v); free(drive); free(seed);
+    printf("PASS asym_ema_edge (fell=%d rose=%d, canary-guarded)\n",
+           fell, rose);
+}
+
 static void test_clip_scale_to_s16_edge(void) {
     float *in_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
     int16_t *out_scalar = (int16_t *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(int16_t));
@@ -1749,6 +1826,8 @@ int main(void) {
     test_fast_sqrt_edge();
     test_wola_accumulate_edge();
     test_clip_scale_to_s16_edge();
+    test_cmag_edge();
+    test_asym_ema_edge();
 
     printf("\n--- microbenchmarks (n=%d, %d reps) ---\n", BENCH_N, BENCH_REPS);
     bench_ema();

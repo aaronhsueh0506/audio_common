@@ -1003,6 +1003,136 @@ static inline void sk_clip_scale_to_s16_arr(int16_t *out, const float *in,
 }
 #endif
 
+/* ═══════════════════════════════ kernel 31 ═════════════════════════════════
+ * sk_cmag_f32 — out[i] = x[i].r*x[i].r + x[i].i*x[i].i + eps
+ *
+ * ⚠ NAME vs OPERATION: this is SQUARED magnitude (power) plus a floor, not
+ * magnitude -- there is no square root. The name is the one its call site
+ * already uses; renaming it would be a silent contract break for that caller,
+ * so the discrepancy is recorded here instead. `eps` is the caller's floor
+ * (the mask estimator passes 1e-8f) and is added AFTER the two products are
+ * summed, matching the scalar reference's association exactly.
+ *
+ * Separate vmulq/vaddq, never vfmaq_f32: the reference spells this as two
+ * multiplies then two adds, which under -ffp-contract=off rounds at each step.
+ *
+ * The de-interleave goes through sk__cquad_load(), never a raw
+ * Complex*->float* cast fed to vld2q_f32(): that cast is a strict-aliasing
+ * violation, and this is a HEADER, so it would compile into every consumer
+ * regardless of that consumer's aliasing flags. The helper also carries the
+ * non-GCC/clang memcpy+vuzpq fallback this kernel would otherwise lose.
+ *
+ * ⚠ Naming, for anyone navigating from AEC's aec_simd_kernels.h: there
+ * `sk_cabs_np_*` is magnitude and `sk_cmag2_np_*` is squared magnitude, both
+ * in the numpy scaled-hypot form. This kernel is the NAIVE r*r+i*i with a
+ * floor, and its name predates that family. It is not a duplicate of
+ * sk_cmag2_np_f32 -- different formula, different rounding.
+ */
+
+static inline void sk_cmag_f32_scalar(float *out, const Complex *x, int n,
+                                       float eps) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = x[i].r * x[i].r + x[i].i * x[i].i + eps;
+}
+
+#if SK_HAVE_NEON
+static inline void sk_cmag_f32(float *out, const Complex *x, int n,
+                                float eps) {
+    int i = 0;
+    float32x4_t ev = vdupq_n_f32(eps);
+    for (; i + 4 <= n; i += 4) {
+        float32x4x2_t ri = sk__cquad_load(x + i);   /* de-interleave */
+        float32x4_t rr = vmulq_f32(ri.val[0], ri.val[0]);
+        float32x4_t ii = vmulq_f32(ri.val[1], ri.val[1]);
+        vst1q_f32(out + i, vaddq_f32(vaddq_f32(rr, ii), ev));
+    }
+    for (; i < n; ++i) out[i] = x[i].r * x[i].r + x[i].i * x[i].i + eps;
+}
+#else
+static inline void sk_cmag_f32(float *out, const Complex *x, int n,
+                                float eps) {
+    sk_cmag_f32_scalar(out, x, n, eps);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 32 ═════════════════════════════════
+ * sk_linear_to_db_f32 — out[i] = 10 * log10f(x[i])
+ *
+ * Power-domain dB (10x, not 20x): the caller feeds it the squared magnitudes
+ * kernel 31 produces.
+ *
+ * ⚠ NO NEON PATH, AND THAT IS THE POINT. The only bit-exact source of
+ * log10f() is libm, and this header's whole contract is that a dispatched
+ * kernel is bitwise identical to its scalar twin. sk_fast_log10_f32 (kernel
+ * 26) is a deliberate APPROXIMATION -- routing this through it would silently
+ * move every value the caller then compares against a dB threshold. A caller
+ * that wants the approximation should call kernel 26 directly and say so.
+ * It is here rather than in the caller because the dB convention (10x, this
+ * epsilon-free form, libm) is a decision worth stating once. ⚠ It does NOT yet
+ * consolidate anything: the scalar `10.0f * log10f(...)` sites elsewhere in
+ * this stack are single-value, not array passes, and were not changed.
+ */
+
+static inline void sk_linear_to_db_f32(float *out, const float *x, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = 10.0f * log10f(x[i]);
+}
+
+/* ═══════════════════════════════ kernel 33 ═════════════════════════════════
+ * sk_asym_ema_f32 — one-pole EMA with a different coefficient per direction:
+ *
+ *     s[i] = (x[i] < s[i]) ? a_down*s[i] + (1-a_down)*x[i]
+ *                          : a_up  *s[i] + (1-a_up)  *x[i]
+ *
+ * The noise-floor tracker shape: a slow a_up so the floor creeps upward, a
+ * faster a_down so it drops promptly. `s` is updated IN PLACE.
+ *
+ * The comparison is strict `<` and selects a_down, exactly as the scalar
+ * reference spells it -- at equality both branches produce the same value, so
+ * the tie only matters for reading the code, not for the result.
+ *
+ * (1-a) is loop-invariant and exact in binary floating point, so hoisting it
+ * out of the loop is bit-identical to recomputing it per element. Separate
+ * vmulq/vaddq, never vfmaq_f32, for the usual reason.
+ */
+
+static inline void sk_asym_ema_f32_scalar(float *s, const float *x, int n,
+                                           float a_up, float a_down) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        if (x[i] < s[i]) s[i] = a_down * s[i] + (1.0f - a_down) * x[i];
+        else             s[i] = a_up   * s[i] + (1.0f - a_up)   * x[i];
+    }
+}
+
+#if SK_HAVE_NEON
+static inline void sk_asym_ema_f32(float *s, const float *x, int n,
+                                    float a_up, float a_down) {
+    int i = 0;
+    float32x4_t up = vdupq_n_f32(a_up);
+    float32x4_t dn = vdupq_n_f32(a_down);
+    float32x4_t up1 = vdupq_n_f32(1.0f - a_up);
+    float32x4_t dn1 = vdupq_n_f32(1.0f - a_down);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t sv = vld1q_f32(s + i);
+        float32x4_t xv = vld1q_f32(x + i);
+        float32x4_t r_dn = vaddq_f32(vmulq_f32(dn, sv), vmulq_f32(dn1, xv));
+        float32x4_t r_up = vaddq_f32(vmulq_f32(up, sv), vmulq_f32(up1, xv));
+        /* x < s ? falling : rising -- compare+select, both branches computed. */
+        vst1q_f32(s + i, vbslq_f32(vcltq_f32(xv, sv), r_dn, r_up));
+    }
+    for (; i < n; ++i) {
+        if (x[i] < s[i]) s[i] = a_down * s[i] + (1.0f - a_down) * x[i];
+        else             s[i] = a_up   * s[i] + (1.0f - a_up)   * x[i];
+    }
+}
+#else
+static inline void sk_asym_ema_f32(float *s, const float *x, int n,
+                                    float a_up, float a_down) {
+    sk_asym_ema_f32_scalar(s, x, n, a_up, a_down);
+}
+#endif
+
 #ifdef __cplusplus
 }
 #endif
