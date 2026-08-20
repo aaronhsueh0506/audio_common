@@ -912,6 +912,97 @@ static inline void sk_wola_accumulate_f32(float *acc, const float *x,
 }
 #endif
 
+/* ═══════════════════════════════ kernel 30 ═════════════════════════════════
+ * sk_clip_scale_to_s16 — float in [-1, 1] -> int16 PCM
+ *
+ * The last step before a float mixing chain hands samples to a PCM sink:
+ * clip to +-1, scale by 32767, convert. Three entry points, because callers
+ * need it in three shapes:
+ *
+ *   sk__clip_scale_to_s16_elem()   one sample; the scalar reference
+ *   sk_clip_scale_to_s16_arr()     a whole planar buffer
+ *   sk_clip_scale_to_s16()         one NEON quad -> int16x4_t, for a caller
+ *                                  that interleaves two channels with
+ *                                  vst2_s16 and therefore cannot hand the
+ *                                  array form a unit-stride destination
+ *
+ * ⚠ The quad form is NEON-only and has no _scalar twin: its return type does
+ * not exist without <arm_neon.h>. Callers guard it with SK_HAVE_NEON and fall
+ * back to the per-sample helper, which is why that helper is part of the
+ * public surface rather than an internal detail.
+ *
+ * Bit-exact against the scalar reference:
+ *   - clipping is vcgtq/vcltq + vbslq_f32 to match sk_clip_f32 (kernel 12), so
+ *     this file has one clipping idiom rather than two. ⚠ Kernel 12's reason
+ *     -- vmaxq/vminq's signed-zero tie-break -- does NOT apply here, and the
+ *     comment is not repeated as if it did: the conversion below maps -0.0f and
+ *     +0.0f to the same int16, so the difference is unobservable through this
+ *     kernel. Verified by mutation: swapping in vmaxq(lo, vminq(hi, v)) leaves
+ *     the selftest passing, where the three mutations below all fail it;
+ *   - vcvtq_s32_f32 truncates toward zero, which is exactly what C's
+ *     float->int conversion does, so there is no rounding-mode divergence.
+ *     ⚠ vcvtnq_s32_f32 rounds to nearest and would NOT match;
+ *   - vqmovn_s32's saturation can never engage, the input already being
+ *     clipped to +-32767, so it is a plain narrow.
+ *
+ * ⚠ No caller lives in these repos. The consumer is platform integration code
+ * outside this tree, which open-coded the sequence; this kernel exists so that
+ * code has one definition to call and a bit-exactness test behind it. Until a
+ * caller lands here, only the selftest exercises it.
+ *
+ * Related but deliberately NOT unified: wav_io.h's writer performs the same
+ * conversion in its NR-style branch, but under a different contract -- it
+ * sanitises non-finite input to 0.0f and COUNTS it, and its AEC-style branch
+ * scales by 32768.0f with round-half-away-from-zero instead. Folding this
+ * kernel in would have to resolve those differences in wav_io.h's favour, and
+ * that path is one fwrite per sample, so there is nothing to win by doing it.
+ *
+ * The high bound is tested before the low one. For every non-NaN input the two
+ * orders agree, so the order is not load-bearing here (unlike kernel 12, whose
+ * reference pins it). NaN is not
+ * handled: it survives both clips and reaches a float->int conversion, which
+ * C leaves undefined. A caller that can produce NaN must stop it upstream --
+ * a NaN reaching a PCM sink is a defect wherever it is converted.
+ */
+
+#define SK_S16_FULL_SCALE 32767.0f
+
+static inline int16_t sk__clip_scale_to_s16_elem(float x) {
+    if (x > 1.0f) x = 1.0f;
+    else if (x < -1.0f) x = -1.0f;
+    return (int16_t)(x * SK_S16_FULL_SCALE);
+}
+
+static inline void sk_clip_scale_to_s16_arr_scalar(int16_t *out,
+                                                    const float *in, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = sk__clip_scale_to_s16_elem(in[i]);
+}
+
+#if SK_HAVE_NEON
+static inline int16x4_t sk_clip_scale_to_s16(float32x4_t v) {
+    const float32x4_t lo = vdupq_n_f32(-1.0f);
+    const float32x4_t hi = vdupq_n_f32(1.0f);
+    v = vbslq_f32(vcgtq_f32(v, hi), hi, v);      /* x > 1 ? 1 : x */
+    v = vbslq_f32(vcltq_f32(v, lo), lo, v);      /* x < -1 ? -1 : x */
+    /* truncate, never vcvtnq_s32_f32 -- see the note above. */
+    return vqmovn_s32(vcvtq_s32_f32(vmulq_n_f32(v, SK_S16_FULL_SCALE)));
+}
+
+static inline void sk_clip_scale_to_s16_arr(int16_t *out, const float *in,
+                                             int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4)
+        vst1_s16(out + i, sk_clip_scale_to_s16(vld1q_f32(in + i)));
+    for (; i < n; ++i) out[i] = sk__clip_scale_to_s16_elem(in[i]);
+}
+#else
+static inline void sk_clip_scale_to_s16_arr(int16_t *out, const float *in,
+                                             int n) {
+    sk_clip_scale_to_s16_arr_scalar(out, in, n);
+}
+#endif
+
 #ifdef __cplusplus
 }
 #endif

@@ -118,8 +118,10 @@ static void fill_complex(Complex *a, int n) {
 
 /* Separate, moderate-range generator for the microbenchmarks only -- keeps
  * the timing loops away from Inf/NaN-producing accumulation artifacts so
- * the reported numbers reflect typical-case throughput. Not used by any
- * correctness check. */
+ * the reported numbers reflect typical-case throughput. Also the in-range
+ * draw for kernel 30's correctness test (gen_pcm_float below), which needs
+ * exactly this distribution -- [-1, 1] at fine granularity -- and would
+ * otherwise re-derive the same two constants. */
 static float gen_bench_float(void) {
     uint32_t r = lcg_next();
     return ((float)(r % 2000001u) / 1000000.0f) - 1.0f; /* ~[-1, 1] */
@@ -1245,6 +1247,116 @@ static void test_clip_edge(void) {
  * copies of the same starting accumulator -- comparing them otherwise would be
  * meaningless. acc doubles as an input and an output arena, so its canary is
  * checked against the OUTPUT offset. */
+/* int16 counterparts of the float canary helpers above -- kernel 30 is the
+ * only kernel whose destination is not float, so these live next to its test
+ * rather than with the float pair. */
+#define EDGE_CANARY_S16 ((int16_t)0x5A5A)
+
+static void edge_fill_canary_s16(int16_t *arena, int len) {
+    int i;
+    for (i = 0; i < len; ++i) arena[i] = EDGE_CANARY_S16;
+}
+
+static void edge_check_canary_s16(const char *label, const int16_t *arena,
+                                   int len, int win_lo, int win_len) {
+    int i, win_hi = win_lo + win_len;
+    for (i = 0; i < len; ++i) {
+        if (i >= win_lo && i < win_hi) continue;
+        g_total_checks++;
+        if (arena[i] != EDGE_CANARY_S16) {
+            fprintf(stderr,
+                "CANARY VIOLATION %s: arena[%d]=%d (want canary %d) "
+                "-- out-of-bounds access, payload window=[%d,%d)\n",
+                label, i, (int)arena[i], (int)EDGE_CANARY_S16, win_lo, win_hi);
+            exit(1);
+        }
+    }
+}
+
+/* Input distribution for kernel 30. gen_float() alone is not enough: it draws
+ * arbitrary bit patterns, so almost every sample is far outside [-1, 1] and
+ * the test would only ever exercise the two clip branches. The extra cases
+ * put samples INSIDE the range at fine granularity, which is where the
+ * float->int conversion's rounding mode is observable at all -- swapping
+ * vcvtq_s32_f32 (truncate) for vcvtnq_s32_f32 (round to nearest) moves roughly
+ * half of them by one LSB, and nothing else in this test would notice. */
+static float gen_pcm_float(void) {
+    switch (lcg_next() % 6u) {
+        case 0: return gen_float();               /* clip branches, inf, denormals */
+        case 1: return 1.0f;                      /* exactly at the bound */
+        case 2: return -1.0f;
+        case 3: return (lcg_next() & 1u) ? 0.0f : -0.0f;
+        default: return gen_bench_float();         /* in range, 1e-6 granularity */
+    }
+}
+
+static void fill_pcm_floats(float *a, int n) {
+    int i;
+    for (i = 0; i < n; ++i) a[i] = gen_pcm_float();
+}
+
+static void test_clip_scale_to_s16_edge(void) {
+    float *in_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    int16_t *out_scalar = (int16_t *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(int16_t));
+    int16_t *out_simd = (int16_t *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(int16_t));
+    int ni, form, o, clipped_lo = 0, clipped_hi = 0, in_range = 0;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (form = 0; form < EDGE_FORM_COUNT; ++form) {
+            for (o = 1; o <= EDGE_OFFSET_MAX; ++o) {
+                int in_off, out_off, k;
+                edge_offsets_for_form(form, o, &in_off, &out_off);
+
+                edge_fill_canary_f(in_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_s16(out_scalar, EDGE_ARENA_LEN);
+                edge_fill_canary_s16(out_simd, EDGE_ARENA_LEN);
+                fill_pcm_floats(in_arena + in_off, n);
+
+                for (k = 0; k < n; ++k) {
+                    float v = in_arena[in_off + k];
+                    if (v > 1.0f) clipped_hi++;
+                    else if (v < -1.0f) clipped_lo++;
+                    else in_range++;
+                }
+
+                sk_clip_scale_to_s16_arr_scalar(out_scalar + out_off,
+                                                 in_arena + in_off, n);
+                sk_clip_scale_to_s16_arr(out_simd + out_off,
+                                          in_arena + in_off, n);
+
+                for (k = 0; k < n; ++k) {
+                    g_total_checks++;
+                    if (out_simd[out_off + k] != out_scalar[out_off + k]) {
+                        fprintf(stderr,
+                            "MISMATCH clip_scale_to_s16_edge n=%d form=%d off=%d "
+                            "idx=%d: simd=%d scalar=%d (in=%.9g)\n",
+                            n, form, o, k, (int)out_simd[out_off + k],
+                            (int)out_scalar[out_off + k], in_arena[in_off + k]);
+                        exit(1);
+                    }
+                }
+                edge_check_canary_f("clip_scale_to_s16_edge:in", in_arena,
+                                     EDGE_ARENA_LEN, in_off, n);
+                edge_check_canary_s16("clip_scale_to_s16_edge:out_scalar",
+                                       out_scalar, EDGE_ARENA_LEN, out_off, n);
+                edge_check_canary_s16("clip_scale_to_s16_edge:out_simd",
+                                       out_simd, EDGE_ARENA_LEN, out_off, n);
+            }
+        }
+    }
+    /* The distribution is generated, so assert it actually reached every
+     * branch rather than trusting that it did. */
+    if (clipped_hi == 0 || clipped_lo == 0 || in_range == 0) {
+        fprintf(stderr, "FATAL clip_scale_to_s16_edge: input never reached a "
+                "branch (hi=%d lo=%d in_range=%d) -- the test proves nothing\n",
+                clipped_hi, clipped_lo, in_range);
+        exit(1);
+    }
+    free(in_arena); free(out_scalar); free(out_simd);
+    printf("PASS clip_scale_to_s16_edge (clip_hi=%d clip_lo=%d in_range=%d, "
+           "canary-guarded)\n", clipped_hi, clipped_lo, in_range);
+}
+
 static void test_wola_accumulate_edge(void) {
     float *x_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
     float *w_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
@@ -1636,6 +1748,7 @@ int main(void) {
     test_clip_edge();
     test_fast_sqrt_edge();
     test_wola_accumulate_edge();
+    test_clip_scale_to_s16_edge();
 
     printf("\n--- microbenchmarks (n=%d, %d reps) ---\n", BENCH_N, BENCH_REPS);
     bench_ema();
