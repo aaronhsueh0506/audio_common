@@ -150,8 +150,25 @@ count_fma() {
 # See the header comment above for the full rationale, especially the two
 # non-obvious classifications (fft_wrapper*/fft_wrapper_ne10* -> EXEMPT,
 # NE10_rfft_float32.neonintrinsic.o -> SCALAR despite its name).
+# Why include/simd_kernels.h has NO row here, and should not get one.
+#
+# Every kernel in that header is `static inline`, so a normal build produces no
+# object carrying one -- an audit row aimed at the header would pass by finding
+# nothing, and a wrapper TU compiled just to give it a body would only prove
+# something about a symbol nobody links.
+#
+# The kernels are covered twice over without that:
+#   1. test/simd_selftest.c compares each kernel against its scalar twin
+#      bit for bit, over canary-guarded arenas at every offset and length.
+#      That checks the ARITHMETIC RESULT, which is stronger than scanning for
+#      a mnemonic.
+#   2. The kernels inline into their call sites, and those objects ARE
+#      disassembled -- by this script for the ones in this repo and NR, and by
+#      Audio_ALG/pipelines/scripts/audit_fp_contract.sh for the pipeline TUs.
+#      Verified: replacing sk_wola_accumulate_f32's separate vmulq/vaddq with
+#      vfmaq_f32 makes audio_pipeline.o fail that audit.
+#
 AUDIT_ENTRIES='
-AC|both|simd_kernels_audit.o|SCALAR|non-inline instantiations of simd_kernels.h kernels (src/simd_kernels_audit.c), present so these header-only kernels have a body to disassemble at all -- sk_wola_accumulate_f32 must show separate vmulq/vaddq and NO vfmaq_f32, matching the multiply-then-add its scalar twin performs
 AC|both|hpf.o|SCALAR|shared HPF core (src/hpf.c) -- no NEON intrinsics, no explicit fmaf/fma anywhere
 AC|kiss|kiss_fft.o|SCALAR|vendored KISS FFT (lib/kiss_fft/kiss_fft.c) -- plain scalar C, no NEON, no explicit fmaf/fma
 AC|kiss|fft_wrapper.o|EXEMPT|fft_power() scalar tail explicitly calls fmaf(re,re,im*im) (see that function comment) + an __ARM_NEON&&__aarch64__-guarded vfmaq_f32/vmulq_f32 block -- both deliberate explicit-fusion requests, not compiler contraction
@@ -186,11 +203,6 @@ for BACKEND in $BACKENDS; do
     make -C "$AC_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD lib >/dev/null
     AC_OBJDIR="$(make -C "$AC_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD print-obj-dir)"
     AC_LIB="$(make -C "$AC_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD print-lib-path)"
-    # The header-only kernels have no object of their own in a normal build;
-    # this goal compiles the audit-only instantiation TU (which is kept OUT of
-    # the delivered archive) so there is a body to disassemble.
-    make -C "$AC_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD simd-kernels-audit-obj >/dev/null
-
     make -C "$NR_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD AC_LIB="$AC_LIB" lib >/dev/null
     NR_OBJDIR="$(make -C "$NR_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD AC_LIB="$AC_LIB" print-obj-dir)"
 

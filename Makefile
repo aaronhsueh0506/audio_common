@@ -240,18 +240,6 @@ BIN_DIR = $(BIN_ROOT)/$(BACKEND)-$(CFG_SIG)
 # Backend-independent shared DSP sources (always in the archive).
 COMMON_SRCS = src/hpf.c src/audio_pre_gain.c src/audio_resampler.c
 
-# Audit-only translation unit. Every kernel in include/simd_kernels.h is
-# `static inline`, so in a normal build it is inlined into its caller or
-# dropped -- there is no object carrying "the kernel", and a disassembly audit
-# aimed at the archive would pass by finding nothing. src/simd_kernels_audit.c
-# gives the audited kernels a real function body to inspect.
-#
-# Deliberately NOT in COMMON_SRCS: the delivered archive must not carry a
-# symbol that exists only for the audit. Built on demand by the
-# `simd-kernels-audit-obj` goal below, which scripts/audit_fp_contract.sh
-# invokes.
-AUDIT_OBJ = $(OBJ_DIR)/simd_kernels_audit.o
-
 ifeq ($(BACKEND),ne10)
   # NE10 source footprint (review F16): fft_wrapper_ne10.c only ever calls the
   # float32 R2C/C2R entry points (ne10_fft_alloc_r2c_float32 /
@@ -938,10 +926,6 @@ $(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 $(OBJ_DIR)/fft_wrapper.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 
 LIB = $(BIN_DIR)/libaudio_common.a
-
-.PHONY: simd-kernels-audit-obj
-simd-kernels-audit-obj: $(AUDIT_OBJ)
-	@echo $(abspath $(AUDIT_OBJ))
 
 .PHONY: all lib selftest test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path _cfg_guard
 all: lib
