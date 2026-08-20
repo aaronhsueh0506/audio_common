@@ -1088,8 +1088,13 @@ static inline void sk_linear_to_db_f32(float *out, const float *x, int n) {
  * faster a_down so it drops promptly. `s` is updated IN PLACE.
  *
  * The comparison is strict `<` and selects a_down, exactly as the scalar
- * reference spells it -- at equality both branches produce the same value, so
- * the tie only matters for reading the code, not for the result.
+ * reference spells it. Scalar and NEON therefore agree at equality because
+ * both take the same branch -- but the two branches do NOT produce the same
+ * value there: `a*v + (1-a)*v` rounds differently for different `a` -- over
+ * v in [0.2, 1.2) that is 17.0% of values across ten coefficient pairs
+ * (14.6% for 0.3/0.8; witness v=0.200000003 -> 0.200000003 vs 0.200000018).
+ * A consumer whose own reference selects on `>` rather than `<` therefore
+ * disagrees with this kernel at the tie and must not be routed through it.
  *
  * (1-a) is loop-invariant and exact in binary floating point, so hoisting it
  * out of the loop is bit-identical to recomputing it per element. Separate
@@ -1130,6 +1135,40 @@ static inline void sk_asym_ema_f32(float *s, const float *x, int n,
 static inline void sk_asym_ema_f32(float *s, const float *x, int n,
                                     float a_up, float a_down) {
     sk_asym_ema_f32_scalar(s, x, n, a_up, a_down);
+}
+#endif
+
+/* ═══════════════════════════════ kernel 34 ═════════════════════════════════
+ * sk_scale_f32 — out[i] = x[i] * g, one broadcast gain over an array.
+ * Supports out == x (in-place): each iteration loads before it stores and
+ * never revisits an index, the same aliasing rule kernel 9 documents.
+ *
+ * A single multiply per element, so there is no add for -ffp-contract to fuse
+ * and the result is exactly rounded however it is vectorised -- this kernel
+ * exists to give the stack ONE broadcast-scale implementation, not to change
+ * any arithmetic. Before it there were three: a hand-rolled NEON loop in
+ * audio_pre_gain.c guarded by its own private copy of the SK_HAVE_NEON
+ * predicate, plus two open-coded scalar loops in the gain stages.
+ */
+
+static inline void sk_scale_f32_scalar(float *out, const float *x,
+                                        float g, int n) {
+    int i;
+    for (i = 0; i < n; ++i) out[i] = x[i] * g;
+}
+
+#if SK_HAVE_NEON
+static inline void sk_scale_f32(float *out, const float *x, float g, int n) {
+    int i = 0;
+    float32x4_t gv = vdupq_n_f32(g);
+    for (; i + 4 <= n; i += 4) {
+        vst1q_f32(out + i, vmulq_f32(vld1q_f32(x + i), gv));
+    }
+    for (; i < n; ++i) out[i] = x[i] * g;
+}
+#else
+static inline void sk_scale_f32(float *out, const float *x, float g, int n) {
+    sk_scale_f32_scalar(out, x, g, n);
 }
 #endif
 

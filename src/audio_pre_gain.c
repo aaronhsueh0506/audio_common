@@ -5,14 +5,9 @@
 #include <string.h>
 
 #include "mem_align.h"
-
-#if defined(__aarch64__) && defined(__ARM_NEON) && \
-    !defined(SIMD_KERNELS_FORCE_SCALAR)
-#include <arm_neon.h>
-#define AUDIO_PRE_GAIN_NEON 1
-#else
-#define AUDIO_PRE_GAIN_NEON 0
-#endif
+#include "simd_kernels.h"   /* sk_scale_f32 -- and, with it, the one shared
+                             * SK_HAVE_NEON gate, replacing the private copy
+                             * of that predicate this file used to carry. */
 
 struct AudioPreGain {
     float gain_db;
@@ -97,19 +92,7 @@ int audio_pre_gain_process(const AudioPreGain* self,
                            float* output,
                            int n_samples)
 {
-    int i = 0;
-    float gain;
     if (!self || !input || !output || n_samples < 0) return -1;
-    gain = self->linear_gain;
-#if AUDIO_PRE_GAIN_NEON
-    {
-        float32x4_t gain_v = vdupq_n_f32(gain);
-        for (; i + 4 <= n_samples; i += 4) {
-            vst1q_f32(output + i,
-                      vmulq_f32(vld1q_f32(input + i), gain_v));
-        }
-    }
-#endif
-    for (; i < n_samples; ++i) output[i] = input[i] * gain;
+    sk_scale_f32(output, input, self->linear_gain, n_samples);
     return 0;
 }

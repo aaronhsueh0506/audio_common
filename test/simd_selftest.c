@@ -430,6 +430,35 @@ static void test_sq_scale(void) {
     printf("PASS sq_scale_f32\n");
 }
 
+/* ═══════════════════════════ correctness: kernel 34 ══════════════════════ */
+
+static void test_scale(void) {
+    float x[SK_TEST_MAX_N], out_scalar[SK_TEST_MAX_N], out_simd[SK_TEST_MAX_N];
+    float ip_scalar[SK_TEST_MAX_N], ip_simd[SK_TEST_MAX_N];
+    int ni, t;
+    const float gains[4] = { 0.5f, 1.0f, -2.25f, 1e-7f };
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (t = 0; t < TRIALS; ++t) {
+            float g = gains[t & 3];
+            fill_floats(x, n);
+            sk_scale_f32_scalar(out_scalar, x, g, n);
+            sk_scale_f32(out_simd, x, g, n);
+            check_bits_or_die("scale_f32", n, t, out_simd, out_scalar, n);
+
+            /* the documented out == x aliasing contract */
+            memcpy(ip_scalar, x, (size_t)n * sizeof(float));
+            memcpy(ip_simd, x, (size_t)n * sizeof(float));
+            sk_scale_f32_scalar(ip_scalar, ip_scalar, g, n);
+            sk_scale_f32(ip_simd, ip_simd, g, n);
+            check_bits_or_die("scale_f32:inplace", n, t, ip_simd, ip_scalar, n);
+            check_bits_or_die("scale_f32:inplace-vs-out", n, t,
+                              ip_simd, out_scalar, n);
+        }
+    }
+    printf("PASS scale_f32\n");
+}
+
 
 /* ═══════════════════════════ correctness: kernel 12 ══════════════════════ */
 
@@ -1826,6 +1855,7 @@ int main(void) {
     test_fast_sqrt_edge();
     test_wola_accumulate_edge();
     test_clip_scale_to_s16_edge();
+    test_scale();
     test_cmag_edge();
     test_asym_ema_edge();
 
