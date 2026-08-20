@@ -1233,6 +1233,61 @@ static void test_clip_edge(void) {
     printf("PASS clip_f32_edge (n=0..17+existing x offset 1..15, single in-place buffer, canary-guarded)\n");
 }
 
+/* kernel 29: sk_wola_accumulate_f32 (acc[i] += x[i]*w[i]).
+ *
+ * Follows this file's edge convention (canary-guarded arenas, the 3-form
+ * input/output offset matrix, N_LIST x TRIALS) rather than a private harness:
+ * that is what gives the kernel misaligned-offset and out-of-bounds coverage,
+ * and what feeds it gen_float()'s special pool (Inf / NaN / subnormals), which
+ * a hand-written edge table cannot match.
+ *
+ * The accumulate is IN-PLACE on acc, so the two paths are given independent
+ * copies of the same starting accumulator -- comparing them otherwise would be
+ * meaningless. acc doubles as an input and an output arena, so its canary is
+ * checked against the OUTPUT offset. */
+static void test_wola_accumulate_edge(void) {
+    float *x_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *w_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *acc_seed = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *acc_scalar_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    float *acc_simd_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
+    int ni, form, o;
+    for (ni = 0; ni < N_LIST_COUNT; ++ni) {
+        int n = N_LIST[ni];
+        for (form = 0; form < EDGE_FORM_COUNT; ++form) {
+            for (o = 1; o <= EDGE_OFFSET_MAX; ++o) {
+                int in_off, out_off;
+                edge_offsets_for_form(form, o, &in_off, &out_off);
+
+                edge_fill_canary_f(x_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(w_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(acc_scalar_arena, EDGE_ARENA_LEN);
+                edge_fill_canary_f(acc_simd_arena, EDGE_ARENA_LEN);
+                fill_floats(x_arena + in_off, n);
+                fill_floats(w_arena, n);
+                fill_floats(acc_seed, n);
+                memcpy(acc_scalar_arena + out_off, acc_seed, (size_t)n * sizeof(float));
+                memcpy(acc_simd_arena + out_off, acc_seed, (size_t)n * sizeof(float));
+
+                sk_wola_accumulate_f32_scalar(acc_scalar_arena + out_off,
+                                              x_arena + in_off, w_arena, n);
+                sk_wola_accumulate_f32(acc_simd_arena + out_off,
+                                       x_arena + in_off, w_arena, n);
+
+                check_bits_or_die("wola_accumulate_edge", n, form * 100 + o,
+                                   acc_simd_arena + out_off, acc_scalar_arena + out_off, n);
+                edge_check_canary_f("wola_accumulate_edge:x", x_arena, EDGE_ARENA_LEN, in_off, n);
+                edge_check_canary_f("wola_accumulate_edge:w", w_arena, EDGE_ARENA_LEN, 0, n);
+                edge_check_canary_f("wola_accumulate_edge:acc_scalar", acc_scalar_arena, EDGE_ARENA_LEN, out_off, n);
+                edge_check_canary_f("wola_accumulate_edge:acc_simd", acc_simd_arena, EDGE_ARENA_LEN, out_off, n);
+            }
+        }
+    }
+    free(x_arena); free(w_arena); free(acc_seed);
+    free(acc_scalar_arena); free(acc_simd_arena);
+    printf("PASS wola_accumulate_edge (n=0..17+existing x offset 1..15 x 3 forms, canary-guarded)\n");
+}
+
 static void test_fast_sqrt_edge(void) {
     float *x_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
     float *out_scalar_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
@@ -1580,6 +1635,7 @@ int main(void) {
     test_min_edge();
     test_clip_edge();
     test_fast_sqrt_edge();
+    test_wola_accumulate_edge();
 
     printf("\n--- microbenchmarks (n=%d, %d reps) ---\n", BENCH_N, BENCH_REPS);
     bench_ema();

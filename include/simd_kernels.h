@@ -869,6 +869,49 @@ static inline void sk_mcra_noise_update_f32(float *noise_psd,
 }
 #endif
 
+
+/* ═══════════════════════════════ kernel 29 ═════════════════════════════════
+ * sk_wola_accumulate_f32 — acc[i] += x[i] * w[i]
+ *
+ * The windowed overlap-add accumulate every AEC-side pipeline runs once per
+ * hop over a whole FFT frame: the synthesis window applied to the inverse
+ * transform, summed into the running OLA tail. Unit stride, no reduction, no
+ * aliasing between the three arrays.
+ *
+ * SEPARATE vmulq_f32 + vaddq_f32, deliberately NOT vfmaq_f32. Every scalar
+ * reference this kernel replaces spells the operation as a multiply followed
+ * by an add, which under this project's mandatory -ffp-contract=off rounds
+ * TWICE; a fused multiply-add rounds once and would differ in the last bit.
+ * That is a per-kernel rule, not a project-wide one -- kernels whose own
+ * scalar reference calls fmaf() do fuse, and must (see aec_simd_kernels.h).
+ */
+
+static inline void sk_wola_accumulate_f32_scalar(float *acc, const float *x,
+                                                  const float *w, int n) {
+    int i;
+    for (i = 0; i < n; ++i) acc[i] += x[i] * w[i];
+}
+
+#if SK_HAVE_NEON
+static inline void sk_wola_accumulate_f32(float *acc, const float *x,
+                                           const float *w, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t a = vld1q_f32(acc + i);
+        float32x4_t xv = vld1q_f32(x + i);
+        float32x4_t wv = vld1q_f32(w + i);
+        /* mul then add, never vfmaq_f32 -- see the note above. */
+        vst1q_f32(acc + i, vaddq_f32(a, vmulq_f32(xv, wv)));
+    }
+    for (; i < n; ++i) acc[i] += x[i] * w[i];
+}
+#else
+static inline void sk_wola_accumulate_f32(float *acc, const float *x,
+                                           const float *w, int n) {
+    sk_wola_accumulate_f32_scalar(acc, x, w, n);
+}
+#endif
+
 #ifdef __cplusplus
 }
 #endif

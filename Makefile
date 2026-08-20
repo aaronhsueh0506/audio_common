@@ -146,6 +146,16 @@ WERROR ?= 0
 # production default; SIMD=0 keeps the selected FFT backend/configuration but
 # dispatches both our kernels and the NE10 wrapper through their scalar C
 # implementations.  `SIMD` is the only public build-time switch.
+#
+# SIMD=0 and SIMD=1 are NOT bit-identical end to end, and are not contracted
+# to be.  Individual kernels in include/simd_kernels.h ARE byte-exact against
+# their scalar twins (test/simd_selftest.c proves it per kernel), but the AEC
+# matched filter deliberately diverges: delay_aec3.c's dot product uses four
+# accumulators plus vfmaq_f32 (reordered summation AND fused rounding) and its
+# NLMS update fuses where the scalar spells a separate multiply and add.  The
+# contract is per-configuration: a change must be byte-exact against the same
+# configuration before it, and across configurations only finite output, the
+# same delay winner/state and a quality tolerance are guaranteed.
 SIMD ?= 1
 ifneq ($(words $(SIMD)),1)
 $(error SIMD must be exactly 0 or 1, got '$(SIMD)')
@@ -229,6 +239,18 @@ BIN_DIR = $(BIN_ROOT)/$(BACKEND)-$(CFG_SIG)
 
 # Backend-independent shared DSP sources (always in the archive).
 COMMON_SRCS = src/hpf.c src/audio_pre_gain.c src/audio_resampler.c
+
+# Audit-only translation unit. Every kernel in include/simd_kernels.h is
+# `static inline`, so in a normal build it is inlined into its caller or
+# dropped -- there is no object carrying "the kernel", and a disassembly audit
+# aimed at the archive would pass by finding nothing. src/simd_kernels_audit.c
+# gives the audited kernels a real function body to inspect.
+#
+# Deliberately NOT in COMMON_SRCS: the delivered archive must not carry a
+# symbol that exists only for the audit. Built on demand by the
+# `simd-kernels-audit-obj` goal below, which scripts/audit_fp_contract.sh
+# invokes.
+AUDIT_OBJ = $(OBJ_DIR)/simd_kernels_audit.o
 
 ifeq ($(BACKEND),ne10)
   # NE10 source footprint (review F16): fft_wrapper_ne10.c only ever calls the
@@ -916,6 +938,10 @@ $(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 $(OBJ_DIR)/fft_wrapper.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 
 LIB = $(BIN_DIR)/libaudio_common.a
+
+.PHONY: simd-kernels-audit-obj
+simd-kernels-audit-obj: $(AUDIT_OBJ)
+	@echo $(abspath $(AUDIT_OBJ))
 
 .PHONY: all lib selftest test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path _cfg_guard
 all: lib

@@ -125,31 +125,15 @@ MAKE_FWD=""
 [ -n "${AR:-}" ]     && MAKE_FWD="$MAKE_FWD AR=$AR"
 [ -n "${RANLIB:-}" ] && MAKE_FWD="$MAKE_FWD RANLIB=$RANLIB"
 
-# --- Disassembler detection -------------------------------------------------
-if command -v objdump >/dev/null 2>&1; then
-    DISASM=objdump
-elif command -v otool >/dev/null 2>&1; then
-    DISASM=otool
-else
-    echo "FATAL: neither objdump nor otool found on PATH" >&2
-    exit 1
-fi
+# --- Disassembler + forbidden-mnemonic set ------------------------------
+# Both live in scripts/fp_contract_lib.sh so consumers further up the stack
+# (Audio_ALG/pipelines) audit against the SAME set rather than a copy of it.
+# Extending the mnemonic list is one edit.
+. "$(dirname "$0")/fp_contract_lib.sh"
+DISASM="$FP_CONTRACT_DISASM"
+FMA_RE="$FP_CONTRACT_FMA_RE"
 
-disas() {
-    case "$DISASM" in
-        objdump) objdump -d "$1" 2>/dev/null ;;
-        otool)   otool -tV "$1" 2>/dev/null ;;
-    esac
-}
-
-# fma-class mnemonics this policy forbids in scalar (non-EXEMPT) code:
-# fmadd/fmsub/fnmadd/fnmsub (AArch64 scalar/vector fused forms) and
-# fmla/fmls (AArch64 NEON vector fused multiply-accumulate/subtract, the
-# form the compiler's auto-vectorizer reaches for when it fuses a
-# vectorized a*b+c/a*b-c pattern -- see NE10_rfft_float32.neonintrinsic.o's
-# case 2 above for a real example). Case-insensitive; both objdump's and
-# otool's mnemonic columns lower-case these.
-FMA_RE='fmadd|fmsub|fnmadd|fnmsub|fmla|fmls'
+disas() { fp_contract_disas "$1"; }
 
 count_fma() {
     # grep -c always prints a count (0 on no match) but exits 1 on no
@@ -167,6 +151,7 @@ count_fma() {
 # non-obvious classifications (fft_wrapper*/fft_wrapper_ne10* -> EXEMPT,
 # NE10_rfft_float32.neonintrinsic.o -> SCALAR despite its name).
 AUDIT_ENTRIES='
+AC|both|simd_kernels_audit.o|SCALAR|non-inline instantiations of simd_kernels.h kernels (src/simd_kernels_audit.c), present so these header-only kernels have a body to disassemble at all -- sk_wola_accumulate_f32 must show separate vmulq/vaddq and NO vfmaq_f32, matching the multiply-then-add its scalar twin performs
 AC|both|hpf.o|SCALAR|shared HPF core (src/hpf.c) -- no NEON intrinsics, no explicit fmaf/fma anywhere
 AC|kiss|kiss_fft.o|SCALAR|vendored KISS FFT (lib/kiss_fft/kiss_fft.c) -- plain scalar C, no NEON, no explicit fmaf/fma
 AC|kiss|fft_wrapper.o|EXEMPT|fft_power() scalar tail explicitly calls fmaf(re,re,im*im) (see that function comment) + an __ARM_NEON&&__aarch64__-guarded vfmaq_f32/vmulq_f32 block -- both deliberate explicit-fusion requests, not compiler contraction
@@ -201,6 +186,10 @@ for BACKEND in $BACKENDS; do
     make -C "$AC_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD lib >/dev/null
     AC_OBJDIR="$(make -C "$AC_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD print-obj-dir)"
     AC_LIB="$(make -C "$AC_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD print-lib-path)"
+    # The header-only kernels have no object of their own in a normal build;
+    # this goal compiles the audit-only instantiation TU (which is kept OUT of
+    # the delivered archive) so there is a body to disassemble.
+    make -C "$AC_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD simd-kernels-audit-obj >/dev/null
 
     make -C "$NR_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD AC_LIB="$AC_LIB" lib >/dev/null
     NR_OBJDIR="$(make -C "$NR_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD AC_LIB="$AC_LIB" print-obj-dir)"
