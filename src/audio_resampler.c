@@ -416,6 +416,15 @@ int audio_resampler_channels(const AudioResampler* self)
 
 int audio_resampler_latency_input_frames(const AudioResampler* self)
 {
+    int up;
     if (!self) return -1;
-    return (self->filter_length - 1) / (2 * self->up);
+    /* The kernel is symmetric with (filter_length - 1) / 2 taps of group
+     * delay on the up-sampled grid, i.e. (filter_length - 1) / (2 * up) input
+     * frames. That is exact for every rate pair whose up factor divides
+     * ratio_max (8k/16k/48k in any combination); for a coprime pair such as
+     * 32k -> 24k (up 3, down 4) it is fractional, so round to the nearest
+     * frame instead of truncating (21.33 -> 21 either way there, but 21.5
+     * would have read 21). */
+    up = 2 * self->up;
+    return (self->filter_length - 1 + up / 2) / up;
 }
