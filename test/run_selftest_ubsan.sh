@@ -30,7 +30,7 @@ BIN="$BIN_DIR/simd_selftest_ubsan"
 mkdir -p "$BIN_DIR"
 
 echo "--- audio_common simd_selftest UBSan build ---"
-"$CC" -Wall -Wextra -O2 -std=gnu99 -Iinclude -ffp-contract=off \
+"$CC" -Wall -Wextra -O2 -std=gnu99 -Iinclude -ffp-contract=off -fno-math-errno \
     -fsanitize=undefined -fno-sanitize-recover=all \
     -o "$BIN" test/simd_selftest.c -lm
 

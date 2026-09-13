@@ -370,7 +370,9 @@ endif
 # other line), so its origin is already final by the time the foreach below
 # queries it. The regex it holds is documented in full where it is actually
 # used (the FP-policy allow-list block, further below).
-FP_POLICY := -ffp-contract=off
+# Keep scalar/NEON operation ordering stable and let AArch64 lower guarded
+# sqrtf calls to a single FSQRT without an errno-checking libm fallback.
+FP_POLICY := -ffp-contract=off -fno-math-errno
 FFT_WRAPPER_ALIAS_CFLAGS := -fno-strict-aliasing
 FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 
@@ -927,10 +929,13 @@ $(OBJ_DIR)/fft_wrapper.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path _cfg_guard
+.PHONY: all lib selftest test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
 all: lib
 
 lib: $(LIB)
+
+test-fast-sqrt-codegen:
+	@FP_POLICY='$(FP_POLICY)' scripts/audit_fast_sqrt_codegen.sh
 
 # --- CFG_SIG collision guard + directory creation (build hygiene) ----------
 # _cfg_guard is the single order-only prerequisite every compile/link/archive
@@ -1037,6 +1042,13 @@ selftest: $(LIB) | _cfg_guard
 	$(CC) $(LDFLAGS) -o $(BIN_DIR)/simd_selftest $(OBJ_DIR)/simd_selftest.o
 	@echo "--- audio_common SIMD kernel selftest [$(BACKEND)] ---"
 	@$(BIN_DIR)/simd_selftest
+	# Second pass with NR's production exp1_approx branch order
+	# (USE_OPTIMIZED_E1): fast_math.h's two orders must stay bit-identical,
+	# NaN included, so the cross-check against the kernel runs in both modes.
+	$(CC) $(CFLAGS) -DUSE_OPTIMIZED_E1 -ffp-contract=off -fstrict-aliasing -c -o $(OBJ_DIR)/simd_selftest_e1.o test/simd_selftest.c
+	$(CC) $(LDFLAGS) -o $(BIN_DIR)/simd_selftest_e1 $(OBJ_DIR)/simd_selftest_e1.o
+	@echo "--- audio_common SIMD kernel selftest [$(BACKEND)] USE_OPTIMIZED_E1 ---"
+	@$(BIN_DIR)/simd_selftest_e1
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_audio_utilities.o test/test_audio_utilities.c
 	$(LINK) -o $(BIN_DIR)/test_audio_utilities $(OBJ_DIR)/test_audio_utilities.o $(LIB) $(LDFLAGS)
 	@echo "--- audio_common pre-gain/resampler test [$(BACKEND)] ---"
@@ -1215,6 +1227,8 @@ print-obj-dir:
 	@echo $(abspath $(OBJ_DIR))
 print-lib-path:
 	@echo $(abspath $(LIB))
+print-fp-policy:
+	@echo $(FP_POLICY)
 
 # --- publish v4: immutable, content-addressed release under $(DIST_ROOT) ---
 # Layout per backend:

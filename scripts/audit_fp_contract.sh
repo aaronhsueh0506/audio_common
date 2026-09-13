@@ -115,6 +115,13 @@ fi
 
 BACKENDS="${*:-kiss ne10}"
 
+# The same release audit also proves that the scalar AArch64 fast_sqrt path
+# is a hardware instruction, not an errno-checking libm call. Read the flags
+# from the production Makefile so this gate fails if its policy ever drifts.
+# The probe uses Linux A53/A73 code generation even on a macOS host.
+AC_FP_POLICY="$(make -C "$AC_DIR" -s --no-print-directory DEBUG=0 print-fp-policy)"
+FP_POLICY="$AC_FP_POLICY" "$SCRIPT_DIR/audit_fast_sqrt_codegen.sh"
+
 # A plain string (not an array): under `set -u`, bash 3.2 (macOS's system
 # /bin/bash) treats expanding an EMPTY array as an unbound-variable error,
 # so a string that word-splits to zero words when empty is the portable

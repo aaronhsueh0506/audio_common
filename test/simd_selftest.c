@@ -233,6 +233,11 @@ static void assert_f32_bits(const char *label, float got, uint32_t want_bits) {
 }
 #endif
 
+/* Used by the USE_STANDARD_MATH branch (libm propagates NaN) and by the
+ * fast_sqrt(+Inf) pin on targets without hardware sqrt (the Newton fallback
+ * ends in Inf/Inf = NaN) -- guarded so the other builds do not warn about an
+ * unused static function. */
+#if defined(USE_STANDARD_MATH) || !FM_HAVE_HW_SQRT
 static void assert_is_nan(const char *label, float got) {
     g_total_checks++;
     if (!isnan(got)) {
@@ -244,6 +249,19 @@ static void assert_is_nan(const char *label, float got) {
         exit(1);
     }
 }
+#endif
+
+#ifndef USE_STANDARD_MATH
+/* fast_sqrt(+Inf): the hardware FSQRT path keeps +Inf; the portable Newton
+ * fallback ends in Inf/Inf = NaN (payload not pinned). */
+static void assert_sqrt_pinf(const char *label, float got) {
+#if FM_HAVE_HW_SQRT
+    assert_f32_bits(label, got, 0x7f800000u);
+#else
+    assert_is_nan(label, got);
+#endif
+}
+#endif
 
 #ifdef USE_STANDARD_MATH
 /* Only used by test_fast_math_special_values's USE_STANDARD_MATH branch
@@ -287,7 +305,7 @@ static void test_fast_math_special_values(void) {
     assert_f32_bits("fast_sqrt(NaN)",   fast_sqrt(qnan),  0x00000000u);
     assert_f32_bits("fast_sqrt(-1)",    fast_sqrt(-1.0f), 0x00000000u);
     assert_f32_bits("fast_sqrt(-0.0)",  fast_sqrt(-0.0f), 0x00000000u); /* sign NOT preserved */
-    assert_is_nan  ("fast_sqrt(+Inf)",  fast_sqrt(pinf));
+    assert_sqrt_pinf("fast_sqrt(+Inf)",  fast_sqrt(pinf));
 #else
     /* USE_STANDARD_MATH: bare libm calls, ordinary IEEE-754 propagation. */
     assert_is_nan("fast_exp(NaN) [libm]", fast_exp(qnan));
@@ -320,11 +338,11 @@ static void test_fast_math_special_values(void) {
         assert_f32_bits("sk_fast_sqrt_f32(NaN) scalar",   out_scalar[0], 0x00000000u);
         assert_f32_bits("sk_fast_sqrt_f32(-1) scalar",    out_scalar[1], 0x00000000u);
         assert_f32_bits("sk_fast_sqrt_f32(-0.0) scalar",  out_scalar[2], 0x00000000u);
-        assert_is_nan  ("sk_fast_sqrt_f32(+Inf) scalar",  out_scalar[3]);
+        assert_sqrt_pinf("sk_fast_sqrt_f32(+Inf) scalar", out_scalar[3]);
         assert_f32_bits("sk_fast_sqrt_f32(NaN) simd",     out_simd[0], 0x00000000u);
         assert_f32_bits("sk_fast_sqrt_f32(-1) simd",      out_simd[1], 0x00000000u);
         assert_f32_bits("sk_fast_sqrt_f32(-0.0) simd",    out_simd[2], 0x00000000u);
-        assert_is_nan  ("sk_fast_sqrt_f32(+Inf) simd",    out_simd[3]);
+        assert_sqrt_pinf("sk_fast_sqrt_f32(+Inf) simd",   out_simd[3]);
 #endif
     }
 
@@ -624,6 +642,50 @@ static void test_fast_sqrt(void) {
     printf("PASS fast_sqrt_f32\n");
 }
 
+/* Spread samples across every normal positive exponent. With hardware sqrt
+ * the production path is sqrtf behind the `v > 0` guard, so this is an
+ * exactness pin: it proves the guard never fires on positive normals and
+ * catches any edit of that body (`!=` is a bit compare here, both sides are
+ * positive normals). The portable Newton fallback is gated at 2e-6 relative
+ * error. */
+static void test_fast_sqrt_accuracy(void) {
+    uint32_t bits;
+#if !FM_HAVE_HW_SQRT
+    float max_rel_error = 0.0f;
+#endif
+    for (bits = 0x00800000u; bits < 0x7F800000u; bits += 8191u) {
+        float x = bits_to_float(bits);
+        float got = fast_sqrt(x);
+        float reference = sqrtf(x);
+        g_total_checks++;
+#if FM_HAVE_HW_SQRT
+        if (got != reference) {
+            fprintf(stderr,
+                    "fast_sqrt hardware-path exactness FAILED: x=%.9g got=%.9g ref=%.9g\n",
+                    (double)x, (double)got, (double)reference);
+            exit(1);
+        }
+#else
+        {
+            float rel_error = fabsf(got - reference) / reference;
+            if (rel_error > 2.0e-6f) {
+                fprintf(stderr,
+                        "fast_sqrt fallback accuracy FAILED: x=%.9g rel_error=%.9g\n",
+                        (double)x, (double)rel_error);
+                exit(1);
+            }
+            if (rel_error > max_rel_error) max_rel_error = rel_error;
+        }
+#endif
+    }
+#if FM_HAVE_HW_SQRT
+    printf("PASS fast_sqrt_accuracy (bit-exact vs sqrtf on every sampled positive normal)\n");
+#else
+    printf("PASS fast_sqrt_accuracy (Newton fallback, max_rel_error=%.9g)\n",
+           (double)max_rel_error);
+#endif
+}
+
 
 /* ═══════════════════ correctness: kernels 23-27 (exp/log family) ═════════
  * s4-audio-common-sweep review: fast_math.h's exp/log/exp1_approx family had
@@ -705,6 +767,101 @@ static void test_fast_log(void) {
     printf("PASS fast_log_f32\n");
 }
 
+/* fast_log accuracy contract and how the gate composes it. The polynomial
+ * error does not depend on the exponent, so all 2^23 normalized mantissas
+ * (exponent 0) are enumerated against the contract minus the E*ln2 rounding
+ * budget; a strided pass over every positive normal float then checks the
+ * full contract across all binades; a seam check bounds the error jump at
+ * the two range-reduction boundaries so opposite-sign errors cannot hide a
+ * step there. Subnormals are outside the contract: production callers clamp
+ * well above FLT_MIN. */
+#define FM_LOG_ABS_ERR_CONTRACT 1.0e-4f
+#define FM_LOG_EXP_TERM_ERR     1.1e-5f   /* E*ln2 float32 rounding budget */
+#define FM_LOG_POLY_ABS_ERR     (FM_LOG_ABS_ERR_CONTRACT - FM_LOG_EXP_TERM_ERR)
+#define FM_LOG_SEAM_ERR_JUMP    2.0e-6
+
+#ifndef USE_STANDARD_MATH
+/* Sweep fast_log over the bit patterns [first, limit) in steps of `step`
+ * against logf; abort past `bound`; return the worst error and its x. When
+ * step == 1 (adjacent floats) also require that the value never drops by
+ * more than one output ULP between neighbours: the separately rounded
+ * Horner chain is not exactly monotone, and a larger drop would mean a
+ * coefficient or seam defect rather than rounding. */
+static float fast_log_sweep(uint32_t first, uint32_t limit, uint32_t step,
+                            float bound, const char *what, float *worst_x) {
+    uint32_t bits;
+    float worst = 0.0f;
+    float previous = -INFINITY;
+    *worst_x = 1.0f;
+    for (bits = first; bits < limit; bits += step) {
+        float x = bits_to_float(bits);
+        float got = fast_log(x);
+        float reference = logf(x);
+        float abs_error = fabsf(got - reference);
+        g_total_checks++;
+        if (abs_error > bound) {
+            fprintf(stderr,
+                    "fast_log accuracy FAILED (%s): x=%.9g got=%.9g ref=%.9g abs_error=%.9g\n",
+                    what, (double)x, (double)got, (double)reference, (double)abs_error);
+            exit(1);
+        }
+        if (step == 1u && got < previous && nextafterf(got, INFINITY) < previous) {
+            fprintf(stderr,
+                    "fast_log step FAILED (%s): x=%.9g drops %.9g -> %.9g (more than 1 ULP)\n",
+                    what, (double)x, (double)previous, (double)got);
+            exit(1);
+        }
+        previous = got;
+        if (abs_error > worst) {
+            worst = abs_error;
+            *worst_x = x;
+        }
+    }
+    return worst;
+}
+#endif
+
+static void test_fast_log_accuracy(void) {
+#ifndef USE_STANDARD_MATH
+    float mantissa_x, binade_x;
+    float mantissa_worst = fast_log_sweep(0x3F800000u, 0x40000000u, 1u,
+                                          FM_LOG_POLY_ABS_ERR, "all mantissas",
+                                          &mantissa_x);
+    float binade_worst = fast_log_sweep(0x00800000u, 0x7F800000u, 977u,
+                                        FM_LOG_ABS_ERR_CONTRACT, "every-binade sweep",
+                                        &binade_x);
+
+    /* Compare the signed approximation error immediately across the two
+     * neighboring range-reduction boundaries. This detects an endpoint
+     * mismatch without confusing it with log's real slope. */
+    {
+        const float boundaries[2] = { 1.0f, 2.0f };
+        int i;
+        for (i = 0; i < 2; ++i) {
+            float right = boundaries[i];
+            float left = nextafterf(right, 0.0f);
+            double left_error = (double)fast_log(left) - log((double)left);
+            double right_error = (double)fast_log(right) - log((double)right);
+            double error_jump = fabs(left_error - right_error);
+            g_total_checks++;
+            if (error_jump > FM_LOG_SEAM_ERR_JUMP) {
+                fprintf(stderr,
+                        "fast_log exponent-boundary FAILED: x=%.9g error_jump=%.9g\n",
+                        (double)right, error_jump);
+                exit(1);
+            }
+        }
+    }
+
+    printf("PASS fast_log_accuracy (all 2^23 mantissas max_abs_error=%.9g at x=%.9g; "
+           "every-binade sweep max_abs_error=%.9g at x=%.9g)\n",
+           (double)mantissa_worst, (double)mantissa_x,
+           (double)binade_worst, (double)binade_x);
+#else
+    printf("PASS fast_log_accuracy (USE_STANDARD_MATH=1, libm)\n");
+#endif
+}
+
 static void test_fast_log10(void) {
     float x[SK_TEST_MAX_N], out_scalar[SK_TEST_MAX_N], out_simd[SK_TEST_MAX_N];
     int ni, t;
@@ -735,6 +892,41 @@ static void test_exp1_approx(void) {
         }
     }
     printf("PASS exp1_approx_f32\n");
+}
+
+/* Lock E1's algorithm provenance independently of the scalar/NEON mirror
+ * check above.  The production formula is Martin et al., EURASIP JASP 2004,
+ * Eq. (17); it is not an unconstrained NR tuning surface.  libm is used only
+ * by this test-side reference.  The loose 1e-3 allowance covers fast_log and
+ * fast_exp error while remaining far below the effect of changing any of the
+ * published segments or split points. */
+static double published_exp1_reference(double v) {
+    if (v <= 1e-10) v = 1e-10;
+    if (v < 0.1) return -2.31 * log10(v) - 0.6;
+    if (v <= 1.0) return -1.544 * log10(v) + 0.166;
+    return pow(10.0, -0.52 * v - 0.26);
+}
+
+static void test_exp1_published_formula(void) {
+    const float x[] = {
+        1e-10f, 0.05f, nextafterf(0.1f, 0.0f), 0.1f,
+        nextafterf(0.1f, 1.0f), 0.5f, nextafterf(1.0f, 0.0f),
+        1.0f, nextafterf(1.0f, 2.0f), 2.0f, 10.0f
+    };
+    size_t i;
+    for (i = 0; i < sizeof x / sizeof x[0]; ++i) {
+        double got = (double)exp1_approx(x[i]);
+        double reference = published_exp1_reference((double)x[i]);
+        double abs_error = fabs(got - reference);
+        g_total_checks++;
+        if (abs_error > 1.0e-3) {
+            fprintf(stderr,
+                    "exp1 Martin-2004 formula FAILED: x=%.9g got=%.9g ref=%.9g abs_error=%.9g\n",
+                    (double)x[i], got, reference, abs_error);
+            exit(1);
+        }
+    }
+    printf("PASS exp1_published_formula (Martin et al. 2004, Eq. 17)\n");
 }
 
 /* Dedicated domain-boundary/special-value sweep: every guard threshold these
@@ -1833,14 +2025,17 @@ int main(void) {
     test_min();
     test_clip();
     test_fast_sqrt();
+    test_fast_sqrt_accuracy();
     test_fast_math_special_values();
 
     printf("\n--- s4-audio-common-sweep: fast_math.h exp/log family + mcra EMA kernel ---\n");
     test_fast_exp();
     test_fast_exp_neg();
     test_fast_log();
+    test_fast_log_accuracy();
     test_fast_log10();
     test_exp1_approx();
+    test_exp1_published_formula();
     test_exp_log_boundaries();
     test_exp_log_family_inplace();
     test_mcra_noise_update();

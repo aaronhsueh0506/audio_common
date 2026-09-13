@@ -7,8 +7,8 @@ One copy of the shared DSP code for every consumer repo (AEC, NR, Audio_ALG):
 | FFT wrapper | `include/fft_wrapper.h`, `src/fft_wrapper.c` (KISS), `src/fft_wrapper_ne10.c` (NE10) | one public API, two backends |
 | KISS FFT | `lib/kiss_fft/` | portable reference backend |
 | NE10 | `lib/ne10/` | vendored DSP subset with documented local patches; see `lib/ne10/VENDORED.md` |
-| fast_math | `include/fast_math.h` | header-only LUT/Taylor approximations |
-| simd_kernels | `include/simd_kernels.h` | header-only **bit-exact** NEON/scalar per-bin kernels (complex magnitude, complex MAC / filter W-updates, EMA, gain apply, min/clip, pairwise sums, fast_sqrt, fast_exp/fast_exp_neg/fast_log/fast_log10/exp1_approx, mcra per-bin-varying-alpha noise update, windowed overlap-add accumulate, float->int16 PCM clip/scale/convert). Every array-form kernel has an always-compiled scalar twin (the one exception is `sk_clip_scale_to_s16`'s single-quad form, whose `int16x4_t` return type does not exist without NEON -- callers guard it with `SK_HAVE_NEON` and fall back to the per-sample `sk__clip_scale_to_s16_elem`); the AArch64 NEON body replicates the scalar op sequence lane-for-lane (strict FMA discipline, no estimate instructions). Use the Makefile's `SIMD=0` switch to select every scalar fallback; consumer TUs must build with `-ffp-contract=off` (see the header's doc comment). `make selftest` runs the bitwise NEON-vs-scalar check (the exp/log family is additionally cross-checked bit-for-bit against fast_math.h's own implementation, which this header privately replicates rather than includes) |
+| fast_math | `include/fast_math.h` | header-only LUT/Taylor exp, minimax log, AArch64 hardware sqrt, and paper-pinned Martin-2004 E1 approximation |
+| simd_kernels | `include/simd_kernels.h` | header-only **bit-exact** NEON/scalar per-bin kernels (complex magnitude, complex MAC / filter W-updates, EMA, gain apply, min/clip, pairwise sums, fast_sqrt, fast_exp/fast_exp_neg/fast_log/fast_log10/exp1_approx, mcra per-bin-varying-alpha noise update, windowed overlap-add accumulate, float->int16 PCM clip/scale/convert). Every array-form kernel has an always-compiled scalar twin (the one exception is `sk_clip_scale_to_s16`'s single-quad form, whose `int16x4_t` return type does not exist without NEON -- callers guard it with `SK_HAVE_NEON` and fall back to the per-sample `sk__clip_scale_to_s16_elem`); the AArch64 NEON body replicates the scalar op sequence lane-for-lane (strict FMA discipline, no estimate instructions; the AArch64 sqrt kernel uses the correctly-rounded `vsqrtq_f32`). Use the Makefile's `SIMD=0` switch to select every scalar fallback; consumer TUs must build with `-ffp-contract=off` (see the header's doc comment). `make selftest` runs the bitwise NEON-vs-scalar check, gates the minimax log's accuracy against libm, and cross-checks the exp/log family bit-for-bit against fast_math.h's own implementation, which this header privately replicates rather than includes. |
 | HPF | `include/hpf.h`, `src/hpf.c` | biquad high-pass (f32, DF2-transposed), `hpf_create`/`hpf_get_mem_size`+`hpf_init` API — shared by platform code AND AEC's mic path |
 | pre-gain | `include/audio_pre_gain.h`, `src/audio_pre_gain.c` | amplitude-dB (`10^(dB/20)`) input gain, heap/static lifecycle, in-place-safe, AArch64 NEON/scalar |
 | resampler | `include/audio_resampler.h`, `src/audio_resampler.c` | streaming rational polyphase float32 resampler; only 8/16/24/32/48 kHz, 1–8 interleaved channels, heap/static lifecycle, block-boundary-identical state |
@@ -67,10 +67,10 @@ consumer repo is single-branch (`main`).
 
 ## FP-contraction policy
 
-`-ffp-contract=off` is a **unified policy spanning all four repos**
+`-ffp-contract=off -fno-math-errno` is a **unified policy spanning all four repos**
 (`audio_common`, `NR/c_impl`, `AEC/c_impl`, `Audio_ALG/pipelines`): every
 translation unit any of their Makefiles compile — each repo's own sources
-*and* the vendored KISS/NE10 C and C++ TUs alike — builds with this flag,
+*and* the vendored KISS/NE10 C and C++ TUs alike — builds with these flags,
 positioned so nothing can override it. In each Makefile the flag is the
 LAST token appended to `CFLAGS`/`CXXFLAGS` (after `EXTRA_CFLAGS`, after any
 BACKEND-conditional append, after `WERROR`/`NO_STDIO`), and each Makefile
@@ -97,6 +97,9 @@ the script's own header comment for the full rationale, including a
 non-obvious finding (`NE10_rfft_float32.neonintrinsic.o`, despite its name,
 uses no fused intrinsic anywhere and is audited like any other scalar TU).
 Run it with `scripts/audit_fp_contract.sh kiss ne10`.
+The audit first compiles `fast_sqrt` for Cortex-A53 and Cortex-A73 Linux and
+requires an `FSQRT` instruction with no remaining `sqrtf` reference; this is
+why `-fno-math-errno` is part of the policy rather than a host-only tuning.
 
 ## API conventions
 

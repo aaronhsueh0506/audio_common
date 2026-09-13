@@ -3,8 +3,8 @@
  *
  * Includes optimized implementations of:
  * - exp() using LUT + Taylor
- * - log() using IEEE 754 + Taylor
- * - sqrt() using Newton-Raphson
+ * - log() using IEEE 754 range reduction + minimax polynomial
+ * - sqrt() using the AArch64 hardware instruction (portable Newton fallback)
  * - E1(v) exponential integral approximation
  *
  * Define USE_STANDARD_MATH to use standard library functions instead
@@ -29,6 +29,23 @@ extern "C" {
 #define FM_LOG10E   0.4342944819032518f  // log10(e) = 1/ln(10)
 #define FM_LN10     2.302585092994046f   // ln(10)
 #define FM_EPSILON  1e-10f
+
+// Correctly-rounded hardware sqrt: AArch64 always has FSQRT. Other targets
+// take the Newton fallback in fast_sqrt().
+#if defined(__aarch64__)
+#define FM_HAVE_HW_SQRT 1
+#else
+#define FM_HAVE_HW_SQRT 0
+#endif
+
+// Degree-4 minimax coefficients for ln(1+m), m in [0,1): p(0) = 0 and
+// p(1) = ln 2 hold exactly, so fast_log is continuous across binade
+// boundaries. C2 is stored positive and subtracted. simd_kernels.h mirrors
+// these under SK_ names.
+#define FM_LOG_C1   0.9972485899925232f
+#define FM_LOG_C2   0.46980342268943787f
+#define FM_LOG_C3   0.22263026237487793f
+#define FM_LOG_C4  -0.05692821741104126f
 
 // ============================================================================
 // Fast exp() - LUT + Taylor expansion
@@ -99,7 +116,7 @@ static inline float exp1_approx(float v) {
 
 /* ────────────────────────── NaN / non-finite contract ─────────────────────
  * fast_exp/fast_log/fast_sqrt below are finite-domain approximations: their
- * Taylor/Newton-Raphson machinery is only ever validated against finite
+ * approximation/range-reduction machinery is only ever validated against finite
  * inputs in-range. Each function's leading domain guard is written as
  * `if (!(x REL bound)) return EDGE;` rather than `if (x INVERSE_REL bound)
  * return EDGE;` specifically so a NaN input -- which makes EVERY IEEE
@@ -107,15 +124,14 @@ static inline float exp1_approx(float v) {
  * negated form catches "not(finite AND in-range)" instead of only "finite
  * AND out-of-range", so NaN maps to the same deterministic domain-edge
  * constant a finite out-of-range input would get, rather than falling
- * through into the fast-path bit tricks (fast_exp's `(int)floorf(x)` cast on
- * NaN is undefined behaviour in C; fast_log/fast_sqrt's IEEE-754
- * bit-reinterpret tricks are not UB on NaN but produce non-deterministic
- * finite garbage or a propagated NaN instead of the documented edge value).
+ * through into the fast path (fast_exp's `(int)floorf(x)` cast on NaN is
+ * undefined behaviour in C; fast_log's IEEE-754 bit-reinterpret is not UB
+ * on NaN but produces a finite garbage value; fast_sqrt would return
+ * sqrtf(NaN) = NaN on AArch64 or propagate the NaN through the Newton
+ * fallback -- none of them the documented edge value).
  * For every FINITE input the two guard forms are logically identical
- * (De Morgan's law over an already-ordered comparison), so this change is a
- * pure NaN-safety fix with zero effect on finite (or already-handled
- * +-Inf) behaviour -- see the per-function comments and the task's
- * before/after truth tables for the exhaustive case analysis.
+ * (De Morgan's law over an already-ordered comparison), so the negated
+ * guards change NaN behaviour only.
  *
  * USE_STANDARD_MATH (the `#ifdef` branch above) calls straight into libm
  * (expf/logf/sqrtf), which instead propagates IEEE NaN/Inf per the C
@@ -159,8 +175,9 @@ static inline float exp1_approx(float v) {
  *     x < 0          -> -1e10f
  *                        (USE_STANDARD_MATH: logf(neg)  = NaN; DIFFERS)
  *     x = +Inf       -> 88.72283935546875f        [bits 0x42b17218]
- *                        (= 128.0f * FM_LN2, computed via the SAME Taylor
- *                        fallthrough an ordinary finite x would take --
+ *                        (= 128.0f * FM_LN2, computed via the SAME range-
+ *                        reduction fallthrough an ordinary finite x would
+ *                        take --
  *                        +Inf is deliberately NOT special-cased in
  *                        fast_log, see that function's own comment; the
  *                        value is deterministic finite garbage-that-looks-
@@ -179,15 +196,10 @@ static inline float exp1_approx(float v) {
  *                        sqrtf does)
  *                        (USE_STANDARD_MATH: sqrtf(-0.0) = -0.0f; DIFFERS
  *                        in sign only)
- *     v = +Inf        -> NaN [bits 0x7fc00000 on this toolchain/CPU] (falls
- *                        through the domain guard -- `+Inf > 0.0f` is true
- *                        -- into the bit-trick seed + 2 Newton iterations;
- *                        iteration 1 computes Inf/finite = Inf, iteration 2
- *                        then computes Inf/Inf = NaN; the exact NaN payload
- *                        is an IEEE-754 implementation-defined "invalid
- *                        operation" default and not asserted bit-for-bit,
- *                        only isnan() is)
- *                        (USE_STANDARD_MATH: sqrtf(+Inf) = +Inf; DIFFERS)
+ *     v = +Inf        -> +Inf on AArch64 (hardware FSQRT)
+ *                        -> NaN on the portable Newton fallback (iteration 2
+ *                           computes Inf/Inf; payload is not pinned)
+ *                        (USE_STANDARD_MATH: sqrtf(+Inf) = +Inf)
  *
  * Summary: fast_* is a finite-domain approximation family. Every non-finite
  * or out-of-domain input still produces a DETERMINISTIC, TESTED float (never
@@ -252,22 +264,16 @@ static inline float fast_exp_neg(float x) {
 }
 
 // ============================================================================
-// Fast log() - IEEE 754 structure + Taylor
+// Fast log() - IEEE 754 range reduction + minimax polynomial
 // ============================================================================
-
-typedef union {
-    float f;
-    uint32_t i;
-    struct {
-        uint32_t mantissa : 23;
-        uint32_t exponent : 8;
-        uint32_t sign : 1;
-    } parts;
-} FloatBits;
 
 /**
  * Fast natural log using IEEE 754 float structure
  * log(x) = (E-127) * ln(2) + ln(1+m)
+ *
+ * Accuracy-contracted for positive NORMAL binary32 values: production
+ * callers clamp their inputs well above FLT_MIN, so subnormal normalization
+ * would spend hot-path cycles on unreachable data and is left out.
  *
  * NaN: fails `x > 0.0f`, so the negated guard below returns -1e10f
  * (approximate -infinity) for NaN too, instead of falling through to the
@@ -286,21 +292,26 @@ static inline float fast_log(float x) {
     // `x <= 0.0f` for all finite x.
     if (!(x > 0.0f)) return -1e10f;  // Approximate -infinity
 
-    FloatBits fb;
+    union { float f; uint32_t i; } fb;
     fb.f = x;
 
-    // Extract exponent E and mantissa
-    int E = (int)fb.parts.exponent - 127;
-
-    // Normalize mantissa to [1, 2)
-    fb.parts.exponent = 127;
+    // Extract exponent E and normalize the mantissa to [1, 2) with explicit
+    // IEEE-754 masks (C bitfield packing order is implementation-defined).
+    uint32_t bits = fb.i;
+    int E = (int)((bits >> 23) & 0xFFu) - 127;
+    fb.i = (bits & 0x007FFFFFu) | 0x3F800000u;
     float m = fb.f - 1.0f;  // m ∈ [0, 1)
 
-    // Taylor expansion for ln(1+m)
-    // ln(1+m) ≈ m - m²/2 + m³/3 - m⁴/4
-    float m2 = m * m;
-    float m3 = m2 * m;
-    float ln_1_m = m - 0.5f * m2 + (1.0f / 3.0f) * m3 - 0.25f * m2 * m2;
+    // Degree-4 minimax Horner chain with separately rounded multiply and add
+    // on every target (no fmaf: the operation order is the scalar/NEON parity
+    // contract, and the consumer TUs are audited to contain no FMA). Worst
+    // absolute error over all positive normal inputs is below 1e-4;
+    // test/simd_selftest.c gates it exhaustively.
+    float poly = FM_LOG_C4;
+    poly = poly * m + FM_LOG_C3;
+    poly = poly * m - FM_LOG_C2;
+    poly = poly * m + FM_LOG_C1;
+    float ln_1_m = poly * m;
 
     return (float)E * FM_LN2 + ln_1_m;
 }
@@ -313,18 +324,19 @@ static inline float fast_log10(float x) {
 }
 
 // ============================================================================
-// Fast sqrt() - Newton-Raphson iteration
+// Fast sqrt() - AArch64 hardware instruction + portable Newton fallback
 // ============================================================================
 
 /**
- * Fast sqrt using Newton-Raphson with IEEE 754 initial estimate
- * x(n+1) = 0.5 * (x(n) + v/x(n))
+ * Fast sqrt.  On AArch64 the guarded input goes to sqrtf(), which the
+ * compiler lowers to the correctly-rounded FSQRT instruction. Production
+ * consumers compile with -fno-math-errno so no cold sqrtf fallback remains
+ * in AArch64 binaries. Other targets use a bit-seed + two-iteration Newton
+ * fallback (relative error below 2e-6 on normal inputs, gated by
+ * test/simd_selftest.c).
  *
  * NaN: fails `v > 0.0f`, so the negated guard below returns 0.0f for NaN
- * too, instead of falling through to the bit-trick seed + Newton-Raphson
- * iterations (not UB on NaN -- the seed is plain integer arithmetic on the
- * bit pattern -- but `v/x` propagates the NaN through both iterations, so
- * the old behaviour was "return NaN", not the documented domain-edge 0.0f).
+ * too (see the NaN / non-finite contract above).
  */
 static inline float fast_sqrt(float v) {
     // Written as `!(v > 0.0f)` (not `v <= 0.0f`) so NaN -- for which every
@@ -332,8 +344,11 @@ static inline float fast_sqrt(float v) {
     // `v <= 0.0f` for all finite v.
     if (!(v > 0.0f)) return 0.0f;
 
+#if FM_HAVE_HW_SQRT
+    return sqrtf(v);
+#else
     // Use IEEE 754 structure for initial estimate
-    FloatBits fb;
+    union { float f; uint32_t i; } fb;
     fb.f = v;
     fb.i = (fb.i >> 1) + 0x1FC00000;  // Approximate sqrt
 
@@ -343,6 +358,7 @@ static inline float fast_sqrt(float v) {
     x = 0.5f * (x + v / x);  // Iteration 2
 
     return x;
+#endif
 }
 
 // ============================================================================
@@ -352,23 +368,26 @@ static inline float fast_sqrt(float v) {
 /**
  * E1(v) = ∫[v,∞] e^(-t)/t dt
  *
- * Three-segment approximation (from Python implementation):
- * - v < 0.1:   E1(v) ≈ -2.31 * log10(v) - 0.6
- * - 0.1 ≤ v ≤ 1.0: E1(v) ≈ -1.544 * log10(v) + 0.166
- * - v > 1.0:   E1(v) ≈ 10^(-0.52*v - 0.26)
+ * Published low-complexity approximation from Martin, Malah, Cox & Accardi,
+ * EURASIP JASP 2004, Eq. (17), DOI 10.1155/S1110865704312138. E1 itself is
+ * part of the Ephraim-Malah MMSE-LSA gain (IEEE TASSP 1985,
+ * DOI 10.1109/TASSP.1985.1164550); keep these coefficients unchanged for
+ * paper traceability.
  */
 #ifdef USE_OPTIMIZED_E1
-// Optimized: check v > 1.0 first (common case in good SNR),
-// then compute log10 only once for the remaining cases
+// Optimized: check the upper segment first (common case in good SNR),
+// then compute log10 only once for the remaining cases. Written as
+// `!(v <= 1.0f)` (not `v > 1.0f`) so a NaN input -- for which every ordered
+// comparison is false -- takes the same fast_exp branch it takes in the
+// default order below (fast_exp(NaN) = 0.0f); identical for all finite v.
 static inline float exp1_approx(float v) {
     if (v <= FM_EPSILON) v = FM_EPSILON;
 
-    if (v > 1.0f) {
-        // E1(v) ≈ 10^(-0.52*v - 0.26) = exp((-0.52*v - 0.26) * ln(10))
+    if (!(v <= 1.0f)) {
         return fast_exp((-0.52f * v - 0.26f) * FM_LN10);
     }
 
-    // Single log10 calculation for v in (0, 1.0]
+    // Single log10 calculation for the lower two segments
     float log10_v = fast_log10(v);
     if (v < 0.1f) {
         return -2.31f * log10_v - 0.6f;
@@ -382,13 +401,10 @@ static inline float exp1_approx(float v) {
     if (v <= FM_EPSILON) v = FM_EPSILON;
 
     if (v < 0.1f) {
-        // E1(v) ≈ -2.31 * log10(v) - 0.6
         return -2.31f * fast_log10(v) - 0.6f;
     } else if (v <= 1.0f) {
-        // E1(v) ≈ -1.544 * log10(v) + 0.166
         return -1.544f * fast_log10(v) + 0.166f;
     } else {
-        // E1(v) ≈ 10^(-0.52*v - 0.26) = exp((-0.52*v - 0.26) * ln(10))
         return fast_exp((-0.52f * v - 0.26f) * FM_LN10);
     }
 }

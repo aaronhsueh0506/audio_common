@@ -8,7 +8,9 @@
  *
  * Preserve scalar operation order and compile including translation units
  * with -ffp-contract=off. Explicit fmaf calls stay fused; ordinary mul/add
- * stays separate. Reciprocal/sqrt estimates and reassociation are forbidden.
+ * stays separate. Reciprocal/sqrt ESTIMATE instructions (frecpe/frsqrte)
+ * and reassociation are forbidden; the correctly-rounded AArch64 FSQRT
+ * (vsqrtq_f32) is not an estimate and is used directly.
  * SIMD_KERNELS_FORCE_SCALAR selects the fallback implementation.
  *
  * Exact in-place aliasing is supported only where a kernel documents it;
@@ -32,6 +34,16 @@
 #define SK_HAVE_NEON 1
 #else
 #define SK_HAVE_NEON 0
+#endif
+
+/* Mirror of fast_math.h's FM_HAVE_HW_SQRT (this header replicates rather
+ * than includes fast_math.h). Keyed on the architecture, NOT on
+ * SK_HAVE_NEON: under SIMD_KERNELS_FORCE_SCALAR on AArch64 the scalar helper
+ * must still be sqrtf so it stays bit-exact with kernel 15's vsqrtq_f32. */
+#if defined(__aarch64__)
+#define SK_HAVE_HW_SQRT 1
+#else
+#define SK_HAVE_HW_SQRT 0
 #endif
 
 /* SK_STATIC_ASSERT -- portable compile-time assert, C99/C11/C++11 alike.
@@ -92,9 +104,10 @@ extern "C" {
  * Used by every scalar kernel AND by every NEON kernel's scalar tail, so
  * the tail matches the fully-scalar path bit-for-bit by construction. */
 
-/* fast_math.h fast_sqrt(), replicated verbatim (bit-trick seed + 2 Newton
- * iterations) rather than #include-d, per the header-comment rationale
- * above. Keep in sync with fast_math.h if that implementation ever moves.
+/* fast_math.h fast_sqrt(), replicated rather than #include-d, per the
+ * header-comment rationale above. AArch64 uses hardware sqrt; other targets
+ * retain the bit-trick seed + 2 Newton iterations. Keep in sync with
+ * fast_math.h if that implementation ever moves.
  *
  * USE_STANDARD_MATH: fast_math.h swaps fast_sqrt for plain sqrtf under this
  * flag (debug/parity builds). This kernel follows the SAME flag so a call
@@ -112,6 +125,9 @@ static inline float sk__fast_sqrt_elem(float v) {
  * lane selects the same 0.0f). Identical to `v <= 0.0f` for all finite v. */
 static inline float sk__fast_sqrt_elem(float v) {
     if (!(v > 0.0f)) return 0.0f;
+#if SK_HAVE_HW_SQRT
+    return sqrtf(v);
+#else
     {
         union { float f; uint32_t u; } fb;
         fb.f = v;
@@ -123,6 +139,7 @@ static inline float sk__fast_sqrt_elem(float v) {
             return x;
         }
     }
+#endif
 }
 #endif /* USE_STANDARD_MATH */
 
@@ -372,16 +389,15 @@ static inline void sk_clip_f32(float *x, float lo, float hi, int n) {
 #endif
 
 /* ═══════════════════════════════ kernel 15 ═════════════════════════════════
- * sk_fast_sqrt_f32 — per-lane replica of fast_math.h fast_sqrt() (bit-trick
- * seed + 2 Newton iterations). The `v>0` guard is applied as a final
- * vcgtq_f32+vbslq_f32 select (matching cabs_np's "compute unconditionally,
- * then select" pattern) rather than a branch: the bit-trick/Newton steps
- * are well-defined (finite, no trap) for non-positive/negative/NaN `v` too —
- * their result is simply discarded by the select for those lanes, same
- * final bits as the scalar early return.
+ * sk_fast_sqrt_f32 — per-lane replica of fast_math.h fast_sqrt() (vsqrtq_f32
+ * on AArch64). The `v>0` guard is applied as a final vcgtq_f32+vbslq_f32
+ * select (matching cabs_np's "compute unconditionally, then select"
+ * pattern) rather than a branch. Hardware sqrt may produce NaN for discarded
+ * negative/NaN lanes, but AArch64 FP exceptions are non-trapping in the
+ * supported runtime configuration.
  *
  * NaN lanes: the select predicate is deliberately `ispos = v > 0` (selecting
- * the Newton-Raphson result `xk` when true, 0.0f otherwise) rather than
+ * the hardware-sqrt result `xk` when true, 0.0f otherwise) rather than
  * `nonpos = v <= 0` (selecting 0.0f when true, `xk` otherwise). Both forms
  * agree for every finite v (exactly one of `v>0`/`v<=0` is true), but they
  * disagree on NaN: vcgtq_f32/vcleq_f32 are ordered compares, so BOTH
@@ -409,12 +425,7 @@ static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
         float32x4_t v = vld1q_f32(x + i);
-        uint32x4_t bits = vreinterpretq_u32_f32(v);
-        uint32x4_t seed_bits = vaddq_u32(vshrq_n_u32(bits, 1),
-                                         vdupq_n_u32(0x1FC00000u));
-        float32x4_t xk = vreinterpretq_f32_u32(seed_bits);
-        xk = vmulq_f32(vdupq_n_f32(0.5f), vaddq_f32(xk, vdivq_f32(v, xk)));
-        xk = vmulq_f32(vdupq_n_f32(0.5f), vaddq_f32(xk, vdivq_f32(v, xk)));
+        float32x4_t xk = vsqrtq_f32(v);
         {
             /* v > 0 (NOT v <= 0): an ordered compare, false for NaN lanes
              * too, so NaN selects the 0.0f branch below -- see the
@@ -447,6 +458,13 @@ static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
 #define SK_FM_LOG10E   0.4342944819032518f
 #define SK_FM_LN10     2.302585092994046f
 #define SK_FM_EPSILON  1e-10f
+
+/* Mirror of fast_math.h's FM_LOG_C1..C4 (degree-4 minimax ln(1+m); C2 is
+ * stored positive and subtracted). */
+#define SK_FM_LOG_C1   0.9972485899925232f
+#define SK_FM_LOG_C2   0.46980342268943787f
+#define SK_FM_LOG_C3   0.22263026237487793f
+#define SK_FM_LOG_C4  -0.05692821741104126f
 
 #define SK_EXP_TABLE_OFFSET 16
 #define SK_EXP_TABLE_SIZE 33
@@ -488,19 +506,6 @@ static const float sk_exp_int_table[SK_EXP_TABLE_SIZE] = {
     8.8861105205078726e+06f   /* e^16  */
 };
 
-/* Private mirror of fast_math.h's FloatBits union (own SK-prefixed name so a
- * TU that includes BOTH headers, e.g. simd_selftest.c, never sees a
- * conflicting typedef). Relies on the mantissa-then-exponent-then-sign
- * bitfield packing every GCC/Clang target this project builds for actually
- * uses for a little-endian `unsigned int`-backed bitfield — the SAME
- * assumption fast_math.h's own fast_log() already makes; this is not a new
- * assumption introduced here. */
-typedef union {
-    float f;
-    uint32_t i;
-    struct { uint32_t mantissa : 23; uint32_t exponent : 8; uint32_t sign : 1; } parts;
-} SkFloatBits;
-
 #ifdef USE_STANDARD_MATH
 static inline float sk__fast_exp_elem(float x)     { return expf(x); }
 static inline float sk__fast_exp_neg_elem(float x) { return expf(-x); }
@@ -540,14 +545,17 @@ static inline float sk__fast_exp_neg_elem(float x) {
  * for the NaN-safety rationale of the `!(x > 0.0f)` guard form). */
 static inline float sk__fast_log_elem(float x) {
     if (!(x > 0.0f)) return -1e10f;
-    SkFloatBits fb;
+    union { float f; uint32_t i; } fb;
     fb.f = x;
-    int E = (int)fb.parts.exponent - 127;
-    fb.parts.exponent = 127;
+    uint32_t bits = fb.i;
+    int E = (int)((bits >> 23) & 0xFFu) - 127;
+    fb.i = (bits & 0x007FFFFFu) | 0x3F800000u;
     float m = fb.f - 1.0f;
-    float m2 = m * m;
-    float m3 = m2 * m;
-    float ln_1_m = m - 0.5f * m2 + (1.0f / 3.0f) * m3 - 0.25f * m2 * m2;
+    float poly = SK_FM_LOG_C4;
+    poly = poly * m + SK_FM_LOG_C3;
+    poly = poly * m - SK_FM_LOG_C2;
+    poly = poly * m + SK_FM_LOG_C1;
+    float ln_1_m = poly * m;
     return (float)E * SK_FM_LN2 + ln_1_m;
 }
 /* Verbatim from fast_math.h's fast_log10(). */
@@ -556,13 +564,13 @@ static inline float sk__fast_log10_elem(float x) {
 }
 /* Verbatim from fast_math.h's exp1_approx() DEFAULT (non-USE_OPTIMIZED_E1)
  * branch order. fast_math.h's USE_OPTIMIZED_E1 variant reorders which check
- * runs first (v>1.0 first, single fast_log10 call reused for the v<=1.0
+ * runs first (upper segment first, single fast_log10 call reused for the lower
  * cases) but computes the IDENTICAL formula for every input with fast_log10
- * called exactly once either way — the two source variants are provably
- * bit-identical for every v, so replicating only this one branch order
- * covers both fast_math.h build modes (verified by test_exp1_approx()
- * against fast_math.h's actual exp1_approx() regardless of whether that TU
- * defines USE_OPTIMIZED_E1). */
+ * called exactly once either way — its upper-segment test is the negated
+ * `!(v <= 1.0f)` so NaN also lands in the fast_exp branch — so the two
+ * source variants are bit-identical for every v and replicating only this
+ * one branch order covers both fast_math.h build modes (the selftest runs
+ * the boundary/NaN cross-check against fast_math.h in BOTH modes). */
 static inline float sk__exp1_approx_elem(float v) {
     if (v <= SK_FM_EPSILON) v = SK_FM_EPSILON;
     if (v < 0.1f) {
@@ -700,21 +708,21 @@ static inline float32x4_t sk__fast_log_vec(float32x4_t x) {
     uint32x4_t bits = vreinterpretq_u32_f32(x);
     int32x4_t exp_bits = vreinterpretq_s32_u32(vandq_u32(vshrq_n_u32(bits, 23), vdupq_n_u32(0xFFu)));
     int32x4_t E = vsubq_s32(exp_bits, vdupq_n_s32(127));
-    /* Clear the exponent field, force it to 127 (bias) -- fb.parts.exponent
-     * = 127 in the scalar union version; mant_sign_mask keeps sign+mantissa,
-     * bias127 ORs in exponent=127 (0x3F800000 == 127<<23). */
-    uint32x4_t mant_sign_mask = vdupq_n_u32(0x807FFFFFu);
+    /* Clear the exponent/sign fields, force exponent to 127 (bias), matching
+     * the scalar explicit-mask implementation. */
+    uint32x4_t mantissa_mask = vdupq_n_u32(0x007FFFFFu);
     uint32x4_t bias127 = vdupq_n_u32(0x3F800000u);
-    uint32x4_t new_bits = vorrq_u32(vandq_u32(bits, mant_sign_mask), bias127);
+    uint32x4_t new_bits = vorrq_u32(vandq_u32(bits, mantissa_mask), bias127);
     float32x4_t mant_f = vreinterpretq_f32_u32(new_bits);
     float32x4_t m = vsubq_f32(mant_f, vdupq_n_f32(1.0f));
-    float32x4_t m2 = vmulq_f32(m, m);
-    float32x4_t m3 = vmulq_f32(m2, m);
-    /* m - 0.5f*m2 + (1/3)*m3 - 0.25f*m2*m2, same left-to-right separate-
-     * rounding op sequence as sk__fast_log_elem -- no vfmaq_f32 anywhere. */
-    float32x4_t t1 = vsubq_f32(m, vmulq_f32(vdupq_n_f32(0.5f), m2));
-    float32x4_t t2 = vaddq_f32(t1, vmulq_f32(vdupq_n_f32(1.0f / 3.0f), m3));
-    float32x4_t ln_1_m = vsubq_f32(t2, vmulq_f32(vdupq_n_f32(0.25f), vmulq_f32(m2, m2)));
+    /* Degree-4 minimax Horner sequence: the same separately rounded
+     * multiply-then-add order as sk__fast_log_elem -- no vfmaq_f32 anywhere,
+     * so every lane matches the scalar helper bit-for-bit. */
+    float32x4_t poly = vdupq_n_f32(SK_FM_LOG_C4);
+    poly = vaddq_f32(vmulq_f32(poly, m), vdupq_n_f32(SK_FM_LOG_C3));
+    poly = vsubq_f32(vmulq_f32(poly, m), vdupq_n_f32(SK_FM_LOG_C2));
+    poly = vaddq_f32(vmulq_f32(poly, m), vdupq_n_f32(SK_FM_LOG_C1));
+    float32x4_t ln_1_m = vmulq_f32(poly, m);
     {
         float32x4_t Ef = vcvtq_f32_s32(E);
         float32x4_t result = vaddq_f32(vmulq_f32(Ef, vdupq_n_f32(SK_FM_LN2)), ln_1_m);
@@ -760,9 +768,7 @@ static inline void sk_exp1_approx_f32(const float *x, float *out, int n) {
 
         float32x4_t log10v = vmulq_f32(sk__fast_log_vec(vc), vdupq_n_f32(SK_FM_LOG10E));
 
-        /* -2.31f*log10v - 0.6f (branch1), -1.544f*log10v + 0.166f (branch2),
-         * fast_exp((-0.52f*vc - 0.26f) * LN10) (branch3) -- each exactly the
-         * scalar op order, no fusion. */
+        /* Same op order as sk__exp1_approx_elem, no fusion. */
         float32x4_t branch1 = vsubq_f32(vmulq_f32(vdupq_n_f32(-2.31f), log10v), vdupq_n_f32(0.6f));
         float32x4_t branch2 = vaddq_f32(vmulq_f32(vdupq_n_f32(-1.544f), log10v), vdupq_n_f32(0.166f));
         float32x4_t exparg = vmulq_f32(

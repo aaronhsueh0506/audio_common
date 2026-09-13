@@ -242,6 +242,7 @@ AUDIO_COMMON_LIB := $(shell $(MAKE) -s -C $(AUDIO_COMMON_DIR) BACKEND=$(BACKEND)
 ```
 -I<audio_common>/include        # 標頭搜尋路徑
 -ffp-contract=off               # 強制要求，見下
+-fno-math-errno                 # AArch64 sqrtf 直接降成 FSQRT，不保留 errno fallback
 ```
 
 連結時加上 `print-lib-path` 給出的封存檔，並確保有 `-lm`。
@@ -249,8 +250,8 @@ AUDIO_COMMON_LIB := $(shell $(MAKE) -s -C $(AUDIO_COMMON_DIR) BACKEND=$(BACKEND)
 **`-ffp-contract=off` 是強制的，而且是對「你自己的 translation unit」的要求。**
 `simd_kernels.h` 與 `fast_math.h` 的內容會編進你的 TU。這些核心刻意寫成「分開的乘法再分開的加法」，而編譯器在沒有這個旗標時會自行把 `a*b + c` 融合成 FMA 指令，導致同一份原始碼在你的 TU 與封存檔裡產生不同的位元結果。
 
-- 只要 include 了 `simd_kernels.h` 或 `fast_math.h` 的 TU，一律要加 `-ffp-contract=off`。
-- 這個旗標要放在 `CFLAGS` 的**最後**，確保不會被後面的附加項覆寫。
+- 只要 include 了 `simd_kernels.h` 或 `fast_math.h` 的 TU，一律要加 `-ffp-contract=off -fno-math-errno`。
+- 這兩個旗標要放在 `CFLAGS` 的**最後**，確保不會被後面的附加項覆寫。
 - 不要在任何地方加 `-Ofast`、`-ffast-math` 或其他 `-ffp-contract=` 值；audio_common 的 Makefile 會在解析階段直接拒絕這類 `EXTRA_CFLAGS`。
 
 消費端 TU 用 `-std=c99` 或 `-std=gnu99` 都可以（不同 TU 用不同 std 是合法的），但 `wav_io.h` 需要 `gnu99` 以上的前處理器支援。
@@ -258,7 +259,7 @@ AUDIO_COMMON_LIB := $(shell $(MAKE) -s -C $(AUDIO_COMMON_DIR) BACKEND=$(BACKEND)
 編譯本手冊中的範例：
 
 ```
-cc -std=gnu99 -O2 -Wall -Wextra -ffp-contract=off \
+cc -std=gnu99 -O2 -Wall -Wextra -ffp-contract=off -fno-math-errno \
    -I<audio_common>/include your_code.c "$(make -s -C <audio_common> print-lib-path)" -lm -o your_app
 ```
 
@@ -886,7 +887,7 @@ static inline float fast_exp_neg(float x);   /* 等同 exp(-x)，針對 x >= 0 �
 static inline float fast_log(float x);
 static inline float fast_log10(float x);
 static inline float fast_sqrt(float v);
-static inline float exp1_approx(float v);    /* 指數積分 E1(v) 的三段近似 */
+static inline float exp1_approx(float v);    /* Martin et al. 2004 式 (17) 的 E1 三段近似 */
 
 static inline float clip_f(float x, float min_val, float max_val);
 static inline float max_f(float a, float b);
@@ -897,14 +898,18 @@ static inline float min_f(float a, float b);
 |---|---|---|
 | `fast_exp(x)` | `x ∈ [-16, 16]` | `x < -16` 或 `x` 為 NaN → `0.0f`；`x > 16`（含 `+Inf`）→ `8.8861105e+06f` |
 | `fast_exp_neg(x)` | `x ∈ [0, 16]` | `x <= 0` → `1.0f`；`x >= 16` → `0.0f` |
-| `fast_log(x)` | `x > 0` 的有限值 | `x <= 0`（含 `±0`）或 NaN → `-1e10f`（代表 −∞） |
+| `fast_log(x)` | 正規化（normal）的有限正數；production 呼叫端會 clamp 到 `FLT_MIN` 以上 | `x <= 0`（含 `±0`）或 NaN → `-1e10f`（代表 −∞）；subnormal 不在精度保證範圍 |
 | `fast_log10(x)` | 同 `fast_log` | 同 `fast_log`，再乘上 `FM_LOG10E` |
-| `fast_sqrt(v)` | `v > 0` 的有限值 | `v <= 0`（含 `-0.0f`）或 NaN → `0.0f`（正零） |
+| `fast_sqrt(v)` | `v > 0` 的有限值 | `v <= 0`（含 `-0.0f`）或 NaN → `0.0f`（正零）；`+Inf` 在 AArch64 硬體路徑回 `+Inf` |
 | `exp1_approx(v)` | `v > 0` | `v <= FM_EPSILON` 會先被夾成 `FM_EPSILON` 再計算 |
 | `clip_f` / `max_f` / `min_f` | 任意有限值 | 無特殊處理，就是單純的比較選擇 |
 
 **重點：這些函式對非有限輸入回傳的是「定義域邊界常數」，不是 IEEE 語意的結果。**
 例如 `fast_sqrt(NaN)` 回 `0.0f`（不是 NaN）、`fast_log(-1.0f)` 回 `-1e10f`（不是 NaN）、`fast_exp(+Inf)` 回一個有限的飽和值（不是 `+Inf`）。這些值是確定且穩定的，但**不具數學意義**。正確做法是在資料進入 DSP 之前就把非有限樣本清掉（`wav_read_float()` 在讀檔端已經做了這件事），而不是依賴這些邊界值。
+
+production `fast_log` 以 IEEE-754 range reduction 加 degree-4 minimax 多項式實作（Horner，各目標同樣的分離乘加順序，不用 FMA）；selftest 對全部 `2^23` 個 normalized mantissa 逐一檢查，並對每個 binade 抽樣掃描，最大絕對誤差契約為 `< 1e-4`。`fast_sqrt` 在 AArch64/NEON 直接使用 `FSQRT`（正確捨入，與 `sqrtf` 逐位元相同）；A53/A73 codegen audit 另要求不能殘留 `sqrtf` errno fallback。其他架構才保留兩次 Newton iteration 的 portable fallback。
+
+`exp1_approx` 的數學目標是 Ephraim–Malah MMSE-LSA 增益裡的精確指數積分；production 三段係數則固定採用 Martin、Malah、Cox、Accardi 2004 論文式 (17) 的低複雜度近似，不把它當成可自由 retune 的 NR 參數。
 
 #### 使用方式
 
@@ -1118,8 +1123,8 @@ float32 輸出路徑（`WAV_IO_WRITER_AEC` + `AEC_OUT_FLOAT=1`）是**原始位�
 
 **編譯旗標**
 
-- [ ] 所有 include 了 `simd_kernels.h` 或 `fast_math.h` 的**消費端 TU** 都帶 `-ffp-contract=off`。
-- [ ] 該旗標放在 `CFLAGS` 最後，沒有被後續附加項覆寫。
+- [ ] 所有 include 了 `simd_kernels.h` 或 `fast_math.h` 的**消費端 TU** 都帶 `-ffp-contract=off -fno-math-errno`。
+- [ ] 這兩個旗標放在 `CFLAGS` 最後，沒有被後續附加項覆寫。
 - [ ] 專案中沒有任何地方出現 `-Ofast`、`-ffast-math` 或其他 `-ffp-contract=` 值。
 - [ ] 消費端有 `-I<audio_common>/include`，連結時有 `-lm`。
 
