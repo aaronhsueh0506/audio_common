@@ -51,6 +51,7 @@ pre code{background:none;padding:0}
 <tr><td><code>audio_pre_gain.h</code></td><td><b>整合者面向</b></td><td>輸入電平調整</td></tr>
 <tr><td><code>mem_align.h</code></td><td>半公開</td><td>只有「自己也要從同一塊 pool 切物件」或自算 pool 總需求時。單純呼叫別人的 <code>_get_mem_size</code>+<code>_init</code> <b>不需要</b></td></tr>
 <tr><td><code>simd_kernels.h</code></td><td class="dead">內部/共用核心</td><td>一般整合者<b>不呼叫</b>。只有自己寫的熱迴圈剛好與某個核心形狀完全一致時才考慮</td></tr>
+<tr><td><code>simd_kernel_nn.h</code></td><td class="dead">內部/共用核心</td><td>神經網路模型前後處理與重取樣器專用的 <code>skn_*</code> 核心(與 <code>simd_kernels.h</code> 分開管理,傳統 AEC/NR 不引用)。一般整合者<b>不呼叫</b></td></tr>
 <tr><td><code>fast_math.h</code></td><td class="dead">內部/共用</td><td>同上。<b>超出定義域回固定邊界常數而非 IEEE 語意</b>(例:<code>fast_sqrt(NaN)</code> 回 <code>0.0f</code>)</td></tr>
 <tr><td><code>wav_io.h</code></td><td class="dead">離線工具專用</td><td><b>不適合即時/嵌入式路徑</b>(用 stdio + malloc,每樣本一次 fread/fwrite)</td></tr>
 </table></div>

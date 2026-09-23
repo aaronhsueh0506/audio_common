@@ -178,6 +178,7 @@ count_fma() {
 AUDIT_ENTRIES='
 AC|both|hpf.o|SCALAR|shared HPF core (src/hpf.c) -- no NEON intrinsics, no explicit fmaf/fma anywhere
 AC|both|audio_pre_gain.o|SCALAR|input gain stage (src/audio_pre_gain.c) -- its broadcast multiply inlines sk_scale_f32, a lone vmulq_f32 with no add to fuse; this row is what makes "the kernels inline into their call sites, and those objects ARE disassembled" true for this one
+AC|both|audio_resampler.o|SCALAR|streaming polyphase resampler (src/audio_resampler.c) -- inlines skn_ring_dot_rows_f32 from simd_kernel_nn.h (separate vmulq_f32/vaddq_f32 lane chains, never vfmaq_f32) and, under SIMD=0, a plain sequential multiply-add loop: any fmla/fmadd here is compiler contraction
 AC|kiss|kiss_fft.o|SCALAR|vendored KISS FFT (lib/kiss_fft/kiss_fft.c) -- plain scalar C, no NEON, no explicit fmaf/fma
 AC|kiss|fft_wrapper.o|EXEMPT|fft_power() scalar tail explicitly calls fmaf(re,re,im*im) (see that function comment) + an __ARM_NEON&&__aarch64__-guarded vfmaq_f32/vmulq_f32 block -- both deliberate explicit-fusion requests, not compiler contraction
 AC|ne10|fft_wrapper_ne10.o|EXEMPT|same pattern as fft_wrapper.o: fft_power() scalar tail explicitly calls fmaf(), plus explicit vfmaq_f32/vmulq_f32 NEON intrinsics

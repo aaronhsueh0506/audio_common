@@ -1049,6 +1049,13 @@ selftest: $(LIB) | _cfg_guard
 	$(CC) $(LDFLAGS) -o $(BIN_DIR)/simd_selftest_e1 $(OBJ_DIR)/simd_selftest_e1.o
 	@echo "--- audio_common SIMD kernel selftest [$(BACKEND)] USE_OPTIMIZED_E1 ---"
 	@$(BIN_DIR)/simd_selftest_e1
+	# simd_kernel_nn.h selftest: the NN pre/post kernels, kept out of
+	# simd_kernels.h so the traditional libraries' kernel set never moves.
+	# Header-only and the same bit-exact gate, same flags.
+	$(CC) $(CFLAGS) -ffp-contract=off -fstrict-aliasing -MD -MP -c -o $(OBJ_DIR)/simd_nn_selftest.o test/simd_nn_selftest.c
+	$(CC) $(LDFLAGS) -o $(BIN_DIR)/simd_nn_selftest $(OBJ_DIR)/simd_nn_selftest.o
+	@echo "--- audio_common NN SIMD kernel selftest [$(BACKEND)] ---"
+	@$(BIN_DIR)/simd_nn_selftest
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_audio_utilities.o test/test_audio_utilities.c
 	$(LINK) -o $(BIN_DIR)/test_audio_utilities $(OBJ_DIR)/test_audio_utilities.o $(LIB) $(LDFLAGS)
 	@echo "--- audio_common pre-gain/resampler test [$(BACKEND)] ---"

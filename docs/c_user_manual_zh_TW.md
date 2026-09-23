@@ -38,6 +38,7 @@
 | `include/audio_pre_gain.h` | 以 dB 設定的輸入增益，逐樣本乘法，支援就地 | opaque handle + 函式 | 是 |
 | `include/mem_align.h` | 自己算 static pool 尺寸時的 16-byte 對齊與溢位安全加乘 | 純巨集／`static inline` | 否 |
 | `include/simd_kernels.h` | 想把 per-bin 迴圈換成向量化版本（NEON／純量兩套，行為一致） | 純標頭 | 否 |
+| `include/simd_kernel_nn.h` | 神經網路模型前後處理（DFN2／ULCNet／GTCRN／DeepVQE）與重取樣器用的向量化核心，與 `simd_kernels.h` 分開管理 | 純標頭 | 否 |
 | `include/fast_math.h` | 熱迴圈裡要 `exp`／`log`／`sqrt`／`E1` 的快速近似版 | 純標頭 | 否 |
 | `include/wav_io.h` | 離線工具讀寫 WAV 檔（強化過的解析器 + 兩種寫入風格） | 純標頭 | 否 |
 
@@ -208,6 +209,7 @@ make test_audio_utils   # pre-gain 與所有支援的取樣率配對測試
 `make SIMD=0` 會對整個封存檔加上 `-DSIMD_KERNELS_FORCE_SCALAR`。這個定義同時影響：
 
 - `simd_kernels.h` 裡所有 `sk_*` 進入點（改為呼叫對應的 `_scalar` 版本，`SK_HAVE_NEON` 變成 0）
+- `simd_kernel_nn.h` 裡所有 `skn_*` 進入點（同上，改走 `_scalar` 版本）
 - `src/fft_wrapper.c` / `src/fft_wrapper_ne10.c` 裡 `fft_magnitude` / `fft_power` / `fft_apply_gain` 的向量化路徑
 - `src/audio_resampler.c` 的向量化內積
 - `src/audio_pre_gain.c` 的向量化乘法

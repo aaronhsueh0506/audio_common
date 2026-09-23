@@ -132,7 +132,7 @@ fft_inverse     y(N-1)[N] × synth_win      y(N) × synth_win          y(N+1) ×
 <h2>相關檔案與測試路徑</h2>
 <ul>
 <li>FFT:<code>audio_common/include/fft_wrapper.h</code>、<code>src/fft_wrapper.c</code>(KISS)、<code>src/fft_wrapper_ne10.c</code>(NE10);vendored 後端:<code>lib/kiss_fft/</code>、<code>lib/ne10/</code>(本地 patch 記錄於 <code>lib/ne10/VENDORED.md</code>,含 P0003 白名單)</li>
-<li>其他模組:<code>include/fast_math.h</code>、<code>include/simd_kernels.h</code>、<code>include/hpf.h</code>+<code>src/hpf.c</code>、<code>include/audio_pre_gain.h</code>、<code>include/audio_resampler.h</code>、<code>include/wav_io.h</code>、<code>include/mem_align.h</code></li>
+<li>其他模組:<code>include/fast_math.h</code>、<code>include/simd_kernels.h</code>、<code>include/simd_kernel_nn.h</code>(NN 前後處理專用核心)、<code>include/hpf.h</code>+<code>src/hpf.c</code>、<code>include/audio_pre_gain.h</code>、<code>include/audio_resampler.h</code>、<code>include/wav_io.h</code>、<code>include/mem_align.h</code></li>
 <li>文件:<code>audio_common/docs/c_user_manual_zh_TW.md</code>、<code>audio_common/README.md</code>(build/後端/FP 政策)</li>
 <li>測試(本頁撰寫時實跑):<code>make selftest</code> ALL PASS,TOTAL CHECKS: 17,723,487(SK_HAVE_NEON=1;含 round-trip、static-vs-heap 頻譜與時域 byte-equal、NEON-vs-scalar 逐位元)/ <code>make test_audio_utils</code> 全過(pre-gain + 全部支援的 resample 率對)/ <code>make test_pool</code> ALL PASS / <code>make test_fft_zero_heap</code>(allocator-hook 零 heap 檢查,AEC 端 <code>test-zero-heap</code> 一併實跑 PASS)</li>
 </ul>

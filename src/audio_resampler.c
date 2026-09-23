@@ -7,13 +7,12 @@
 #include <string.h>
 
 #include "mem_align.h"
+#include "simd_kernel_nn.h"
 
-#if defined(__aarch64__) && defined(__ARM_NEON) && \
-    !defined(SIMD_KERNELS_FORCE_SCALAR)
-#include <arm_neon.h>
-#define AUDIO_RESAMPLER_NEON 1
+#if defined(__GNUC__) || defined(__clang__)
+#define RS_ALWAYS_INLINE __attribute__((__always_inline__)) inline
 #else
-#define AUDIO_RESAMPLER_NEON 0
+#define RS_ALWAYS_INLINE inline
 #endif
 
 #ifndef M_PI
@@ -255,71 +254,111 @@ void audio_resampler_reset(AudioResampler* self)
     self->next_output_tick = 0;
 }
 
-static int audio_resampler_outputs_for_next_input(
-    const AudioResampler* self)
+#if !SK_HAVE_NEON
+/* `make SIMD=0` arithmetic: each row is a plain sequential sum, tap 0
+ * (newest sample) first, on its own accumulator. Called only with a literal
+ * n_rows, so the row tests fold away after inlining. */
+static RS_ALWAYS_INLINE void audio_resampler_seq_rows(
+    const float* const* rows, const int n_rows, const float* history,
+    int history_head, int taps, float* out)
 {
-    uint64_t tick = self->next_output_tick;
-    int count = 0;
-    while (tick / (uint64_t)self->up == self->input_index) {
-        ++count;
-        tick += (uint64_t)self->down;
+    const float* c0 = rows[0];
+    const float* c1 = n_rows > 1 ? rows[1] : rows[0];
+    const float* c2 = n_rows > 2 ? rows[2] : rows[0];
+    const float* c3 = n_rows > 3 ? rows[3] : rows[0];
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    int tap = 0;
+    /* newest-to-oldest: head down to 0, then taps-1 down to head+1 */
+    for (int index = history_head; index >= 0; --index, ++tap) {
+        float h = history[index];
+        s0 += c0[tap] * h;
+        if (n_rows > 1) s1 += c1[tap] * h;
+        if (n_rows > 2) s2 += c2[tap] * h;
+        if (n_rows > 3) s3 += c3[tap] * h;
     }
-    return count;
+    for (int index = taps - 1; tap < taps; --index, ++tap) {
+        float h = history[index];
+        s0 += c0[tap] * h;
+        if (n_rows > 1) s1 += c1[tap] * h;
+        if (n_rows > 2) s2 += c2[tap] * h;
+        if (n_rows > 3) s3 += c3[tap] * h;
+    }
+    out[0] = s0;
+    if (n_rows > 1) out[1] = s1;
+    if (n_rows > 2) out[2] = s2;
+    if (n_rows > 3) out[3] = s3;
+}
+#endif
+
+/* Dot up to SKN_RING_DOT_MAX_ROWS polyphase FIR rows -- the output phases
+ * one input sample produces -- against the newest-to-oldest circular
+ * history. NEON: skn_ring_dot_rows_f32 (its header documents the per-row
+ * operation order). SIMD=0: audio_resampler_seq_rows. The two arithmetics
+ * sum in different orders; each is the same whatever rows run together. */
+static RS_ALWAYS_INLINE void audio_resampler_dot_rows(const float* const* rows,
+                                                      int n_rows,
+                                                      const float* history,
+                                                      int history_head,
+                                                      int taps,
+                                                      float* out)
+{
+#if SK_HAVE_NEON
+    skn_ring_dot_rows_f32(rows, n_rows, history, history_head, taps, out);
+#else
+    switch (n_rows) {
+    case 1:
+        audio_resampler_seq_rows(rows, 1, history, history_head, taps,
+                                 out);
+        break;
+    case 2:
+        audio_resampler_seq_rows(rows, 2, history, history_head, taps,
+                                 out);
+        break;
+    case 3:
+        audio_resampler_seq_rows(rows, 3, history, history_head, taps,
+                                 out);
+        break;
+    case 4:
+        audio_resampler_seq_rows(rows, 4, history, history_head, taps,
+                                 out);
+        break;
+    default: break;
+    }
+#endif
 }
 
-/* Dot one polyphase FIR row against the newest-to-oldest circular history.
- * Keep the scalar implementation in the same TU so `make SIMD=0` exercises
- * exactly the same state machine and only changes this arithmetic kernel. */
-static float audio_resampler_dot(const float* coefficients,
-                                 const float* history,
-                                 int history_head,
-                                 int taps)
-{
-#if AUDIO_RESAMPLER_NEON
-    float32x4_t vacc = vdupq_n_f32(0.0f);
-    float scalar = 0.0f;
-    int tap = 0;
-    int index = history_head;
+/* The supported rates (8/16/24/32/48 kHz) give up <= 6, so an input emits at
+ * most two row groups. */
+#define AUDIO_RESAMPLER_MAX_PHASES (2 * SKN_RING_DOT_MAX_ROWS)
 
-    /* A load is ascending in memory while the ring is consumed descending.
-     * vrev64+vext reverses all four lanes without an aliasing cast. */
-    while (tap + 4 <= taps && index >= 3) {
-        float32x4_t h = vld1q_f32(history + index - 3);
-        h = vrev64q_f32(h);
-        h = vextq_f32(h, h, 2);
-        vacc = vaddq_f32(
-            vacc, vmulq_f32(vld1q_f32(coefficients + tap), h));
-        tap += 4;
-        index -= 4;
+/* Emit the `n` output frames one input sample produces, `rows` holding their
+ * phases in output order, starting at `output` (frame-aligned). Rows run in
+ * at most two groups, split evenly (six phases as 3 + 3). */
+static RS_ALWAYS_INLINE void audio_resampler_emit(const AudioResampler* self,
+                                                  const float* const* rows,
+                                                  int n, int history_head,
+                                                  float* output)
+{
+    const int taps = self->taps_per_phase;
+    const int channels = self->channels;
+    const int first = n > SKN_RING_DOT_MAX_ROWS ? (n + 1) / 2 : n;
+    for (int done = 0; done < n;) {
+        int group = done == 0 ? first : n - done;
+        if (channels == 1) {
+            audio_resampler_dot_rows(rows + done, group, self->history,
+                                     history_head, taps, output + done);
+        } else {
+            float dots[SKN_RING_DOT_MAX_ROWS];
+            for (int channel = 0; channel < channels; ++channel) {
+                audio_resampler_dot_rows(rows + done, group,
+                                         self->history + channel * taps,
+                                         history_head, taps, dots);
+                for (int r = 0; r < group; ++r)
+                    output[(done + r) * channels + channel] = dots[r];
+            }
+        }
+        done += group;
     }
-    while (tap < taps && index >= 0) {
-        scalar += coefficients[tap++] * history[index--];
-    }
-    index = taps - 1;
-    while (tap + 4 <= taps) {
-        float32x4_t h = vld1q_f32(history + index - 3);
-        h = vrev64q_f32(h);
-        h = vextq_f32(h, h, 2);
-        vacc = vaddq_f32(
-            vacc, vmulq_f32(vld1q_f32(coefficients + tap), h));
-        tap += 4;
-        index -= 4;
-    }
-    scalar += vaddvq_f32(vacc);
-    while (tap < taps) {
-        scalar += coefficients[tap++] * history[index--];
-    }
-    return scalar;
-#else
-    float sum = 0.0f;
-    int history_index = history_head;
-    for (int tap = 0; tap < taps; ++tap) {
-        sum += coefficients[tap] * history[history_index];
-        history_index -= 1;
-        if (history_index < 0) history_index = taps - 1;
-    }
-    return sum;
-#endif
 }
 
 int audio_resampler_process(AudioResampler* self,
@@ -348,38 +387,84 @@ int audio_resampler_process(AudioResampler* self,
         return 0;
     }
 
-    while (consumed < input_frames) {
-        int required = audio_resampler_outputs_for_next_input(self);
-        if (required > output_capacity_frames - produced) break;
+    {
+        const int up = self->up;
+        const int down = self->down;
+        const int taps = self->taps_per_phase;
+        const int channels = self->channels;
+        int head = self->history_head;
+        /* The next output's position on the up-sampled grid relative to the
+         * current input's first tick: next_output_tick - input_index * up.
+         * An input emits the outputs whose tick falls in its own [0, up)
+         * window, phase = that relative tick; each output moves it on by
+         * `down`, each consumed input takes `up` off, so it stays in
+         * [0, down) between inputs. The two 64-bit fields are written back
+         * once, below. */
+        int ahead = (int)(self->next_output_tick -
+                          self->input_index * (uint64_t)up);
 
-        self->history_head += 1;
-        if (self->history_head == self->taps_per_phase)
-            self->history_head = 0;
-        for (int channel = 0; channel < self->channels; ++channel) {
-            self->history[
-                channel * self->taps_per_phase + self->history_head] =
-                input[consumed * self->channels + channel];
-        }
-
-        while (self->next_output_tick / (uint64_t)self->up ==
-               self->input_index) {
-            int phase =
-                (int)(self->next_output_tick % (uint64_t)self->up);
-            for (int channel = 0; channel < self->channels; ++channel) {
-                const float* coefficients =
-                    self->coefficients + phase * self->taps_per_phase;
-                const float* history =
-                    self->history + channel * self->taps_per_phase;
-                output[produced * self->channels + channel] =
-                    audio_resampler_dot(
-                        coefficients, history, self->history_head,
-                        self->taps_per_phase);
+        if (up == 1 && channels == 1) {
+            /* Mono decimation: an input emits at most one output, when
+             * `ahead` has counted down to 0. */
+            const float* row = self->coefficients;
+            while (consumed < input_frames) {
+                if (ahead == 0 && produced >= output_capacity_frames) break;
+                head += 1;
+                if (head == taps) head = 0;
+                self->history[head] = input[consumed];
+                if (ahead == 0) {
+                    audio_resampler_dot_rows(&row, 1, self->history, head,
+                                             taps, output + produced);
+                    produced += 1;
+                    ahead = down - 1;
+                } else {
+                    ahead -= 1;
+                }
+                consumed += 1;
             }
-            produced += 1;
-            self->next_output_tick += (uint64_t)self->down;
+        } else if (down == 1) {
+            /* Integer up-sampling: every input emits all `up` phases in
+             * order and `ahead` stays 0, so the rows are fixed per call. */
+            const float* rows[AUDIO_RESAMPLER_MAX_PHASES];
+            for (int r = 0; r < up; ++r)
+                rows[r] = self->coefficients + r * taps;
+            while (consumed < input_frames &&
+                   up <= output_capacity_frames - produced) {
+                head += 1;
+                if (head == taps) head = 0;
+                for (int channel = 0; channel < channels; ++channel) {
+                    self->history[channel * taps + head] =
+                        input[consumed * channels + channel];
+                }
+                audio_resampler_emit(self, rows, up, head,
+                                     output + produced * channels);
+                produced += up;
+                consumed += 1;
+            }
+        } else {
+            while (consumed < input_frames) {
+                const float* rows[AUDIO_RESAMPLER_MAX_PHASES];
+                int required = 0;
+                for (int t = ahead; t < up; t += down)
+                    rows[required++] = self->coefficients + t * taps;
+                if (required > output_capacity_frames - produced) break;
+                head += 1;
+                if (head == taps) head = 0;
+                for (int channel = 0; channel < channels; ++channel) {
+                    self->history[channel * taps + head] =
+                        input[consumed * channels + channel];
+                }
+                audio_resampler_emit(self, rows, required, head,
+                                     output + produced * channels);
+                produced += required;
+                ahead += required * down - up;
+                consumed += 1;
+            }
         }
-        self->input_index += 1;
-        consumed += 1;
+        self->history_head = head;
+        self->input_index += (uint64_t)consumed;
+        self->next_output_tick =
+            self->input_index * (uint64_t)up + (uint64_t)ahead;
     }
     *consumed_frames = consumed;
     *produced_frames = produced;
