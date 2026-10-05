@@ -38,9 +38,19 @@ void audio_resampler_reset(AudioResampler* self);
 /**
  * Process as many complete input frames as output_capacity_frames permits.
  *
- * Returns 0 on success. consumed_frames and produced_frames are always
- * written on success.  For unequal rates input/output buffers must not
- * overlap. Equal-rate conversion is an exact memmove passthrough.
+ * Input and output are interleaved: `output` needs room for
+ * output_capacity_frames * channels floats. Returns 0 on success.
+ * consumed_frames and produced_frames are always written on success.
+ * consumed_frames < input_frames means the output capacity ran out: the
+ * caller feeds the remainder again. The stream does not depend on how it is
+ * split into calls or on the capacity given. For unequal rates input/output
+ * buffers must not overlap. Equal-rate conversion is an exact memmove
+ * passthrough.
+ *
+ * A non-finite input sample contaminates the outputs of the next
+ * taps_per_phase + 3 input frames (the NEON build pads each phase to a
+ * multiple of 4 taps; SIMD=0 reaches 3 frames less). The resampler does not
+ * isolate it, so guard the input.
  */
 int audio_resampler_process(AudioResampler* self,
                             const float* input,

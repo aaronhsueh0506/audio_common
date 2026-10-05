@@ -240,39 +240,6 @@ static void test_div_floor(void) {
     printf("PASS div_floor_f32\n");
 }
 
-static float H[256], R0[4][256];
-
-static void test_ring_dot(void) {
-    static const int TAPS[] = {1, 2, 3, 4, 5, 7, 8, 9, 12, 13, 16, 17, 33, 49, 97, 193};
-    int ti, rows, head, t;
-    for (ti = 0; ti < (int)(sizeof TAPS / sizeof TAPS[0]); ++ti) {
-        int taps = TAPS[ti];
-        for (rows = 1; rows <= SKN_RING_DOT_MAX_ROWS; ++rows) {
-            for (t = 0; t < 3; ++t) {
-                int i, r;
-                const float *rp[SKN_RING_DOT_MAX_ROWS];
-                for (i = 0; i < taps; ++i) H[i] = gen_finite(0) * 1e-20f + ((next_u32() & 1) ? 0.5f : -0.25f) * (float)(i % 7);
-                for (r = 0; r < rows; ++r) {
-                    for (i = 0; i < taps; ++i) R0[r][i] = (float)((int32_t)next_u32()) * 1e-10f;
-                    rp[r] = R0[r];
-                }
-                for (head = 0; head < taps; ++head) {
-                    float o1[SKN_RING_DOT_MAX_ROWS], o2[SKN_RING_DOT_MAX_ROWS];
-                    skn_ring_dot_rows_f32(rp, rows, H, head, taps, o1);
-                    skn_ring_dot_rows_f32_scalar(rp, rows, H, head, taps, o2);
-                    for (r = 0; r < rows; ++r)
-                        if (bits(o1[r]) != bits(o2[r])) {
-                            printf("FAIL ring_dot taps=%d rows=%d head=%d row=%d: 0x%08x vs 0x%08x\n",
-                                   taps, rows, head, r, (unsigned)bits(o1[r]), (unsigned)bits(o2[r]));
-                            exit(1);
-                        }
-                }
-            }
-        }
-    }
-    printf("PASS ring_dot_rows_f32\n");
-}
-
 static double now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -302,7 +269,6 @@ int main(void) {
     test_fill_mul_power();
     test_interleave();
     test_div_floor();
-    test_ring_dot();
     bench();
     printf("ALL PASS simd_kernel_nn (SK_HAVE_NEON=%d)\n", SK_HAVE_NEON);
     return 0;

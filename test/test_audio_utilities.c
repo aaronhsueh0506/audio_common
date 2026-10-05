@@ -206,6 +206,195 @@ static int test_downsample_antialias(void)
     return 0;
 }
 
+/* ---- streaming contract: the stream does not depend on how it is fed ---- */
+
+#define STREAM_FRAMES 4000
+#define STREAM_MAX_CH 3
+
+static unsigned stream_state = 2463534242u;
+
+static unsigned stream_next(void)
+{
+    stream_state ^= stream_state << 13;
+    stream_state ^= stream_state >> 17;
+    stream_state ^= stream_state << 5;
+    return stream_state;
+}
+
+static void stream_signal(float* signal, int frames, int channels)
+{
+    for (int i = 0; i < frames * channels; ++i) {
+        signal[i] = 0.3f * ((float)(stream_next() & 0xFFFFu) / 32768.0f - 1.0f);
+    }
+}
+
+/* Drive one resampler with an output capacity of a few frames per call, so
+ * that most calls consume only part of their input and calls split between
+ * inputs and inside one input's outputs. Returns the output frame count. */
+static int stream_with_tiny_capacity(int rate_in, int rate_out, int channels,
+                                     const float* input, float* output,
+                                     int capacity)
+{
+    AudioResampler* resampler =
+        audio_resampler_create(rate_in, rate_out, channels);
+    int input_position = 0;
+    int output_position = 0;
+    int idle = 0;
+    if (!resampler) return -1;
+    while (input_position < STREAM_FRAMES && idle < 100) {
+        int request = STREAM_FRAMES - input_position;
+        int room = capacity - output_position;
+        int limit = (int)(stream_next() % 24u);
+        int consumed;
+        int produced;
+        if (request > 300) request = 300;
+        if (room > limit) room = limit;
+        if (audio_resampler_process(
+                resampler, input + (size_t)input_position * channels, request,
+                output + (size_t)output_position * channels, room, &consumed,
+                &produced) != 0) {
+            audio_resampler_destroy(resampler);
+            return -1;
+        }
+        input_position += consumed;
+        output_position += produced;
+        idle = consumed == 0 && produced == 0 ? idle + 1 : 0;
+    }
+    audio_resampler_destroy(resampler);
+    return input_position == STREAM_FRAMES ? output_position : -1;
+}
+
+static int test_stream_does_not_depend_on_feeding(void)
+{
+    static const int rates[] = {8000, 16000, 24000, 32000, 48000};
+    static const int blocks[] = {1, 5, 127, 128, 129, 1000};
+    enum { CAPACITY = STREAM_FRAMES * 6 + 64 };
+    static float input[STREAM_FRAMES * STREAM_MAX_CH];
+    static float whole[CAPACITY * STREAM_MAX_CH];
+    static float other[CAPACITY * STREAM_MAX_CH];
+    for (int a = 0; a < 5; ++a) {
+        for (int b = 0; b < 5; ++b) {
+            if (a == b) continue;
+            for (int channels = 1; channels <= STREAM_MAX_CH; ++channels) {
+                const size_t bytes_per_frame = channels * sizeof(float);
+                int reference;
+                stream_signal(input, STREAM_FRAMES, channels);
+                {
+                    AudioResampler* resampler = audio_resampler_create(
+                        rates[a], rates[b], channels);
+                    CHECK(resampler != NULL, "create");
+                    reference = run_resampler(resampler, input, STREAM_FRAMES,
+                                              channels, STREAM_FRAMES, whole,
+                                              CAPACITY);
+                    audio_resampler_destroy(resampler);
+                }
+                CHECK(reference > 0, "one-call resample");
+                for (int k = 0; k < (int)(sizeof blocks / sizeof blocks[0]); ++k) {
+                    AudioResampler* resampler = audio_resampler_create(
+                        rates[a], rates[b], channels);
+                    int count;
+                    CHECK(resampler != NULL, "create");
+                    count = run_resampler(resampler, input, STREAM_FRAMES,
+                                          channels, blocks[k], other,
+                                          CAPACITY);
+                    audio_resampler_destroy(resampler);
+                    CHECK(count == reference &&
+                          memcmp(whole, other,
+                                 (size_t)reference * bytes_per_frame) == 0,
+                          "output is independent of the input block size");
+                }
+                {
+                    int count = stream_with_tiny_capacity(
+                        rates[a], rates[b], channels, input, other, CAPACITY);
+                    CHECK(count == reference &&
+                          memcmp(whole, other,
+                                 (size_t)reference * bytes_per_frame) == 0,
+                          "output is independent of the output capacity");
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static int test_reset_restores_the_initial_state(void)
+{
+    static float input[STREAM_FRAMES];
+    enum { RESET_CAPACITY = STREAM_FRAMES * 3 + 64 };
+    static float first[RESET_CAPACITY];
+    static float second[RESET_CAPACITY];
+    AudioResampler* resampler = audio_resampler_create(16000, 48000, 1);
+    int consumed;
+    int produced;
+    int count;
+    CHECK(resampler != NULL, "create");
+    stream_signal(input, STREAM_FRAMES, 1);
+    CHECK(audio_resampler_process(resampler, input, STREAM_FRAMES, first,
+                                  RESET_CAPACITY, &consumed,
+                                  &produced) == 0 && consumed == STREAM_FRAMES,
+          "first pass");
+    count = produced;
+    CHECK(audio_resampler_process(resampler, input, 777, second,
+                                  RESET_CAPACITY, &consumed,
+                                  &produced) == 0,
+          "dirty the state");
+    audio_resampler_reset(resampler);
+    CHECK(audio_resampler_process(resampler, input, STREAM_FRAMES, second,
+                                  RESET_CAPACITY, &consumed,
+                                  &produced) == 0 &&
+          produced == count &&
+          memcmp(first, second, (size_t)count * sizeof(float)) == 0,
+          "reset reproduces the first pass");
+    audio_resampler_destroy(resampler);
+    return 0;
+}
+
+/* A tone through the pairs whose group delay is a whole number of inputs
+ * (integer up, integer down and the 3:2, 2:3 and 4:3 rational ratios) must
+ * come out as the same tone, delayed by that group delay: an accuracy gate
+ * that shares no code with the resampler. The filter's pass band ripple is
+ * far below the tolerance; a wrong tap, phase or boundary handling is far
+ * above it. */
+static int test_tone_accuracy(void)
+{
+    static const int pairs[][2] = {
+        {8000, 16000}, {16000, 8000}, {8000, 48000}, {48000, 8000},
+        {16000, 48000}, {48000, 16000}, {24000, 48000}, {48000, 24000},
+        {32000, 48000}, {48000, 32000}, {24000, 32000}};
+    enum { FRAMES = 6000 };
+    static float input[FRAMES];
+    static float output[FRAMES * 6 + 64];
+    const double frequency = 1000.0;
+    for (int p = 0; p < (int)(sizeof pairs / sizeof pairs[0]); ++p) {
+        const int rate_in = pairs[p][0];
+        const int rate_out = pairs[p][1];
+        AudioResampler* resampler =
+            audio_resampler_create(rate_in, rate_out, 1);
+        int consumed;
+        int produced;
+        int latency;
+        double worst = 0.0;
+        CHECK(resampler != NULL, "create");
+        for (int i = 0; i < FRAMES; ++i) {
+            input[i] = (float)(0.5 * sin(2.0 * M_PI * frequency * i / rate_in));
+        }
+        CHECK(audio_resampler_process(resampler, input, FRAMES, output,
+                                      FRAMES * 6 + 64, &consumed,
+                                      &produced) == 0 && consumed == FRAMES,
+              "tone pass");
+        latency = audio_resampler_latency_input_frames(resampler);
+        for (int k = 4 * latency * rate_out / rate_in + 64; k < produced; ++k) {
+            const double t = (double)k / rate_out - (double)latency / rate_in;
+            const double err = fabs((double)output[k] -
+                                    0.5 * sin(2.0 * M_PI * frequency * t));
+            if (err > worst) worst = err;
+        }
+        CHECK(worst < 2e-3, "tone amplitude and phase through the resampler");
+        audio_resampler_destroy(resampler);
+    }
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_pre_gain() == 0, "pre-gain tests");
@@ -213,6 +402,10 @@ int main(void)
     CHECK(test_identity_and_pool() == 0, "resampler identity/pool");
     CHECK(test_streaming_continuity() == 0, "resampler continuity");
     CHECK(test_downsample_antialias() == 0, "resampler anti-alias");
+    CHECK(test_stream_does_not_depend_on_feeding() == 0,
+          "resampler stream independent of block size and capacity");
+    CHECK(test_reset_restores_the_initial_state() == 0, "resampler reset");
+    CHECK(test_tone_accuracy() == 0, "resampler tone accuracy");
     printf("All audio pre-gain/resampler tests passed\n");
     return 0;
 }
