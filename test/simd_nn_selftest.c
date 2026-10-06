@@ -240,6 +240,48 @@ static void test_div_floor(void) {
     printf("PASS div_floor_f32\n");
 }
 
+
+/* Up to 18 taps over up to 260 bins (the shipped CCM runs 255 bins x 9 taps,
+ * the deep filter 96 x 5). Coefficients are finite; the sources may carry
+ * +-Inf, which both twins turn into the same NaN/Inf. */
+static void test_ctaps_mac(void) {
+    enum { MAX_TAPS = 18, MAX_BINS = 260 };
+    static float rows_re[MAX_TAPS][MAX_BINS], rows_im[MAX_TAPS][MAX_BINS];
+    static float coef[MAX_BINS * MAX_TAPS * 2];
+    static float OA[2][MAX_BINS + 2 * CANARY], OB[2][MAX_BINS + 2 * CANARY];
+    const int tap_list[] = {1, 2, 3, 5, 9, 18};
+    const float *sr[MAX_TAPS], *si[MAX_TAPS];
+    int ni, ti, t, k, i, c;
+    for (ti = 0; ti < (int)(sizeof tap_list / sizeof tap_list[0]); ++ti) {
+        int taps = tap_list[ti];
+        for (ni = 0; ni < N_COUNT && N_LIST[ni] <= MAX_BINS; ++ni) {
+            int n = N_LIST[ni];
+            for (t = 0; t < TRIALS; ++t) {
+                for (k = 0; k < taps; ++k) {
+                    for (i = 0; i < MAX_BINS; ++i) {
+                        rows_re[k][i] = gen_finite(t % 4 == 0);
+                        rows_im[k][i] = gen_finite(t % 4 == 0);
+                    }
+                    sr[k] = rows_re[k]; si[k] = rows_im[k];
+                }
+                for (i = 0; i < n * taps * 2; ++i) coef[i] = gen_finite(0);
+                for (c = 0; c < 2; ++c) {
+                    canary_fill(OA[c], n); canary_fill(OB[c], n);
+                }
+                skn_ctaps_mac_f32(OA[0] + CANARY, OA[1] + CANARY, (size_t)n,
+                                  (size_t)taps, sr, si, coef);
+                skn_ctaps_mac_f32_scalar(OB[0] + CANARY, OB[1] + CANARY,
+                                         (size_t)n, (size_t)taps, sr, si, coef);
+                for (c = 0; c < 2; ++c) {
+                    canary_check("ctaps_mac", OA[c], n);
+                    cmp_arrays("ctaps_mac", n, t, OA[c] + CANARY, OB[c] + CANARY);
+                }
+            }
+        }
+    }
+    printf("PASS ctaps_mac_f32\n");
+}
+
 static double now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -247,6 +289,32 @@ static double now_ns(void) {
 }
 
 static volatile int g_sink;
+
+
+static void bench_ctaps(int n, int taps) {
+    enum { REPS = 20000, MAXB = 256, MAXT = 9 };
+    static float rows[2 * MAXT][MAXB + 4], coef[MAXB * MAXT * 2];
+    static float out_re[MAXB], out_im[MAXB];
+    const float *sr[MAXT], *si[MAXT];
+    int i, k, r;
+    double t0, t1, t2;
+    for (k = 0; k < taps; ++k) { sr[k] = rows[2 * k]; si[k] = rows[2 * k + 1]; }
+    for (i = 0; i < 2 * MAXT * (MAXB + 4); ++i) ((float *)rows)[i] = (float)(i % 17) * 0.01f;
+    for (i = 0; i < MAXB * MAXT * 2; ++i) coef[i] = (float)(i % 13) * 0.02f;
+    t0 = now_ns();
+    for (r = 0; r < REPS; ++r) {
+        skn_ctaps_mac_f32_scalar(out_re, out_im, (size_t)n, (size_t)taps, sr, si, coef);
+        g_sink += (int)out_re[r % n];
+    }
+    t1 = now_ns();
+    for (r = 0; r < REPS; ++r) {
+        skn_ctaps_mac_f32(out_re, out_im, (size_t)n, (size_t)taps, sr, si, coef);
+        g_sink += (int)out_re[r % n];
+    }
+    t2 = now_ns();
+    printf("BENCH ctaps_mac n=%d taps=%d: scalar %.3f us, kernel %.3f us\n", n, taps,
+           (t1 - t0) / REPS / 1e3, (t2 - t1) / REPS / 1e3);
+}
 
 static void bench(void) {
     enum { N = 24576, REPS = 4000 };
@@ -262,6 +330,8 @@ static void bench(void) {
     g_sink = acc;
     printf("BENCH all_finite n=%d: scalar %.2f us, kernel %.2f us\n", N,
            (t1 - t0) / REPS / 1e3, (t2 - t1) / REPS / 1e3);
+    bench_ctaps(255, 9);   /* DeepVQE CCM interior */
+    bench_ctaps(96, 5);    /* DeepFilterNet2 deep filter */
 }
 
 int main(void) {
@@ -269,6 +339,7 @@ int main(void) {
     test_fill_mul_power();
     test_interleave();
     test_div_floor();
+    test_ctaps_mac();
     bench();
     printf("ALL PASS simd_kernel_nn (SK_HAVE_NEON=%d)\n", SK_HAVE_NEON);
     return 0;

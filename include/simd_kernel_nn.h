@@ -357,6 +357,87 @@ static inline void skn_div_floor_f32(float *out, const float *num,
 }
 #endif
 
+/* ═══════════════════════════ skn_ctaps_mac_f32 ════════════════════════════
+ * Per-bin complex tap filter: for every bin k in [0, n),
+ *   acc = 0; for t in 0..taps-1 (in that order):
+ *     acc.re += xr*cr - xi*ci;   acc.im += xi*cr + xr*ci;
+ * with (xr, xi) = (src_re[t][k], src_im[t][k]) and (cr, ci) the tap's
+ * coefficient read from `coef` laid out [bin][tap][re,im] (stride 2*taps
+ * floats per bin). One source row per tap, each already offset to bin 0 of
+ * the range, so a caller shifts a frequency tap by moving the row pointer.
+ * DeepVQE's CCM and DeepFilterNet2's deep filter are both this loop.
+ * out_re/out_im must not alias any source or coef. Every bin takes all
+ * `taps` taps: a bin with out-of-range taps is the caller's to handle. The
+ * four bins of a NEON step read their coefficients through lane loads,
+ * because the tap stride (10 or 18 floats) is not a vector multiple. */
+
+static inline void skn__ctaps_mac_range(float *out_re, float *out_im,
+                                        size_t k0, size_t n, size_t taps,
+                                        const float *const *src_re,
+                                        const float *const *src_im,
+                                        const float *coef) {
+    size_t k, t;
+    for (k = k0; k < n; ++k) {
+        float sum_re = 0.0f;
+        float sum_im = 0.0f;
+        for (t = 0; t < taps; ++t) {
+            const float xr = src_re[t][k];
+            const float xi = src_im[t][k];
+            const float cr = coef[2 * (k * taps + t)];
+            const float ci = coef[2 * (k * taps + t) + 1];
+            sum_re += xr * cr - xi * ci;
+            sum_im += xi * cr + xr * ci;
+        }
+        out_re[k] = sum_re;
+        out_im[k] = sum_im;
+    }
+}
+
+static inline void skn_ctaps_mac_f32_scalar(float *out_re, float *out_im,
+                                            size_t n, size_t taps,
+                                            const float *const *src_re,
+                                            const float *const *src_im,
+                                            const float *coef) {
+    skn__ctaps_mac_range(out_re, out_im, 0, n, taps, src_re, src_im, coef);
+}
+
+#if SK_HAVE_NEON
+static inline void skn_ctaps_mac_f32(float *out_re, float *out_im, size_t n,
+                                     size_t taps, const float *const *src_re,
+                                     const float *const *src_im,
+                                     const float *coef) {
+    size_t k = 0, t;
+    for (; k + 4 <= n; k += 4) {
+        const float *c = coef + 2 * k * taps;
+        float32x4_t sum_re = vdupq_n_f32(0.0f);
+        float32x4_t sum_im = vdupq_n_f32(0.0f);
+        for (t = 0; t < taps; ++t) {
+            const float32x4_t xr = vld1q_f32(src_re[t] + k);
+            const float32x4_t xi = vld1q_f32(src_im[t] + k);
+            const float32x4x2_t cc = vuzpq_f32(
+                vcombine_f32(vld1_f32(c + 2 * t),
+                             vld1_f32(c + 2 * (taps + t))),
+                vcombine_f32(vld1_f32(c + 2 * (2 * taps + t)),
+                             vld1_f32(c + 2 * (3 * taps + t))));
+            sum_re = vaddq_f32(sum_re, vsubq_f32(vmulq_f32(xr, cc.val[0]),
+                                                 vmulq_f32(xi, cc.val[1])));
+            sum_im = vaddq_f32(sum_im, vaddq_f32(vmulq_f32(xi, cc.val[0]),
+                                                 vmulq_f32(xr, cc.val[1])));
+        }
+        vst1q_f32(out_re + k, sum_re);
+        vst1q_f32(out_im + k, sum_im);
+    }
+    skn__ctaps_mac_range(out_re, out_im, k, n, taps, src_re, src_im, coef);
+}
+#else
+static inline void skn_ctaps_mac_f32(float *out_re, float *out_im, size_t n,
+                                     size_t taps, const float *const *src_re,
+                                     const float *const *src_im,
+                                     const float *coef) {
+    skn_ctaps_mac_f32_scalar(out_re, out_im, n, taps, src_re, src_im, coef);
+}
+#endif
+
 #ifdef __cplusplus
 }
 #endif
