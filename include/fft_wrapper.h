@@ -12,6 +12,12 @@
 #include <stddef.h>
 
 #ifdef __cplusplus
+#define AC_FFT_RESTRICT __restrict
+#else
+#define AC_FFT_RESTRICT restrict
+#endif
+
+#ifdef __cplusplus
 extern "C" {
 #endif
 
@@ -114,8 +120,8 @@ int fft_get_n_freqs(const FftHandle* handle);
  * Overlapping buffers are undefined behavior -- use fft_forward_scratch()
  * (below) if you need an in-place-style call on a scratch buffer.
  */
-void fft_forward(FftHandle* handle, const float* restrict time_in,
-                 Complex* restrict freq_out);
+void fft_forward(FftHandle* handle, const float* AC_FFT_RESTRICT time_in,
+                 Complex* AC_FFT_RESTRICT freq_out);
 
 /**
  * Inverse FFT: complex input -> real output
@@ -127,8 +133,8 @@ void fft_forward(FftHandle* handle, const float* restrict time_in,
  * `restrict`: see fft_forward()'s doc comment above -- same audited
  * no-aliasing guarantee at every call site.
  */
-void fft_inverse(FftHandle* handle, const Complex* restrict freq_in,
-                 float* restrict time_out);
+void fft_inverse(FftHandle* handle, const Complex* AC_FFT_RESTRICT freq_in,
+                 float* AC_FFT_RESTRICT time_out);
 
 /**
  * Forward FFT: real input -> complex output, input clobber PERMITTED.
@@ -218,5 +224,7 @@ void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);
 #ifdef __cplusplus
 }
 #endif
+
+#undef AC_FFT_RESTRICT
 
 #endif // FFT_WRAPPER_H

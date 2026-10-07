@@ -987,7 +987,7 @@ static void test_exp_log_boundaries(void) {
 
 
 /* ═══════ correctness: kernels 23/24/25/27 in-place (out==x) aliasing ═════
- * NR/c_impl's mmse_lsa_denoiser.c calculate_gain() and spp_estimator.c
+ * NR/c_impl's anr.c calculate_gain() and spp_estimator.c
  * spp_estimate()/spp_estimate_ex() chain sk_exp1_approx_f32/sk_fast_exp_f32/
  * sk_fast_log_f32 (calculate_gain) and sk_fast_exp_neg_f32 (spp_estimate)
  * back-to-back over the SAME scratch buffer (out==x) to cut per-call

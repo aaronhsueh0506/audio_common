@@ -189,7 +189,7 @@ AC|ne10|NE10_fft_generic_float32.o|SCALAR|vendored NE10 generic (non-power-of-2)
 AC|ne10|NE10_rfft_float32.o|SCALAR|vendored NE10 R2C/C2R scalar reference implementation -- plain scalar C; its "neon" text hits are struct-field/function-name substrings (r_twiddles_neon etc.), not intrinsic calls -- confirmed by grep
 AC|ne10|NE10_fft_generic_int32.o|SCALAR|vendored NE10 generic int32 (.cpp, the one C++ TU this archive compiles) -- plain scalar C++, zero NEON intrinsic hits
 AC|ne10|NE10_rfft_float32.neonintrinsic.o|SCALAR|vendored NE10 R2C/C2R NEON-vectorized kernel -- despite the filename, grep confirms it calls ONLY separate vmulq_f32/vaddq_f32/vsubq_f32/vnegq_f32 (no vfmaq_f32/vfmsq_f32 anywhere): NOT an explicit-FMA TU, so audited like any other -- see the script header case 2
-NR|both|mmse_lsa_denoiser.o|SCALAR|includes fast_math.h/fft_wrapper.h/mmse_lsa_types.h/mcra_noise_estimator.h/spp_estimator.h only -- no NEON intrinsics, no explicit fmaf/fma anywhere
+NR|both|anr.o|SCALAR|ANR uses non-fused gain kernels; no explicit FMA
 NR|both|mcra_noise_estimator.o|SCALAR|includes fast_math.h/fft_wrapper.h only -- no NEON intrinsics, no explicit fmaf/fma anywhere
 NR|both|spp_estimator.o|SCALAR|includes fast_math.h/fft_wrapper.h only -- no NEON intrinsics, no explicit fmaf/fma anywhere
 '
