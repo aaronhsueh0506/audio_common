@@ -190,8 +190,8 @@ AC|ne10|NE10_fft_generic_float32.o|SCALAR|vendored NE10 generic (non-power-of-2)
 AC|ne10|NE10_rfft_float32.o|SCALAR|vendored NE10 R2C/C2R scalar reference implementation -- plain scalar C; its "neon" text hits are struct-field/function-name substrings (r_twiddles_neon etc.), not intrinsic calls -- confirmed by grep
 AC|ne10|NE10_fft_generic_int32.o|SCALAR|vendored NE10 generic int32 (.cpp, the one C++ TU this archive compiles) -- plain scalar C++, zero NEON intrinsic hits
 AC|ne10|NE10_rfft_float32.neonintrinsic.o|SCALAR|vendored NE10 R2C/C2R NEON-vectorized kernel -- despite the filename, grep confirms it calls ONLY separate vmulq_f32/vaddq_f32/vsubq_f32/vnegq_f32 (no vfmaq_f32/vfmsq_f32 anywhere): NOT an explicit-FMA TU, so audited like any other -- see the script header case 2
-NR|both|anr.o|SCALAR|ANR uses non-fused gain kernels; no explicit FMA
-NR|both|mcra_noise_estimator.o|SCALAR|includes fast_math.h/fft_wrapper.h only -- no NEON intrinsics, no explicit fmaf/fma anywhere
+NR|both|anr.o|SCALAR|inlines the simd_kernels.h gain kernels (sk_exp1_approx_f32, sk_fast_exp_f32, sk_fast_log_f32; unfused), including the batched final-gain exponential under USE_FAST_GAIN_SMOOTHING on NEON; no explicit fmaf/fma in the TU
+NR|both|mcra_noise_estimator.o|SCALAR|own NEON code is the ordered minimum search mcra_min_ordered (vceqq/vminvq NaN test, vextq, vcltq + vbslq select; no arithmetic); also inlines simd_kernels.h kernels (sk_ema_f32, sk_fast_log_f32, sk_mcra_noise_update_f32; unfused); no explicit fmaf/fma in the TU
 NR|both|spp_estimator.o|SCALAR|includes fast_math.h/fft_wrapper.h only -- no NEON intrinsics, no explicit fmaf/fma anywhere
 '
 
