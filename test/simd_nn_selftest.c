@@ -178,6 +178,49 @@ static void test_fill_mul_power(void) {
     printf("PASS fill_f32 / mul_f32 / power_scale_f32\n");
 }
 
+static void test_mag_eps(void) {
+    static const float EPS[] = { 0.0f, 1e-12f, 1e-20f, 0x1p-149f, 1.0f, -1.0f, 3.5e38f };
+    int ni, t, i, n, off;
+    for (ni = 0; ni < N_COUNT; ++ni) {
+        n = N_LIST[ni];
+        for (t = 0; t < TRIALS * 2; ++t) {
+            float eps = EPS[t % (int)(sizeof(EPS) / sizeof(EPS[0]))];
+            for (i = 0; i < n; ++i) {
+                X[i] = (t % 3 == 2) ? gen_any() : gen_finite(1);
+                Y[i] = (t % 3 == 2) ? gen_any() : gen_finite(1);
+            }
+            arm(n);
+            skn_mag_eps_f32(A + CANARY, X, Y, (size_t)n, eps);
+            skn_mag_eps_f32_scalar(B + CANARY, X, Y, (size_t)n, eps);
+            check_out("mag_eps", n, t);
+            /* in place on re and on im */
+            memcpy(A + CANARY, X, (size_t)n * 4); memcpy(B + CANARY, X, (size_t)n * 4);
+            skn_mag_eps_f32(A + CANARY, A + CANARY, Y, (size_t)n, eps);
+            skn_mag_eps_f32_scalar(B + CANARY, B + CANARY, Y, (size_t)n, eps);
+            cmp_arrays("mag_eps_inplace_re", n, t, A + CANARY, B + CANARY);
+            memcpy(A + CANARY, Y, (size_t)n * 4); memcpy(B + CANARY, Y, (size_t)n * 4);
+            skn_mag_eps_f32(A + CANARY, X, A + CANARY, (size_t)n, eps);
+            skn_mag_eps_f32_scalar(B + CANARY, X, B + CANARY, (size_t)n, eps);
+            cmp_arrays("mag_eps_inplace_im", n, t, A + CANARY, B + CANARY);
+        }
+    }
+    /* every length 0..70 at every 4-byte misalignment of inputs and output */
+    for (n = 0; n <= 70; ++n) {
+        for (off = 0; off < 4; ++off) {
+            for (t = 0; t < 4; ++t) {
+                float eps = EPS[(n + t) % (int)(sizeof(EPS) / sizeof(EPS[0]))];
+                for (i = 0; i < n + 4; ++i) { X[i] = gen_finite(1); Y[i] = gen_finite(1); }
+                arm(n + 4);
+                skn_mag_eps_f32(A + CANARY + off, X + off, Y + (3 - off), (size_t)n, eps);
+                skn_mag_eps_f32_scalar(B + CANARY + off, X + off, Y + (3 - off), (size_t)n, eps);
+                canary_check("mag_eps_align", A, n + 4);
+                cmp_arrays("mag_eps_align", n, t, A + CANARY + off, B + CANARY + off);
+            }
+        }
+    }
+    printf("PASS mag_eps_f32\n");
+}
+
 static void test_interleave(void) {
     int ni, t, i;
     for (ni = 0; ni < N_COUNT; ++ni) {
@@ -337,6 +380,7 @@ static void bench(void) {
 int main(void) {
     test_all_finite();
     test_fill_mul_power();
+    test_mag_eps();
     test_interleave();
     test_div_floor();
     test_ctaps_mac();

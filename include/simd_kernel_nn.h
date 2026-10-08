@@ -214,6 +214,39 @@ static inline void skn_power_scale_f32(float *p, const float *re,
 }
 #endif
 
+/* ═══════════════════════════ skn_mag_eps_f32 ══════════════════════════════
+ * out[k] = sqrtf((re[k]*re[k] + im[k]*im[k]) + eps) -- the magnitude with a
+ * floor term inside the root, in that exact association (two products, their
+ * sum, then eps, then the correctly rounded IEEE square root, which is what
+ * vsqrtq_f32 and sqrtf both are). out may be exactly re or im. */
+
+static inline void skn_mag_eps_f32_scalar(float *out, const float *re,
+                                          const float *im, size_t n,
+                                          float eps) {
+    size_t k;
+    for (k = 0; k < n; ++k) out[k] = sqrtf((re[k] * re[k] + im[k] * im[k]) + eps);
+}
+
+#if SK_HAVE_NEON
+static inline void skn_mag_eps_f32(float *out, const float *re,
+                                   const float *im, size_t n, float eps) {
+    const float32x4_t e = vdupq_n_f32(eps);
+    size_t k = 0;
+    for (; k + 4 <= n; k += 4) {
+        float32x4_t r = vld1q_f32(re + k);
+        float32x4_t i = vld1q_f32(im + k);
+        vst1q_f32(out + k, vsqrtq_f32(vaddq_f32(
+            vaddq_f32(vmulq_f32(r, r), vmulq_f32(i, i)), e)));
+    }
+    for (; k < n; ++k) out[k] = sqrtf((re[k] * re[k] + im[k] * im[k]) + eps);
+}
+#else
+static inline void skn_mag_eps_f32(float *out, const float *re,
+                                   const float *im, size_t n, float eps) {
+    skn_mag_eps_f32_scalar(out, re, im, n, eps);
+}
+#endif
+
 /* ══════════════════════ skn_(de)interleave[_scale]_cf32 ═══════════════════
  * Complex (AoS) <-> split re/im arrays. The _scale forms multiply each part
  * by `scale` on the way; the plain forms are exact moves (no arithmetic, so
