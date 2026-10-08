@@ -238,7 +238,7 @@ OBJ_DIR = $(OBJ_ROOT)/$(BACKEND)-$(CFG_SIG)
 BIN_DIR = $(BIN_ROOT)/$(BACKEND)-$(CFG_SIG)
 
 # Backend-independent shared DSP sources (always in the archive).
-COMMON_SRCS = src/hpf.c src/audio_pre_gain.c src/audio_resampler.c
+COMMON_SRCS = src/hpf.c src/audio_pre_gain.c src/audio_resampler.c src/audio_stft.c
 
 ifeq ($(BACKEND),ne10)
   # NE10 source footprint (review F16): fft_wrapper_ne10.c only ever calls the
@@ -929,7 +929,7 @@ $(OBJ_DIR)/fft_wrapper.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
+.PHONY: all lib selftest test_stft test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
 all: lib
 
 lib: $(LIB)
@@ -1025,7 +1025,7 @@ $(OBJ_DIR)/%.o: %.c | _cfg_guard
 $(OBJ_DIR)/%.o: %.cpp | _cfg_guard
 	$(CXX) $(CXXFLAGS) -MD -MP -c -o $@ $<
 
-selftest: $(LIB) | _cfg_guard
+selftest: $(LIB) test_stft | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/roundtrip.o test/roundtrip.c
 	$(LINK) -o $(BIN_DIR)/roundtrip $(OBJ_DIR)/roundtrip.o $(LIB) $(LDFLAGS)
 	@echo "--- audio_common selftest [$(BACKEND)] ---"
@@ -1060,6 +1060,17 @@ selftest: $(LIB) | _cfg_guard
 	$(LINK) -o $(BIN_DIR)/test_audio_utilities $(OBJ_DIR)/test_audio_utilities.o $(LIB) $(LDFLAGS)
 	@echo "--- audio_common pre-gain/resampler test [$(BACKEND)] ---"
 	@$(BIN_DIR)/test_audio_utilities
+
+# test_stft: audio_stft.h against reference copies of the framing code in
+# test/stft_ref/. Built twice because the envelope-normalised reference copy
+# is sized by TEST_N at compile time.
+test_stft: $(LIB) | _cfg_guard
+	@for n in 512 1024; do \
+	  $(CC) $(CFLAGS) -fstrict-aliasing -Itest -DTEST_N=$$n -MD -MP -c -o $(OBJ_DIR)/test_stft_$$n.o test/test_stft.c && \
+	  $(LINK) -o $(BIN_DIR)/test_stft_$$n $(OBJ_DIR)/test_stft_$$n.o $(LIB) $(LDFLAGS) && \
+	  echo "--- audio_common STFT/ISTFT test [$(BACKEND)] TEST_N=$$n ---" && \
+	  $(BIN_DIR)/test_stft_$$n > $(BIN_DIR)/test_stft_$$n.log && tail -n 1 $(BIN_DIR)/test_stft_$$n.log || exit 1; \
+	done
 
 test_audio_utils: $(LIB) | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_audio_utilities.o test/test_audio_utilities.c

@@ -29,6 +29,7 @@
  * (a deliberate malloc()/calloc()/realloc()/free() call must be observed)
  * before any of the zero-heap assertions get to lean on it.
  */
+#include "audio_stft.h"
 #include "fft_wrapper.h"
 #include "mem_align.h"
 #include "zero_heap_hook.h"
@@ -259,6 +260,59 @@ static void test_heap_vs_pool_bit_identical(void) {
     free(pool);
 }
 
+/* audio_stft.h objects: init, push, flush and reset on a pool never touch the allocator. */
+static void test_stft_zero_heap(void) {
+    int mode;
+
+    for (mode = 0; mode < 2; ++mode) {
+        AcStftConfig cfg;
+        size_t sa, ss;
+        void *ma = NULL, *ms = NULL;
+        float in[ZH_FFT_SIZE / 2], out[ZH_FFT_SIZE / 2];
+        float re[2 * ZH_N_FREQS], im[2 * ZH_N_FREQS];
+        long mc, cc, rc, fc;
+        int t, ok = 0;
+
+        ac_stft_config_default(&cfg, ZH_FFT_SIZE);
+        cfg.center = mode;
+        cfg.ola = mode ? AC_OLA_ENV_NORM : AC_OLA_ACCUMULATE;
+        cfg.spec_scale = mode ? 1.0f : 0.5f;
+        cfg.ispec_scale = mode ? 1.0f : 2.0f;
+        sa = ac_stft_get_mem_size(&cfg);
+        ss = ac_istft_get_mem_size(&cfg);
+        CHECK(sa > 0 && ss > 0, "audio_stft mem sizes must be > 0");
+        if (sa == 0 || ss == 0) return;
+        CHECK(posix_memalign(&ma, 16, sa) == 0 && posix_memalign(&ms, 16, ss) == 0,
+              "posix_memalign for audio_stft pools");
+        if (!ma || !ms) return;
+        memset(ma, 0xA5, sa);
+        memset(ms, 0xA5, ss);
+
+        zh_reset_counters();
+        {
+            AcStft* a = ac_stft_init(ma, sa, &cfg);
+            AcIstft* s = ac_istft_init(ms, ss, &cfg);
+            ok = (a != NULL && s != NULL);
+            for (t = 0; ok && t < ZH_FRAMES; ++t) {
+                int n, f;
+                fill_synthetic(in, ZH_FFT_SIZE / 2, t);
+                n = ac_stft_push_planar(a, in, re, im);
+                for (f = 0; f < n; ++f)
+                    ac_istft_push_planar(s, re + f * ZH_N_FREQS, im + f * ZH_N_FREQS, out);
+                ac_stft_flush_planar(a, re, im);
+                ac_istft_flush(s, out);
+                if (t == ZH_FRAMES / 2) { ac_stft_reset(a); ac_istft_reset(s); }
+            }
+        }
+        zh_get_counters(&mc, &cc, &rc, &fc);
+        CHECK(ok, "audio_stft init on a dirty pool must succeed");
+        CHECK(mc == 0 && cc == 0 && rc == 0 && fc == 0,
+              "audio_stft init, push, flush and reset must call the allocator zero times");
+        free(ma);
+        free(ms);
+    }
+}
+
 /* ═══════════════════════════════════ main ════════════════════════════════ */
 
 int main(void) {
@@ -267,6 +321,7 @@ int main(void) {
     test_destroy_idempotent();
     test_dirty_pool_matches_zero_pool();
     test_heap_vs_pool_bit_identical();
+    test_stft_zero_heap();
 
     if (g_fail) {
         printf(">>> FAIL\n");
