@@ -79,6 +79,7 @@ static int inputs_finite(const float* x, size_t n) { return skn_all_finite_f32(x
 
 /* ----------------------------- test utilities ----------------------------- */
 
+static uint64_t g_hash = 1469598103934665603ull;   /* FNV-1a over every compared reference buffer */
 static int g_fail = 0;
 static int g_shown = 0;
 
@@ -99,6 +100,7 @@ static int same_bytes(const void* a, const void* b, size_t n_floats, const char*
     const unsigned char* x = (const unsigned char*)a;
     const unsigned char* y = (const unsigned char*)b;
     size_t i;
+    for (i = 0; i < n_floats * 4; ++i) g_hash = (g_hash ^ x[i]) * 1099511628211ull;
     for (i = 0; i < n_floats; ++i) {
         if (memcmp(x + 4 * i, y + 4 * i, 4) != 0) {
             fail(what, (long)i);
@@ -843,6 +845,7 @@ int main(void) {
         fprintf(stderr, "test_stft FAILED (%d failing checks)\n", g_fail);
         return 1;
     }
+    printf("HASH| outputs fnv1a64=%016llx\n", (unsigned long long)g_hash);
     printf("test_stft PASS\n");
     return 0;
 }
