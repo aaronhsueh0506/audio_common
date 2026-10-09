@@ -40,12 +40,13 @@ pre code{background:none;padding:0}
 </nav>
 
 <h1>audio_common C API 使用說明</h1>
-<p class="small">本頁是<b>整合者視角</b>的 API 說明。audio_common 是 AEC／NR／pipelines 共用的底層 DSP 層,<b>其中只有四個 header 是給整合者用的</b>,其餘是共用實作細節。canonical 出處是 <code>audio_common/docs/c_user_manual_zh_TW.md</code>。</p>
+<p class="small">本頁是<b>整合者視角</b>的 API 說明。audio_common 是 AEC／NR／pipelines 共用的底層 DSP 層,<b>其中只有五個 header 是給整合者用的</b>,其餘是共用實作細節。canonical 出處是 <code>audio_common/docs/c_user_manual_zh_TW.md</code>。</p>
 
-<h2>1. 八個 header,先分清楚哪些該碰</h2>
+<h2>1. 十個 header,先分清楚哪些該碰</h2>
 <div class="tblwrap"><table>
 <tr><th>Header</th><th>分類</th><th>什麼時候需要</th></tr>
-<tr><td><code>fft_wrapper.h</code></td><td><b>整合者面向</b></td><td>自己做 STFT／WOLA 時。<b>也是 NR 的 <code>Complex</code> 型別來源</b></td></tr>
+<tr><td><code>fft_wrapper.h</code></td><td><b>整合者面向</b></td><td>只要 FFT 本身時(組幀與 overlap-add 請用 <code>audio_stft.h</code>)。<b>也是 NR 的 <code>Complex</code> 型別來源</b></td></tr>
+<tr><td><code>audio_stft.h</code></td><td><b>整合者面向</b></td><td>自己要做 sqrt-Hann STFT／ISTFT(50% overlap 的組幀、加窗、overlap-add)時</td></tr>
 <tr><td><code>audio_resampler.h</code></td><td><b>整合者面向</b></td><td>擷取取樣率 ≠ 處理取樣率時</td></tr>
 <tr><td><code>hpf.h</code></td><td><b>整合者面向</b></td><td>要在 AEC <b>之外</b>做高通時(AEC 內建 mic-path HPF,見下)</td></tr>
 <tr><td><code>audio_pre_gain.h</code></td><td><b>整合者面向</b></td><td>輸入電平調整</td></tr>
@@ -58,7 +59,7 @@ pre code{background:none;padding:0}
 <div class="warn">若你的 TU 直接 include 了 <code>simd_kernels.h</code> 或 <code>fast_math.h</code>,<b>必須加 <code>-ffp-contract=off</code></b>(放 CFLAGS 最後),否則你的 TU 與 archive 內同名邏輯的浮點捨入路徑會不一致。這兩個 header 的所有核心都是 <code>void</code>、<b>不檢查 NULL/範圍、沒有錯誤通道</b>。</div>
 
 <h2>2. 共通的 static-pool 模式</h2>
-<p>四個整合者面向的模組(以及 AEC／NR)全部遵守同一個模式:</p>
+<p>五個整合者面向的模組(以及 AEC／NR)全部遵守同一個模式:</p>
 <pre>config → get_mem_size() → caller 配置「至少 16-byte 對齊」的 pool
        → init(pool, bytes, ...) → process...（不可 malloc）
        → reset（需要時）→ destroy（不釋放 caller pool）→ caller 釋放 pool</pre>
@@ -66,7 +67,7 @@ pre code{background:none;padding:0}
 <tr><th>規則</th><th>細節</th></tr>
 <tr><td>對齊</td><td><b>16 bytes</b>,由 <code>MEM_IS_ALIGNED16</code> 在每個 <code>_init()</code> 進入點檢查,未對齊一律回 <code>NULL</code></td></tr>
 <tr><td>heap vs pool</td><td>兩條路徑<b>同時存在於同一份 object</b>,handle 內部 flag 決定 <code>destroy()</code> 要不要 <code>free()</code>。pool 路徑的 destroy 是 no-op、可重複呼叫;heap 路徑<b>只能呼叫一次</b></td></tr>
-<tr><td>有狀態物件必須存活整段串流</td><td><code>AudioResampler</code>／<code>Hpf</code>／<code>FftHandle</code> <b>不要逐 block 重建</b></td></tr>
+<tr><td>有狀態物件必須存活整段串流</td><td><code>AudioResampler</code>／<code>Hpf</code>／<code>FftHandle</code>／<code>AcStft</code>／<code>AcIstft</code> <b>不要逐 block 重建</b></td></tr>
 <tr><td>溢位</td><td><code>mem_align.h</code> 的 <code>ck_add_size</code>／<code>ck_mul_size</code>／<code>ck_align16_size</code>／<code>ck_field_size</code> 是<b>飽和</b>算術,任一步溢位就飽和到 <code>SIZE_MAX</code> 並一路傳遞,走訪結尾用 <code>MEM_SIZE_INVALID()</code> 檢查一次</td></tr>
 </table></div>
 
@@ -89,7 +90,7 @@ fft_destroy(fft);</pre>
 <tr><td>pool 內容</td><td><code>fft_get_mem_size()</code> <b>已包含</b>後端的 twiddle/config → <code>fft_init()</code> 之後不會再向 heap 要記憶體</td></tr>
 <tr><td>省一次複製</td><td>輸入是可破壞的 scratch 時用 <code>fft_forward_scratch()</code>／<code>fft_inverse_scratch()</code>,呼叫後輸入內容<b>未定義</b></td></tr>
 </table></div>
-<div class="warn"><b>Aliasing 規則與 NR 相反。</b>NR 的 <code>mmse_lsa_process()</code> 明確支援 <code>out == in</code>(完全同一指標);FFT 這裡則是任何重疊都 UB。兩層不要套用同一條直覺。</div>
+<div class="warn"><b>Aliasing 規則與 NR 相反。</b>NR 的 <code>anr_process()</code> 明確支援 <code>out == in</code>(完全同一指標);FFT 這裡則是任何重疊都 UB。兩層不要套用同一條直覺。</div>
 <p>其他:<code>fft_magnitude</code>／<code>fft_power</code>(較便宜,不開根號)／<code>fft_phase</code>／<code>fft_from_mag_phase</code>／<code>fft_apply_gain</code>(就地)。</p>
 <h3>Backend 是編譯期決定的</h3>
 <div class="tblwrap"><table>
@@ -98,6 +99,35 @@ fft_destroy(fft);</pre>
 <tr><td><code>kiss</code></td><td>可攜、可位元重現。手動乘 <code>1.0f/n</code></td></tr>
 </table></div>
 <div class="warn"><b>兩個後端的輸出不是逐位元相同</b>(不同 FFT 實作)。位元級回歸比對必須兩邊同後端;也不要混連不同 BACKEND 的產物。</div>
+
+<h2>3b. <code>audio_stft.h</code> — sqrt-Hann STFT／ISTFT</h2>
+<pre>AcStftConfig cfg;
+ac_stft_config_default(&amp;cfg, 512);              /* hop = 256 */
+size_t sa = ac_stft_get_mem_size(&amp;cfg);         /* 0 = 設定不合法 */
+size_t ss = ac_istft_get_mem_size(&amp;cfg);
+AcStft  *an  = ac_stft_init(pool_a16, sa, &amp;cfg);    /* NULL = 失敗 */
+AcIstft *syn = ac_istft_init(pool_s16, ss, &amp;cfg);
+
+Complex spec[2 * 257];                          /* center = 1 時一次最多 2 幀 */
+float   hop_in[256], hop_out[256];
+
+int n = ac_stft_push(an, hop_in, spec);         /* 回傳幀數;幀 f 在 spec + f * 257 */
+/* ... 處理 spec ... */
+for (int f = 0; f &lt; n; ++f)
+    ac_istft_push(syn, spec + f * 257, hop_out);   /* 回傳寫出的樣本數(hop 或 0) */</pre>
+<div class="tblwrap"><table>
+<tr><th>項目</th><th>契約</th></tr>
+<tr><td>設定</td><td><code>AcStftConfig</code>:<code>fft_size</code>(2 的冪、<code>[16, 8192]</code>,hop = <code>fft_size/2</code>)、<code>center</code>(0／1,只影響 <code>AcStft</code>)、<code>ola</code>(<code>AC_OLA_ACCUMULATE</code>／<code>AC_OLA_ENV_NORM</code>,只影響 <code>AcIstft</code>)、<code>spec_scale</code>／<code>ispec_scale</code>、<code>fft</code>／<code>window</code>(借用或 NULL)。用 <code>ac_stft_config_default()</code> 起手,再改要改的欄位</td></tr>
+<tr><td>窗</td><td>只有一種:週期 sqrt-Hann <code>sqrtf(0.5f*(1.0f-cosf(2.0f*pi*k/N)))</code>;<code>ac_window_build(w, n)</code> 可單獨建表,<code>ac_stft_window()</code>／<code>ac_istft_window()</code> 取得使用中的表</td></tr>
+<tr><td>縮放</td><td><code>spec_scale</code> 乘在前向 FFT 輸出的每個 bin;<code>ispec_scale</code> 乘在反向 FFT 輸入的每個 bin。<b>恰為 <code>1.0f</code> 時略過乘法</b>(精確搬移)。FFT 本身仍是前向未正規化、反向含 <code>1/N</code></td></tr>
+<tr><td>借用 vs 自帶</td><td><code>cfg.fft</code>／<code>cfg.window</code> 為 NULL 時從 pool 切出自己的(<code>get_mem_size</code> 已含);非 NULL 時借用:handle 的 <code>n_freqs</code> 必須等於 <code>fft_size/2+1</code>(否則 <code>get_mem_size</code> 回 0、<code>init</code> 回 NULL),窗表須維持不變且活得比物件久;一支 handle 可被多個物件共用(呼叫須循序、不可並行)</td></tr>
+<tr><td><code>AcStft</code> 輸出幀數</td><td><code>center = 0</code>:每次 push 恆 1 幀(第 1 次 push 的前半窗是歸零歷史)。<code>center = 1</code>:第 1 次 push 0 幀、第 2 次 2 幀、之後 1 幀,輸出緩衝區要容納 2 幀;<code>ac_stft_flush()</code> 吐尾端 reflect 幀(回 1,不足兩個 hop 回 0)</td></tr>
+<tr><td><code>AcIstft</code> 輸出</td><td><code>AC_OLA_ACCUMULATE</code>:每幀吐 hop 個樣本。<code>AC_OLA_ENV_NORM</code>:acc／max(env, <code>1e-11f</code>);第 1 幀吐 0 個;<code>ac_istft_flush()</code> 吐 hop 個尚在 overlap 內的樣本(不推進狀態)。輸入頻譜不會被修改</td></tr>
+<tr><td>別名</td><td>輸出緩衝區不得與輸入重疊;<code>ac_stft_frame()</code> 的 <code>frame</code> 是呼叫端自備的 N 樣本,不改變歷史</td></tr>
+<tr><td>延遲</td><td>恆等串接 = hop 個樣本(<code>ac_stft_latency_samples()</code>)</td></tr>
+<tr><td>記憶體</td><td>只有 static 路徑,無 heap、無 destroy;pool 16-byte 對齊。<code>init</code> 對髒 pool 與全零 pool 給出相同輸出(<code>test_stft</code> 檢查)</td></tr>
+</table></div>
+<div class="note">目前 pipelines 與 NN 前後處理仍各自持有等價的組幀實作;<code>test_stft</code> 以這些實作的逐行複本驗證本物件:pipeline 合成與 centered 分析／包絡正規化合成逐位元相同,DFN2／GTCRN 的正規化頻譜版分析頻譜逐位元相同、合成輸出只差偶發的 ±0.0 符號(報告見 <code>test_stft</code> 的 <code>B|</code> 輸出列)。</div>
 
 <h2>4. <code>hpf.h</code> — 高通濾波器設定</h2>
 <pre>Hpf *hpf = hpf_create(80.0f, 16000);   /* 或 hpf_get_mem_size() + hpf_init() */
@@ -208,7 +238,7 @@ make -C audio_common lib BACKEND=kiss SIMD=0     # 參考建置</pre>
 <h2>10. 整合檢查清單</h2>
 <ul>
 <li>所有 pool 基底 16-byte 對齊;<code>_get_mem_size()</code> 與 <code>_init()</code> 回傳值都檢查。</li>
-<li><code>FftHandle</code>／<code>Hpf</code>／<code>AudioResampler</code> 在整段串流期間存活,沒有逐 block 重建。</li>
+<li><code>FftHandle</code>／<code>Hpf</code>／<code>AudioResampler</code>／<code>AcStft</code>／<code>AcIstft</code> 在整段串流期間存活,沒有逐 block 重建。</li>
 <li>FFT 的 forward/inverse <b>沒有</b>任何 buffer 重疊(含相同指標)。</li>
 <li><code>fft_inverse</code> 之後<b>沒有</b>再自己除以 N。</li>
 <li>Resampler 用 <code>output_bound()</code> 配容量,並依 <code>consumed</code>/<code>produced</code> 推進。</li>
@@ -220,8 +250,9 @@ make -C audio_common lib BACKEND=kiss SIMD=0     # 參考建置</pre>
 
 <h2>相關檔案與測試路徑</h2>
 <ul class="small">
-<li><code>audio_common/include/</code> — 八個 header</li>
+<li><code>audio_common/include/</code> — 十個 header</li>
 <li><code>audio_common/docs/c_user_manual_zh_TW.md</code> — canonical 手冊(逐函式簽章、錯誤回傳、常見錯誤)</li>
+<li><code>audio_common/test/test_stft.c</code> — <code>audio_stft.h</code> 對參考複本(<code>test/stft_ref/</code>)的逐位元比對與 B 類差異量測</li>
 <li><code>audio_common/test/simd_selftest.c</code> — 每個 <code>sk_*</code> 核心與其 <code>_scalar</code> 雙胞胎的 <code>memcmp</code> 全等測試</li>
 <li><code>audio_common/scripts/audit_fp_contract.sh</code> — 反組譯稽核(確認沒有意外的 FMA)</li>
 </ul>

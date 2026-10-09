@@ -28,11 +28,12 @@
 - **不是**會替你檢查取樣率一致性的框架。取樣率、通道數、緩衝區長度全部由呼叫端負責對齊。
 - **不做**自動裁切（clipping）與自動正規化。pre-gain 明確不做裁切；溢位政策是呼叫端的責任。
 
-### 八個標頭檔的功能地圖
+### 十個標頭檔的功能地圖
 
 | 標頭檔 | 解決什麼問題 | 型態 | 需要連結 `.a` 嗎 |
 |---|---|---|---|
 | `include/fft_wrapper.h` | 實數訊號 ↔ 頻譜（rfft / irfft）、頻譜的振幅／功率／增益套用 | opaque handle + 函式 | 是 |
+| `include/audio_stft.h` | sqrt-Hann STFT／ISTFT（50% overlap 組幀、加窗、overlap-add；centered reflect 分析與包絡正規化合成） | opaque handle + 函式 | 是 |
 | `include/audio_resampler.h` | 8/16/24/32/48 kHz 之間互轉，可跨區塊連續串流，最多 8 通道交錯 | opaque handle + 函式 | 是 |
 | `include/hpf.h` | 去直流、去低頻隆隆聲的二階高通濾波，逐樣本就地處理 | opaque handle + 函式 | 是 |
 | `include/audio_pre_gain.h` | 以 dB 設定的輸入增益，逐樣本乘法，支援就地 | opaque handle + 函式 | 是 |
@@ -45,6 +46,7 @@
 **選用指引（一句話版）**
 
 - 要做頻域處理 → `fft_wrapper.h`
+- 要做 sqrt-Hann STFT／ISTFT 組幀 → `audio_stft.h`
 - 輸入取樣率跟處理取樣率不同 → `audio_resampler.h`
 - 麥克風訊號有直流偏移／低頻雜訊 → `hpf.h`
 - 輸入電平太小或太大 → `audio_pre_gain.h`
@@ -1100,6 +1102,61 @@ float32 輸出路徑（`WAV_IO_WRITER_AEC` + `AEC_OUT_FLOAT=1`）是**原始位�
 4. 在 include 之後才定義 `WAV_IO_WRITER_STYLE`，結果拿到預設風格。
 5. 餵 24-bit 或 44.1 kHz 以外沒問題但格式不合的檔案，`wav_open_read()` 回 `NULL` 卻沒檢查。
 6. 在即時路徑上使用這個模組。
+
+---
+
+### 5.9 `audio_stft.h` — sqrt-Hann STFT／ISTFT
+
+#### 何時使用
+
+需要 50% overlap 的 sqrt-Hann 組幀時：`AcStft` 每次吃 hop = `fft_size/2` 個樣本、吐加窗 rFFT 幀；`AcIstft` 吃一幀頻譜、吐 hop 個完成的樣本。
+
+#### 生命週期
+
+只有 static 路徑，沒有 heap、沒有 destroy。
+
+```c
+AcStftConfig cfg;
+ac_stft_config_default(&cfg, 512);                 /* hop = 256 */
+size_t sa = ac_stft_get_mem_size(&cfg);            /* 0 = 設定不合法 */
+size_t ss = ac_istft_get_mem_size(&cfg);
+AcStft  *an  = ac_stft_init(pool_a, sa, &cfg);     /* pool 16-byte 對齊；NULL = 失敗 */
+AcIstft *syn = ac_istft_init(pool_s, ss, &cfg);
+```
+
+`cfg.fft`／`cfg.window` 為 NULL 時由 pool 自帶；非 NULL 時借用（handle 的 `n_freqs` 必須等於 `fft_size/2+1`，窗表須維持不變且活得比物件久，一支 handle 可被多個物件循序共用）。
+
+#### 逐函式簽章與呼叫時機
+
+```c
+int  ac_stft_push(AcStft*, const float* hop_in, Complex* out);              /* 回傳幀數 0..2 */
+int  ac_stft_push_planar(AcStft*, const float* hop_in, float* re, float* im);
+void ac_stft_frame(AcStft*, const float* frame, Complex* out);              /* 呼叫端自備 N 樣本，不碰歷史 */
+int  ac_stft_flush(AcStft*, Complex* out);                                  /* 僅 center=1：尾端 reflect 幀 */
+int  ac_istft_push(AcIstft*, const Complex* spec, float* out);              /* 回傳樣本數：hop 或 0 */
+int  ac_istft_push_planar(AcIstft*, const float* re, const float* im, float* out);
+int  ac_istft_flush(AcIstft*, float* out);                                  /* 僅 ENV_NORM：hop 個尚在 overlap 內的樣本 */
+void ac_window_build(float* w, int n);
+int  ac_stft_latency_samples(const AcStftConfig*);                          /* 恆等串接延遲 = fft_size/2；不合法 -1 */
+```
+
+#### 緩衝區大小規則
+
+`center = 1` 時 `ac_stft_push` 的輸出要容納 2 幀（第 f 幀在 `out + f * n_freqs`）；`center = 0` 恆 1 幀。`ac_istft_push` 的輸出要容納 hop 個 float。
+
+#### 就地／別名限制
+
+輸出緩衝區不得與輸入重疊；`ac_istft_push` 不修改輸入頻譜。
+
+#### 錯誤回傳
+
+`get_mem_size` 回 0、`init` 回 NULL 表示設定不合法（`fft_size` 非 2 的冪或不在 [16, 8192]、`center` 非 0／1、`ola` 不是兩個列舉值之一、借用 handle 大小不符）、pool 太小或未對齊。push／flush 遇 NULL 引數回 0。
+
+#### 常見錯誤
+
+- `spec_scale`／`ispec_scale` 恰為 `1.0f` 時略過乘法；要縮放就給 `1.0f` 以外的值。
+- 同一個 `AcStft` 不可混用兩種 `center`；`center` 在建立時固定。
+- `AC_OLA_ENV_NORM` 的第 1 幀不吐樣本，`center = 1` 的第 1 次 push 不產出幀；呼叫端自行補第 1 個 hop 的零。
 
 ---
 

@@ -27,7 +27,7 @@ pre code{background:none;padding:0}
 <h1>audio_common — 共用 DSP 層(FFT wrapper 等)</h1>
 
 <h2>概要</h2>
-<p><code>audio_common</code> 是 AEC / NR / Audio_ALG pipelines 共用的 DSP 底層,與 Audio_ALG 同層的獨立 repo(引用時 <code>-I audio_common/include</code> + 連結 <code>libaudio_common.a</code>)。本頁聚焦 <code>FftHandle</code> 契約與零 heap 慣例;其餘模組(fast_math、simd_kernels、HPF、pre-gain、resampler、wav_io)列於檔案節。</p>
+<p><code>audio_common</code> 是 AEC / NR / Audio_ALG pipelines 共用的 DSP 底層,與 Audio_ALG 同層的獨立 repo(引用時 <code>-I audio_common/include</code> + 連結 <code>libaudio_common.a</code>)。本頁聚焦 <code>FftHandle</code> 契約與零 heap 慣例;STFT/ISTFT 框架(<code>audio_stft.h</code>)見 API 用法節;其餘模組(fast_math、simd_kernels、HPF、pre-gain、resampler、wav_io)列於檔案節。</p>
 <ul>
 <li><b>一個公開 API、兩個後端</b>:KISS(可攜參考、bit-reproducible、host/CI 用)與 NE10(ARM NEON、嵌入式用)。後端是 build 旋鈕(<code>make BACKEND=kiss|ne10</code>)不是分支屬性;不明示 <code>BACKEND=</code> 時依編譯目標自動偵測(<code>__ARM_NEON</code>/<code>__aarch64__</code>)→ 有 NEON 選 <b>NE10</b>,否則退回 KISS。<b>2026-08-18 起在 NEON 目標上這使自動偵測預設變成 NE10</b>(之前預設 KISS);KISS 仍是需要逐位元可重現時的明示可攜參考後端,交付/交叉編譯建議永遠明示 <code>BACKEND=</code>。<b>NE10 與 KISS 輸出不逐位元相同</b>;所有 vs-Python parity 保證僅限 KISS。同一後端下 heap 與 static 路徑 byte-equal(selftest 實測)。</li>
 <li><b>FP 政策</b>:<code>-ffp-contract=off</code> 是四 repo 統一政策,每個 Makefile 把它放在 CFLAGS 最後且在 parse 期擋掉 <code>-ffast-math</code>/<code>-Ofast</code>/自帶 <code>-ffp-contract</code> 的覆寫;<code>scripts/audit_fp_contract.sh</code> 用反組譯證明無自動 FMA。</li>
@@ -63,7 +63,31 @@ fft_destroy(h);   /* fft_init 的 handle:真 no-op、可重複呼叫 */</code></
 <li>純函式 helpers(無 state):<code>fft_magnitude / fft_power / fft_apply_gain</code>(<code>fft_phase / fft_from_mag_phase</code> 已宣告但目前全 repo 無呼叫者——見標頭註解)。</li>
 </ul>
 
-<p><b>sqrt-Hann 慣例(誠實說明)</b>:audio_common <b>不輸出</b> sqrt-Hann 建表函式。四 repo 共用的是「window = sqrt(periodic Hann)(denom = N、<code>sym=False</code>),50% overlap 即 COLA、無需再正規化」這個<b>約定</b>,各 consumer 自建常數表:AEC <code>lib/aec/c_impl/src/pbfdkf.c</code>(<code>sqrt_hann</code> 分析窗)、NR 範例 <code>lib/nr/c_impl/example/main_mem.c</code> 的 <code>build_sqrt_hann()</code>(bit-match <code>np.sqrt(hann(N, sym=False))</code>)、pipeline <code>pipelines/mono_aec_nr_res/audio_pipeline.c</code>(<code>synth_win</code> 合成窗)。</p>
+<p><b>sqrt-Hann 慣例</b>:四 repo 共用的是「window = sqrt(periodic Hann)(denom = N、<code>sym=False</code>),50% overlap 即 COLA、無需再正規化」這個約定。audio_common 以 <code>ac_window_build(w, n)</code>(<code>audio_stft.h</code>)提供這張表,公式 <code>sqrtf(0.5f * (1.0f - cosf(2.0f * pi * k / N)))</code>。目前 AEC <code>lib/aec/c_impl/src/pbfdkf.c</code>(<code>sqrt_hann</code>)、NR 範例 <code>lib/nr/c_impl/example/main_mem.c</code>(<code>build_sqrt_hann()</code>)與各 pipeline／NN 前後處理仍各自持有等價建表;<code>test_stft</code> 對 mono／4ch pipeline、pbfdkf、DFN2、GTCRN、rate bridge、ULCNet 的建表逐位元比對,2 的冪 N ∈ [16, 8192] 全部 0 bit 差。</p>
+
+<p><b>STFT / ISTFT(<code>audio_stft.h</code>)</b>:一對物件取代各處重複的組幀／overlap-add 實作。<code>AcStft</code> 每次吃 hop = N/2 個樣本、吐加窗 rFFT 幀;<code>AcIstft</code> 吃一幀頻譜、吐 hop 個完成的樣本。靜態記憶體(<code>get_mem_size</code> + <code>init</code>,無 heap、無 destroy);FFT handle 與窗表可借用(<code>cfg.fft</code>/<code>cfg.window</code> 非 NULL,借用的 handle 可被多個物件共用,呼叫須循序)或由 pool 自帶(NULL)。</p>
+<pre><code>#include "audio_stft.h"
+
+AcStftConfig cfg;
+ac_stft_config_default(&amp;cfg, 512);   /* hop = 256;center=0、AC_OLA_ACCUMULATE、scale=1.0f、自帶 FFT 與窗 */
+size_t sa = ac_stft_get_mem_size(&amp;cfg);    /* 0 = 設定不合法(fft_size 非 2 的冪、不在 [16,8192]、借用 handle 大小不符…) */
+size_t ss = ac_istft_get_mem_size(&amp;cfg);
+AcStft  *an  = ac_stft_init(pool_a, sa, &amp;cfg);   /* pool 16-byte 對齊;NULL = 失敗 */
+AcIstft *syn = ac_istft_init(pool_s, ss, &amp;cfg);
+
+Complex spec[2 * 257];                       /* center=1 時一次最多 2 幀 */
+float   hop_in[256], hop_out[256];
+int n = ac_stft_push(an, hop_in, spec);      /* 回傳本次幀數;幀 f 在 spec + f * 257 */
+/* ...處理 spec[0..n)... */
+for (int f = 0; f &lt; n; ++f)
+    ac_istft_push(syn, spec + f * 257, hop_out);   /* 回傳寫出的樣本數:hop,或 ENV_NORM 的第 1 幀回 0 */</code></pre>
+<div class="tblwrap"><table>
+<tr><th>用途</th><th>設定</th><th>行為</th></tr>
+<tr><td>pipeline 合成端(accumulate→emit→shift→尾端清零)</td><td>預設值</td><td>每幀吐 hop 個樣本(含第 1 幀);不縮放頻譜</td></tr>
+<tr><td>NN 正規化頻譜(DFN2:<code>spec_scale = 1/sqrtf(N)</code>、<code>ispec_scale = sqrtf(N)</code>;GTCRN:兩者 1.0f)</td><td><code>center = 0</code>、<code>AC_OLA_ACCUMULATE</code>、<code>spec_scale</code>/<code>ispec_scale</code></td><td>縮放發生在前向 FFT 之後、反向 FFT 之前的每個 bin;<b>scale 恰為 1.0f 時略過乘法</b>(bin 為精確搬移,NaN payload 與 −0.0 不變)</td></tr>
+<tr><td>torch.stft(center=True, reflect) / torch.istft 語意(Align-ULCNet、AIAEC)</td><td><code>center = 1</code>、<code>AC_OLA_ENV_NORM</code></td><td>分析:第 1 次 push 0 幀、第 2 次 2 幀(reflect 前綴幀 + 第 1 幀)、之後每次 1 幀;<code>ac_stft_flush</code> 補尾端 reflect 幀。合成:同時累加窗平方包絡,輸出 acc / max(env, 1e-11f);第 1 幀落在被裁掉的半窗,不吐樣本;<code>ac_istft_flush</code> 吐出 hop 個尚在 overlap 內的樣本</td></tr>
+</table></div>
+<p>其他入口:<code>ac_stft_push_planar</code> / <code>ac_istft_push_planar</code>(re、im 分開的陣列,多幀時第 f 幀在 <code>re + f * n_freqs</code>)、<code>ac_stft_frame[_planar]</code>(對呼叫端自備的 N 樣本幀做加窗 rFFT,不碰歷史,例如 FIFO 取幀的橋接器)、<code>ac_stft_window()</code>/<code>ac_istft_window()</code>(取得使用中的窗表以便共用)、<code>ac_stft_reset()</code>/<code>ac_istft_reset()</code>、<code>ac_stft_latency_samples()</code>。同一個 <code>AcStft</code> 的 <code>center</code> 在建立時固定,兩種框架不可共用一個物件。</p>
 
 <p><b>零 heap 慣例(全模組一體適用)</b>:每個模組都有 heap 路徑(<code>X_create/X_destroy</code>)與 static 路徑(<code>X_get_mem_size(...)</code> + <code>X_init(void* mem, size_t mem_size, ...)</code>),runtime 以 <code>pool_owned/is_static</code> 旗標區分、無編譯期開關;<code>get_mem_size</code> 與 <code>init</code> 必須以<b>相同順序</b>走欄位(對齊 <code>ALIGN16</code>,見 <code>mem_align.h</code>);<code>X_destroy</code> 對兩路徑都安全(pool 實例不 free 任何東西)。<code>fft_get_mem_size</code> 涵蓋 <code>fft_init</code> 會碰的每一個 byte(含後端內部 cfg),兩後端在 init 路徑上完全不碰 heap(<code>test_fft_zero_heap</code> 以 allocator hook 實測)。</p>
 
@@ -84,6 +108,22 @@ fft_destroy(h);   /* fft_init 的 handle:真 no-op、可重複呼叫 */</code></
    fft_power / fft_magnitude / fft_apply_gain   ← 無 handle、無 state 的逐 bin helpers
 </pre>
 
+<pre>
+ AcStft (hop 個樣本進)                              AcIstft (一幀頻譜進)
+ hop_in[N/2]                                        spec[n_freqs]  (Complex 或 re/im 分開)
+   |  history_append: 移位 + 附加(最近 N 個樣本)         |  × ispec_scale(≠1.0f 時;先進內部 staging,輸入不被改)
+   v                                                  v
+ [center=1 且為前 2 次 push: reflect 前綴 / 尾端 flush 另組幀]   fft_inverse(_scratch)  → time[N] (已含 1/N)
+   v                                                  v
+ skn_mul_f32(seg, frame, window)                    sk_wola_accumulate_f32(acc, time, window)
+   v                                                  |  ENV_NORM: 另 sk_wola_accumulate_f32(env, window, window)
+ fft_forward_scratch(seg → spec)                      v
+   v                                                ACCUMULATE: out = acc[0..hop);移位;尾端 hop 個清零
+ × spec_scale(≠1.0f 時) / skn_deinterleave(_scale)  ENV_NORM:   frames_seen &gt; 1 時 out = skn_div_floor_f32(acc, env, 1e-11f);移位(acc、env)
+   v                                                  v
+ frame(s) out(回傳幀數 0/1/2)                       hop 個樣本 out(回傳 hop 或 0)
+</pre>
+
 <h2>訊號泳道圖(共用 WOLA 框架約定;hop 為欄)</h2>
 <p class="small">FFT 本身無跨呼叫 state、同呼叫內完成;下圖是 consumer(NR 範例 runner / pipeline 合成端)套在它上面的 50%-overlap sqrt-Hann WOLA 慣例與其 1 hop 框架延遲。</p>
 <pre>
@@ -102,6 +142,17 @@ fft_inverse     y(N-1)[N] × synth_win      y(N) × synth_win          y(N+1) ×
                 ── 發出的 hop 混了前一 frame 的貢獻 → 框架 1 hop lag(由 caller 承擔)──
 </pre>
 
+<p class="small"><code>audio_stft.h</code> 的兩種框架(P = push 序號,從 0 起;單位為 hop):</p>
+<pre>
+center=0 + AC_OLA_ACCUMULATE        P=0        P=1        P=2
+ac_stft_push 回傳幀數               1          1          1       ← 第 1 次 push 的前半窗是歸零的歷史
+ac_istft_push 吐出                  hop        hop        hop     ← 內容 = 第 P-1 次 push 的輸入(延遲 1 hop)
+
+center=1 + AC_OLA_ENV_NORM          P=0        P=1        P=2
+ac_stft_push 回傳幀數               0          2          1       ← P=1: reflect 前綴幀 + 第 1 幀
+ac_istft_push 吐出(逐幀)           —(無幀)   0 , hop    hop     ← 第 1 幀被裁掉;P=1 吐的是輸入 [0, hop)
+</pre>
+
 <h2>I O 表</h2>
 <div class="tblwrap"><table>
 <tr><th>張量</th><th>shape</th><th>dtype</th><th>每次呼叫幀數</th><th>時域樣本數</th><th>備註</th></tr>
@@ -110,12 +161,16 @@ fft_inverse     y(N-1)[N] × synth_win      y(N) × synth_win          y(N+1) ×
 <tr><td><code>fft_inverse.freq_in / time_out</code></td><td>[n_freqs] / [fft_size]</td><td>Complex / float32</td><td>1</td><td>fft_size</td><td>已含 ×1/N</td></tr>
 <tr><td><code>fft_power / fft_magnitude</code> 輸出</td><td>[n_freqs]</td><td>float32</td><td>1</td><td>—</td><td>|X|² / |X|</td></tr>
 <tr><td><code>fft_apply_gain</code></td><td>freq [n_freqs] × gain [n_freqs]</td><td>Complex × float32</td><td>1</td><td>—</td><td>就地相乘</td></tr>
+<tr><td><code>ac_stft_push[_planar]</code> 輸入 → 輸出</td><td>[fft_size/2] → [0..2] × [n_freqs]</td><td>float32 → Complex 或 float32 re/im</td><td>center=0 恆 1 幀;center=1 為 0/2/1 幀</td><td>fft_size/2(hop)</td><td>輸出緩衝區須容納 center=1 的 2 幀</td></tr>
+<tr><td><code>ac_istft_push[_planar]</code> 輸入 → 輸出</td><td>[n_freqs] → [fft_size/2]</td><td>Complex 或 re/im → float32</td><td>1 幀 → hop 或 0 個樣本</td><td>fft_size/2(hop)</td><td>輸入頻譜不被修改;ENV_NORM 第 1 幀吐 0</td></tr>
 </table></div>
 
 <h2>State 表(跨呼叫 state)</h2>
 <div class="tblwrap"><table>
 <tr><th>state</th><th>大小</th><th>誰存放</th><th>內容</th></tr>
 <tr><td><code>FftHandle</code>(後端 cfg + twiddle + scratch)</td><td>KISS 實測:128→4,688 B、256→8,784 B、512→16,976 B、1024→33,360 B。NE10:688 + 21×fft_size B(對齊前;標頭文件公式)</td><td>C struct(caller pool 經 <code>fft_init</code>,或 heap 經 <code>fft_create</code>)</td><td>plan 期常數(twiddle);<b>呼叫間無可變 state</b>——forward/inverse 為純轉換</td></tr>
+<tr><td><code>AcStft</code></td><td>實測(<code>get_mem_size</code>,自帶 FFT 與窗 / 借用兩者):KISS N=256:12,976 / 3,168 B;N=512:25,264 / 6,240 B;N=1024:49,840 / 12,384 B。NE10:N=256:12,368 / 3,168 B;N=512:23,888 / 6,240 B;N=1024:46,928 / 12,384 B</td><td>C struct(pool)</td><td>最近 N 個樣本的歷史、加窗暫存 <code>seg[N]</code>、FFT 輸出 staging <code>spec[N/2+1]</code>、幀計數(飽和於 3);窗與 FFT 自帶時另佔 pool</td></tr>
+<tr><td><code>AcIstft</code></td><td>ACCUMULATE:與 <code>AcStft</code> 同尺寸;ENV_NORM 多一個 <code>env[N]</code>:KISS N=512:27,312 / 8,288 B;NE10 N=512:25,936 / 8,288 B(自帶 / 借用)</td><td>C struct(pool)</td><td>OLA 累加器 <code>acc[N]</code>(原點 = 下一段輸出)、(ENV_NORM)平方窗包絡 <code>env[N]</code>、反向 FFT 輸出 <code>time[N]</code>、輸入 staging <code>spec[N/2+1]</code>、幀計數(飽和於 2)</td></tr>
 <tr><td><code>Hpf</code>(biquad DF2-transposed)</td><td><code>hpf_get_mem_size()</code>(小,固定)</td><td>C struct(pool/heap)</td><td>2 階濾波器延遲線(跨樣本 state;<code>hpf_reset</code> 清除)</td></tr>
 <tr><td><code>AudioResampler</code></td><td><code>audio_resampler_get_mem_size(in,out,ch)</code></td><td>C struct(pool/heap)</td><td>polyphase 串流歷史(block 邊界不變式;<code>reset</code> 只在換流時呼叫)</td></tr>
 <tr><td>fast_math / simd_kernels</td><td>—</td><td>header-only、無 state</td><td>純函式(LUT 為編譯期常數)</td></tr>
@@ -125,6 +180,7 @@ fft_inverse     y(N-1)[N] × synth_win      y(N) × synth_win          y(N+1) ×
 <h2>延遲與 warm-up</h2>
 <ul>
 <li><code>fft_forward/fft_inverse</code>:單呼叫內完成,<b>0 樣本延遲、無 warm-up</b>。WOLA 框架的 1 hop 延遲屬於 consumer 的組幀/OLA 慣例(見泳道圖),不屬於本函式庫。</li>
+<li><code>AcStft</code> → <code>AcIstft</code> 恆等串接:延遲 = hop = <code>fft_size/2</code> 樣本(<code>ac_stft_latency_samples()</code>),<code>center</code> 0/1 相同。實測(<code>test_stft</code>):N = 64、512、1024 時 impulse 延遲 32、256、512 樣本;重建最大絕對誤差(center=0):2.4e-7(N=64)、3.6e-7(N=512)、4.8e-7(N=1024);center=1 為 2.4e-7、2.4e-7、3.0e-7。center=1 時第 1 次 push 無幀、ENV_NORM 的第 1 個合成幀不吐樣本,呼叫端自行補第 1 個 hop 的零。</li>
 <li><code>Hpf</code>:IIR biquad,無整體(bulk)延遲、無 warm-up(初始 state 為 0)。</li>
 <li><code>AudioResampler</code>:有濾波器延遲,查 <code>audio_resampler_latency_input_frames()</code>;等取樣率為精確 pass-through。每個輸出點只由自己的視窗與相位列決定,與輸入如何切塊、輸出容量多大無關;NEON(四 lane 逐塊累加)與 <code>SIMD=0</code>(sequential、最新 tap 先加)求和順序不同,兩者只在 float 誤差內一致(<code>SIMD=0</code> 與 Python twin 逐位元一致)。</li>
 </ul>
@@ -132,9 +188,10 @@ fft_inverse     y(N-1)[N] × synth_win      y(N) × synth_win          y(N+1) ×
 <h2>相關檔案與測試路徑</h2>
 <ul>
 <li>FFT:<code>audio_common/include/fft_wrapper.h</code>、<code>src/fft_wrapper.c</code>(KISS)、<code>src/fft_wrapper_ne10.c</code>(NE10);vendored 後端:<code>lib/kiss_fft/</code>、<code>lib/ne10/</code>(本地 patch 記錄於 <code>lib/ne10/VENDORED.md</code>,含 P0003 白名單)</li>
-<li>其他模組:<code>include/fast_math.h</code>、<code>include/simd_kernels.h</code>、<code>include/simd_kernel_nn.h</code>(NN 前後處理專用核心:finite 掃描、fill、mul、power、complex (de)interleave、WOLA 除法、逐 bin 複數 tap 濾波 <code>skn_ctaps_mac_f32</code>)、<code>include/hpf.h</code>+<code>src/hpf.c</code>、<code>include/audio_pre_gain.h</code>、<code>include/audio_resampler.h</code>、<code>include/wav_io.h</code>、<code>include/mem_align.h</code></li>
+<li>STFT/ISTFT:<code>include/audio_stft.h</code>、<code>src/audio_stft.c</code>;測試 <code>test/test_stft.c</code>(參考實作逐行複本在 <code>test/stft_ref/</code>)
+</li><li>其他模組:<code>include/fast_math.h</code>、<code>include/simd_kernels.h</code>、<code>include/simd_kernel_nn.h</code>(NN 前後處理專用核心:finite 掃描、fill、mul、power、complex (de)interleave、WOLA 除法、逐 bin 複數 tap 濾波 <code>skn_ctaps_mac_f32</code>、開根號的幅度含 eps <code>skn_mag_eps_f32</code>)、<code>include/hpf.h</code>+<code>src/hpf.c</code>、<code>include/audio_pre_gain.h</code>、<code>include/audio_resampler.h</code>、<code>include/wav_io.h</code>、<code>include/mem_align.h</code></li>
 <li>文件:<code>audio_common/docs/c_user_manual_zh_TW.md</code>、<code>audio_common/README.md</code>(build/後端/FP 政策)</li>
-<li>測試(本頁撰寫時實跑):<code>make selftest</code> ALL PASS,TOTAL CHECKS: 37,073,253(SK_HAVE_NEON=1;含 round-trip、static-vs-heap 頻譜與時域 byte-equal、NEON-vs-scalar 逐位元)/ <code>make test_audio_utils</code> 全過(pre-gain + 全部支援的 resample 率對;輸出與輸入切塊、輸出容量無關(1–3 聲道)、reset 還原、11 組速率對的音調準確度;NEON 與 <code>SIMD=0</code> 兩種建置都跑)/ <code>make test_pool</code> ALL PASS / <code>make test_fft_zero_heap</code>(allocator-hook 零 heap 檢查,AEC 端 <code>test-zero-heap</code> 一併實跑 PASS)</li>
+<li>測試(本頁撰寫時實跑):<code>make selftest</code> ALL PASS,TOTAL CHECKS: 37,073,253(SK_HAVE_NEON=1;含 round-trip、static-vs-heap 頻譜與時域 byte-equal、NEON-vs-scalar 逐位元)/ <code>make test_audio_utils</code> 全過(pre-gain + 全部支援的 resample 率對;輸出與輸入切塊、輸出容量無關(1–3 聲道)、reset 還原、11 組速率對的音調準確度;NEON 與 <code>SIMD=0</code> 兩種建置都跑)/ <code>make test_stft</code>(selftest 內含;TEST_N = 512 與 1024 各一支):A 類(pipeline 合成)與 C 類(centered 分析、包絡正規化合成)對參考複本逐位元相同,kiss/ne10 × SIMD 0/1 共四種建置皆過;B 類(DFN2/GTCRN 正規化頻譜)分析頻譜 0 bit 差、合成輸出僅偶發 ±0.0 符號差,數字見 <code>B|</code> 輸出列 / <code>make test_pool</code> ALL PASS / <code>make test_zero_heap</code>(allocator-hook 零 heap 檢查,含 <code>audio_stft</code> 物件)</li>
 </ul>
 </body>
 </html>
