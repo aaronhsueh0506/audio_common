@@ -967,7 +967,7 @@ static void test_exp_log_family_inplace(void) {
             check_bits_or_die("exp1_approx_f32_inplace", n, t, buf, out_sep, n);
         }
     }
-    printf("PASS exp_log_family_inplace (out==x aliasing, kernels 23/24/25/27)\n");
+    printf("PASS exp_log_family_inplace (out==x aliasing)\n");
 }
 
 
@@ -1905,7 +1905,7 @@ int main(void) {
     test_fast_sqrt_accuracy();
     test_fast_math_special_values();
 
-    printf("\n--- s4-audio-common-sweep: fast_math.h exp/log family + mcra EMA kernel ---\n");
+    printf("\n--- fast_math.h exp/log family and mcra EMA kernel ---\n");
     test_fast_exp();
     test_fast_exp_neg();
     test_fast_log();

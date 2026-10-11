@@ -646,7 +646,7 @@ static void test_write_float_mode_bitexact_and_riff_size(void) {
             long file_size = wav_io_file_size(fp);
             CHECK(file_size >= 44, "sanity: file must be at least header-sized");
             CHECK((uint64_t)riff_chunk_size == (uint64_t)file_size - 8,
-                  "R01 fix: outer RIFF chunk_size (bytes 4-7) must equal file_size-8 in float32 mode");
+                  "outer RIFF chunk_size (bytes 4-7) must equal file_size-8 in float32 mode");
             CHECK((uint64_t)data_chunk_size == (uint64_t)n * sizeof(float),
                   "data sub-chunk size (bytes 40-43) must equal n*sizeof(float)");
 

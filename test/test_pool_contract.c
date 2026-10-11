@@ -137,9 +137,9 @@ static void test_fft_size_whitelist(void) {
     /* NE10 backend only (NE10_ENABLE_DSP is defined iff BACKEND=ne10): the
      * block sizes for the production fft_size values are part of the pool
      * contract and must not change. */
-    CHECK(fft_get_mem_size(256)  == 8176,  "NE10 fft_get_mem_size(256) must be byte-identical to pre-P0003");
-    CHECK(fft_get_mem_size(512)  == 15600, "NE10 fft_get_mem_size(512) must be byte-identical to pre-P0003");
-    CHECK(fft_get_mem_size(1024) == 30448, "NE10 fft_get_mem_size(1024) must be byte-identical to pre-P0003");
+    CHECK(fft_get_mem_size(256)  == 8176,  "NE10 fft_get_mem_size(256) must be 8176");
+    CHECK(fft_get_mem_size(512)  == 15600, "NE10 fft_get_mem_size(512) must be 15600");
+    CHECK(fft_get_mem_size(1024) == 30448, "NE10 fft_get_mem_size(1024) must be 30448");
 #endif
 }
 

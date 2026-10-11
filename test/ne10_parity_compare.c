@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
         if (rel > max_rel)  { max_rel = rel;  max_rel_idx = i; }
     }
 
-    printf("F11 NE10 NEON-vs-C parity: %zu floats compared\n", n);
+    printf("NE10 NEON-vs-C parity: %zu floats compared\n", n);
     printf("  max abs diff = %.6e at index %zu (neon=%.9g c=%.9g)\n",
            max_abs, max_abs_idx, (double)a[max_abs_idx], (double)b[max_abs_idx]);
     printf("  max rel diff = %.6e at index %zu (neon=%.9g c=%.9g)\n",
