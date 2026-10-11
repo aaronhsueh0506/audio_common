@@ -174,7 +174,7 @@ static int run_case(const Case* c) {
     cfg.ispec_scale = 2.0f;
     if (!c->own_fft) {
         size_t fb = fft_get_mem_size(c->n);
-        shared_mem = aligned_alloc(16, ALIGN16(fb));
+        if (posix_memalign(&shared_mem, 16, ALIGN16(fb)) != 0) shared_mem = NULL;
         shared = shared_mem ? fft_init(shared_mem, fb, c->n) : NULL;
         if (!shared) { fprintf(stderr, "FAIL: shared fft setup N=%d\n", c->n); free(shared_mem); return 1; }
         cfg.fft = shared;
