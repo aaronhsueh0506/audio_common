@@ -1,42 +1,26 @@
 /*
- * test_wav_io.c - negative-corpus tests for the hardened, shared WAV parser
- * (F06 remediation: unsafe duplicated WAV parser).
+ * test_wav_io.c - negative-corpus tests for the shared WAV parser and writer
+ * (include/wav_io.h).
  *
- * Exercises audio_common/include/wav_io.h directly (this test does not set
- * WAV_IO_WRITER_STYLE, so it gets the default WAV_IO_WRITER_AEC writer --
- * the writer style knob isn't reader-observable and isn't what's under
- * test here).
+ * The test does not set WAV_IO_WRITER_STYLE, so it gets the default
+ * WAV_IO_WRITER_AEC writer; the style does not affect the reader.
  *
- * Every malformed input below must make wav_open_read() return NULL
- * without crashing (no OOB read, no divide-by-zero, no fseek/fread on a
- * freed/NULL FILE*). Every well-formed input must parse exactly as it did
- * before the F06 hardening pass.
+ * Every malformed input must make wav_open_read() return NULL without
+ * crashing (no out-of-bounds read, no division by zero, no use of a NULL or
+ * freed FILE*). Every well-formed input must parse.
  *
- * Also covers the writer's finalize path (B08):
- * wav_finalize_write()'s checked fseek/fwrite/fclose failure paths, via a
- * funopen()/fopencookie()-backed injectable-failure FILE* (see the section
- * above main() below) -- RLIMIT_FSIZE (used for the plain wav_write_float
- * short-write test) can only reach fwrite, not fseek or fclose, and not a
- * fwrite failure at finalize time specifically. That fake-stream backend is
- * BSD/macOS funopen() or glibc fopencookie(); on any other platform the
- * injectable-failure test group is skipped with a clear SKIP message
- * instead of failing to compile/link -- everything
- * else in this file is portable C99/POSIX and still runs there.
+ * It also covers the writer: wav_finalize_write() failure paths (fseek,
+ * fwrite, fclose) through a FILE* with injectable failures (funopen on
+ * BSD/macOS, fopencookie on glibc; the group is skipped with a SKIP message
+ * elsewhere, and the rest of the file is portable C99/POSIX), the argument
+ * and header-field validation of wav_open_write(), and the oversize abandon
+ * path of wav_finalize_write().
  *
- * Also covers wav_open_write()'s fail-fast argument/header-field validation
- * and wav_finalize_write()'s pathological-size abandon path.
- *
- * Plain assert-and-report harness, same shape as test_pool_contract.c: no
- * external framework, every failure prints and flips a global fail flag,
- * main() reports ALL PASS / FAIL at the end so one bad check doesn't hide
- * the rest.
+ * Every failure is printed and sets a global flag; main() reports ALL PASS or
+ * FAIL at the end.
  */
-/* Must precede every #include: glibc's fopencookie()/
- * off64_t/cookie_io_functions_t are only declared behind _GNU_SOURCE, and
- * that has to be visible before <stdio.h> is first pulled in by ANY header
- * below (including wav_io.h itself). __linux__ is a compiler-predefined
- * macro, available before any header is processed, so this is safe to gate
- * on unconditionally (a no-op on non-Linux platforms). */
+/* glibc declares fopencookie / cookie_io_functions_t only behind _GNU_SOURCE,
+ * which must be defined before the first system header. */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif
@@ -191,10 +175,8 @@ static void test_reject_truncated_header(void) {
 static void test_reject_fmt_size_12(void) {
     ByteBuf b; bb_init(&b);
     bb_riff_header(&b, 100);
-    /* fmt chunk_sz=12 (< 16), but the buffer still has the following 16
-     * bytes there anyway -- this is exactly the pre-hardening desync
-     * scenario: the old parser would happily fread() 16 bytes regardless
-     * of the declared (too-small) chunk_sz. */
+    /* fmt chunk_sz = 12 (< 16) while 16 field bytes follow: the parser must
+     * trust the declared size, not read 16 bytes regardless. */
     bb_fmt_chunk(&b, 12, 1, 1, 16000, 32000, 2, 16);
     bb_str4(&b, "data");
     bb_u32(&b, 4);
@@ -289,10 +271,8 @@ static void test_reject_bits_24_pcm(void) {
 }
 
 static void test_reject_bits_32_int_pcm(void) {
-    /* format==1 (PCM) with bits==32 is a real (if rare) WAV variant the
-     * pre-hardening reader's wav_read_float() had code for, but the F06
-     * accept-list narrows wav_open_read() to exactly (1,16) and (3,32) --
-     * see wav_io.h's file header doc. */
+    /* Format 1 (PCM) with 32 bits is a valid WAV variant, but wav_open_read
+     * accepts only (1, 16) and (3, 32); see the wav_io.h file comment. */
     ByteBuf b; bb_init(&b);
     bb_riff_header(&b, 100);
     bb_fmt_chunk(&b, 16, 1, 1, 16000, 16000 * 4, 4, 32);
@@ -399,8 +379,8 @@ static void test_reject_data_chunk_size_exceeds_file(void) {
 }
 
 static void test_reject_oversized_unknown_chunk(void) {
-    /* A non-fmt, non-data chunk claiming to be larger than the file: must
-     * be rejected (not silently seeked past EOF) while searching for fmt. */
+    /* A non-fmt, non-data chunk larger than the file is rejected while
+     * searching for fmt, not seeked past EOF. */
     ByteBuf b; bb_init(&b);
     bb_riff_header(&b, 100);
     bb_str4(&b, "JUNK");
@@ -420,9 +400,8 @@ static void test_reject_oversized_unknown_chunk(void) {
 /* ═══════════════════════════════ accept tests ═════════════════════════════ */
 
 static void test_accept_odd_junk_chunk_with_pad(void) {
-    /* A 3-byte "JUNK" chunk before "data" -- odd chunk_sz means a RIFF
-     * pad byte follows it before the next chunk id. The pre-hardening
-     * parser never accounted for that pad byte and would desync. */
+    /* A 3-byte "JUNK" chunk before "data": the odd size means a RIFF pad
+     * byte follows it before the next chunk id. */
     const int16_t samples[4] = { 100, -200, 32767, -32768 };
     ByteBuf b; bb_init(&b);
     bb_riff_header(&b, 100);
@@ -552,19 +531,10 @@ static void test_valid_pcm16_parses_as_before(void) {
 /* ═══════════════════════════ writer round-trip test ═══════════════════════ */
 
 static void test_write_read_roundtrip_byte_exact(void) {
-    /* Values chosen to round exactly through *32768.0f round-half-away
-     * quantization (the default WAV_IO_WRITER_AEC style, since this test
-     * doesn't set WAV_IO_WRITER_STYLE) with no ambiguity at the .5 boundary.
-     * NOTE: deliberately NOT testing exactly +1.0f here -- that hits a
-     * pre-existing (not introduced by F06) latent UB in this quantizer:
-     * scaled = 1.0f*32768.0f = 32768.0f, +0.5f = 32768.5f, and int16_t's
-     * range is asymmetric ([-32768, 32767]), so casting 32768.5f to
-     * int16_t discards a fractional part whose integral part (32768)
-     * doesn't fit -- undefined behavior per C99 6.3.1.4p1. It's preserved
-     * byte-for-byte (per the F06 writer-preservation contract) rather than
-     * fixed here, but a *test* asserting a specific outcome from UB isn't a
-     * meaningful conformance check (two call sites of the same UB
-     * expression are free to differ, and were observed to in practice). */
+    /* Values that round exactly through the *32768.0f round-half-away
+     * quantization of the default WAV_IO_WRITER_AEC style, with no ambiguity
+     * at the .5 boundary. +1.0f is left to the special-values test below,
+     * where it saturates. */
     const float in_samples[6] = { 0.0f, 0.5f, -0.5f, 0.999969482421875f /* 32767/32768 */, -1.0f, 0.99993896484375f /* 32766/32768 */ };
     char path[64];
     snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_io_wr_XXXXXX");
@@ -610,28 +580,21 @@ static void test_write_read_roundtrip_byte_exact(void) {
     unlink(path);
 }
 
-/* ═════════════════════ writer special-values corpus (R01) ═════════════════
- * The shared corpus/expected-value logic lives in test_wav_writer_common.h
- * (included above) so it can run unchanged against BOTH writer styles --
- * this TU gets WAV_IO_WRITER_AEC (the default, since it doesn't set
- * WAV_IO_WRITER_STYLE, same as every other test in this file). The NR-style
- * run of the exact same corpus lives in test_wav_writer_nr_style.c.
+/* ═════════════════════ writer special-values corpus ═══════════════════════
+ * The corpus and expected values are in test_wav_writer_common.h and run
+ * against both writer styles; this file runs the default AEC style and
+ * test_wav_writer_nr_style.c runs the NR style.
  */
 static void test_writer_special_values_corpus_aec_style(void) {
     if (test_wav_writer_special_values_corpus()) g_fail = 1;
 }
 
-/* Float mode (WAV_IO_WRITER_AEC + AEC_OUT_FLOAT=1) is a raw, unquantized
- * bit-exact passthrough -- unlike the PCM16 path, it deliberately does NOT
- * sanitize NaN/Inf (see wav_io.h's Writer hardening doc: that would hide
- * exactly the divergence this test-only path exists to surface). Verifying
- * "bit-exact, including the NaN's raw payload" therefore means reading the
- * on-disk bytes directly, NOT through wav_read_float (which sanitizes NaN/
- * Inf to 0.0f on ingress and would hide the very thing under test here).
- * This also asserts the R01 RIFF-size fix: the outer RIFF chunk_size
- * (bytes 4-7) must now equal file_size-8, and the data sub-chunk size
- * (bytes 40-43) must equal n*sizeof(float) -- both were already correct
- * for PCM16 output, but the outer size was wrong for float32 pre-fix.
+/* Float mode (WAV_IO_WRITER_AEC with AEC_OUT_FLOAT=1) writes samples
+ * unchanged and, unlike the PCM16 path, does not sanitize NaN / Inf. The
+ * test therefore reads the file bytes directly: wav_read_float would replace
+ * NaN / Inf by 0.0f. It also checks that the RIFF chunk size (bytes 4-7)
+ * equals file_size - 8 and the data chunk size (bytes 40-43) equals
+ * n * sizeof(float).
  */
 static void test_write_float_mode_bitexact_and_riff_size(void) {
     setenv("AEC_OUT_FLOAT", "1", 1);
@@ -642,10 +605,8 @@ static void test_write_float_mode_bitexact_and_riff_size(void) {
     in_samples[1] = -1.0f;
     in_samples[2] = nextafterf(1.0f, 0.0f);
     in_samples[3] = nextafterf(-1.0f, 0.0f);
-    /* A NaN with a deliberately non-canonical payload bit pattern: if the
-     * float write path (or a compiler/libc) silently canonicalized this
-     * (unlike the PCM16 path's explicit, intentional sanitize-to-0.0f), the
-     * raw on-disk bytes would differ from this exact pattern. */
+    /* A NaN with a non-canonical payload: if the writer or libc
+     * canonicalised it, the file bytes would differ from this pattern. */
     uint32_t custom_nan_bits = 0x7FC00123u;
     float custom_nan;
     memcpy(&custom_nan, &custom_nan_bits, sizeof(float));
@@ -733,27 +694,18 @@ static void test_write_zero_and_negative_n_is_noop(void) {
     unlink(path);
 }
 
-/* Forces a genuine short fwrite() inside wav_write_float's PCM16 loop (via
- * RLIMIT_FSIZE) and checks write_error gets set, samples_written stops
- * exactly at the true on-disk count, and the process survives (SIGXFSZ is
- * explicitly ignored first -- its default disposition is to terminate the
- * process, which would defeat observing fwrite's short-write return here).
+/* Forces a short fwrite inside wav_write_float's PCM16 loop (via
+ * RLIMIT_FSIZE) and checks that write_error is set, samples_written stops at
+ * the count actually on disk, and the process survives (SIGXFSZ is ignored
+ * first; by default it terminates the process).
  *
- * Two things must happen in a specific order for this to actually exercise
- * the code path instead of quietly no-oping:
- *   1. The rlimit is applied only AFTER wav_open_write() returns, so the
- *      44-byte placeholder header (written inside wav_open_write, and not
- *      itself return-value-checked -- out of scope for this fix) isn't
- *      affected by it.
- *   2. w->fp is switched to unbuffered (setvbuf _IONBF) before the rlimit
- *      is applied and before any sample is written. Per-sample fwrite calls
- *      here are only 2 bytes each -- with the default fully-buffered mode,
- *      those just memcpy into libc's internal buffer and every fwrite call
- *      would report success regardless of the rlimit, with the eventual
- *      failure only surfacing (unobserved) at the buffer's first real
- *      flush. Unbuffered mode makes each 2-byte fwrite hit write(2)
- *      directly, so the 3rd sample's write can actually be observed
- *      failing exactly when the limit is crossed.
+ * Order matters:
+ *   1. The rlimit is applied only after wav_open_write() returns, so it does
+ *      not affect the 44-byte placeholder header.
+ *   2. w->fp is made unbuffered (setvbuf _IONBF) before the rlimit is applied
+ *      and any sample is written. Buffered 2-byte fwrites would all succeed
+ *      into libc's buffer and fail only at a later flush; unbuffered, each
+ *      reaches write(2), so the failure shows at the third sample.
  */
 static void test_write_error_on_short_write(void) {
     char path[64];
@@ -774,12 +726,10 @@ static void test_write_error_on_short_write(void) {
     if (w) {
         setvbuf(w->fp, NULL, _IONBF, 0);
 
-        // 44-byte header (already flushed above via the setvbuf-triggered
-        // buffer switch) + exactly 2 PCM16 samples (4 bytes) fit; the 3rd
-        // sample's fwrite must come back short once the limit is hit. Only
-        // rlim_cur is lowered -- rlim_max is left at its original value (a
-        // non-privileged process generally cannot raise rlim_max back up
-        // once lowered, so this keeps the restore-on-exit below possible).
+        // The 44-byte header plus exactly 2 PCM16 samples (4 bytes) fit; the
+        // third sample's fwrite must come back short. Only rlim_cur is
+        // lowered: a non-privileged process cannot raise rlim_max again, and
+        // the limit is restored below.
         struct rlimit lim;
         lim.rlim_cur = 48;
         lim.rlim_max = have_old_lim ? old_lim.rlim_max : RLIM_INFINITY;
@@ -792,10 +742,9 @@ static void test_write_error_on_short_write(void) {
             CHECK(w->samples_written == 2,
                   "samples_written must stop exactly at the count that actually made it to disk");
             if (have_old_lim) setrlimit(RLIMIT_FSIZE, &old_lim);
-            // wav_close_write still finalizes a header from the true
-            // samples_written -- must not crash even though the file is
-            // right at its size limit (the header is an in-place overwrite
-            // of bytes already on disk, not a growth past the old limit).
+            // wav_close_write finalizes the header from samples_written; it
+            // overwrites bytes already on disk, so it must not fail at the
+            // size limit.
             wav_close_write(w);
         } else {
             wav_close_write(w);
@@ -806,35 +755,20 @@ static void test_write_error_on_short_write(void) {
     unlink(path);
 }
 
-/* ══════════ B08: wav_finalize_write() injectable-failure coverage ══════════
- * wav_finalize_write() (wav_io.h) is wav_close_write()'s checked replacement:
- * it observes every fseek/fwrite/fclose return value plus any write_error
- * already flagged by an earlier short write, instead of ignoring all of
- * them. test_write_error_on_short_write() above already exercises the
- * fwrite-failure path that happens DURING wav_write_float() (via
- * RLIMIT_FSIZE), but that mechanism can't reach fseek() or fclose(), and it
- * can't reach a fwrite() failure at finalize time specifically (the header
- * writes wav_finalize_write() itself performs).
+/* ══════════ wav_finalize_write() injectable-failure coverage ══════════════
+ * wav_finalize_write() checks every fseek / fwrite / fclose result and any
+ * write_error flagged by an earlier short write. The RLIMIT_FSIZE test above
+ * reaches only fwrite failures during wav_write_float; failures of fseek,
+ * fclose and of the header writes at finalize time need a FILE* whose
+ * read / write / seek / close callbacks can be made to fail independently:
+ *   - funopen(3) on BSD/macOS;
+ *   - fopencookie(3) on glibc.
+ * HAVE_FAKE_STREAM selects the one the platform offers; otherwise
+ * test_finalize_write_injectable_failures() prints a SKIP line.
  *
- * A FILE* backed by caller-supplied read/write/seek/close callbacks instead
- * of a real fd/file lets each of the three be made to fail independently
- * and on demand. Two such APIs exist, with different callback signatures,
- * and neither is portable C99/POSIX-base:
- *   - funopen(3) on BSD/macOS.
- *   - fopencookie(3) (a cookie_io_functions_t of read/write/seek/close
- *     function pointers) on glibc.
- * HAVE_FAKE_STREAM selects whichever this platform offers; on any other
- * platform it's 0 and test_finalize_write_injectable_failures() below prints
- * one clear SKIP line instead of running (everything else in this file is
- * portable and still runs there).
- *
- * Each test below builds a WavWriter the normal way -- wav_open_write()
- * against a real throwaway temp file, so the genuine 44-byte placeholder
- * header actually lands on disk -- then swaps w->fp to one of these fake
- * streams before calling wav_finalize_write(). WavWriter.fp is a plain
- * public struct field (wav_io.h has no opaque/private convention for it),
- * so this needs no change to the public API surface beyond
- * wav_finalize_write() itself.
+ * Each test builds a WavWriter with wav_open_write() on a temp file, so the
+ * 44-byte placeholder header is really written, then replaces the public
+ * w->fp with a fake stream before calling wav_finalize_write().
  */
 
 typedef struct {

@@ -1,5 +1,7 @@
-/* Reference copies of the pipelines' synthesis hop, line-for-line. Harness stubs precede them. */
-/* Audio_ALG/pipelines/mono_aec_nr_res/audio_pipeline.c:945-956 synthesize_hop, :518-519 window loop */
+/* Reference copies of the synthesis hop and window builders of the pipelines,
+ * statement for statement; the harness stubs they need precede them in
+ * test_stft.c. Each copy names its source file and function. */
+/* Audio_ALG/pipelines/mono_aec_nr_res/audio_pipeline.c: synthesize_hop; window loop in pipeline_build */
 static void synthesize_hop(AudioPipeline* p, const Complex* spectrum,
                            float* out) {
     const int hop      = p->hop;
@@ -20,7 +22,7 @@ static void ref_mono_window(float* w, int frame_sz) {
             p->synth_win[k] = sqrtf(0.5f * (1.0f - cosf(2.0f * M_PI_F * k / frame_sz)));
 }
 
-/* Audio_ALG/pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c:1955-1970 finish_hop, :948-952 window loop */
+/* Audio_ALG/pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c: finish_hop; window loop in four_aec_nr_res_init_ex */
 static int finish_hop(FourAecNrRes* p, const Complex* spectrum, float* out) {
     int hop = p->hop_size;
     int fft = p->fft_size;
@@ -49,7 +51,7 @@ static void ref_4ch_window(float* w, int fft) {
         }
 }
 
-/* Audio_ALG/pipelines/dfn_rate_bridge.c:385-393 synth_hop, :207-212 make_root_hann */
+/* Audio_ALG/pipelines/dfn_rate_bridge.c: synth_hop, make_root_hann */
 static void synth_hop(FftHandle *fft, const Complex *spec, float *ifft_buf,
                       float *ola, const float *win, int n_fft, int hop,
                       float *hop_out) {
@@ -67,7 +69,7 @@ static void make_root_hann(float *window, int n) {
             2.0f * (float)M_PI * (float)i / (float)n));
 }
 
-/* Audio_ALG/lib/aec/c_impl/src/pbfdkf.c:100-103 window loop */
+/* AEC c_impl/src/pbfdkf.c: window loop in pbfdaf_fill_windows */
 static void ref_pbfdkf_window(float* sqrt_hann, int block_size) {
     for (int i = 0; i < block_size; ++i) {
         float h = 0.5f * (1.0f - cosf(2.0f * M_PI_AEC * (float)i / (float)block_size));

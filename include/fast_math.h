@@ -115,57 +115,34 @@ static inline float exp1_approx(float v) {
 #else  // Fast math implementations
 
 /* ────────────────────────── NaN / non-finite contract ─────────────────────
- * fast_exp/fast_log/fast_sqrt below are finite-domain approximations: their
- * approximation/range-reduction machinery is only ever validated against finite
- * inputs in-range. Each function's leading domain guard is written as
- * `if (!(x REL bound)) return EDGE;` rather than `if (x INVERSE_REL bound)
- * return EDGE;` specifically so a NaN input -- which makes EVERY IEEE
- * ordered comparison (<, <=, >, >=) false -- still takes the early-out: the
- * negated form catches "not(finite AND in-range)" instead of only "finite
- * AND out-of-range", so NaN maps to the same deterministic domain-edge
- * constant a finite out-of-range input would get, rather than falling
- * through into the fast path (fast_exp's `(int)floorf(x)` cast on NaN is
- * undefined behaviour in C; fast_log's IEEE-754 bit-reinterpret is not UB
- * on NaN but produces a finite garbage value; fast_sqrt would return
- * sqrtf(NaN) = NaN on AArch64 or propagate the NaN through the Newton
- * fallback -- none of them the documented edge value).
- * For every FINITE input the two guard forms are logically identical
- * (De Morgan's law over an already-ordered comparison), so the negated
- * guards change NaN behaviour only.
+ * fast_exp / fast_log / fast_sqrt are finite-domain approximations. Each
+ * leading guard is written `if (!(x REL bound)) return EDGE;` so that a NaN
+ * input, for which every ordered comparison is false, takes the early-out and
+ * returns the same deterministic edge constant as a finite out-of-range input.
+ * (Without it fast_exp would convert NaN to int, which is undefined
+ * behaviour, and fast_log would return a plausible-looking finite value.) For
+ * finite inputs the negated guards are equivalent to the plain forms.
  *
- * USE_STANDARD_MATH (the `#ifdef` branch above) calls straight into libm
- * (expf/logf/sqrtf), which instead propagates IEEE NaN/Inf per the C
- * standard (e.g. sqrtf(NaN) == NaN, not 0.0f). That divergence between the
- * two build modes on non-finite input is intentional and out-of-contract --
- * USE_STANDARD_MATH exists for debugging/verification against a reference
- * implementation, not for bit-identical behaviour with the fast path on
- * every possible float bit pattern; only the finite-domain results need to
- * match (and are what the parity/regression gates actually check).
+ * USE_STANDARD_MATH calls libm instead, which propagates NaN / Inf per IEEE
+ * (sqrtf(NaN) == NaN). The two modes differ on non-finite input by design;
+ * only finite-domain results are expected to match.
  *
  * ───────────────── Special-value contract table ─────────────────────────
- * Plain statement of the above as a lookup table, one row per non-finite or
- * boundary input, both build modes side by side. Every "fast_*" entry below
- * is measured and pinned by test/simd_selftest.c's dedicated special-value
- * asserts (not just asserted in this comment) -- see that file's "pinned
- * special-value contract" section. Bit patterns are this
- * toolchain's IEEE-754 binary32 (Apple clang 17, arm64, -ffp-contract=off);
- * they follow deterministically from the source below, not from any
- * platform-specific rounding mode.
+ * One row per non-finite or boundary input, both modes side by side. Every
+ * fast_* entry is pinned by test/simd_selftest.c. Bit patterns are IEEE-754
+ * binary32.
  *
  *   fast_exp(x):
  *     x = NaN        -> 0.0f                    [bits 0x00000000]
  *                        (USE_STANDARD_MATH: expf(NaN)  = NaN)
  *     x = +Inf       -> 8.8861105e+06f           [bits 0x4b07975e]
- *                        (identical to fast_exp(x) for any finite x > 16 --
- *                        the ">16" saturation constant, NOT a separate
- *                        Inf-specific branch)
+ *                        (the saturation constant for any finite x > 16;
+ *                        there is no Inf-specific branch)
  *                        (USE_STANDARD_MATH: expf(+Inf) = +Inf; DIFFERS)
  *     x = -Inf       -> 0.0f                     [bits 0x00000000]
  *                        (same path as any finite x < -16)
  *                        (USE_STANDARD_MATH: expf(-Inf) = 0.0f; matches)
- *     x = 0.0f       -> 1.0f                     (ordinary in-range Taylor
- *                        result, not a special-cased edge -- listed for
- *                        completeness only)
+ *     x = 0.0f       -> 1.0f                     (ordinary in-range result)
  *
  *   fast_log(x):
  *     x = NaN        -> -1e10f                   [bits 0xd01502f9]
@@ -175,14 +152,9 @@ static inline float exp1_approx(float v) {
  *     x < 0          -> -1e10f
  *                        (USE_STANDARD_MATH: logf(neg)  = NaN; DIFFERS)
  *     x = +Inf       -> 88.72283935546875f        [bits 0x42b17218]
- *                        (= 128.0f * FM_LN2, computed via the SAME range-
- *                        reduction fallthrough an ordinary finite x would
- *                        take --
- *                        +Inf is deliberately NOT special-cased in
- *                        fast_log, see that function's own comment; the
- *                        value is deterministic finite garbage-that-looks-
- *                        like-a-real-result, pinned here precisely because
- *                        it is NOT a designed edge value)
+ *                        (= 128.0f * FM_LN2 from the ordinary range
+ *                        reduction; +Inf is not special-cased, so this is
+ *                        a deterministic artefact, not a designed edge)
  *                        (USE_STANDARD_MATH: logf(+Inf) = +Inf; DIFFERS)
  *
  *   fast_sqrt(v):
@@ -201,35 +173,22 @@ static inline float exp1_approx(float v) {
  *                           computes Inf/Inf; payload is not pinned)
  *                        (USE_STANDARD_MATH: sqrtf(+Inf) = +Inf)
  *
- * Summary: fast_* is a finite-domain approximation family. Every non-finite
- * or out-of-domain input still produces a DETERMINISTIC, TESTED float (never
- * a trap, never UB, never platform-dependent aside from the one documented
- * NaN-payload exception above) -- but that value is a domain-edge constant
- * or Taylor-fallthrough artifact, not a mathematically meaningful result,
- * and it will generally NOT match USE_STANDARD_MATH's libm behaviour on the
- * same input (see the DIFFERS annotations above). The system-level defense
- * against ever exercising this table in production is ingress sanitization
- * upstream of the DSP: the hardened WAV reader replaces non-finite samples
- * with 0.0f, and config float fields are range/finite-validated at load --
- * so in practice fast_exp/fast_log/fast_sqrt are only ever called on finite
- * inputs, and this table exists to pin the OUT-of-contract behaviour as a
- * regression gate, not because callers are expected to rely on it.
+ * Every non-finite or out-of-domain input yields a deterministic float (no
+ * trap, no undefined behaviour; only the NaN payload of the Newton fallback is
+ * unpinned), but the value is an edge constant, not a meaningful result, and
+ * generally differs from USE_STANDARD_MATH. Callers are expected to pass
+ * finite values (the WAV reader replaces non-finite samples with 0.0f); the
+ * table pins the out-of-contract behaviour only.
  */
 
 /**
  * Fast exp(x) using LUT + Taylor expansion
  * Range: [-16, 16], outside this range returns 0 or saturates.
- * NaN: fails `x >= -16.0f` (every IEEE comparison with NaN is false), so the
- * negated guard below returns 0.0f for NaN as well as for finite x < -16 --
- * this also closes a real out-of-bounds bug: without it, NaN falls through
- * to `(int)floorf(x)`, and converting a NaN float to int is undefined
- * behaviour in C (and could index exp_int_table out of bounds).
+ * NaN fails `x >= -16.0f`, so the guard below returns 0.0f for NaN as well
+ * as for finite x < -16.
  */
 static inline float fast_exp(float x) {
-    // Handle boundaries. Written as `!(x >= -16.0f)` (not `x < -16.0f`) so
-    // NaN -- for which every ordered comparison is false -- also takes this
-    // early-out instead of falling through to the (int) cast below (UB on
-    // NaN). Identical to `x < -16.0f` for all finite x.
+    // Boundaries; `!(x >= -16.0f)` so that NaN takes the early-out too.
     if (!(x >= -16.0f)) return 0.0f;
     if (x > 16.0f) return 8.8861105e+06f;
 
@@ -275,21 +234,12 @@ static inline float fast_exp_neg(float x) {
  * callers clamp their inputs well above FLT_MIN, so subnormal normalization
  * would spend hot-path cycles on unreachable data and is left out.
  *
- * NaN: fails `x > 0.0f`, so the negated guard below returns -1e10f
- * (approximate -infinity) for NaN too, instead of falling through to the
- * exponent/mantissa bit-extraction, which for a NaN input (biased exponent
- * 255, same as +-Inf) is not UB but silently produces a large, non-obvious
- * *finite* garbage value masquerading as a real log() result. +Inf is
- * deliberately NOT special-cased here: it still falls through and gets the
- * same finite garbage-but-plausible-looking value it always has (Inf > 0.0f
- * is true, an ordered comparison) -- only NaN's behaviour changes. Ingress
- * sanitization upstream is relied on to keep +Inf from reaching this
- * function in practice; only the NaN early-out is this fix's contract.
+ * NaN fails `x > 0.0f`, so the guard below returns -1e10f (approximate
+ * -infinity) for NaN too. +Inf is not special-cased: it takes the ordinary
+ * path (see the table above).
  */
 static inline float fast_log(float x) {
-    // Written as `!(x > 0.0f)` (not `x <= 0.0f`) so NaN -- for which every
-    // ordered comparison is false -- also takes this early-out. Identical to
-    // `x <= 0.0f` for all finite x.
+    // `!(x > 0.0f)` so that NaN takes the early-out too.
     if (!(x > 0.0f)) return -1e10f;  // Approximate -infinity
 
     union { float f; uint32_t i; } fb;
@@ -304,9 +254,8 @@ static inline float fast_log(float x) {
 
     // Degree-4 minimax Horner chain with separately rounded multiply and add
     // on every target (no fmaf: the operation order is the scalar/NEON parity
-    // contract, and the consumer TUs are audited to contain no FMA). Worst
-    // absolute error over all positive normal inputs is below 1e-4;
-    // test/simd_selftest.c gates it exhaustively.
+    // contract). Worst absolute error over all positive normal inputs is below
+    // 1e-4; test/simd_selftest.c checks it exhaustively.
     float poly = FM_LOG_C4;
     poly = poly * m + FM_LOG_C3;
     poly = poly * m - FM_LOG_C2;
@@ -335,13 +284,10 @@ static inline float fast_log10(float x) {
  * fallback (relative error below 2e-6 on normal inputs, gated by
  * test/simd_selftest.c).
  *
- * NaN: fails `v > 0.0f`, so the negated guard below returns 0.0f for NaN
- * too (see the NaN / non-finite contract above).
+ * NaN fails `v > 0.0f`, so the guard below returns 0.0f for NaN too.
  */
 static inline float fast_sqrt(float v) {
-    // Written as `!(v > 0.0f)` (not `v <= 0.0f`) so NaN -- for which every
-    // ordered comparison is false -- also takes this early-out. Identical to
-    // `v <= 0.0f` for all finite v.
+    // `!(v > 0.0f)` so that NaN takes the early-out too.
     if (!(v > 0.0f)) return 0.0f;
 
 #if FM_HAVE_HW_SQRT
@@ -375,11 +321,9 @@ static inline float fast_sqrt(float v) {
  * paper traceability.
  */
 #ifdef USE_OPTIMIZED_E1
-// Optimized: check the upper segment first (common case in good SNR),
-// then compute log10 only once for the remaining cases. Written as
-// `!(v <= 1.0f)` (not `v > 1.0f`) so a NaN input -- for which every ordered
-// comparison is false -- takes the same fast_exp branch it takes in the
-// default order below (fast_exp(NaN) = 0.0f); identical for all finite v.
+// Upper segment first (common at high SNR), then one log10 for the other two.
+// `!(v <= 1.0f)` so that NaN takes the same fast_exp branch as in the default
+// order below.
 static inline float exp1_approx(float v) {
     if (v <= FM_EPSILON) v = FM_EPSILON;
 
@@ -396,7 +340,7 @@ static inline float exp1_approx(float v) {
     }
 }
 #else
-// Original version
+// Default segment order: lowest first.
 static inline float exp1_approx(float v) {
     if (v <= FM_EPSILON) v = FM_EPSILON;
 

@@ -1,9 +1,8 @@
 /*
  * zero_heap_hook.h - allocator call-counting hook for test_fft_zero_heap.c.
  *
- * See zero_heap_hook.c for the interposition mechanism (platform-specific)
- * and why it has to live in its own translation unit / shared object rather
- * than inline in the test file.
+ * See zero_heap_hook.c for the platform-specific interposition mechanism and
+ * why it is a separate translation unit.
  */
 #ifndef ZERO_HEAP_HOOK_H
 #define ZERO_HEAP_HOOK_H

@@ -5,9 +5,7 @@
 #include <string.h>
 
 #include "mem_align.h"
-#include "simd_kernels.h"   /* sk_scale_f32 -- and, with it, the one shared
-                             * SK_HAVE_NEON gate, replacing the private copy
-                             * of that predicate this file used to carry. */
+#include "simd_kernels.h"   /* sk_scale_f32 */
 
 struct AudioPreGain {
     float gain_db;

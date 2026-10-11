@@ -40,7 +40,7 @@ extern "C" {
  * `MODULE_get_mem_size` and `MODULE_init` must walk fields in identical
  * order to keep alignment + bytes consistent.
  * --------------------------------------------------------------------------- */
-#include "mem_align.h"   /* ALIGN16 — the one shared alignment for every module */
+#include "mem_align.h"   /* ALIGN16 */
 
 /* Complex number structure */
 typedef struct {
@@ -54,11 +54,8 @@ typedef struct FftHandle FftHandle;
 /**
  * Create FFT handle for given size (heap path).
  *
- * @param fft_size FFT size — must be a power of 2 in [16, 8192] (P0003,
- *                 lib/ne10/VENDORED.md); both backends reject anything
- *                 outside that range (0 / NULL), including other positive
- *                 powers of two. 8192 is 8x the largest production fft_size
- *                 (1024 @ 48kHz).
+ * @param fft_size FFT size: a power of 2 in [16, 8192]. Both backends reject
+ *                 anything else (NULL / 0).
  * @return FFT handle, or NULL on error
  */
 FftHandle* fft_create(int fft_size);
@@ -74,17 +71,10 @@ FftHandle* fft_create(int fft_size);
  * `fft_get_mem_size` (and NULL from `fft_init`) if `fft_size` is outside the
  * [16, 8192] power-of-two range documented on `fft_create` above.
  *
- * Both backends' `fft_get_mem_size` includes every byte fft_init() touches,
- * including backend-internal FFT twiddle/config storage — there is nothing
- * left for either backend to allocate off the caller's pool. KISS's cfg size
- * is queried from kiss_fft_alloc() itself; NE10's is
- * `688 + 21*fft_size` bytes before 16-byte alignment (see
- * ne10_fft_r2c_mem_size_float32() in lib/ne10/modules/dsp/NE10_rfft_float32.c,
- * vendored patch P0001 in lib/ne10/VENDORED.md) — computed in 32-bit
- * (ne10_uint32_t) arithmetic, which is why P0003 whitelists fft_size to a
- * range that arithmetic cannot overflow within (~173KB at fft_size=8192).
- * Upstream NE10 has no external-memory API for this config, so both backends
- * are fully heap-free on the fft_init() path.
+ * `fft_get_mem_size` covers every byte fft_init() touches, including the
+ * backend's twiddle/config storage, so neither backend allocates outside the
+ * caller's block (the NE10 backend uses the external-memory init described in
+ * lib/ne10/VENDORED.md).
  */
 size_t     fft_get_mem_size(int fft_size);
 FftHandle* fft_init(void* mem, size_t mem_size, int fft_size);
@@ -92,13 +82,9 @@ FftHandle* fft_init(void* mem, size_t mem_size, int fft_size);
 /**
  * Destroy FFT handle.
  *
- * Genuinely a no-op — on BOTH backends — for a handle created via fft_init():
- * the static-memory path never allocates anything beyond the caller's pool
- * (see fft_get_mem_size above), so there is nothing to release, and calling
- * fft_destroy() any number of times on an fft_init() handle is safe and
- * idempotent. For an fft_create() (heap) handle, fft_destroy() frees it as
- * usual and — like any free() — must not be called more than once on the
- * same handle.
+ * A no-op on both backends for a handle created by fft_init(): nothing was
+ * allocated outside the caller's block, so any number of calls is safe. An
+ * fft_create() handle is freed, and like free() must be destroyed only once.
  */
 void fft_destroy(FftHandle* handle);
 
@@ -114,11 +100,9 @@ int fft_get_n_freqs(const FftHandle* handle);
  * @param time_in Real input [fft_size] -- must not alias freq_out
  * @param freq_out Complex output [n_freqs] -- must not alias time_in
  *
- * `restrict`: every call site across AEC/NR/Audio_ALG/audio_common passes
- * distinct, non-overlapping buffers (audited); this lets the compiler
- * auto-vectorize the copy/scale loops it otherwise can't prove safe.
- * Overlapping buffers are undefined behavior -- use fft_forward_scratch()
- * (below) if you need an in-place-style call on a scratch buffer.
+ * `restrict` lets the compiler vectorise the copy and scale loops. The two
+ * buffers must not overlap (undefined behaviour otherwise); use
+ * fft_forward_scratch() when the input buffer may be given up.
  */
 void fft_forward(FftHandle* handle, const float* AC_FFT_RESTRICT time_in,
                  Complex* AC_FFT_RESTRICT freq_out);
@@ -130,8 +114,7 @@ void fft_forward(FftHandle* handle, const float* AC_FFT_RESTRICT time_in,
  * @param freq_in Complex input [n_freqs] -- must not alias time_out
  * @param time_out Real output [fft_size] -- must not alias freq_in
  *
- * `restrict`: see fft_forward()'s doc comment above -- same audited
- * no-aliasing guarantee at every call site.
+ * `restrict`: as for fft_forward().
  */
 void fft_inverse(FftHandle* handle, const Complex* AC_FFT_RESTRICT freq_in,
                  float* AC_FFT_RESTRICT time_out);
@@ -139,12 +122,10 @@ void fft_inverse(FftHandle* handle, const Complex* AC_FFT_RESTRICT freq_in,
 /**
  * Forward FFT: real input -> complex output, input clobber PERMITTED.
  *
- * Same transform as fft_forward(), but the caller's input buffer contents
- * are UNDEFINED after the call: a backend that would otherwise stage a
- * private defensive copy of the input (to protect it from a kernel that
- * may write through its input pointer) is free to skip that copy and let
- * the kernel operate on `time_in_clobbered` directly. Use only when the
- * caller has no further use for the input buffer after this call.
+ * Same transform as fft_forward(), but the input buffer's contents are
+ * undefined after the call: a backend that would otherwise copy the input to
+ * protect it from a kernel that writes through its input pointer may skip
+ * that copy. Use it only when the input is not needed afterwards.
  *
  * @param handle FFT handle
  * @param time_in_clobbered Real input [fft_size]; contents undefined on return
@@ -155,8 +136,8 @@ void fft_forward_scratch(FftHandle* handle, float* time_in_clobbered, Complex* c
 /**
  * Inverse FFT: complex input -> real output, input clobber PERMITTED.
  *
- * Same transform as fft_inverse(), but the caller's input buffer contents
- * are UNDEFINED after the call. See fft_forward_scratch() for the rationale.
+ * Same transform as fft_inverse(), but the input buffer's contents are
+ * undefined after the call (see fft_forward_scratch).
  *
  * @param handle FFT handle
  * @param freq_in_clobbered Complex input [n_freqs]; contents undefined on return
@@ -185,12 +166,6 @@ void fft_power(const Complex* freq, float* power, int n_freqs);
 /**
  * Compute phase spectrum from complex spectrum (atan2f(im, re) per bin).
  *
- * Defined in both backends (fft_wrapper.c / fft_wrapper_ne10.c) but had no
- * header declaration -- currently no caller anywhere in AEC/NR/Audio_ALG/
- * audio_common. Flagged, not removed, since deleting a public-looking pair
- * (fft_phase/fft_from_mag_phase) is a bigger decision than adding the
- * missing prototypes.
- *
  * @param freq Complex spectrum [n_freqs]
  * @param phase Output phase (radians) [n_freqs]
  * @param n_freqs Number of frequency bins
@@ -200,9 +175,6 @@ void fft_phase(const Complex* freq, float* phase, int n_freqs);
 /**
  * Reconstruct a complex spectrum from magnitude + phase
  * (spectrum[k] = magnitude[k] * (cosf(phase[k]) + i*sinf(phase[k]))).
- *
- * Same currently-unreferenced status as fft_phase() above — see that
- * function's doc comment.
  *
  * @param magnitude Input magnitude [n_freqs]
  * @param phase Input phase (radians) [n_freqs]

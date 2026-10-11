@@ -1,4 +1,5 @@
-/* Audio_ALG/AIAEC/Align_ULCNet/ulcnet_process.h:119-140,181-198 structs; ulcnet_process.c:26-191 */
+/* Audio_ALG/AIAEC/Align_ULCNet/ulcnet_process.h: UlcnetAnalysis, UlcnetSynthesis;
+ * ulcnet_process.c: ulcnet_make_window, ulcnet_rfft, ulcnet_analysis_*, ulcnet_synthesis_* */
 typedef struct UlcnetAnalysis {
     const float *window;           /* caller-owned shared sqrt-Hann table */
     FftHandle   *fft;              /* caller-owned ULCNET_N_FFT-point handle; may be
@@ -6,17 +7,10 @@ typedef struct UlcnetAnalysis {
                                     * synthesis (strictly sequential use
                                     * within a hop -- never concurrent)   */
     float history[ULCNET_N_FFT];   /* 最近 N_FFT 個 raw 樣本 (rolling) */
-    long  hops_seen;               /* SATURATES at 3 (guarded before the
-                                    * increment). Consumers only distinguish
-                                    * 1 (first hop, no frame yet), 2 (the
-                                    * reflect-prefix double emission) and
-                                    * >= 3 steady state (flush: < 2 vs
-                                    * >= 2), so the clamp is semantics-
-                                    * preserving; it exists to prevent
-                                    * signed overflow (UB) on unbounded
-                                    * streams. */
-    /* Per-call FFT scratch: caller-owned via this struct, NOT the stack
-     * (embedded task stacks cannot absorb multi-KB frames). Contents are
+    long  hops_seen;               /* saturates at 3: 1 = first hop (no frame
+                                    * yet), 2 = reflect-prefix double
+                                    * emission, >= 3 = steady state */
+    /* Per-call FFT scratch kept in the struct, off the stack; contents are
      * undefined between calls. */
     float   seg[ULCNET_N_FFT];     /* windowed segment; clobbered by FFT  */
     Complex spec[ULCNET_BINS];     /* RFFT output staging                 */
@@ -28,15 +22,10 @@ typedef struct UlcnetSynthesis {
                                     * sharing contract as UlcnetAnalysis  */
     float acc[ULCNET_N_FFT];       /* overlap-add 累加器 (局部原點 = 下一段輸出) */
     float env[ULCNET_N_FFT];       /* 窗平方包絡累加器 (torch.istft 語意) */
-    long  frames_seen;             /* SATURATES at 2 (guarded before the
-                                    * increment). Consumers only distinguish
-                                    * 0 (nothing accumulated), 1 (frame #0,
-                                    * inside the trimmed half window) and
-                                    * >= 2 (steady one-hop emission), so the
-                                    * clamp is semantics-preserving; it
-                                    * exists to prevent signed overflow (UB)
-                                    * on unbounded streams. */
-    /* Per-call FFT scratch -- same off-stack rationale as UlcnetAnalysis. */
+    long  frames_seen;             /* saturates at 2: 0 = nothing accumulated,
+                                    * 1 = frame 0 (inside the trimmed half
+                                    * window), >= 2 = steady state */
+    /* Per-call FFT scratch kept in the struct, as in UlcnetAnalysis. */
     Complex spec[ULCNET_BINS];     /* IRFFT input staging; clobbered by FFT */
     float   time[ULCNET_N_FFT];    /* IRFFT time-domain output              */
 } UlcnetSynthesis;
@@ -68,8 +57,7 @@ static void ulcnet_rfft(UlcnetAnalysis *st, const float *segment,
 int ulcnet_analysis_init(UlcnetAnalysis *st, FftHandle *fft,
                          const float *window) {
     if (!st || !fft || !window) return -1;
-    /* Reject-first: the handle must match the compiled deployment grid -- a wrong
-     * size would silently break the checkpoint's feature-time contract. */
+    /* The handle must match the compiled grid. */
     if (fft_get_n_freqs(fft) != ULCNET_BINS) return -1;
     memset(st, 0, sizeof(*st));
     st->fft = fft;
@@ -91,10 +79,8 @@ int ulcnet_analysis_push(UlcnetAnalysis *st, const float hop_in[ULCNET_HOP],
                          float out_re[2][ULCNET_BINS],
                          float out_im[2][ULCNET_BINS]) {
     history_append(st, hop_in);
-    /* Saturate at 3, guarded BEFORE the increment: every consumer only
-     * distinguishes 1 / 2 / >= 3 (and flush: < 2 vs >= 2), so the clamp is
-     * semantics-preserving while preventing signed overflow (UB) on
-     * unbounded streams. */
+    /* Saturates at 3: only 1, 2 and >= 3 (and, for flush, < 2 and >= 2) are
+     * distinguished, and the clamp avoids signed overflow. */
     if (st->hops_seen < 3) st->hops_seen++;
 
     if (st->hops_seen == 1) return 0;   /* frame 0 needs sample index HOP */
@@ -178,9 +164,8 @@ int ulcnet_synthesis_push(UlcnetSynthesis *st,
      * always advances exactly one hop per frame. */
     sk_wola_accumulate_f32(st->acc, st->time, st->window, ULCNET_N_FFT);
     sk_wola_accumulate_f32(st->env, st->window, st->window, ULCNET_N_FFT);
-    /* Saturate at 2, guarded BEFORE the increment: consumers only
-     * distinguish 0 / 1 / >= 2, so the clamp is semantics-preserving while
-     * preventing signed overflow (UB) on unbounded streams. */
+    /* Saturates at 2: only 0, 1 and >= 2 are distinguished, and the clamp
+     * avoids signed overflow. */
     if (st->frames_seen < 2) st->frames_seen++;
 
     emitted = 0;

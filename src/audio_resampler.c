@@ -277,9 +277,9 @@ void audio_resampler_reset(AudioResampler* self)
  *   NEON:  four lanes, each accumulating row[j] * win[j] with an unfused
  *          multiply then add in ascending j, then the lanes summed pairwise
  *          ((l0 + l1) + (l2 + l3)).
- *   SIMD=0: one sequential sum, newest tap first -- the order the Python twin
- *          (pipelines/dfn2_rate_adapter.py) reproduces bit for bit. `first`
- *          is the oldest real tap; the zero padding in front is skipped. */
+ *   SIMD=0: one sequential sum, newest tap first -- the order the Python
+ *          rate adapter reproduces bit for bit. `first` is the oldest real
+ *          tap; the zero padding in front is skipped. */
 #if SK_HAVE_NEON
 static RS_ALWAYS_INLINE float rs_dot1(const float* row, const float* win,
                                       int window, int first)
@@ -579,9 +579,8 @@ int audio_resampler_latency_input_frames(const AudioResampler* self)
      * delay on the up-sampled grid, i.e. (filter_length - 1) / (2 * up) input
      * frames. That is exact for every rate pair whose up factor divides
      * ratio_max (8k/16k/48k in any combination); for a coprime pair such as
-     * 32k -> 24k (up 3, down 4) it is fractional, so round to the nearest
-     * frame instead of truncating (21.33 -> 21 either way there, but 21.5
-     * would have read 21). */
+     * 32k -> 24k (up 3, down 4) it is fractional and is rounded to the
+     * nearest frame. */
     up = 2 * self->up;
     return (self->filter_length - 1 + up / 2) / up;
 }

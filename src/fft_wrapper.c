@@ -1,21 +1,18 @@
 /**
  * fft_wrapper.c — fft_wrapper.h implementation using KISS FFT.
  *
- * Vendored from the NR repo (SE/NR/c_impl/src/fft_wrapper.c) so AEC and NR share
- * one portable FFT layer. Real-to-complex FFT via KISS FFT's complex FFT
+ * Portable backend: real-to-complex FFT through KISS FFT's complex FFT
  * (kiss_fft_scalar = float). For the ARM NEON build see fft_wrapper_ne10.c.
  *
- * Convention (matches the retired pocketfft backend's callers):
+ * Convention (numpy):
  *     fft_forward(x)  == rfft(x), unnormalised
  *     fft_inverse(X)  == irfft(X), normalised by 1/N
- * KISS computes in float32, so results match numpy's fp64 np.fft to ~float32
- * precision (~1e-5 e2e, a documented tolerance — NOT 0/0 bit-exact). The
- * non-FFT C logic remains bit-exact to Python.
+ * KISS computes in float32, so results match numpy's float64 FFT to about
+ * 1e-5, not bit for bit.
  *
- * AEC addition over the NR original: the static-memory API (fft_get_mem_size /
- * fft_init). KISS supports cfg placement into a caller buffer, so the static
- * path is FULLY heap-free (the FftHandle, work buffers, and both kiss configs
- * all live in the caller pool).
+ * Static-memory API (fft_get_mem_size / fft_init): KISS places its configs
+ * into a caller buffer, so the static path is fully heap-free (the FftHandle,
+ * the work buffers and both KISS configs live in the caller's block).
  */
 #include "fft_wrapper.h"
 #include "kiss_fft.h"
@@ -26,20 +23,11 @@
 #if defined(__ARM_NEON) && defined(__aarch64__) && \
     !defined(SIMD_KERNELS_FORCE_SCALAR)
 #include <arm_neon.h>
-#include "simd_kernels.h"   /* sk__cquad_load/sk__cquad_store: may_alias-safe
-                             * vld2q_f32/vst2q_f32, see simd_kernels.h */
+#include "simd_kernels.h"   /* sk__cquad_load/sk__cquad_store */
 #endif
 
-/* fft_size whitelist --------------------------------------------------------
- * Mirrors fft_wrapper_ne10.c's fft_size_in_range: [16, 8192], power of two.
- * KISS's own arithmetic here already runs through the checked ck_* helpers
- * (mem_align.h) in 64-bit size_t, so it does not share the NE10 backend's
- * 32-bit-wraparound exposure -- but every real caller across AEC/NR/
- * Audio_ALG only ever derives fft_size from {256, 512, 1024}, and the two
- * backends are meant to be interchangeable behind the same fft_wrapper.h
- * contract, so this whitelist is applied here too for API symmetry (a
- * program that only ever validates against one backend should not discover
- * different accepted-input behavior when relinked against the other). */
+/* Accepted sizes: power of two in [16, 8192]. The NE10 backend accepts the
+ * same set, so both backends behave alike behind fft_wrapper.h. */
 static int fft_size_in_range(int fft_size) {
     return fft_size >= 16 && fft_size <= 8192 && (fft_size & (fft_size - 1)) == 0;
 }
@@ -62,7 +50,7 @@ struct FftHandle {
 
 FftHandle* fft_create(int fft_size) {
     if (!fft_size_in_range(fft_size)) {
-        return NULL;  /* fft_size must be a power of 2 in [16, 8192] (P0003) */
+        return NULL;
     }
 
     FftHandle* h = (FftHandle*)calloc(1, sizeof(FftHandle));
@@ -86,7 +74,7 @@ FftHandle* fft_create(int fft_size) {
 /* --- construction (static pool, heap-free) -------------------------------- */
 
 size_t fft_get_mem_size(int fft_size) {
-    if (!fft_size_in_range(fft_size)) return 0;  /* P0003 */
+    if (!fft_size_in_range(fft_size)) return 0;
     size_t lf = 0, li = 0;
     kiss_fft_alloc(fft_size, 0, NULL, &lf);   /* query forward cfg size */
     kiss_fft_alloc(fft_size, 1, NULL, &li);   /* query inverse cfg size */
@@ -100,13 +88,11 @@ size_t fft_get_mem_size(int fft_size) {
 }
 
 FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
-    if (!mem || !fft_size_in_range(fft_size)) return NULL;  /* P0003 */
-    if (!MEM_IS_ALIGNED16(mem)) return NULL;  /* F07: reject a misaligned base before any write */
+    if (!mem || !fft_size_in_range(fft_size)) return NULL;
+    if (!MEM_IS_ALIGNED16(mem)) return NULL;
     if (mem_size == 0) return NULL;
     size_t need = fft_get_mem_size(fft_size);
-    /* need==0 means fft_get_mem_size's own arithmetic overflowed -- no mem_size
-     * can ever satisfy that (mem_size < 0 is never true for a size_t), so it
-     * must be rejected explicitly rather than falling through the compare. */
+    /* need == 0: the size arithmetic overflowed. */
     if (need == 0 || mem_size < need) return NULL;
 
     uint8_t* ptr = (uint8_t*)mem;
@@ -160,15 +146,10 @@ void fft_forward(FftHandle* h, const float* restrict real_in, Complex* restrict 
 
     int n = h->fft_size;
 
-    /* Staging buffers must be read out of the handle ONCE. A store through
-     * h->fft_in[] could, for all the compiler can prove, land on the
-     * FftHandle's own fft_in/fft_out members, forcing a re-load of the
-     * pointer on every element and blocking vectorization of the interleaved
-     * store below. Both buffers are carved once (fft_create/fft_init) and
-     * never reassigned during a transform, so the loads are loop-invariant.
-     * Plain values, not `restrict`: the parameter-level restrict already
-     * supplies the caller-buffer no-alias facts, and qualifying these changes
-     * no generated instruction. */
+    /* Staging pointers are read out of the handle once: a store through
+     * h->fft_in[] could, for all the compiler can prove, alias the handle's
+     * own fft_in/fft_out members, which would force a reload per element and
+     * block vectorisation of the interleaved store below. */
     kiss_fft_cpx* fin  = h->fft_in;
     kiss_fft_cpx* fout = h->fft_out;
 
@@ -195,8 +176,7 @@ void fft_inverse(FftHandle* h, const Complex* restrict complex_in, float* restri
     int n = h->fft_size;
     int n_freqs = h->n_freqs;
 
-    /* Loop-invariant staging pointers -- see fft_forward() above for why the
-     * handle members cannot stay in the loop bodies. */
+    /* Staging pointers read once, as in fft_forward. */
     kiss_fft_cpx* fin  = h->fft_in;
     kiss_fft_cpx* fout = h->fft_out;
 
@@ -219,15 +199,9 @@ void fft_inverse(FftHandle* h, const Complex* restrict complex_in, float* restri
     }
 }
 
-/* --- scratch variants (caller's input buffer contents left undefined) ----
- * KISS's fft_forward/fft_inverse already copy the caller's input into a
- * private buffer (h->fft_in) before touching kiss_fft's engine and never
- * write back into the caller's buffer -- the staging here is structural,
- * not a defensive copy against a clobbering kernel. So there is nothing to
- * elide: real_in/complex_in are never modified by the plain API either.
- * The _scratch entry points just forward to it; the API contract ("contents
- * undefined after the call") is satisfied trivially since it only permits
- * clobbering, it doesn't require it. */
+/* --- scratch variants (the input buffer's contents are undefined afterwards) --
+ * The plain functions already stage the input in a private buffer and never
+ * write to the caller's, so the scratch entry points simply forward. */
 
 void fft_forward_scratch(FftHandle* h, float* time_in_clobbered, Complex* complex_out) {
     fft_forward(h, time_in_clobbered, complex_out);
@@ -244,17 +218,10 @@ void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
     int k = 0;
 #if defined(__ARM_NEON) && defined(__aarch64__) && \
     !defined(SIMD_KERNELS_FORCE_SCALAR)
-    /* UNLIKE fft_power() just below, this TU's fft_magnitude() does NOT call
-     * fmaf() anywhere -- `re*re + im*im` is a plain separately-rounded
-     * multiply/multiply/add, and this TU builds with -ffp-contract=off (see
-     * the Makefile's FP-contraction policy), so the compiler may not fuse it
-     * either. This NEON path must therefore mirror that UNFUSED shape
-     * (vmulq_f32/vmulq_f32/vaddq_f32, never vfmaq_f32) to stay bit-identical
-     * to the scalar reference below -- do not copy fft_power()'s fused
-     * pattern here, that would silently change this function's rounding.
-     * vsqrtq_f32 is IEEE-754 correctly-rounded, matching scalar sqrtf()
-     * lane-for-lane (same argument as sk_fast_sqrt_f32's USE_STANDARD_MATH
-     * path in simd_kernels.h). */
+    /* Unlike fft_power, re*re + im*im here is two separately rounded
+     * multiplies and an add (the TU builds with -ffp-contract=off), so the
+     * NEON path uses vmulq/vmulq/vaddq and never vfmaq to stay bit-identical
+     * to the scalar loop below. vsqrtq_f32 is correctly rounded like sqrtf. */
     for (; k + 4 <= n_freqs; k += 4) {
         float32x4x2_t v = sk__cquad_load(spectrum + k);
         float32x4_t re = v.val[0], im = v.val[1];
@@ -273,14 +240,9 @@ void fft_power(const Complex* spectrum, float* power, int n_freqs) {
     int k = 0;
 #if defined(__ARM_NEON) && defined(__aarch64__) && \
     !defined(SIMD_KERNELS_FORCE_SCALAR)
-    /* Verified via `objdump -d` on the CURRENT build (no -ffp-contract=off
-     * on this TU): clang contracts `re*re + im*im` into
-     *   fmul s1, im, im
-     *   fmadd s0, re, re, s1
-     * i.e. fmaf(re, re, im*im) -- im*im rounded separately, then re*re fused
-     * against it. The explicit scalar form below reproduces that exactly,
-     * and this NEON path mirrors the same fused/unfused shape lane-for-lane
-     * (im*im via vmulq_f32, then vfmaq_f32(that, re, re)). */
+    /* fmaf(re, re, im * im): im * im rounded on its own, then re * re fused
+     * into it. The scalar tail calls fmaf explicitly and this NEON path
+     * matches it lane for lane (vmulq_f32, then vfmaq_f32). */
     for (; k + 4 <= n_freqs; k += 4) {
         float32x4x2_t v = sk__cquad_load(spectrum + k);
         float32x4_t re = v.val[0], im = v.val[1];
@@ -315,8 +277,7 @@ void fft_apply_gain(Complex* spectrum, const float* gain, int n_freqs) {
     int k = 0;
 #if defined(__ARM_NEON) && defined(__aarch64__) && \
     !defined(SIMD_KERNELS_FORCE_SCALAR)
-    /* Pure multiplies, no add -- nothing for fp-contraction to fuse either
-     * way, so this NEON path is a plain deinterleave/vmulq/reinterleave. */
+    /* Multiplies only: nothing to fuse. */
     for (; k + 4 <= n_freqs; k += 4) {
         float32x4x2_t v = sk__cquad_load(spectrum + k);
         float32x4_t g = vld1q_f32(gain + k);

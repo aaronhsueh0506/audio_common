@@ -3,8 +3,8 @@
  *
  * Bilinear transform from analog prototype.
  * Direct Form II transposed implementation.
- * Structurally mirrors the AEC Python reference's HighPassFilter formula
- * (float32, not bit-exact — see the README precision policy).
+ * Same formula as the AEC Python reference HighPassFilter, in float32 (not
+ * bit-exact with it).
  */
 
 #include "hpf.h"
@@ -40,11 +40,9 @@ static void hpf_compute_coeffs(Hpf* h, float cutoff_hz, int sample_rate) {
     h->z2 = 0.0f;
 }
 
-/* F14: shared cutoff/sample_rate domain check for hpf_create and hpf_init.
- * cutoff_hz must be finite and > 0; sample_rate (already an int -- always
- * "finite" -- is range-checked instead) must be > 0; and cutoff_hz is kept a
- * fixed margin below Nyquist (0.45*sample_rate, not 0.5) so wc/2 in
- * hpf_compute_coeffs stays well clear of tanf's pi/2 singularity. */
+/* Parameter domain shared by hpf_create and hpf_init: cutoff_hz finite and
+ * > 0, sample_rate > 0, cutoff_hz below 0.45 * sample_rate so that wc / 2 in
+ * hpf_compute_coeffs stays clear of the pi/2 pole of tanf. */
 static int hpf_params_valid(float cutoff_hz, int sample_rate) {
     if (!isfinite(cutoff_hz) || cutoff_hz <= 0.0f) return 0;
     if (sample_rate <= 0) return 0;
@@ -71,13 +69,11 @@ size_t hpf_get_mem_size(void) {
 
 Hpf* hpf_init(void* mem, size_t mem_size, float cutoff_hz, int sample_rate) {
     if (!mem) return NULL;
-    if (!MEM_IS_ALIGNED16(mem)) return NULL;  /* F07: reject a misaligned base before any write */
-    if (!hpf_params_valid(cutoff_hz, sample_rate)) return NULL;  /* F14 */
+    if (!MEM_IS_ALIGNED16(mem)) return NULL;
+    if (!hpf_params_valid(cutoff_hz, sample_rate)) return NULL;
     if (mem_size == 0) return NULL;
     size_t need = hpf_get_mem_size();
-    /* need==0 would mean hpf_get_mem_size's arithmetic overflowed -- no
-     * mem_size could ever satisfy that via mem_size < need, so reject it
-     * explicitly (see the identical note in fft_wrapper.c's fft_init). */
+    /* need == 0: the size arithmetic overflowed. */
     if (need == 0 || mem_size < need) return NULL;
 
     Hpf* h = (Hpf*)mem;

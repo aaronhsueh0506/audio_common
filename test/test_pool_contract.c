@@ -2,22 +2,18 @@
  * test_pool_contract.c - negative-input contract tests for the shared
  * static-memory pool APIs (fft_wrapper.h, hpf.h).
  *
- * Covers the review-remediation fixes:
- *   F07 - public pool inits (fft_init, hpf_init) must reject a misaligned
- *         base pointer (MEM_IS_ALIGNED16) BEFORE writing anything into the
- *         pool, and must reject mem_size smaller than get_mem_size()'s
- *         report (including the exact-size boundary).
- *   F14 - hpf_create/hpf_init must reject a cutoff_hz/sample_rate pair that
- *         is non-finite, non-positive, or at/above the 0.45*sample_rate
- *         margin below Nyquist.
+ * Covers:
+ *   - the pool inits (fft_init, hpf_init) reject a misaligned base pointer
+ *     before writing anything, and a mem_size smaller than get_mem_size()
+ *     reports (including the exact-size boundary);
+ *   - hpf_create / hpf_init reject a cutoff_hz / sample_rate pair that is
+ *     non-finite, non-positive, or at or above 0.45 * sample_rate.
  *
- * Backend-agnostic like roundtrip.c/simd_selftest.c: whichever FFT backend
- * (kiss or ne10) the Makefile links in, fft_wrapper.h's public API is the
- * same, so this test only exercises that public surface.
+ * Backend-agnostic: it uses only the public fft_wrapper.h API of whichever
+ * backend is linked.
  *
- * Plain assert-and-report harness, no external framework: every failure is
- * printed and flips a global fail flag; main() reports ALL PASS / FAIL at
- * the end so one bad check doesn't hide the rest.
+ * Every failure is printed and sets a global flag; main() reports ALL PASS or
+ * FAIL at the end so one failure does not hide the rest.
  */
 #include "fft_wrapper.h"
 #include "hpf.h"
@@ -38,11 +34,9 @@ static int g_fail = 0;
     } \
 } while (0)
 
-/* Returns a 16-byte-aligned pointer at least `pad` bytes inside `*out_base`
- * (which the caller must free()), with at least `usable` bytes available
- * from the aligned pointer onward. Centralizes the "carve an aligned
- * address out of a malloc'd block, with slop for +1..+15 offset probing"
- * logic shared by every misaligned-base test below. */
+/* A 16-byte-aligned pointer inside a malloc'd block (*out_base, which the
+ * caller frees) with at least `usable` bytes from that pointer on and slack
+ * for probing +1..+15 offsets. */
 static unsigned char* aligned_ptr_in(unsigned char** out_base, size_t usable, size_t pad) {
     size_t alloc_sz = usable + pad + 32;
     unsigned char* base = (unsigned char*)malloc(alloc_sz);
@@ -106,33 +100,17 @@ static void test_fft_size_boundary(void) {
     free(pool);
 }
 
-/* External-memory size/init boundary: fft_get_mem_size /
- * fft_create / fft_init must whitelist fft_size to powers of two in [16, 8192]
- * on BOTH backends -- rejecting (0 / NULL):
- *   - other positive powers of two (1/2/4/8) that, pre-P0003, reached NE10's
- *     nfft<16 silent-degenerate path (a non-NULL config whose r_factors/
- *     r_twiddles/etc. were never populated -- now deleted, replaced by an
- *     explicit reject);
- *   - non-powers-of-two (24), already rejected pre-P0003 too;
- *   - powers of two above the whitelist (16384), previously accepted; and
- *   - huge powers of two (1<<28, 1<<30) whose true NE10-backend byte
- *     requirement wrapped in ne10_fft_r2c_mem_size_float32's internal
- *     ne10_uint32_t arithmetic pre-P0003 (measured: 2^28 -> 1,342,177,968,
- *     2^30 -> 1,073,742,512 -- both far smaller than the unrepresentable true
- *     requirement, i.e. fft_get_mem_size used to return a deceptively "valid"
- *     nonzero size for these instead of failing loudly).
- * -16 stands in for "negative fft_size", already covered structurally by the
- * same `>= 16` bound as the other rejects, not a distinct code path.
- */
+/* fft_get_mem_size / fft_create / fft_init accept only powers of two in
+ * [16, 8192] on both backends and reject (0 / NULL) everything else: sizes
+ * below 16, non-powers of two, sizes above 8192, and huge powers of two
+ * whose NE10 size would wrap in 32-bit arithmetic. -16 stands for any
+ * negative size. */
 static void test_fft_size_whitelist(void) {
     const int invalid[] = { 0, 1, 2, 4, 8, -16, 24, 16384, (1 << 28), (1 << 30) };
     const size_t n_invalid = sizeof(invalid) / sizeof(invalid[0]);
 
-    /* A generously-sized, 16-byte-aligned dummy pool. Every fft_size below
-     * must be rejected by the fft_size whitelist check alone, which fft_init
-     * evaluates before it ever reads/writes through `mem` -- so the pool's
-     * actual contents/size past "aligned and nonzero" are irrelevant to
-     * these particular calls. */
+    /* Every size below is rejected by the size check alone, before the pool
+     * is read or written, so its contents do not matter. */
     unsigned char* base = NULL;
     unsigned char* pool = aligned_ptr_in(&base, 4096, 16);
     CHECK(pool != NULL, "malloc for fft size-whitelist test");
@@ -156,14 +134,9 @@ static void test_fft_size_whitelist(void) {
     }
 
 #ifdef NE10_ENABLE_DSP
-    /* NE10 backend only (NE10_ENABLE_DSP is defined project-wide by the
-     * Makefile's NE10_DEFS iff BACKEND=ne10 -- see Makefile's CFLAGS block):
-     * byte-neutrality lock for the three production fft_size values. These
-     * three totals were measured on the pre-P0003 tree (git stash + a scratch
-     * probe binary linked against bin/ne10/libaudio_common.a) and must never
-     * move -- P0003 only narrows ACCEPTANCE (which fft_size values are
-     * valid), it must not change the byte count fft_get_mem_size reports for
-     * an fft_size that was already valid before the fix. */
+    /* NE10 backend only (NE10_ENABLE_DSP is defined iff BACKEND=ne10): the
+     * block sizes for the production fft_size values are part of the pool
+     * contract and must not change. */
     CHECK(fft_get_mem_size(256)  == 8176,  "NE10 fft_get_mem_size(256) must be byte-identical to pre-P0003");
     CHECK(fft_get_mem_size(512)  == 15600, "NE10 fft_get_mem_size(512) must be byte-identical to pre-P0003");
     CHECK(fft_get_mem_size(1024) == 30448, "NE10 fft_get_mem_size(1024) must be byte-identical to pre-P0003");

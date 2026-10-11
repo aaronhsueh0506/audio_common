@@ -1,21 +1,16 @@
 /*
- * test_wav_writer_common.h - shared writer special-values corpus test body,
- * included by BOTH test_wav_io.c (default WAV_IO_WRITER_AEC, via the
- * canonical wav_io.h's own unset-knob default) and
- * test_wav_writer_nr_style.c (which #defines WAV_IO_WRITER_STYLE to
- * WAV_IO_WRITER_NR before including wav_io.h) -- shared writer regression
- * R01 regression coverage for the PCM16 quantizer's undefined behavior at
- * the +-1.0f boundary (AEC style specifically: `(int16_t)32768.5f` is an
- * out-of-range float-to-integer conversion, reproduced under UBSan) and the
- * unsanitized NaN/+-Inf path (both styles: NaN fails every ordered
- * comparison, so the pre-fix [-1,1] clamp silently let it through to the
- * same undefined cast).
+ * test_wav_writer_common.h - writer special-values test body shared by
+ * test_wav_io.c (default WAV_IO_WRITER_AEC) and test_wav_writer_nr_style.c
+ * (WAV_IO_WRITER_NR).
  *
- * ONE function body covers both writer styles -- the expected int16 values
- * differ (round-half-away-from-zero + saturate vs plain truncation +
- * defensive saturate), selected at compile time via WAV_IO_WRITER_STYLE,
- * which is already defined by the time this header is included (must be
- * included AFTER "wav_io.h").
+ * It checks the PCM16 quantizer at the +-1.0f boundary (AEC style:
+ * (int16_t)32768.5f would be an out-of-range conversion) and for NaN / +-Inf
+ * input, which must be replaced by zero because NaN passes every ordered
+ * comparison of the clamp.
+ *
+ * One body covers both styles; the expected int16 values differ (round half
+ * away from zero plus saturate versus truncation) and are selected by
+ * WAV_IO_WRITER_STYLE. Include it after "wav_io.h".
  */
 #ifndef TEST_WAV_WRITER_COMMON_H
 #define TEST_WAV_WRITER_COMMON_H
@@ -50,23 +45,16 @@ static inline int test_wav_writer_special_values_corpus(void) {
     in_samples[8] = -0.5f;
 
 #if WAV_IO_WRITER_STYLE == WAV_IO_WRITER_AEC
-    /* Round-half-away-from-zero (`sample*32768.0f`, then +-0.5f before
-     * truncating into a wider int32_t), THEN saturate into int16_t's
-     * range. Pre-fix, +-1.0f produced (int16_t)+-32768.5f -- undefined
-     * behavior; post-fix these saturate to the values a defined round
-     * would give anyway. Values re-derived from the exact production
-     * formula via a standalone scratch computation (not hand-guessed):
-     * nextafterf(1.0f,0)*32768+0.5 truncates to 32768 pre-saturate (still
-     * clamps to 32767); nextafterf(-1.0f,0) truncates to exactly -32768
-     * (no saturation needed, already in range). */
+    /* Round half away from zero (`sample*32768.0f`, then +-0.5f, truncated
+     * into an int32_t), then saturate to the int16_t range:
+     * nextafterf(1.0f, 0) gives 32768 before saturation and so 32767;
+     * nextafterf(-1.0f, 0) gives -32768 exactly. */
     const int16_t expect[9] = {
         32767, -32768, 32767, -32768, 0, 0, 0, 16384, -16384
     };
 #else
-    /* Plain truncation (`sample*32767.0f`, no rounding). The saturate added
-     * by the R01 fix is pure defense here -- the preceding [-1,1] clamp and
-     * non-finite sanitize already bound the input, so it's never actually
-     * triggered for any of these (all land in [-32767, 32767] already). */
+    /* Truncation (`sample*32767.0f`, no rounding); every value lands in
+     * [-32767, 32767] without saturating. */
     const int16_t expect[9] = {
         32767, -32767, 32766, -32766, 0, 0, 0, 16383, -16383
     };

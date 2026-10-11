@@ -54,17 +54,9 @@ int main(void) {
     fft_destroy(hs);
     free(pool);
 
-    /* fft_magnitude() NEON-path sanity (s4-audio-common-sweep review):
-     * fft_magnitude has no production caller anywhere in the four-repo tree
-     * (currently dead code -- see the review), so there is no existing
-     * consumer regression gate covering it. Cross-check the function's
-     * output bit-for-bit against the exact same `sqrtf(re*re+im*im)`
-     * formula computed independently right here, in the SAME translation
-     * unit under the SAME -ffp-contract=off build flag -- this directly
-     * exercises whichever path (NEON body + scalar tail, or plain scalar on
-     * a non-NEON build) fft_magnitude() actually took, at several n_freqs
-     * values that cross the kernel's 4-lane boundary (0, 1, 3, 4, 5, 257 --
-     * matching the KISS nf=257 buffer already built above). */
+    /* fft_magnitude against `sqrtf(re*re+im*im)` computed here under the same
+     * -ffp-contract=off build, bit for bit, at n_freqs values around the
+     * kernel's 4-lane boundary (0, 1, 3, 4, 5, 257). */
     int mag_ok = 1;
     {
         Complex mspec[257];
@@ -89,8 +81,7 @@ int main(void) {
                 printf("FAIL: fft_magnitude n_freqs=%d differs from scalar reference\n", m);
             }
         }
-        /* NULL-input no-op guard (matches every other fft_wrapper entry
-         * point's `if (!spectrum || !magnitude) return;` contract). */
+        /* NULL inputs are a no-op. */
         fft_magnitude(NULL, mag, 4);
         fft_magnitude(mspec, NULL, 4);
     }

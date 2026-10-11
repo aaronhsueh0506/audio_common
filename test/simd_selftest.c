@@ -14,12 +14,10 @@
  * After correctness, runs a small microbenchmark per kernel (n=257,
  * ~200k reps, CLOCK_MONOTONIC) and prints a one-line summary.
  *
- * Re-review R07 adds test_fast_math_special_values(): explicit pinned
- * asserts for the fast_math.h special-value contract table (see that
- * header's "Special-value contract table" comment) -- fast_exp/fast_log/
- * fast_sqrt's exact documented return for NaN/+Inf/-Inf/0/negative inputs,
- * plus the NEON sk_fast_sqrt_f32 lane equivalents. These make the doc-
- * comment's table an executable regression gate instead of only prose.
+ * test_fast_math_special_values() pins the special-value contract table of
+ * fast_math.h: the exact return of fast_exp / fast_log / fast_sqrt for
+ * NaN, +Inf, -Inf, 0 and negative inputs, and the NEON sk_fast_sqrt_f32 lane
+ * equivalents.
  */
 #include "simd_kernels.h"
 #include "fast_math.h"
@@ -35,11 +33,9 @@
 /* ═══════════════════════════════ config ═══════════════════════════════ */
 
 #define SK_TEST_MAX_N 512
-/* Extended to n=0 (must be a zero-read/zero-write no-op,
- * see the canary section below) plus the COMPLETE 1..17 run (every kernel's
- * 4-lane NEON/scalar-tail boundary crossed at every possible remainder, not
- * just a sparse sample) -- on top of the original hand-picked lane/leaf/
- * split boundary values, which stay for their own documented reasons. */
+/* n = 0 must be a zero-read, zero-write no-op (see the canary section); 1..17
+ * crosses every kernel's 4-lane NEON / scalar-tail boundary at every
+ * remainder; the larger values are lane, leaf and split boundaries. */
 static const int N_LIST[] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
     128, 129, 160, 255, 256, 257, 512
@@ -51,11 +47,10 @@ static const int N_LIST[] = {
 #define BENCH_REPS 200000
 
 /* ═══════════════════════════ input generation ═══════════════════════════
- * Deterministic LCG over raw uint32 bit patterns mapped to floats (25% of
- * draws), mixed with a curated special-value pool (75%... actually the
- * other way: special pool draws 25% of the time, see gen_float()). NaN
- * bit patterns from the raw-bits path are remapped to 0.0f -- NaN payload
- * propagation is explicitly out of the bit-exactness contract. */
+ * Deterministic LCG over raw uint32 bit patterns mapped to floats, mixed
+ * with a pool of special values (drawn 25% of the time, see gen_float()).
+ * NaN bit patterns from the raw-bits path are remapped to 0.0f; NaN payload
+ * propagation is outside the bit-exactness contract. */
 
 static uint32_t g_lcg = 0x9E3779B9u;
 
@@ -116,12 +111,9 @@ static void fill_complex(Complex *a, int n) {
     for (i = 0; i < n; ++i) gen_complex(&a[i]);
 }
 
-/* Separate, moderate-range generator for the microbenchmarks only -- keeps
- * the timing loops away from Inf/NaN-producing accumulation artifacts so
- * the reported numbers reflect typical-case throughput. Also the in-range
- * draw for kernel 30's correctness test (gen_pcm_float below), which needs
- * exactly this distribution -- [-1, 1] at fine granularity -- and would
- * otherwise re-derive the same two constants. */
+/* Moderate-range generator for the microbenchmarks, which keeps the timing
+ * loops free of Inf / NaN artefacts, and the in-range draw of the
+ * sk_clip_scale_to_s16 test (gen_pcm_float): [-1, 1] at fine granularity. */
 static float gen_bench_float(void) {
     uint32_t r = lcg_next();
     return ((float)(r % 2000001u) / 1000000.0f) - 1.0f; /* ~[-1, 1] */
@@ -138,14 +130,10 @@ static void fill_bench_complex(Complex *a, int n) {
 }
 
 /* ═══════════════════════════ mismatch reporting ═══════════════════════════
- * g_total_checks: a running count of individual
- * bit-pattern comparisons actually performed, incremented at each of the
- * few chokepoints every check funnels through (check_bits_or_die,
- * check_scalar_bits_or_die, the special-value asserts, and the new canary
- * checks below) -- so main()'s final printout is a real, reproducible
- * "how much did this run actually verify" number instead of a hand count,
- * and comparing it before and after a change is just two runs of the
- * same binary at two points in this file's history, not a hand-wavy claim. */
+ * g_total_checks counts the individual bit-pattern comparisons performed,
+ * incremented at the few functions every check goes through
+ * (check_bits_or_die, the special-value asserts, the canary checks); main()
+ * prints it. */
 
 static long g_total_checks = 0;
 
@@ -176,28 +164,11 @@ static void check_bits_or_die(const char *kernel, int n, int trial,
     }
 }
 
-/* NOTE: check_scalar_bits_or_die (the single-float-return sibling of
- * check_bits_or_die) is not needed here -- it was only ever called by the
- * pairwise-sum-family kernels' tests, all of which moved to
- * AEC/c_impl/test/simd_selftest_aec.c along with their kernels. */
-
-/* check_complex_bits_or_die -- the Complex-typed sibling of check_bits_or_die,
- * used by the kernel 9/10 (sk_capply_gain_f32/sk_cadd_f32) tests below. Every
- * one of those call sites used to cast its `Complex *` buffers straight to
- * `(const float *)` and hand that to check_bits_or_die directly -- a canary/
- * reference test doing the exact Complex*->float* type-based-aliasing cast
- * pattern the surrounding review exists to remove from the real NEON kernels
- * (see simd_kernels.h's sk__cquad_load/sk__cquad_store comment) would be an
- * odd inconsistency, even though (unlike a NEON vld2q_f32/vst2q_f32 call) the
- * old cast here was never actually dereferenced as a `float` lvalue -- only
- * ever fed to memcpy via address-of-subscript, which C11 6.5.3.2p3 defines as
- * pure pointer arithmetic, not a load. Fixed the same way as the real
- * kernels: memcpy the two Complex buffers' bytes into genuine local `float`
- * objects first, then delegate to check_bits_or_die on those -- no
- * Complex*->float* pointer cast anywhere in this file's kernel-9/10 tests
- * after this point. `n_elems` is a Complex-element count (bounded by
- * SK_TEST_MAX_N/EDGE_MAX_N at every call site in this file, both aliases for
- * the same constant); the scratch arrays are sized for the worst case. */
+/* check_complex_bits_or_die: the Complex-typed sibling of check_bits_or_die,
+ * used by the sk_capply_gain_f32 and sk_cadd_f32 tests. It copies the bytes
+ * of both buffers into local float arrays and compares those, so no
+ * Complex* -> float* pointer cast is needed. `n_elems` is a Complex element
+ * count bounded by SK_TEST_MAX_N; the scratch arrays are sized for it. */
 static void check_complex_bits_or_die(const char *kernel, int n, int trial,
                                        const Complex *simd, const Complex *scalar,
                                        int n_elems) {
@@ -208,18 +179,15 @@ static void check_complex_bits_or_die(const char *kernel, int n, int trial,
 }
 
 /* ═════════════════ pinned special-value contract ═════════════════════════
- * fast_math.h's header comment documents an exact "Special-value contract
- * table" for fast_exp/fast_log/fast_sqrt (NaN/+-Inf/0/negative -> exact
- * deterministic float). These two helpers plus test_fast_math_special_values
- * below turn that table into an executable regression gate: exit(1) on any
- * deviation, no tolerance, same house style as check_bits_or_die above. */
+ * fast_math.h documents an exact special-value table for fast_exp / fast_log
+ * / fast_sqrt (NaN, +-Inf, 0, negative). These helpers and
+ * test_fast_math_special_values check it with no tolerance: any deviation
+ * calls exit(1). */
 
 #ifndef USE_STANDARD_MATH
-/* Only used by the fast-math-path assertions below (bit-exact domain-edge
- * constants) -- USE_STANDARD_MATH's branch uses assert_f32_eq/assert_is_nan
- * instead, since libm's NaN/Inf propagation isn't a fixed bit pattern to pin
- * this precisely. #ifdef-guarded so the USE_STANDARD_MATH build doesn't warn
- * about an unused static function. */
+/* Bit-exact domain-edge constants of the fast-math path; the
+ * USE_STANDARD_MATH branch uses assert_f32_eq / assert_is_nan because libm's
+ * NaN / Inf results are not a fixed bit pattern. */
 static void assert_f32_bits(const char *label, float got, uint32_t want_bits) {
     uint32_t got_bits;
     g_total_checks++;
@@ -234,9 +202,8 @@ static void assert_f32_bits(const char *label, float got, uint32_t want_bits) {
 #endif
 
 /* Used by the USE_STANDARD_MATH branch (libm propagates NaN) and by the
- * fast_sqrt(+Inf) pin on targets without hardware sqrt (the Newton fallback
- * ends in Inf/Inf = NaN) -- guarded so the other builds do not warn about an
- * unused static function. */
+ * fast_sqrt(+Inf) check on targets without hardware sqrt (the Newton fallback
+ * ends in Inf/Inf = NaN). */
 #if defined(USE_STANDARD_MATH) || !FM_HAVE_HW_SQRT
 static void assert_is_nan(const char *label, float got) {
     g_total_checks++;
@@ -264,10 +231,7 @@ static void assert_sqrt_pinf(const char *label, float got) {
 #endif
 
 #ifdef USE_STANDARD_MATH
-/* Only used by test_fast_math_special_values's USE_STANDARD_MATH branch
- * below (the fast-math branch uses assert_f32_bits/assert_is_nan instead) --
- * #ifdef-guarded so the non-USE_STANDARD_MATH build doesn't warn about an
- * unused static function. */
+/* Used by the USE_STANDARD_MATH branch of test_fast_math_special_values. */
 static void assert_f32_eq(const char *label, float got, float want) {
     g_total_checks++;
     if (got != want) {
@@ -278,21 +242,17 @@ static void assert_f32_eq(const char *label, float got, float want) {
 }
 #endif
 
-/* Two build modes assert two different (each internally consistent) sets of
- * values: the default fast-math path pins the documented domain-edge
- * constants; USE_STANDARD_MATH pins ordinary libm NaN/Inf propagation
- * (fast_math.h's #else branch is a bare expf/logf/sqrtf call, so this is
- * really pinning libm's own contract) -- so the DIVERGENCE between the two
- * modes documented in fast_math.h's contract table is itself
- * regression-tested here, in both directions, not just asserted in prose. */
+/* The two build modes assert different values: the default path the
+ * documented domain-edge constants, USE_STANDARD_MATH the ordinary libm
+ * NaN / Inf propagation. The divergence between the modes that the
+ * fast_math.h table documents is therefore itself tested. */
 static void test_fast_math_special_values(void) {
     float qnan = bits_to_float(0x7FC00000u);
     float pinf = (float)INFINITY;
     float ninf = -(float)INFINITY;
 
 #ifndef USE_STANDARD_MATH
-    /* Fast-math domain-edge constants -- see fast_math.h's "Special-value
-     * contract table" comment for the derivation of each bit pattern. */
+    /* Fast-math domain-edge constants (see the fast_math.h table). */
     assert_f32_bits("fast_exp(NaN)",  fast_exp(qnan), 0x00000000u);
     assert_f32_bits("fast_exp(+Inf)", fast_exp(pinf), 0x4b07975eu); /* 8.8861105e+06f */
     assert_f32_bits("fast_exp(-Inf)", fast_exp(ninf), 0x00000000u);
@@ -322,12 +282,9 @@ static void test_fast_math_special_values(void) {
     assert_f32_eq("fast_sqrt(+Inf) [libm]", fast_sqrt(pinf), pinf);
 #endif
 
-    /* NEON sk_fast_sqrt_f32 lane equivalents. No #ifdef needed for the
-     * scalar-vs-NEON bit-exactness check itself -- sk__fast_sqrt_elem and
-     * sk_fast_sqrt_f32's NEON body both switch on the SAME USE_STANDARD_MATH
-     * flag (see simd_kernels.h), so they always agree with each other; the
-     * per-lane VALUE assertions below are still fast-math-only, same as
-     * the scalar checks above. */
+    /* NEON sk_fast_sqrt_f32 lane equivalents. The scalar-versus-NEON check
+     * holds in both modes (both follow USE_STANDARD_MATH); the per-lane value
+     * assertions are fast-math only. */
     {
         float in[4], out_scalar[4], out_simd[4];
         in[0] = qnan; in[1] = -1.0f; in[2] = -0.0f; in[3] = pinf;
@@ -353,7 +310,7 @@ static void test_fast_math_special_values(void) {
 #endif
 }
 
-/* ═══════════════════════════ correctness: kernel 4 ═══════════════════════ */
+/* ═══════════════════════════ correctness: sk_ema_f32 ═════════════════════ */
 
 static void test_ema(void) {
     float state_init[SK_TEST_MAX_N], state_scalar[SK_TEST_MAX_N], state_simd[SK_TEST_MAX_N];
@@ -376,7 +333,7 @@ static void test_ema(void) {
 }
 
 
-/* ═══════════════════════════ correctness: kernel 9 ═══════════════════════ */
+/* ═══════════════════════════ correctness: sk_capply_gain_f32 ═════════════ */
 
 static void test_capply_gain(void) {
     Complex z[SK_TEST_MAX_N];
@@ -393,7 +350,7 @@ static void test_capply_gain(void) {
             check_complex_bits_or_die("capply_gain_f32", n, t, out_simd, out_scalar, n);
         }
     }
-    /* dedicated in-place check: out == z */
+    /* In place: out == z. */
     {
         Complex buf_scalar[SK_TEST_MAX_N], buf_simd[SK_TEST_MAX_N], orig[SK_TEST_MAX_N];
         float g2[SK_TEST_MAX_N];
@@ -410,7 +367,7 @@ static void test_capply_gain(void) {
 }
 
 
-/* ═══════════════════════════ correctness: kernel 10 ══════════════════════ */
+/* ═══════════════════════════ correctness: sk_cadd_f32 ═══════════════════ */
 
 static void test_cadd(void) {
     Complex a[SK_TEST_MAX_N], b[SK_TEST_MAX_N];
@@ -430,7 +387,7 @@ static void test_cadd(void) {
 }
 
 
-/* ═══════════════════════════ correctness: kernel 11 ══════════════════════ */
+/* ═══════════════════════════ correctness: sk_sq_scale_f32 ════════════════ */
 
 static void test_sq_scale(void) {
     float x[SK_TEST_MAX_N], out_scalar[SK_TEST_MAX_N], out_simd[SK_TEST_MAX_N];
@@ -448,7 +405,7 @@ static void test_sq_scale(void) {
     printf("PASS sq_scale_f32\n");
 }
 
-/* ═══════════════════════════ correctness: kernel 34 ══════════════════════ */
+/* ═══════════════════════════ correctness: sk_scale_f32 ═══════════════════ */
 
 static void test_scale(void) {
     float x[SK_TEST_MAX_N], out_scalar[SK_TEST_MAX_N], out_simd[SK_TEST_MAX_N];
@@ -478,7 +435,7 @@ static void test_scale(void) {
 }
 
 
-/* ═══════════════════════════ correctness: kernel 12 ══════════════════════ */
+/* ═══════════════════════════ correctness: sk_min_f32, sk_clip_f32 ═══════ */
 
 static void test_min(void) {
     float a[SK_TEST_MAX_N], b[SK_TEST_MAX_N];
@@ -494,8 +451,8 @@ static void test_min(void) {
             check_bits_or_die("min_f32", n, t, out_simd, out_scalar, n);
         }
     }
-    /* dedicated signed-zero tie-break check (both orderings, across lanes --
-     * see the header-comment note: vminq_f32(-0,+0) != (a<b)?a:b). */
+    /* Signed-zero tie-break, both orderings across lanes:
+     * vminq_f32(-0, +0) differs from (a<b)?a:b. */
     {
         float az[8], bz[8], out_s[8], out_n[8];
         int k;
@@ -507,12 +464,10 @@ static void test_min(void) {
         sk_min_f32(out_n, az, bz, 8);
         check_bits_or_die("min_f32_signed_zero", 8, 0, out_n, out_s, 8);
     }
-    /* dedicated NaN check (F10): sk_min_f32's scalar ternary `(a<b)?a:b` and
-     * the NEON `vcltq_f32(a,b)`-then-select both use an ORDERED '<' compare,
-     * which is false whenever either operand is NaN -- so both paths fall
-     * through to "return b" for every NaN case below, not just the ones
-     * where b happens to be the smaller value. Covers NaN-in-a, NaN-in-b,
-     * NaN-in-both, and NaN-vs-negative, all bitwise scalar-vs-NEON. */
+    /* NaN: the scalar ternary `(a<b)?a:b` and the NEON vcltq_f32 select both
+     * use an ordered compare, false whenever either operand is NaN, so both
+     * return b. Covers NaN in a, in b, in both, and NaN against a negative,
+     * bit for bit. */
     {
         float a[4], b[4], out_s[4], out_n[4];
         float qnan = bits_to_float(0x7FC00000u);
@@ -544,7 +499,7 @@ static void test_clip(void) {
             check_bits_or_die("clip_f32", n, t, x_simd, x_scalar, n);
         }
     }
-    /* dedicated lo=0.0f boundary w/ -0.0f input (see header note). */
+    /* lo = 0.0f boundary with a -0.0f input. */
     {
         float x0_scalar[4] = { -0.0f, 0.0f, -0.0f, 0.0f };
         float x0_simd[4]   = { -0.0f, 0.0f, -0.0f, 0.0f };
@@ -552,13 +507,10 @@ static void test_clip(void) {
         sk_clip_f32(x0_simd, 0.0f, 1.0f, 4);
         check_bits_or_die("clip_f32_signed_zero", 4, 0, x0_simd, x0_scalar, 4);
     }
-    /* dedicated NaN check (F10): sk_clip_f32's scalar `if(x<lo)...else if
-     * (x>hi)...` and the NEON vcltq_f32/vcgtq_f32-then-select both use
-     * ORDERED compares, which are false for a NaN input either way -- so
-     * neither branch fires and the original (NaN) bit pattern passes
-     * through unmodified in both paths. Verifies that "leave unchanged"
-     * agreement bitwise, including a NaN sitting exactly at a `lo`/`hi`
-     * bound value. */
+    /* NaN: the scalar `if(x<lo)...else if(x>hi)` and the NEON vcltq_f32 /
+     * vcgtq_f32 selects use ordered compares, so neither branch fires and the
+     * NaN passes through unchanged in both. Checked bit for bit, including a
+     * NaN at a `lo` / `hi` bound value. */
     {
         float qnan = bits_to_float(0x7FC00000u);
         float qnan_neg = bits_to_float(0xFFC00000u);
@@ -572,7 +524,7 @@ static void test_clip(void) {
 }
 
 
-/* ═══════════════════════════ correctness: kernel 15 ══════════════════════ */
+/* ═══════════════════════════ correctness: sk_fast_sqrt_f32 ═══════════════ */
 
 static void test_fast_sqrt(void) {
     float x[SK_TEST_MAX_N], out_scalar[SK_TEST_MAX_N], out_simd[SK_TEST_MAX_N];
@@ -586,14 +538,12 @@ static void test_fast_sqrt(void) {
             check_bits_or_die("fast_sqrt_f32", n, t, out_simd, out_scalar, n);
         }
     }
-    /* dedicated NaN check (F10 fix): sk__fast_sqrt_elem's `!(v>0.0f)` guard
-     * and sk_fast_sqrt_f32's NEON `ispos = v>0` select both use an ORDERED
-     * '>' compare -- false for NaN -- so every NaN lane below must land on
-     * the 0.0f domain-edge branch in BOTH paths, matching fast_math.h's
-     * fast_sqrt() fix. Covers a quiet NaN, a negative-signed NaN, and a
-     * signaling-NaN-shaped bit pattern (exponent all-1s, nonzero mantissa,
-     * quiet bit clear) mixed with ordinary negative/positive/zero values so
-     * the NaN lanes sit next to non-NaN lanes within the same 4-wide vector. */
+    /* NaN: the `!(v>0.0f)` guard of sk__fast_sqrt_elem and the NEON
+     * `ispos = v>0` select use an ordered compare, false for NaN, so every
+     * NaN lane lands on the 0.0f edge in both paths, as in fast_math.h's
+     * fast_sqrt. Covers a quiet NaN, a NaN with the sign bit set and a
+     * signaling-NaN pattern, mixed with ordinary values so that NaN and
+     * non-NaN lanes share a 4-wide vector. */
     {
         float nan_in[8], out_s[8], out_n[8];
         int i;
@@ -608,16 +558,9 @@ static void test_fast_sqrt(void) {
         sk_fast_sqrt_f32_scalar(nan_in, out_s, 8);
         sk_fast_sqrt_f32(nan_in, out_n, 8);
         check_bits_or_die("fast_sqrt_f32_nan", 8, 0, out_n, out_s, 8);
-        /* Also assert the NaN lanes land on the documented value for the
-         * ACTIVE build mode, not just "scalar and NEON happen to agree on
-         * some other garbage". Pre-R07 this unconditionally expected 0.0f,
-         * which is only correct for the default fast-math path -- under
-         * USE_STANDARD_MATH, sk__fast_sqrt_elem/sk_fast_sqrt_f32 are bare
-         * sqrtf()/vsqrtq_f32 calls (see simd_kernels.h), so a NaN input
-         * propagates to a NaN output instead; the old hardcoded check would
-         * have exit(1)'d the very first time this file was ever built with
-         * -DUSE_STANDARD_MATH (verified: it does, on the pre-R07 code too --
-         * a latent gap, not a regression introduced here). */
+        /* The NaN lanes must also land on the documented value of the active
+         * build mode: 0.0f by default; under USE_STANDARD_MATH the kernels
+         * are bare sqrtf / vsqrtq_f32 calls and a NaN input gives NaN. */
         for (i = 0; i < 4; ++i) {
             g_total_checks++;
 #ifndef USE_STANDARD_MATH
@@ -687,16 +630,13 @@ static void test_fast_sqrt_accuracy(void) {
 }
 
 
-/* ═══════════════════ correctness: kernels 23-27 (exp/log family) ═════════
- * s4-audio-common-sweep review: fast_math.h's exp/log/exp1_approx family had
- * zero NEON coverage anywhere. Beyond the usual scalar-vs-NEON bit-exactness
- * check every kernel in this file gets, these five ALSO cross-check
- * sk_<name>_f32_scalar's per-element output against fast_math.h's ACTUAL
- * fast_exp/fast_exp_neg/fast_log/fast_log10/exp1_approx on the SAME inputs
- * (check_matches_fastmath below) -- simd_kernels.h deliberately does not
- * #include fast_math.h and instead replicates its algorithm verbatim as a
- * private helper (see that header's Style section), so this is the gate
- * that catches any transcription drift between the two copies. */
+/* ═══════════════════ correctness: exp/log family ═════════════════════════
+ * Besides the scalar-versus-NEON bit-exactness check every kernel gets, these
+ * five kernels are compared per element with fast_math.h's own fast_exp /
+ * fast_exp_neg / fast_log / fast_log10 / exp1_approx on the same inputs
+ * (check_matches_fastmath). simd_kernels.h replicates those algorithms
+ * instead of including fast_math.h, and this comparison catches any drift
+ * between the two copies. */
 
 static void check_matches_fastmath(const char *label, float (*ref_fn)(float),
                                     const float *x, const float *sk_out, int n) {
@@ -929,11 +869,11 @@ static void test_exp1_published_formula(void) {
     printf("PASS exp1_published_formula (Martin et al. 2004, Eq. 17)\n");
 }
 
-/* Dedicated domain-boundary/special-value sweep: every guard threshold these
- * five functions branch on (-16, 16, 0, 0.1, 1.0, FM_EPSILON=1e-10), plus
- * NaN/+-Inf, packed into 4-wide vectors so the boundary values sit at every
- * lane position (not just lane 0) across both the NEON body and the scalar
- * tail. Same three-way check (scalar==NEON, scalar==fast_math.h) as above. */
+/* Domain boundaries: every threshold these five functions branch on (-16,
+ * 16, 0, 0.1, 1.0, FM_EPSILON = 1e-10) plus NaN and +-Inf, packed into 4-wide
+ * vectors so that each boundary value sits at every lane position, in the
+ * NEON body and in the scalar tail. Same checks as above: scalar equals NEON
+ * and equals fast_math.h. */
 static void test_exp_log_boundaries(void) {
     float qnan = bits_to_float(0x7FC00000u);
     float qnan_neg = bits_to_float(0xFFC00000u);
@@ -986,24 +926,15 @@ static void test_exp_log_boundaries(void) {
 }
 
 
-/* ═══════ correctness: kernels 23/24/25/27 in-place (out==x) aliasing ═════
- * NR/c_impl's anr.c calculate_gain() and spp_estimator.c
- * spp_estimate()/spp_estimate_ex() chain sk_exp1_approx_f32/sk_fast_exp_f32/
- * sk_fast_log_f32 (calculate_gain) and sk_fast_exp_neg_f32 (spp_estimate)
- * back-to-back over the SAME scratch buffer (out==x) to cut per-call
- * scratch-array footprint (review-round buffer-reuse hardening) -- see the
- * "In-place (out==x) safety" paragraph in simd_kernels.h's kernels-23-27
- * section header for why this is safe (each 4-lane block is fully loaded
- * before it is stored, no cross-block state, same shape as
- * sk_capply_gain_f32's kernel-9 out==z contract). This is the dedicated
- * regression gate for that reliance: run each kernel with out==x on a copy
- * of the input and compare against the SAME kernel run with separate
- * (non-aliased) buffers, bit-for-bit -- if any of the four ever developed a
- * cross-lane dependency (e.g. a future edit added inter-block state), this
- * would catch it even though test_fast_exp() etc. above would not (those
- * always use non-overlapping buffers). sk_fast_log10_f32 (kernel 26) is
- * deliberately NOT exercised here -- no call site relies on out==x for it
- * (see simd_kernels.h's "no restrict" contract note). */
+/* ═══════ correctness: exp/log family in place (out == x) ═════════════════
+ * The NR gain and speech-presence code chain sk_exp1_approx_f32,
+ * sk_fast_exp_f32, sk_fast_log_f32 and sk_fast_exp_neg_f32 back to back over
+ * one scratch buffer (out == x). Each 4-lane block is loaded before it is
+ * stored and there is no cross-block state, so this is safe. The test runs
+ * each kernel with out == x on a copy of the input and compares it bit for
+ * bit with the same kernel on separate buffers; the non-aliased tests above
+ * would not notice a cross-lane dependency. sk_fast_log10_f32 is not
+ * covered: nothing relies on out == x for it. */
 
 static void test_exp_log_family_inplace(void) {
     float x[SK_TEST_MAX_N];
@@ -1040,12 +971,10 @@ static void test_exp_log_family_inplace(void) {
 }
 
 
-/* ═══════════════════════════ correctness: kernel 28 ══════════════════════
- * sk_mcra_noise_update_f32 -- no fast_math.h ground truth to cross-check
- * against (this mirrors an NR/c_impl call site, not a fast_math.h function),
- * so this is a plain scalar-vs-NEON bit-exactness check, same shape as
- * test_ema() (kernel 4) since it is structurally the same per-bin-varying-
- * alpha EMA shape. */
+/* ═══════════════════════════ correctness: sk_mcra_noise_update_f32 ════════
+ * There is no fast_math.h function to compare with, so this is a plain
+ * scalar-versus-NEON bit-exactness check, shaped like test_ema (an EMA with a
+ * per-bin alpha). */
 
 static void test_mcra_noise_update(void) {
     float npsd_init[SK_TEST_MAX_N], npsd_scalar[SK_TEST_MAX_N], npsd_simd[SK_TEST_MAX_N];
@@ -1065,10 +994,8 @@ static void test_mcra_noise_update(void) {
             check_bits_or_die("mcra_noise_update_f32", n, t, npsd_simd, npsd_scalar, n);
         }
     }
-    /* dedicated spp/bb_scale boundary sweep: spp in {0,1} (fully-noise vs
-     * fully-speech gating) and bb_scale in {0,1} (broadband-reset gate fully
-     * open vs disabled), the four corner combinations of the call site's own
-     * documented gating semantics. */
+    /* Boundary values: spp in {0, 1} (fully noise versus fully speech) and
+     * bb_scale in {0, 1} (broadband gate disabled versus fully open). */
     {
         float npsd_s[8], npsd_n[8], spp8[8], power8[8];
         int k;
@@ -1086,58 +1013,29 @@ static void test_mcra_noise_update(void) {
 
 
 /* ═══════════ alignment + canary edge-case matrix ═══════════════════════════
- * This edge-case matrix, layered on top of the per-kernel
- * correctness tests above:
+ * Layered on the per-kernel tests above:
  *
- *   - n=0: every test above already runs it (see the extended N_LIST). For
- *     n=0 specifically, "correct" means the kernel touches NOTHING (every
- *     loop here is a plain `for(i=0;i<n;...)`/`i+4<=n` guard, zero
- *     iterations when n==0) -- the canary buffers below turn that
- *     "touches nothing" claim into something actually checked, not just
- *     implied by code inspection.
- *   - n=1..17: also already covered by the same extended N_LIST (every
- *     kernel's 4-lane tail boundary, every possible remainder).
- *   - Unaligned float-element offsets 1..15: NOT covered above -- every
- *     existing test calls each kernel at the natural start of a plain
- *     array (offset 0). This section is new: every buffer lives in its own
- *     64-byte-aligned arena (posix_memalign), and each kernel is called at
- *     a deliberately +1..+15-FLOAT offset into it -- always 4-byte aligned
- *     (a float is always 4-byte aligned; a whole-float-element offset can
- *     never construct a misaligned float*, that would be UB and isn't what
- *     "unaligned" means for a NEON kernel test), but deliberately NOT
- *     16-byte (4-lane) or 64-byte aligned, so vld1q_f32/vst1q_f32 land on
- *     every possible sub-vector byte lane. Three forms, per the finding's
- *     ask: input-buffer offset only, output-buffer offset only, both
- *     buffers offset to DIFFERENT values (edge_offsets_for_form's "+7 mod
- *     15" derangement, never equal by construction -- see its own
- *     comment). For kernels with more than one read-only input array
- *     (cadd/min: a,b) or an extra scalar-per-bin array (capply_gain's g),
- *     only the first/primary array plays "input" for this matrix; the
- *     remaining array(s) stay at offset 0 -- a deliberate scope decision
- *     (the finding's own wording is binary: "input offset only, output
- *     offset only, both"), documented here rather than left implicit.
- *     sk_clip_f32 is a single in-place buffer (no separate output array),
- *     so its own test below sweeps just that one offset instead of the
- *     3-form matrix -- see test_clip_edge's comment.
- *   - Canary guard (the finding's own ask): every arena is entirely
- *     canary-filled (float bit pattern 0x7fc0dead) before each call, then
- *     the payload window is overwritten with real generated data (inputs)
- *     or left as canary (pure outputs, so the kernel's own write is what
- *     populates it). After the call, every element OUTSIDE the payload
- *     window must still read back as the untouched canary pattern, in
- *     EVERY arena the kernel touched (including read-only ones, as a
- *     defense-in-depth cross-check against unexpected aliasing writes).
- *     Because the window can be placed anywhere (offset 1..15) or be EMPTY
- *     (n==0), one check function catches an out-of-bounds write on either
- *     side of the payload, or literally any write at all when n==0,
- *     without a separate front/back special case.
+ *   - n = 0 (run by every test above) means the kernel touches nothing; the
+ *     canary buffers below check that. n = 1..17 covers every remainder of
+ *     the 4-lane tail.
+ *   - Offsets 1..15 floats: every buffer lives in its own 64-byte-aligned
+ *     arena (posix_memalign) and each kernel is called at a +1..+15 float
+ *     offset into it. Such pointers are always float-aligned but not 16-byte
+ *     aligned, so vld1q_f32 / vst1q_f32 hit every sub-vector position. Three
+ *     forms: input offset only, output offset only, and both offset to
+ *     different values (edge_offsets_for_form). For kernels with several
+ *     input arrays (cadd, min, capply_gain's g) only the primary array takes
+ *     the offset; the others stay at offset 0. sk_clip_f32 works in place on
+ *     one buffer, so test_clip_edge sweeps that one offset only.
+ *   - Canary guard: every arena is filled with the pattern 0x7fc0dead before
+ *     each call; the payload window then receives generated data (inputs) or
+ *     stays canary (outputs). Afterwards every element outside the payload
+ *     window of every arena the kernel could touch, read-only ones included,
+ *     must still hold the canary. One check catches an out-of-bounds write on
+ *     either side of the payload, and any write at all when n = 0.
  *
- * scalar-vs-NEON comparison is inherent to every check_bits_or_die call
- * below, same as the rest of this file -- this satisfies the review's
- * forced-scalar/forced-NEON comparison ask for this file's kernels (the
- * NE10 FFT kernel side of that same ask is covered by audio_common's
- * SIMD=0 switch, exercised via `make test_ne10_force_c`, not by
- * this file). */
+ * Scalar-versus-NEON agreement is checked by every check_bits_or_die call
+ * (the NE10 side is covered by `make test_ne10_force_c`). */
 
 #define EDGE_GUARD 32           /* guaranteed guard elements each side of the
                                  * payload window, regardless of offset/n */
@@ -1164,12 +1062,10 @@ static void edge_fill_canary_f(float *arena, int len) {
     for (i = 0; i < len; ++i) arena[i] = c;
 }
 
-/* Verifies every float in arena[0,len) OUTSIDE the payload window
- * [win_lo, win_lo+win_len) still holds the exact canary bit pattern -- an
- * empty window (win_len==0, i.e. n==0) means the ENTIRE arena must still be
- * canary, which is exactly the "n==0 performs zero reads/writes" contract
- * this section exists to check. exit(1) with a precise diagnostic on the
- * first violation, same house style as check_bits_or_die. */
+/* Every float of arena[0, len) outside the payload window
+ * [win_lo, win_lo + win_len) must still hold the canary bit pattern; an empty
+ * window (n = 0) means the whole arena. Calls exit(1) with a diagnostic on
+ * the first violation. */
 static void edge_check_canary_f(const char *label, const float *arena, int len,
                                  int win_lo, int win_len) {
     int i;
@@ -1190,16 +1086,9 @@ static void edge_check_canary_f(const char *label, const float *arena, int len,
     }
 }
 
-/* Complex-array counterparts: Complex is {float r; float i;} contiguous
- * (fft_wrapper.h), so a Complex arena's bytes are laid out exactly like a
- * float arena of twice the length -- but this iterates NATIVELY over each
- * Complex element's `.r`/`.i` struct-member lvalues instead of reinterpreting
- * the whole arena through a Complex*->float* pointer cast (which would repeat,
- * in a canary test of all places, the exact type-based-aliasing cast pattern
- * this same review removed from the real NEON kernels -- see
- * simd_kernels.h's sk__cquad_load/sk__cquad_store comment). len/win_lo/
- * win_len here are Complex-element counts throughout (no doubling: each
- * element contributes its own two field checks directly). */
+/* Complex-array counterparts. They visit each element's `.r` and `.i`
+ * members rather than casting the arena to float*, to avoid a strict-aliasing
+ * cast. len, win_lo and win_len are Complex element counts. */
 static void edge_fill_canary_c(Complex *arena, int len) {
     int i;
     float c = edge_canary_float();
@@ -1226,14 +1115,10 @@ static void edge_check_canary_c(const char *label, const Complex *arena, int len
     }
 }
 
-/* Derives the (input-role, output-role) element offsets for the matrix's
- * three forms. Form 2 ("both, different") uses `((o+7)%15)+1` rather than
- * the obvious mirror `16-o`: the mirror collides with o itself at the
- * midpoint (o==8 -> 16-8==8), silently degrading "both different" into
- * "both the same" for exactly one offset value. `(o+7)%15` is a fixed-
- * point-free derangement over {1..15} (o+7 == o (mod 15) requires
- * 7 == 0 (mod 15), which is false for every o), so out_off != in_off for
- * every o in 1..15 by construction, not by empirical luck. */
+/* The (input, output) element offsets of the three forms. Form 2 ("both,
+ * different") uses `((o+7)%15)+1`: unlike the mirror `16-o`, which equals o at
+ * o = 8, it differs from o for every o in 1..15, because o + 7 == o (mod 15)
+ * has no solution. */
 static void edge_offsets_for_form(int form, int o, int *in_off, int *out_off) {
     switch (form) {
     case 0: *in_off = o; *out_off = 0; break;                   /* input offset only */
@@ -1298,7 +1183,7 @@ static void test_capply_gain_edge(void) {
                 edge_fill_canary_c(out_simd_arena, EDGE_ARENA_LEN);
                 edge_fill_canary_f(g_arena, EDGE_ARENA_LEN);
                 fill_complex(z_arena + in_off, n);
-                fill_floats(g_arena, n); /* g stays at a fixed offset 0, see header note */
+                fill_floats(g_arena, n); /* g stays at offset 0 */
 
                 sk_capply_gain_f32_scalar(out_scalar_arena + out_off, z_arena + in_off, g_arena, n);
                 sk_capply_gain_f32(out_simd_arena + out_off, z_arena + in_off, g_arena, n);
@@ -1429,11 +1314,8 @@ static void test_clip_edge(void) {
     float *x_simd_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
     const float lo = -1.0f, hi = 1.0f;
     int ni, o;
-    /* sk_clip_f32 is a single in-place buffer (no separate input/output
-     * array), so the 3-form input/output split used by every other kernel
-     * in this section doesn't apply here -- there is exactly one buffer
-     * role to offset, tested directly at each of the 15 offsets (documented
-     * deviation, see this section's header comment). */
+    /* sk_clip_f32 works in place on one buffer, so there is no input /
+     * output split: that one buffer is tested at each of the 15 offsets. */
     for (ni = 0; ni < N_LIST_COUNT; ++ni) {
         int n = N_LIST[ni];
         for (o = 1; o <= EDGE_OFFSET_MAX; ++o) {
@@ -1456,21 +1338,17 @@ static void test_clip_edge(void) {
     printf("PASS clip_f32_edge (n=0..17+existing x offset 1..15, single in-place buffer, canary-guarded)\n");
 }
 
-/* kernel 29: sk_wola_accumulate_f32 (acc[i] += x[i]*w[i]).
+/* sk_wola_accumulate_f32 (acc[i] += x[i]*w[i]).
  *
- * Follows this file's edge convention (canary-guarded arenas, the 3-form
- * input/output offset matrix, N_LIST x TRIALS) rather than a private harness:
- * that is what gives the kernel misaligned-offset and out-of-bounds coverage,
- * and what feeds it gen_float()'s special pool (Inf / NaN / subnormals), which
- * a hand-written edge table cannot match.
+ * It follows the edge convention of this file (canary-guarded arenas, the
+ * three-form offset matrix, N_LIST x TRIALS), which gives it misaligned and
+ * out-of-bounds coverage and feeds it the special-value pool of gen_float().
  *
- * The accumulate is IN-PLACE on acc, so the two paths are given independent
- * copies of the same starting accumulator -- comparing them otherwise would be
- * meaningless. acc doubles as an input and an output arena, so its canary is
- * checked against the OUTPUT offset. */
-/* int16 counterparts of the float canary helpers above -- kernel 30 is the
- * only kernel whose destination is not float, so these live next to its test
- * rather than with the float pair. */
+ * The accumulate is in place on acc, so the two paths get independent copies
+ * of the same starting accumulator. acc is both input and output, so its
+ * canary is checked against the output offset. */
+/* int16 counterparts of the float canary helpers: sk_clip_scale_to_s16 is the
+ * only kernel whose destination is not float. */
 #define EDGE_CANARY_S16 ((int16_t)0x5A5A)
 
 static void edge_fill_canary_s16(int16_t *arena, int len) {
@@ -1494,13 +1372,12 @@ static void edge_check_canary_s16(const char *label, const int16_t *arena,
     }
 }
 
-/* Input distribution for kernel 30. gen_float() alone is not enough: it draws
- * arbitrary bit patterns, so almost every sample is far outside [-1, 1] and
- * the test would only ever exercise the two clip branches. The extra cases
- * put samples INSIDE the range at fine granularity, which is where the
- * float->int conversion's rounding mode is observable at all -- swapping
- * vcvtq_s32_f32 (truncate) for vcvtnq_s32_f32 (round to nearest) moves roughly
- * half of them by one LSB, and nothing else in this test would notice. */
+/* Input distribution for sk_clip_scale_to_s16. gen_float() alone draws
+ * arbitrary bit patterns, almost all far outside [-1, 1], so it would only
+ * exercise the clip branches. The extra cases put samples inside the range at
+ * fine granularity, where the rounding mode of the float -> int conversion is
+ * observable: vcvtnq_s32_f32 (round to nearest) instead of vcvtq_s32_f32
+ * (truncate) moves about half of them by one LSB. */
 static float gen_pcm_float(void) {
     switch (lcg_next() % 6u) {
         case 0: return gen_float();               /* clip branches, inf, denormals */
@@ -1731,9 +1608,9 @@ static void test_fast_sqrt_edge(void) {
 }
 
 /* ═══════════════════════════════ microbench ═══════════════════════════════
- * n=257, ~200k reps, CLOCK_MONOTONIC. `g_bench_sink` (volatile) forces the
- * compiler to keep each call's result live, so the timing loop can't be
- * hoisted/eliminated as dead/invariant code. */
+ * n = 257, about 200k repetitions, CLOCK_MONOTONIC. The volatile
+ * `g_bench_sink` keeps each call's result live so the compiler cannot remove
+ * the timing loop. */
 
 static volatile double g_bench_sink = 0.0;
 

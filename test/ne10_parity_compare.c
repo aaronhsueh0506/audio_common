@@ -1,19 +1,14 @@
 /*
- * ne10_parity_compare.c - F11: NEON-vs-C dump comparison tool.
+ * ne10_parity_compare.c - NEON-vs-C dump comparison tool.
  *
- * Standalone (no fft_wrapper/NE10 dependency at all -- just libc) so it
- * builds with a single plain `cc` invocation regardless of BACKEND. Reads
- * the two raw float32 dump files produced by two separate builds of
- * test_ne10_c_parity.c (one linked against the normal NE10 `_neon` kernels,
- * one against SIMD=0's `_c` kernels) and reports the max
- * absolute and max relative difference between them.
+ * Standalone (libc only). Reads the two raw float32 dump files written by two
+ * builds of test_ne10_c_parity.c (one linked against the NE10 `_neon`
+ * kernels, one against the SIMD=0 `_c` kernels) and reports the maximum
+ * absolute and relative difference between them.
  *
- * The two dumps are NOT expected to be bit-identical -- the `_neon` and `_c`
- * kernels compute the same mathematical FFT via different instruction
- * sequences (NEON butterfly intrinsics vs. plain scalar C), so floating-
- * point rounding accumulates differently across the O(nfft log nfft)
- * butterfly stages. This tool's job is to quantify that drift, not to
- * demand zero drift.
+ * The dumps are not expected to be bit-identical: the two kernel sets
+ * compute the same FFT with different instruction sequences, so rounding
+ * accumulates differently. The tool bounds that drift.
  *
  * Usage: ne10_parity_compare <neon_dump> <c_dump>
  * Exit status: 0 if max relative diff <= NE10_PARITY_REL_TOL, else 1.
@@ -22,15 +17,11 @@
 #include <stdlib.h>
 #include <math.h>
 
-/* Empirically, NEON-vs-C drift for these nfft sizes (256/512/1024, impulse +
- * a full-scale deterministic-random signal) lands many orders of magnitude
- * below this -- see the F11 report for the measured numbers. This tolerance
- * is intentionally generous (not a tight bound tuned to today's measurement)
- * so the test doesn't become flaky if NE10's internal butterfly ordering
- * changes slightly across a future vendor update; it exists to catch a
- * REAL divergence (wrong kernel called, corrupted twiddle table, a layout
- * bug the F11 static_asserts didn't catch, etc.), not to police ULP-level
- * float noise. */
+/* The NEON-vs-C drift for nfft 256/512/1024 (impulse and a full-scale
+ * deterministic random signal) is orders of magnitude below these
+ * tolerances. They are generous on purpose: they catch a real divergence
+ * (wrong kernel, corrupted twiddle table, layout error), not ulp-level
+ * rounding. */
 #define NE10_PARITY_REL_TOL 1e-4
 #define NE10_PARITY_ABS_TOL 1e-4
 

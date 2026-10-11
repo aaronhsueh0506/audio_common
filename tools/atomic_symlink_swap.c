@@ -6,40 +6,28 @@
  *   swapln <link-target> <link-path>
  *
  * Creates the symlink <link-path>.<pid>.tmp -> <link-target>, then rename(2)s
- * it onto <link-path>. rename(2) NEVER follows symbolic links in either
- * argument (POSIX; verified semantics on both macOS and GNU/Linux), so this
- * atomically replaces an existing <link-path> symlink in one syscall -- no
- * observable window where <link-path> is missing, and no possibility of the
- * temp link being moved INTO the directory the old symlink points at (the
- * userland `mv` failure mode this helper replaces: mv stat()s -- i.e.
- * FOLLOWS -- a symlink-to-directory destination and appends the source's
- * basename to it; GNU mv only avoids that with -T, which BSD/macOS mv does
- * not have, and the previous rm+mv fallback left a window with no `current`
- * at all and went destructive on ANY mv failure).
+ * it onto <link-path>. rename(2) does not follow symbolic links in either
+ * argument, so an existing <link-path> symlink is replaced in one syscall:
+ * <link-path> is never missing, and the temp link is never moved into the
+ * directory the old symlink points at (which `mv` does when the destination
+ * is a symlink to a directory).
  *
- * Mode 2 (one-event-one-file ATTEST install):
+ * Mode 2 (one-event-one-file attestation install):
  *
  *   swapln --excl-install <src-file> <dst-path>
  *
- * Copies <src-file>'s full content to <dst-path>.<pid>.tmp, then link(2)s the
- * temp onto <dst-path>. link(2) fails with EEXIST if <dst-path> already
- * exists (atomic no-clobber -- the kernel-level equivalent of
- * open(O_CREAT|O_EXCL), but installing complete content in one step so the
- * final name is only ever observable with its full bytes, never partially
- * written). Exit status: 0 on success, 2 if <dst-path> already exists (the
- * caller regenerates its event id and retries -- it must NEVER overwrite),
- * 1 on any other failure. The temp is unlinked on every path.
+ * Copies <src-file> to <dst-path>.<pid>.tmp, then link(2)s the temp onto
+ * <dst-path>. link(2) fails with EEXIST if <dst-path> exists, so an existing
+ * file is never overwritten and the final name only ever appears with its
+ * full content. Exit status: 0 on success, 2 if <dst-path> already exists
+ * (the caller picks a new name and retries), 1 on any other failure. The temp
+ * is unlinked on every path.
  *
- * No fsync: consistent with every other install in this build system
- * (MANIFEST, config.manifest, archives -- all temp+atomic-rename without
- * fsync). Durability across power loss was never part of the contract;
- * atomicity against concurrent readers/writers is.
+ * Neither mode calls fsync: the guarantee is atomicity against concurrent
+ * readers and writers, not durability across power loss.
  *
- * Both modes embed the PID in the temp name (no fixed-name collision between
- * concurrent callers). Compiled at publish time with the HOST compiler
- * (HOSTCC, default `cc`) -- never $(CC), which may be a cross compiler whose
- * output cannot run on the build host. See each repo's Makefile `publish`
- * recipe.
+ * The PID in the temp name keeps concurrent callers apart. Build with the
+ * host compiler, not a cross compiler.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,10 +36,8 @@
 #include <fcntl.h>
 #include <errno.h>
 
-/* Builds "<path>.<pid>.tmp" into buf and clears any stale same-PID temp (it
- * can only be our own, from a previous failed run of this exact path in this
- * exact process id -- safe to clear). Shared by both modes so the temp-naming
- * scheme cannot drift between them. */
+/* Builds "<path>.<pid>.tmp" into buf and removes a leftover temp of the same
+ * name (it can only be this process's own). */
 static int make_tmp_path(char* buf, size_t bufsz, const char* path) {
     int n = snprintf(buf, bufsz, "%s.%ld.tmp", path, (long)getpid());
     if (n < 0 || (size_t)n >= bufsz) {

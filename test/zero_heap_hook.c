@@ -1,47 +1,27 @@
 /*
- * zero_heap_hook.c - allocator call-counting hook for test_fft_zero_heap.c
- * (review F02/F08 acceptance test support).
+ * zero_heap_hook.c - allocator call-counting hook for test_fft_zero_heap.c.
  *
- * Counts every process-wide call to malloc/calloc/realloc/free so the test
- * can prove a zero-CALL window around fft_init()..fft_destroy() (not merely
- * a zero-net-bytes one, which would miss a paired alloc+free that still
- * shouldn't have happened).
+ * Counts every process-wide call to malloc / calloc / realloc / free, so the
+ * test can show there is no allocator call at all around fft_init() ..
+ * fft_destroy() (a paired alloc and free would also count).
  *
- * Mechanism -- chosen at compile time, and BOTH verified empirically against
- * this repo's actual toolchain before being trusted (see
- * test_hook_actually_counts() in test_fft_zero_heap.c):
+ * Mechanism, chosen at compile time (test_hook_actually_counts() in
+ * test_fft_zero_heap.c checks that the hook fires):
  *
- *   - macOS: dyld's `__DATA,__interpose` static-interposing-tuple section.
- *     IMPORTANT, discovered while building this test: an `__interpose`
- *     section only takes effect when it lives in a *separate Mach-O image*
- *     from the code whose calls you want to intercept -- dyld's interpose
- *     pass explicitly skips the main executable's own image. An
- *     `__interpose` section embedded directly in the test's main executable
- *     was empirically confirmed (on this host, Xcode 17 / Apple clang
- *     17.0.0, macOS 25.5) to NOT fire -- the hook function was never called.
- *     Building the exact same tuples into a small dependent `.dylib`
- *     (`libzero_heap_hook.dylib`, linked normally, no DYLD_INSERT_LIBRARIES
- *     needed) DOES fire, and intercepts calls made from every other
- *     statically-linked object in the process -- including calls from deep
- *     inside the vendored NE10 code, which is exactly what this test needs.
- *     So on macOS the Makefile builds *this file* as a small dylib, and
- *     test_fft_zero_heap links against it.
+ *   - macOS: dyld's `__DATA,__interpose` section. dyld skips the main
+ *     executable's own image, so the tuples must live in a separate image:
+ *     the Makefile builds this file as a small dylib that the test links
+ *     against. It then intercepts the calls of every other object in the
+ *     process, including the vendored NE10 code. The linker moves the
+ *     section into `__DATA_CONST`; dyld matches it by section name, so that
+ *     is harmless.
  *
- *     A second wrinkle: the linker relocates the `__interpose` section into
- *     the `__DATA_CONST` segment regardless of the `__DATA,__interpose`
- *     section spec (`-Wl,-no_data_const` does not change this). That
- *     turned out to be harmless -- dyld's interpose scan matches on section
- *     name, not the segment it landed in -- so no special link flag is
- *     needed for this part.
+ *   - Linux: GNU ld `--wrap=<symbol>`. It works from a plain object linked
+ *     into the test binary; the Makefile passes
+ *     -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free for the
+ *     test_zero_heap target only.
  *
- *   - Linux: GNU ld's `--wrap=<symbol>` link-time renaming. Unlike the macOS
- *     mechanism this works from a plain object file linked directly into the
- *     test binary (no separate shared object needed) -- the Makefile passes
- *     -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free only for
- *     the test_zero_heap target.
- *
- * This file is intentionally NOT built into libaudio_common.a -- it exists
- * only to support test_fft_zero_heap.c.
+ * This file is not part of libaudio_common.a.
  */
 #include "zero_heap_hook.h"
 
@@ -76,9 +56,8 @@ int zh_counters_all_zero(void) {
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
 
-/* Forward to malloc_zone_* on the default zone -- a DIFFERENT symbol than
- * malloc/calloc/realloc/free, so this call is not itself re-intercepted
- * (the classic interpose self-recursion trap). */
+/* Forward to malloc_zone_* on the default zone: a different symbol from
+ * malloc / free, so the hook does not intercept itself. */
 static void* hook_malloc(size_t size) {
     g_malloc_count++;
     return malloc_zone_malloc(malloc_default_zone(), size);

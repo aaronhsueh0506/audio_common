@@ -1,33 +1,19 @@
 /*
- * test_fft_zero_heap.c - allocator-hook acceptance test for the static-memory
- * FFT path (review F02/F08).
+ * test_fft_zero_heap.c - allocator-hook test for the static-memory paths.
  *
- * F02: the NE10 backend's static-memory path (fft_get_mem_size/fft_init) must
- * make ZERO malloc/calloc/realloc/free calls between fft_init() and
- * fft_destroy() -- not even NE10's own internal twiddle-config allocation
- * (see lib/ne10/VENDORED.md patch P0001, NE10_rfft_float32.c). KISS
- * (fft_wrapper.c) was already fully pool-carved, so this test is expected to
- * trivially pass there too -- it's backend-agnostic, like roundtrip.c /
- * test_pool_contract.c.
+ *   - fft_get_mem_size / fft_init / fft_destroy make no malloc, calloc,
+ *     realloc or free call, including inside the vendored NE10 code
+ *     (lib/ne10/VENDORED.md).
+ *   - fft_destroy on a pool-owned handle is a no-op however often it is
+ *     called.
+ *   - the audio_stft.h objects never touch the allocator.
  *
- * F08: fft_destroy() on an fft_init() (pool-owned) handle must be a true,
- * unconditionally idempotent no-op -- calling it any number of times must
- * never double-release anything.
+ * The hook (zero_heap_hook.c) is described there; this file only uses its
+ * zh_* counter API. The test is backend-agnostic: it exercises whichever FFT
+ * backend is linked.
  *
- * The allocator-hook mechanism itself (dyld __DATA,__interpose on macOS /
- * GNU ld --wrap on Linux) lives in zero_heap_hook.c, NOT in this file --
- * on macOS it has to be built into a separate .dylib to take effect at all
- * (see that file's header comment for why, and what was empirically ruled
- * out getting here). This file only consumes the zh_* counter API and is
- * backend-agnostic, like roundtrip.c / test_pool_contract.c: whichever FFT
- * backend (kiss or ne10) the Makefile links in, fft_wrapper.h's public API
- * is the same, so this test exercises whichever one was built. KISS
- * (fft_wrapper.c) was already fully pool-carved, so this test is expected to
- * trivially pass there too.
- *
- * test_hook_actually_counts() below proves the hook mechanism actually fires
- * (a deliberate malloc()/calloc()/realloc()/free() call must be observed)
- * before any of the zero-heap assertions get to lean on it.
+ * test_hook_actually_counts() first shows that a deliberate allocator call is
+ * observed, so the zero-call assertions rest on a working hook.
  */
 #include "audio_stft.h"
 #include "fft_wrapper.h"
@@ -152,9 +138,8 @@ static void test_zero_heap_init_to_destroy(void) {
     free(pool);
 }
 
-/* F08: fft_destroy() on a pool-owned handle must be idempotent -- calling it
- * repeatedly must never touch the allocator (it has nothing left to
- * release). */
+/* fft_destroy on a pool-owned handle is idempotent and never touches the
+ * allocator. */
 static void test_destroy_idempotent(void) {
     size_t sz = fft_get_mem_size(ZH_FFT_SIZE);
     if (sz == 0) { CHECK(0, "fft_get_mem_size(512) must be > 0"); return; }

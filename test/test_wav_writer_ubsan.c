@@ -1,20 +1,14 @@
 /*
  * test_wav_writer_ubsan.c - UBSan probe for the WAV writer bounds contract.
  *
- * Pre-fix, the AEC-style PCM16 quantizer in wav_write_float cast
- * `scaled +- 0.5f` straight to int16_t; for sample==+1.0f that's
- * (int16_t)32768.5f, an out-of-range float-to-integer conversion --
- * undefined behavior per C99 6.3.1.4p1. This tiny standalone TU writes
- * {1.0f, -1.0f, NAN} through wav_write_float in the default (AEC-style)
- * PCM16 mode and must run clean under -fsanitize=undefined
- * -fno-sanitize-recover=all (the Makefile's `test-wav-ubsan` target wires
- * those flags). Pre-fix, this reproducibly aborted with UBSan's
- * "outside the range of representable values" diagnostic on the +1.0f
- * sample; post-fix (int32_t round-then-saturate, and NaN sanitized to
- * 0.0f before conversion) it must complete and print PASS.
+ * Writes {1.0f, -1.0f, NAN} through wav_write_float in the default (AEC
+ * style) PCM16 mode and must run clean under -fsanitize=undefined
+ * -fno-sanitize-recover=all (the `test-wav-ubsan` target sets the flags).
+ * Converting 1.0f * 32768 + 0.5 directly to int16_t would be an out-of-range
+ * float-to-integer conversion (C99 6.3.1.4p1); the writer rounds into an
+ * int32_t and saturates, and replaces NaN by 0.0f first.
  *
- * Standalone by design (header-only, no archive link needed), same shape
- * as test_wav_io.c.
+ * Standalone and header-only, like test_wav_io.c.
  */
 #include "wav_io.h"
 
@@ -41,9 +35,7 @@ int main(void) {
         return 1;
     }
 
-    // The historically-UB call: pre-fix, sample==1.0f drove
-    // (int16_t)32768.5f inside this call, which UBSan flagged and
-    // -fno-sanitize-recover=all turned into an abort.
+    // 1.0f exercises the saturate, NAN the sanitize.
     wav_write_float(w, samples, 3);
     wav_close_write(w);
 
