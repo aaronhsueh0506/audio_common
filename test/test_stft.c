@@ -9,6 +9,11 @@
  *   family B  normalised-spectrum NN stages (spec_scale / ispec_scale): compared and
  *      printed as "B|" lines; the checks allow only a sign-of-zero difference
  *      in the synthesis output.
+ *   windows  ac_window_build against every window formula of the callers at
+ *      every power of two in [16, 8192].
+ *   scaled entry points   with non-unit spec_scale / ispec_scale the
+ *      interleaved (Complex) and the split calls give the same bits, and both
+ *      equal the unscaled transform times the scale.
  *
  * Built twice (TEST_N = 512 and 1024) because the C copy is sized by a macro.
  * SIMD=0 / SIMD=1 and the FFT backend come from the build; results are only
@@ -223,10 +228,24 @@ static void diff_merge(Diff* a, const Diff* b) {
 
 /* ----------------------------- windows ----------------------------- */
 
+/* The ULCNet window formula with a run-time size. The copy in ref_c.inc is
+ * sized by ULCNET_N_FFT at compile time and is compared at that size only. */
+static void ref_ulcnet_window_n(float* w, int n) {
+    int i;
+    for (i = 0; i < n; ++i)
+        w[i] = sqrtf(0.5f - 0.5f * cosf(2.0f * (float)M_PI * (float)i / (float)n));
+}
+
+/* ac_window_build against every window formula of the callers at every
+ * power of two in [16, 8192]. Pipeline-style formulas (mono, 4ch, pbfdkf):
+ * byte compare. Reference formulas of the NN stages (dfn2, gtcrn, bridge,
+ * ulcnet): bit-difference statistics. Each formula covers sum(N) elements. */
 static void test_windows(void) {
-    int n;
-    Diff wb_all;
+    int n, nsizes = 0;
+    unsigned long long per_formula = 0, a_side = 0;
+    Diff wb_all, d_fixed;
     memset(&wb_all, 0, sizeof(wb_all));
+    d_fixed = wb_all;
     for (n = 16; n <= 8192; n *= 2) {
         float* w   = (float*)pool_alloc((size_t)n * sizeof(float));
         float* ra  = (float*)pool_alloc((size_t)n * sizeof(float));
@@ -235,6 +254,7 @@ static void test_windows(void) {
         float* rd  = (float*)pool_alloc((size_t)n * sizeof(float));
         float* re  = (float*)pool_alloc((size_t)n * sizeof(float));
         float* rf  = (float*)pool_alloc((size_t)n * sizeof(float));
+        float* ru  = (float*)pool_alloc((size_t)n * sizeof(float));
         Diff d_dfn2, d_gtcrn, d_bridge, d_ulcnet;
         int i;
         memset(&d_dfn2, 0, sizeof(Diff)); d_gtcrn = d_bridge = d_ulcnet = d_dfn2;
@@ -243,38 +263,50 @@ static void test_windows(void) {
         ref_4ch_window(rb, n);
         ref_pbfdkf_window(rc, n);
         expect(same_bytes(w, ra, (size_t)n, "window vs mono pipeline"), "window vs mono pipeline");
-        same_bytes(w, rb, (size_t)n, "window vs 4ch pipeline");
-        same_bytes(w, rc, (size_t)n, "window vs pbfdkf");
+        expect(same_bytes(w, rb, (size_t)n, "window vs 4ch pipeline"), "window vs 4ch pipeline");
+        expect(same_bytes(w, rc, (size_t)n, "window vs pbfdkf"), "window vs pbfdkf");
+        a_side += 3ull * (unsigned long long)n;
         dfn2_ref_make_root_hann(rd, n);
         gtcrn_ref_make_root_hann(re, n);
         make_root_hann(rf, n);
+        ref_ulcnet_window_n(ru, n);
+#ifdef MUTATE_REF_ULCNET_WINDOW
+        if (n == 64) ru[5] = nextafterf(ru[5], 2.0f);
+#endif
         for (i = 0; i < n; ++i) {
             diff_add(&d_dfn2, w[i], rd[i]);
             diff_add(&d_gtcrn, w[i], re[i]);
             diff_add(&d_bridge, w[i], rf[i]);
+            diff_add(&d_ulcnet, w[i], ru[i]);
         }
+        per_formula += (unsigned long long)n;
+        nsizes++;
         if (n == TEST_N) {
-            float* ru = (float*)pool_alloc((size_t)n * sizeof(float));
-            ulcnet_make_window(ru);
-            for (i = 0; i < n; ++i) diff_add(&d_ulcnet, w[i], ru[i]);
-            free(ru);
+            float* rt = (float*)pool_alloc((size_t)n * sizeof(float));
+            ulcnet_make_window(rt);
+            for (i = 0; i < n; ++i) diff_add(&d_fixed, w[i], rt[i]);
+            free(rt);
         }
         {
             char label[64];
             snprintf(label, sizeof(label), "window N=%d A-vs-dfn2", n);   diff_print(label, &d_dfn2);
             snprintf(label, sizeof(label), "window N=%d A-vs-gtcrn", n);  diff_print(label, &d_gtcrn);
             snprintf(label, sizeof(label), "window N=%d A-vs-bridge", n); diff_print(label, &d_bridge);
-            if (n == TEST_N) {
-                snprintf(label, sizeof(label), "window N=%d A-vs-ulcnet", n);
-                diff_print(label, &d_ulcnet);
-            }
+            snprintf(label, sizeof(label), "window N=%d A-vs-ulcnet", n); diff_print(label, &d_ulcnet);
         }
         diff_merge(&wb_all, &d_dfn2); diff_merge(&wb_all, &d_gtcrn);
         diff_merge(&wb_all, &d_bridge); diff_merge(&wb_all, &d_ulcnet);
-        free(w); free(ra); free(rb); free(rc); free(rd); free(re); free(rf);
+        free(w); free(ra); free(rb); free(rc); free(rd); free(re); free(rf); free(ru);
     }
     diff_print("window all N A-vs-B/C builders", &wb_all);
+    diff_print("window ulcnet fixed-size copy", &d_fixed);
+    printf("WIN| sizes=%d elements_per_formula=%llu pipeline_formulas=3 (%llu elements) nn_formulas=4 (%llu elements)\n",
+           nsizes, per_formula, a_side, (unsigned long long)wb_all.n);
+    expect(wb_all.n == 4ull * per_formula && a_side == 3ull * per_formula,
+           "every window formula is compared at every power-of-two size");
+    expect(d_fixed.n == (unsigned long long)TEST_N, "the fixed-size ulcnet copy is compared at TEST_N");
     expect(wb_all.bit_diff == 0, "A and B window builders agree bit for bit for every power-of-two N");
+    expect(d_fixed.bit_diff == 0, "the fixed-size ulcnet window agrees bit for bit");
 #ifdef MUTATE_REF_WINDOW
     {
         float w[64], r[64];
@@ -605,9 +637,15 @@ static int run_identity(int n, int center, AcOlaMode ola, float* x, float* y, in
     return ac_stft_latency_samples(&cfg);
 }
 
+/* Identity chain: the impulse delay equals ac_stft_latency_samples, and the
+ * reconstruction error of random input stays below IDENTITY_MAX_ERR. The
+ * error depends on N and on the FFT backend; the input is seeded here so
+ * that it does not depend on TEST_N. */
+#define IDENTITY_MAX_ERR 1e-6
 static void test_latency(void) {
-    static const int sizes[] = { 64, 512, 1024 };
+    static const int sizes[] = { 64, 256, 512, 1024 };
     size_t si;
+    g_rng = 0x2545F4914F6CDD1Dull;
     for (si = 0; si < sizeof(sizes) / sizeof(sizes[0]); ++si) {
         const int n = sizes[si], hop = n / 2, hops = 24;
         float* x = (float*)pool_alloc((size_t)hops * hop * 4);
@@ -633,7 +671,7 @@ static void test_latency(void) {
                 if (e > err) err = e;
             }
             printf("LAT| N=%d center=%d identity max_abs_error=%.3g\n", n, center, err);
-            expect(err < 1e-5, "analysis -> synthesis identity reconstructs the delayed input");
+            expect(err < IDENTITY_MAX_ERR, "analysis -> synthesis identity reconstructs the delayed input");
         }
         free(x); free(y);
     }
@@ -717,6 +755,182 @@ static void test_api_contract(void) {
         }
         free(ka); free(kb); free(ks); free(ku);
     }
+}
+
+/* ------------------- interleaved and planar entry points ------------------- */
+
+static void hash_add(const void* p, size_t bytes) {
+    const unsigned char* b = (const unsigned char*)p;
+    size_t i;
+    for (i = 0; i < bytes; ++i) g_hash = (g_hash ^ b[i]) * 1099511628211ull;
+}
+
+/* Bit comparison of an interleaved spectrum with a split one. */
+static int same_complex_planar(const Complex* c, const float* re, const float* im,
+                               int n, const char* what) {
+    int k;
+    hash_add(re, (size_t)n * sizeof(float));
+    hash_add(im, (size_t)n * sizeof(float));
+    for (k = 0; k < n; ++k) {
+        if (memcmp(&c[k].r, &re[k], sizeof(float)) != 0 ||
+            memcmp(&c[k].i, &im[k], sizeof(float)) != 0) {
+            fail(what, k);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Kinds without NaN / Inf: a non-unit scale multiplies, and NaN payloads are
+ * outside the bit-exact contract of the NEON and scalar multiplies. */
+static const int k_finite_kinds[] = { KIND_UNIFORM, KIND_RANGE, KIND_SIGNED_ZERO, KIND_SPARSE,
+                                      KIND_DENORM, KIND_DC, KIND_ALT, KIND_SILENCE, KIND_NEGZERO };
+#define N_FINITE_KINDS ((int)(sizeof(k_finite_kinds) / sizeof(k_finite_kinds[0])))
+
+/* With non-unit spec_scale / ispec_scale the interleaved (Complex) and the
+ * split entry points must give the same bits, and both must equal the
+ * unscaled transform multiplied by the scale. Scales: DFN2-like 1/sqrt(N) and
+ * sqrt(N), the same at N = 512, and values that are not powers of two. */
+static void test_scaled_entry_points(void) {
+    typedef struct { int n; float spec_scale, ispec_scale; } ScaleCase;
+    const ScaleCase cases[] = {
+        { 1024, 1.0f / sqrtf(1024.0f), sqrtf(1024.0f) },
+        { 512,  1.0f / sqrtf(512.0f),  sqrtf(512.0f)  },
+        { 256,  0.3f,  3.1f  },
+        { 64,   2.0f,  0.5f  },
+        { 16,  -0.7f,  1.9f  },
+    };
+    size_t ci;
+    int checked = 0;
+    for (ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+        const int n = cases[ci].n, hop = n / 2, nf = n / 2 + 1;
+        int center, ola;
+        for (center = 0; center <= 1; ++center) for (ola = 0; ola <= 1; ++ola) {
+            AcStftConfig cs, cu;
+            AcStft *ai, *ap, *au;
+            AcIstft *si, *sp, *su;
+            void *k1, *k2, *k3, *k4, *k5, *k6;
+            Complex *spi = (Complex*)pool_alloc((size_t)2 * nf * sizeof(Complex));
+            Complex *spu = (Complex*)pool_alloc((size_t)2 * nf * sizeof(Complex));
+            Complex *scaled = (Complex*)pool_alloc((size_t)nf * sizeof(Complex));
+            Complex *orig = (Complex*)pool_alloc((size_t)nf * sizeof(Complex));
+            float *re = (float*)pool_alloc((size_t)2 * nf * sizeof(float));
+            float *im = (float*)pool_alloc((size_t)2 * nf * sizeof(float));
+            float *in = (float*)pool_alloc((size_t)n * sizeof(float));
+            float *oi = (float*)pool_alloc((size_t)hop * sizeof(float));
+            float *op = (float*)pool_alloc((size_t)hop * sizeof(float));
+            float *ou = (float*)pool_alloc((size_t)hop * sizeof(float));
+            char what[128];
+            int t, f, ni, np, nu;
+            ac_stft_config_default(&cs, n);
+            cs.center = center;
+            cs.ola = ola ? AC_OLA_ENV_NORM : AC_OLA_ACCUMULATE;
+            cs.spec_scale = cases[ci].spec_scale;
+            cs.ispec_scale = cases[ci].ispec_scale;
+            cu = cs; cu.spec_scale = 1.0f; cu.ispec_scale = 1.0f;
+            ai = make_stft(&cs, &k1); ap = make_stft(&cs, &k2); au = make_stft(&cu, &k3);
+            si = make_istft(&cs, &k4); sp = make_istft(&cs, &k5); su = make_istft(&cu, &k6);
+            if (!ai || !ap || !au || !si || !sp || !su) return;
+
+            for (t = 0; t < 24; ++t) {
+                const int kind = k_finite_kinds[t % N_FINITE_KINDS];
+                /* analysis: push */
+                gen_block(in, hop, kind);
+                ni = ac_stft_push(ai, in, spi);
+                np = ac_stft_push_planar(ap, in, re, im);
+                nu = ac_stft_push(au, in, spu);
+                snprintf(what, sizeof(what), "scaled N=%d center=%d push frame count", n, center);
+                expect(ni == np && ni == nu, what);
+                for (f = 0; f < ni && ni == np && ni == nu; ++f) {
+                    int k;
+                    snprintf(what, sizeof(what), "scaled N=%d center=%d push interleaved vs planar t=%d", n, center, t);
+                    same_complex_planar(spi + f * nf, re + f * nf, im + f * nf, nf, what);
+                    for (k = 0; k < nf; ++k) {
+                        scaled[k].r = spu[f * nf + k].r * cases[ci].spec_scale;
+                        scaled[k].i = spu[f * nf + k].i * cases[ci].spec_scale;
+                    }
+                    snprintf(what, sizeof(what), "scaled N=%d center=%d push vs unscaled * scale t=%d", n, center, t);
+                    same_bytes(spi + f * nf, scaled, (size_t)nf * 2, what);
+                    checked++;
+                }
+                /* analysis: stateless frame of n samples */
+                gen_block(in, n, kind);
+                ac_stft_frame(ai, in, spi);
+                ac_stft_frame_planar(ap, in, re, im);
+                ac_stft_frame(au, in, spu);
+                snprintf(what, sizeof(what), "scaled N=%d frame interleaved vs planar t=%d", n, t);
+                same_complex_planar(spi, re, im, nf, what);
+                {
+                    int k;
+                    for (k = 0; k < nf; ++k) {
+                        scaled[k].r = spu[k].r * cases[ci].spec_scale;
+                        scaled[k].i = spu[k].i * cases[ci].spec_scale;
+                    }
+                }
+                snprintf(what, sizeof(what), "scaled N=%d frame vs unscaled * scale t=%d", n, t);
+                same_bytes(spi, scaled, (size_t)nf * 2, what);
+                checked++;
+
+                /* synthesis */
+                gen_spec(orig, nf, kind);
+                memcpy(spi, orig, (size_t)nf * sizeof(Complex));
+                for (f = 0; f < nf; ++f) { re[f] = orig[f].r; im[f] = orig[f].i; }
+                for (f = 0; f < nf; ++f) {
+                    scaled[f].r = orig[f].r * cases[ci].ispec_scale;
+                    scaled[f].i = orig[f].i * cases[ci].ispec_scale;
+                }
+                ni = ac_istft_push(si, spi, oi);
+                np = ac_istft_push_planar(sp, re, im, op);
+                nu = ac_istft_push(su, scaled, ou);
+                snprintf(what, sizeof(what), "scaled N=%d ola=%d synthesis emit count", n, ola);
+                expect(ni == np && ni == nu, what);
+                snprintf(what, sizeof(what), "scaled N=%d ola=%d synthesis input left unchanged", n, ola);
+                same_bytes(spi, orig, (size_t)nf * 2, what);
+                if (ni == np && ni == nu) {
+                    snprintf(what, sizeof(what), "scaled N=%d ola=%d synthesis interleaved vs planar t=%d", n, ola, t);
+                    same_bytes(oi, op, (size_t)ni, what);
+                    snprintf(what, sizeof(what), "scaled N=%d ola=%d synthesis vs unscaled of scaled input t=%d", n, ola, t);
+                    same_bytes(oi, ou, (size_t)ni, what);
+                }
+                checked++;
+            }
+            if (center) {
+                ni = ac_stft_flush(ai, spi);
+                np = ac_stft_flush_planar(ap, re, im);
+                nu = ac_stft_flush(au, spu);
+                expect(ni == 1 && np == 1 && nu == 1, "scaled flush returns one frame");
+                if (ni == 1 && np == 1 && nu == 1) {
+                    int k;
+                    snprintf(what, sizeof(what), "scaled N=%d flush interleaved vs planar", n);
+                    same_complex_planar(spi, re, im, nf, what);
+                    for (k = 0; k < nf; ++k) {
+                        scaled[k].r = spu[k].r * cases[ci].spec_scale;
+                        scaled[k].i = spu[k].i * cases[ci].spec_scale;
+                    }
+                    snprintf(what, sizeof(what), "scaled N=%d flush vs unscaled * scale", n);
+                    same_bytes(spi, scaled, (size_t)nf * 2, what);
+                    checked++;
+                }
+            }
+            if (ola) {
+                ni = ac_istft_flush(si, oi);
+                np = ac_istft_flush(sp, op);
+                nu = ac_istft_flush(su, ou);
+                expect(ni == hop && np == hop && nu == hop, "scaled synthesis flush returns hop samples");
+                if (ni == hop && np == hop && nu == hop) {
+                    snprintf(what, sizeof(what), "scaled N=%d synthesis flush", n);
+                    same_bytes(oi, op, (size_t)hop, what);
+                    same_bytes(oi, ou, (size_t)hop, what);
+                    checked++;
+                }
+            }
+            free(spi); free(spu); free(scaled); free(orig); free(re); free(im); free(in);
+            free(oi); free(op); free(ou);
+            free(k1); free(k2); free(k3); free(k4); free(k5); free(k6);
+        }
+    }
+    printf("SCALE| %d comparison groups (interleaved vs planar, and both vs unscaled times scale) over %d configurations\n",
+           checked, (int)(sizeof(cases) / sizeof(cases[0])) * 4);
 }
 
 /* ----------------------------- family B measurement ----------------------------- */
@@ -840,6 +1054,7 @@ int main(void) {
     test_family_c_short_flush();
     test_latency();
     test_api_contract();
+    test_scaled_entry_points();
     test_family_b();
     if (g_fail) {
         fprintf(stderr, "test_stft FAILED (%d failing checks)\n", g_fail);
