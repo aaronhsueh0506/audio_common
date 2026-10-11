@@ -929,7 +929,7 @@ $(OBJ_DIR)/fft_wrapper.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test_stft test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
+.PHONY: all lib selftest test_stft test_stft_guard test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
 all: lib
 
 lib: $(LIB)
@@ -1025,7 +1025,7 @@ $(OBJ_DIR)/%.o: %.c | _cfg_guard
 $(OBJ_DIR)/%.o: %.cpp | _cfg_guard
 	$(CXX) $(CXXFLAGS) -MD -MP -c -o $@ $<
 
-selftest: $(LIB) test_stft | _cfg_guard
+selftest: $(LIB) test_stft test_stft_guard | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/roundtrip.o test/roundtrip.c
 	$(LINK) -o $(BIN_DIR)/roundtrip $(OBJ_DIR)/roundtrip.o $(LIB) $(LDFLAGS)
 	@echo "--- audio_common selftest [$(BACKEND)] ---"
@@ -1071,6 +1071,14 @@ test_stft: $(LIB) | _cfg_guard
 	  echo "--- audio_common STFT/ISTFT test [$(BACKEND)] TEST_N=$$n ---" && \
 	  $(BIN_DIR)/test_stft_$$n > $(BIN_DIR)/test_stft_$$n.log && tail -n 1 $(BIN_DIR)/test_stft_$$n.log || exit 1; \
 	done
+
+# test_stft_guard: AcStft and AcIstft in exact-size blocks that end against a guard
+# page (POSIX only; the test prints SKIP elsewhere).
+test_stft_guard: $(LIB) | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_stft_guard.o test/test_stft_guard.c
+	$(LINK) -o $(BIN_DIR)/test_stft_guard $(OBJ_DIR)/test_stft_guard.o $(LIB) $(LDFLAGS)
+	@echo "--- audio_common STFT/ISTFT guard-page test [$(BACKEND)] ---"
+	@$(BIN_DIR)/test_stft_guard
 
 test_audio_utils: $(LIB) | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_audio_utilities.o test/test_audio_utilities.c
