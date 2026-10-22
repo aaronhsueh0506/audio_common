@@ -1,1532 +1,284 @@
-# audio_common — shared audio DSP layer (FFT wrapper + KISS/NE10 backends + fast_math)
+# Reusable spatial DSP libraries used by Audio_ALG pipelines.
 #
-# One copy of the FFT layer for every consumer repo (AEC, NR, Audio_ALG). Consumers
-# add `-I audio_common/include` and link the backend they want:
+#   make SIMD=0|1
 #
-#   FFT backend policy (no BACKEND given -> auto-detected from the compiler
-#   target: NE10 when ARM NEON is available, else KISS; explicit BACKEND=
-#   always overrides the auto-detect):
-#     make BACKEND=ne10      -> ARM NEON NE10 FFT   (embedded deliverable; NE10_DSP_RFFT_SCALING on)
-#     make BACKEND=kiss      -> portable KISS FFT   (bit-reproducible reference backend)
+# BACKEND (ne10, the only FFT backend) follows common/AEC/NR's build identity
+# even though these frequency-domain algorithms do not execute an FFT
+# themselves.  Their public API uses common's backend-neutral Complex type.
+# SIMD selects the shared scalar/NEON spatial kernels.
 #
-# Both backends expose the SAME public API (fft_wrapper.h): a heap path
-# (fft_create/fft_destroy) and a static-memory path (fft_get_mem_size/fft_init),
-# with a runtime pool_owned flag (no compile-time gate).
+# common/ is a sibling directory inside this same repo (not a separate git
+# checkout), so its path is a fixed relative COMMON_DIR rather than a
+# wildcard-searched, possibly-submodule-nested one.
 
-CC      ?= cc
-CXX     ?= c++
+CC ?= cc
+CXX ?= c++
+AR ?= ar
+RANLIB ?= ranlib
 
-# Archiver tools, explicit (CFG_SIG payload coverage below): a cross-compiling
-# caller overriding AR/RANLIB (e.g. an arm-none-eabi- toolchain) lands in a
-# different config signature automatically, same as overriding CC/CXX.
-AR      ?= ar
-RANLIB  ?= ranlib
-
-# CFG_SIG payload-coverage placeholders. CPPFLAGS/
-# EXTRA_LDFLAGS/NO_STDIO/DEBUG are not consumed by this particular Makefile
-# today, but the CFG_SIG payload (see "Hash-keyed object directory" below)
-# unconditionally includes all of them so that (a) the payload string has
-# the same stable shape across all three repos sharing this build design and
-# (b) a future use of any of them here automatically starts keying builds
-# correctly instead of silently aliasing with a build that didn't set it.
-# EXTRA_LDFLAGS/NO_STDIO/DEBUG use ?= with an explicit (possibly empty)
-# value, not left undefined, so the payload string never depends on whether
-# the variable happens to be defined.
-#
-# CPPFLAGS is different: it is also one of the six names the "Command-line
-# override rejection" foreach further below rejects a command-line/`-e`
-# override of it. `?=` only ever assigns when the
-# variable's origin is still "undefined" -- if CPPFLAGS already has a value
-# from the environment, `?=` is a complete no-op (GNU Make never attempts
-# the assignment at all), so the origin never flips to "environment
-# override" under `make -e` no matter how early this line sits, and the
-# foreach's $(origin CPPFLAGS) check silently missed it (confirmed
-# empirically: `env CPPFLAGS=x make -e ...` used to sail straight through).
-# `+=` fixes this while keeping the externally-visible behavior identical:
-# appending an empty string is a no-op on the VALUE (a plain-environment
-# CPPFLAGS still folds in -- origin becomes "file", exactly like CFLAGS's
-# own `+=` below -- and still participates in CFG_SIG_PAYLOAD unchanged),
-# but `+=` is an unconditional assignment ATTEMPT, so under `-e` GNU Make's
-# origin bookkeeping now correctly flips it to "environment override",
-# which the foreach rejects.
-CPPFLAGS      +=
-EXTRA_LDFLAGS ?=
-NO_STDIO      ?= 0
-DEBUG         ?= 0
-
-# TOOLCHAIN_CHECK=0 skips the CC/CXX -dumpmachine target-coherence guard in
-# _cfg_guard below. Participates in CFG_SIG, so a
-# guard-skipped build can never alias a guarded one.
-TOOLCHAIN_CHECK ?= 1
-
-# DIST_ROOT: where `make publish` writes its release
-# tree (default: dist/ in this directory). A legitimate override channel --
-# the isolation test scripts publish into a throwaway mktemp directory so
-# they can exercise publish/republish/tamper scenarios without ever touching
-# (let alone deleting) the REAL dist/ releases. Deliberately NOT in CFG_SIG:
-# it changes where a release is copied, never what is built.
-#
-# HOSTCC: compiles the tiny atomic-symlink-swap helper
-# (tools/atomic_symlink_swap.c) AT PUBLISH TIME. This must be a compiler
-# whose output runs on the BUILD HOST -- never $(CC), which may be a cross
-# compiler targeting the board. Not in CFG_SIG: publish-time tooling only,
-# never part of any built artifact.
-#
-# OBJ_ROOT / BIN_ROOT: where the keyed obj/bin trees
-# live (defaults: obj/ and bin/ in this directory -- the default expansion
-# is byte-identical to the previous hardcoded paths). Same rationale as
-# DIST_ROOT: a placement knob, never a build-content knob, so deliberately
-# NOT in CFG_SIG. The isolation tests use these to run tamper/injection
-# scenarios (corrupt a config.manifest, inject a foreign archive member)
-# against a scratch-directory build of the real worktree, so the REAL
-# obj/ and bin/ artifacts are never modified -- not even transiently.
-#
-# ALLOW_DIRTY_PUBLISH:
-# `make publish` REFUSES by default when this checkout has uncommitted
-# TRACKED changes (`git status --porcelain -uno` non-empty) or is not a git
-# checkout at all (commit unknown) -- a release whose ATTEST provenance
-# cannot name the exact source state is not a board deliverable.
-# ALLOW_DIRTY_PUBLISH=1 is the explicit escape hatch for dev publishes; it
-# is recorded in the attestation together with a sha256 of
-# `git diff --binary HEAD` so the deviation itself is traceable. It covers
-# TRACKED changes only -- untracked files have their own dimension below
-# (the tracked diff hash says nothing about untracked
-# bytes, so lumping the two under one flag let two different untracked
-# source states publish with identical provenance).
-#
-# ALLOW_UNTRACKED_PUBLISH: publish also REFUSES by default
-# when the checkout contains ANY untracked, non-ignored file (`git ls-files
-# --others --exclude-standard` non-empty; gitignored build output is
-# excluded by design and never part of this provenance) -- an untracked
-# source a (possibly dirty) Makefile references can change the artifact
-# without leaving a trace in the tracked diff. ALLOW_UNTRACKED_PUBLISH=1 is
-# the separate escape hatch; it records untracked_tree_sha256 in the
-# attestation: sha256 over sorted FIXED-FIELD per-file records --
-# "L <sha256(path)> <sha256(readlink output)>" for symlinks,
-# "F <mode> <sha256(path)> <sha256(content)>" for regular files -- every
-# variable-length value is itself hashed, so records concatenate
-# unambiguously (raw space-joined path/target strings were collision-prone:
-# "a b"->"c" vs "a"->"b c" encoded identically) and any stat/readlink/
-# shasum failure downgrades the entry to an X record => FATAL, never an
-# empty hash (fail-closed). A path that is neither a regular file nor a
-# symlink (an embedded git checkout, a fifo) is always refused, named.
-# A checkout with NO git identity at all is refused UNCONDITIONALLY --
-# neither knob admits it (provenance is impossible). Neither knob is in
-# CFG_SIG: they never change what is built, only whether publish proceeds.
-#
-# ATTEST_STAMP (TEST-ONLY): overrides the UTC timestamp
-# embedded in the attestation FILENAME so the isolation tests can
-# deterministically force same-second publish collisions and prove the
-# no-clobber retry path. Never use it on a real publish -- though note a
-# forged stamp is within the already-accepted threat model: attestations
-# are unsigned and provide traceability, NOT authenticity against an
-# attacker with filesystem access. Not in CFG_SIG or MANIFEST.
-DIST_ROOT ?= dist
-HOSTCC    ?= cc
-OBJ_ROOT  ?= obj
-BIN_ROOT  ?= bin
-ALLOW_DIRTY_PUBLISH ?= 0
-ALLOW_UNTRACKED_PUBLISH ?= 0
-ATTEST_STAMP ?=
-
-# -Werror opt-in (default off; CI can flip it on with `make WERROR=1`).
-# Declared this early (rather than down by its ifeq block, where it used to
-# live) because CFG_SIG below folds WERROR into its hash and needs its
-# final value already resolved -- GNU Make expands variable references in a
-# rule's target/prerequisite list (including a target-specific variable
-# assignment's target) IMMEDIATELY when that line is parsed, not deferred
-# like a recipe body, so CFG_SIG must be a fully-resolved `:=` before the
-# first rule mentions anything derived from it (verified empirically: a
-# forward-referenced variable in a target name silently resolves using
-# whatever that variable's value was AT PARSE TIME, which can be the empty
-# string if the real assignment comes later in the file).
-WERROR ?= 0
-
-# One project-wide switch for every optional SIMD path.  SIMD=1 is the
-# production default; SIMD=0 keeps the selected FFT backend/configuration but
-# dispatches both our kernels and the NE10 wrapper through their scalar C
-# implementations.  `SIMD` is the only public build-time switch.
-#
-# SIMD=0 and SIMD=1 are NOT bit-identical end to end, and are not contracted
-# to be.  Individual kernels in include/simd_kernels.h ARE byte-exact against
-# their scalar twins (test/simd_selftest.c proves it per kernel), but the AEC
-# matched filter deliberately diverges: delay_aec3.c's dot product uses four
-# accumulators plus vfmaq_f32 (reordered summation AND fused rounding) and its
-# NLMS update fuses where the scalar spells a separate multiply and add.  The
-# contract is per-configuration: a change must be byte-exact against the same
-# configuration before it, and across configurations only finite output, the
-# same delay winner/state and a quality tolerance are guaranteed.
+COMMON_DIR := common
+BACKEND = ne10
 SIMD ?= 1
-ifneq ($(words $(SIMD)),1)
-$(error SIMD must be exactly 0 or 1, got '$(SIMD)')
+WERROR = 0
+NO_STDIO = 0
+DEBUG = 0
+TOOLCHAIN_CHECK = 1
+EXTRA_CFLAGS =
+EXTRA_LDFLAGS =
+CPPFLAGS +=
+CXXFLAGS +=
+
+ifneq ($(BACKEND),ne10)
+$(error BACKEND must be ne10 (got '$(BACKEND)'): ne10 is the only FFT backend)
 endif
-ifneq ($(filter-out 0 1,$(SIMD)),)
-$(error SIMD must be exactly 0 or 1, got '$(SIMD)')
+
+define require_bool
+ifneq ($$(words $$($(1))),1)
+$$(error $(1) must be exactly 0 or 1, got '$$($(1))')
 endif
+ifneq ($$(filter-out 0 1,$$($(1))),)
+$$(error $(1) must be exactly 0 or 1, got '$$($(1))')
+endif
+endef
+$(eval $(call require_bool,SIMD))
+$(eval $(call require_bool,WERROR))
+$(eval $(call require_bool,NO_STDIO))
+$(eval $(call require_bool,DEBUG))
+$(eval $(call require_bool,TOOLCHAIN_CHECK))
+
+ifneq ($(findstring ;,$(EXTRA_CFLAGS) $(EXTRA_LDFLAGS)),)
+$(error EXTRA_CFLAGS/EXTRA_LDFLAGS must not contain ';')
+endif
+ifneq ($(filter -Ofast -ffast-math -funsafe-math-optimizations -ffp-contract=%,$(CFLAGS) $(CPPFLAGS) $(EXTRA_CFLAGS)),)
+$(error fast-math and caller-supplied -ffp-contract flags are unsupported)
+endif
+
 ifeq ($(SIMD),0)
 SIMD_CFLAGS := -DSIMD_KERNELS_FORCE_SCALAR
 else
 SIMD_CFLAGS :=
 endif
 
-# FFT backend selection:
-#   - explicit `make BACKEND=kiss|ne10` always wins (policy: host/reference
-#     builds -> kiss, embedded deliverable -> ne10; single main branch).
-#   - otherwise AUTO-DETECT from the (possibly cross-)compiler: NE10 when the
-#     target has ARM NEON (__ARM_NEON / __aarch64__ predefined), else KISS. Using
-#     the compiler (not uname) makes this correct under cross-compilation.
-ifeq ($(origin BACKEND),undefined)
-  HAS_NEON := $(shell $(CC) -dM -E -x c /dev/null 2>/dev/null | grep -Eq '__ARM_NEON|__aarch64__' && echo yes)
-  ifeq ($(HAS_NEON),yes)
-    BACKEND := ne10
-  else
-    BACKEND := kiss
-  endif
-endif
-# Gated on MAKECMDGOALS (parse purity for query targets):
-# print-bin-dir/print-obj-dir/print-lib-path are consumed programmatically by
-# other Makefiles' recipes (`ac="$$(make -s ... print-lib-path)"`) and by
-# scripts; their stdout must be ONLY the path, nothing else. A bare `make
-# print-lib-path` would otherwise also print this banner (parse time runs
-# unconditionally, before any target is selected), corrupting the captured
-# value.
-ifeq ($(filter print-%,$(MAKECMDGOALS)),)
-$(info audio_common: FFT backend = $(BACKEND) -- switch with `make BACKEND=kiss` or `make BACKEND=ne10`)
+ifeq ($(DEBUG),1)
+OPT_CFLAGS := -O0 -g
+else
+OPT_CFLAGS := -O2
 endif
 
-# gnu99 (not strict c99): the vendored NE10 headers use the GNU asm("label")
-# extension. Consumers may still compile their own code with -std=c99 and link
-# this archive — different TUs, different std is fine.
-CFLAGS  += -Wall -Wextra -O2 -std=gnu99 -Iinclude
-# -isystem (not -I) for the vendor NE10 include dirs: this dir's own headers
-# (include/) are OUR code and stay -I so their diagnostics stay visible; NE10's
-# headers are vendored and carry warnings we don't own, so demoting them to
-# "system" headers suppresses diagnostics originating INSIDE those headers
-# without touching diagnostics for our own TUs that happen to include them
-# (F12 build hygiene -- see also the -isystem swap for lib/kiss_fft below).
-CXXFLAGS+= -O2 -isystem lib/ne10/inc -isystem lib/ne10/common -isystem lib/ne10/modules
-LDFLAGS += -lm
+ifeq ($(WERROR),1)
+WERROR_CFLAGS := -Werror
+else
+WERROR_CFLAGS :=
+endif
 
-# EXTRA_CFLAGS lets callers inject unrelated project defines/flags into every
-# compiled TU.  SIMD selection intentionally goes through `SIMD=0|1` only.
-CFLAGS  += $(EXTRA_CFLAGS)
-CXXFLAGS+= $(EXTRA_CFLAGS)
-CFLAGS  += $(SIMD_CFLAGS)
-CXXFLAGS+= $(SIMD_CFLAGS)
-LDFLAGS += $(EXTRA_LDFLAGS)
+override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
+                   -I$(COMMON_DIR)/utility -Idoa -Ibf -IVAD -I$(COMMON_DIR)/include -I$(COMMON_DIR) \
+                   $(CPPFLAGS) $(EXTRA_CFLAGS) $(SIMD_CFLAGS) \
+                   $(WERROR_CFLAGS) -ffp-contract=off -fno-math-errno
 
-# Per-backend, per-config-signature object AND binary dir (CFG_SIG is
-# computed further below, after every BACKEND-conditional CFLAGS/CXXFLAGS
-# append) so a kiss build, an ne10 build, and any two builds differing only
-# in EXTRA_CFLAGS/WERROR/etc. each land in their own directory automatically
-# -- nothing is ever wiped to "switch" between them, and two such builds
-# (e.g. one per backend) can run concurrently in this same tree without
-# stomping each other's objects OR each other's final archive (BIN_DIR
-# used to be per-backend only, `bin/$(BACKEND)`, so an
-# ne10 build after a kiss build -- or a stale mtime from a differently-flagged
-# same-backend build -- could silently deliver the WRONG archive to whatever
-# last happened to write that flat path; test_ne10_force_c's forced-C rebuild
-# also used to overwrite the normal NE10 archive this way). Both OBJ_DIR and
-# BIN_DIR are plain recursive (`=`) assignments referencing $(CFG_SIG) before
-# CFG_SIG's own `:=` line below -- that's fine (and unavoidable, since BACKEND
-# itself must already be resolved above): a recursive assignment just stores
-# the unexpanded text, and nothing between here and CFG_SIG's `:=` assignment
-# below ever expands $(OBJ_DIR)/$(BIN_DIR) (no rule mentions them yet), so by
-# the time anything actually expands either variable, CFG_SIG already holds
-# its final value.
+SRCS = common/utility/spatial_complex.c common/utility/spatial_simd.c \
+       doa/doa_smoother.c doa/steering.c doa/srp.c bf/bf.c \
+       VAD/masker.c VAD/vad.c VAD/vad_api.c
+# The same CC command can select a different SDK through PATH.
+# Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
+override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) SRCS=$(sort $(SRCS))
+CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
+
+OBJ_ROOT ?= obj
+BIN_ROOT ?= bin
 OBJ_DIR = $(OBJ_ROOT)/$(BACKEND)-$(CFG_SIG)
 BIN_DIR = $(BIN_ROOT)/$(BACKEND)-$(CFG_SIG)
 
-# Backend-independent shared DSP sources (always in the archive).
-COMMON_SRCS = src/hpf.c src/audio_pre_gain.c src/audio_resampler.c src/audio_stft.c
+SPATIAL_COMMON_LIB = $(BIN_DIR)/libspatial_common.a
+DOA_LIB = $(BIN_DIR)/libdoa.a
+BF_LIB = $(BIN_DIR)/libbf.a
+VAD_LIB = $(BIN_DIR)/libvad.a
 
-ifeq ($(BACKEND),ne10)
-  # NE10 source footprint (review F16): fft_wrapper_ne10.c only ever calls the
-  # float32 R2C/C2R entry points (ne10_fft_alloc_r2c_float32 /
-  # ne10_fft_r2c_mem_size_float32 / ne10_fft_init_r2c_float32_ext /
-  # ne10_fft_destroy_r2c_float32 / ne10_fft_r2c_1d_float32_neon /
-  # ne10_fft_c2r_1d_float32_neon) and never calls ne10_init() (see
-  # fft_wrapper_ne10.c's header comment) -- so this is an explicit file list,
-  # NOT a wildcard, empirically pared down to the smallest set that still
-  # links cleanly (verified: `make BACKEND=ne10 clean selftest test_pool
-  # test_wav test_zero_heap`, zero unresolved symbols, all four PASS).
-  #   - NE10_rfft_float32.c / .neonintrinsic.c: the float32 R2C/C2R
-  #     implementation itself (scalar reference + NEON kernels), including
-  #     the P0001 external-memory init (VENDORED.md).
-  #   - NE10_fft.c: not float32-R2C-specific, but the R2C path calls into it
-  #     for ne10_factor()/ne10_fft_generate_twiddles_float32()/
-  #     _transposed_float32(), and fft_wrapper_ne10.c's heap fft_destroy()
-  #     calls its ne10_fft_destroy_r2c_float32() directly.
-  #   - NE10_fft_float32.c, NE10_fft_int32.c, NE10_fft_generic_float32.c,
-  #     NE10_fft_generic_int32.cpp: none of these float32/int32
-  #     complex-to-complex (c2c) or non-power-of-2 "generic" paths are ever
-  #     CALLED by this wrapper (it's real-to-complex, power-of-2-only, all
-  #     the way through) -- but NE10_fft.c unconditionally defines
-  #     ne10_fft_alloc_c2c_float32_neon/_int32_neon, and those reference
-  #     ne10_fft_alloc_c2c_float32_c (NE10_fft_float32.c) and
-  #     ne10_fft_alloc_c2c_int32_c (NE10_fft_int32.c) at file scope (not
-  #     guarded by NE10_UNROLL_LEVEL or any other #if), which in turn
-  #     reference the ALG_ANY/generic butterfly helpers -- confirmed
-  #     empirically by dropping each file in turn and reading the linker's
-  #     "Undefined symbols" list. Since ne10_fft.o is unavoidably pulled into
-  #     the link (for ne10_factor/twiddle-gen above) and static-archive
-  #     linking resolves an entire .o's symbol table as a unit (no
-  #     function-level granularity without -ffunction-sections/--gc-sections,
-  #     which is out of scope for a source-list-only trim), these four files
-  #     must stay to satisfy the linker without editing any NE10 source.
-  #     NE10_fft_generic_int32.cpp is why BACKEND=ne10 still needs a C++ TU
-  #     (LINK=$(CXX) below) despite this trim.
-  # Confirmed EXCLUDABLE (dropping each was verified to still link + pass all
-  # four test targets):
-  #   - NE10_init.c / NE10_init_dsp.c: ne10_init()/ne10_init_dsp() runtime
-  #     dispatch setup -- dead weight now that nothing calls ne10_init().
-  #   - NE10_fft_float32.neonintrinsic.c, NE10_fft_int32.neonintrinsic.c: the
-  #     NEON c2c COMPUTE kernels (ne10_fft_c2c_1d_{float32,int32}_neon) --
-  #     unlike the _c alloc functions above, nothing (not even NE10_fft.c's
-  #     c2c NEON allocators) ever calls the NEON c2c compute entry points
-  #     themselves, only the plain "_c" alloc/factor/twiddle machinery.
-  #   - NE10_fft_generic_float32.neonintrinsic.cpp,
-  #     NE10_fft_generic_int32.neonintrinsic.cpp: NEON-optimised generic
-  #     (non-power-of-2) kernels -- same reasoning, only the "_c" generic
-  #     alloc path is ever reachable from ne10_fft.o, not these.
-  #   - NE10_fft_int16.c/.neonintrinsic.c: integer16 FFT, a fully separate
-  #     family NE10_fft.c never touches.
-  #   - NE10_fir.c/NE10_fir_init.c, NE10_iir.c/NE10_iir_init.c: FIR/IIR DSP
-  #     families, unrelated to the FFT wrapper entirely.
-  # No NE10 source is edited to achieve this trim -- it is purely a build
-  # source-list change; every excluded file is still present under lib/ne10/
-  # (see VENDORED.md) for provenance, just not compiled into this archive.
-  NE10_C_SRCS  = lib/ne10/modules/dsp/NE10_fft.c \
-                 lib/ne10/modules/dsp/NE10_fft_float32.c \
-                 lib/ne10/modules/dsp/NE10_fft_int32.c \
-                 lib/ne10/modules/dsp/NE10_fft_generic_float32.c \
-                 lib/ne10/modules/dsp/NE10_rfft_float32.c \
-                 lib/ne10/modules/dsp/NE10_rfft_float32.neonintrinsic.c
-  NE10_CXXSRCS = lib/ne10/modules/dsp/NE10_fft_generic_int32.cpp
-  # OWN_SRCS/VENDOR_SRCS split (F12 build hygiene): OWN_SRCS is code we wrote
-  # and own the warnings for; VENDOR_SRCS/VENDOR_CXXSRCS is unmodified NE10.
-  # BE_SRCS/BE_CXXSRCS (used by BE_OBJS below) are derived from these so the
-  # archive's file list is unchanged, just re-expressed.
-  OWN_SRCS       = src/fft_wrapper_ne10.c $(COMMON_SRCS)
-  VENDOR_SRCS    = $(NE10_C_SRCS)
-  VENDOR_CXXSRCS = $(NE10_CXXSRCS)
-  # NE10_DSP_RFFT_SCALING makes c2r normalise by 1/N (verified round-trip); it is
-  # default-on in NE10_fft.h — defined explicitly so no build can silently drop it.
-  NE10_DEFS = -DNE10_ENABLE_DSP -DNE10_DSP_RFFT_SCALING
-  # -isystem for the vendor NE10 include dirs (see the CXXFLAGS comment
-  # above); NE10_DEFS stays a plain -D (a set of defines, not a search path --
-  # isystem only applies to -I-style entries).
-  CFLAGS  += -isystem lib/ne10/inc -isystem lib/ne10/common -isystem lib/ne10/modules $(NE10_DEFS)
-  CXXFLAGS+= $(NE10_DEFS)
-else
-  OWN_SRCS       = src/fft_wrapper.c $(COMMON_SRCS)
-  VENDOR_SRCS    = lib/kiss_fft/kiss_fft.c
-  VENDOR_CXXSRCS =
-  # -isystem for the vendor KISS FFT include dir (see the CXXFLAGS comment
-  # above for the NE10 side of this same F12 fix).
-  CFLAGS  += -isystem lib/kiss_fft
+# Every deployable archive, in one place: `all`, `libs` and the NO_STDIO
+# audit all read this, so a new archive cannot be added to the build while
+# quietly escaping the gate.
+ARCHIVES = $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB) $(VAD_LIB)
+
+# The archives above need only common's HEADERS. The test BINARY links, so
+# it needs the archive itself.
+#
+# ⚠ common keys its output directory on FIFTEEN variables, not just
+# BACKEND/SIMD -- DEBUG=1 and NO_STDIO=1 each land in a different hash dir
+# (measured). Forwarding a subset would resolve, and link, the WRONG archive
+# with no diagnostic. So every knob this Makefile accepts is forwarded, and
+# COMMON_LIB is an input a caller can supply directly (the 4ch Makefile
+# already has the resolved path in hand and passes it).
+# Same set the 4ch Makefile forwards to its producers. CFLAGS/CXXFLAGS are
+# deliberately absent: common refuses them from the command line because
+# overriding would drop its own FP-policy and backend appends.
+COMMON_FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) \
+         CC='$(CC)' CXX='$(CXX)' AR='$(AR)' RANLIB='$(RANLIB)' \
+         EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) \
+         TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
+COMMON_LIB ?= $(shell $(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(COMMON_FWD) print-lib-path)
+ifeq ($(strip $(COMMON_LIB)),)
+$(error cannot resolve the common archive; pass COMMON_LIB= explicitly)
 endif
 
-# Link driver (declared HERE, before CFG_SIG, so it can
-# participate in the payload below -- it used to live after CFG_SIG, where a
-# command-line LINK= override changed the produced binaries without changing
-# their keyed directory). The NE10 archive contains a C++ TU
-# (NE10_fft_generic_int32.cpp), so anything linking it uses the C++ driver --
-# which also supplies the correct C++ runtime library itself (libc++ on
-# macOS/clang, libstdc++ on GNU/Linux gcc); the old hardcoded `-lc++` in
-# LDFLAGS was a macOS-ism (duplicate of what the driver adds there, and a
-# link error on GNU/Linux where the library is libstdc++) and is gone.
-LINK = $(CC)
-ifeq ($(BACKEND),ne10)
-  LINK = $(CXX)
-endif
+# print-lib-path only ECHOES; nothing builds the archive. Without this rule the
+# test link would reference a file no target ever asked anyone to produce.
+$(COMMON_LIB): FORCE
+	+$(MAKE) -C $(COMMON_DIR) $(COMMON_FWD) lib
+	@test -f '$@' || { echo "FATAL: common did not produce $@" >&2; exit 1; }
 
-# --- Bare-literal policy flags, defined early (`make -e`
-# environment-override gap) --------------------------------------------------
-# FP_POLICY and FFT_WRAPPER_ALIAS_CFLAGS are both plain, dependency-free `:=`
-# literals (no reference to CFLAGS/CXXFLAGS or anything else computed above)
-# that used to be defined much further down this file, immediately ahead of
-# CFG_SIG_PAYLOAD -- each for reasons that still apply and are unaffected by
-# this move (see the "FP-contraction policy" and "Build-cache-invalidation
-# fix" comments further below: FP_POLICY's CFLAGS/CXXFLAGS append still needs
-# to happen AFTER every other CFLAGS/CXXFLAGS append, and CFG_SIG_PAYLOAD
-# still needs FFT_WRAPPER_ALIAS_CFLAGS's FINAL value -- both still true with
-# only the bare `:=` literal relocated here). Both names are ALSO listed in
-# the "Command-line override rejection" foreach directly below, and that
-# combination used to be a real gap under `make -e`, empirically confirmed:
-# `env FP_POLICY=x make -e ...` and `env FFT_WRAPPER_ALIAS_CFLAGS=x make -e
-# ...` both used to sail straight through with no error, silently dropping
-# -ffp-contract=off / -fno-strict-aliasing from a real, fully-buildable
-# archive (see the foreach's own comment for the full mechanism). Duplicating
-# only the bare literal up here -- ahead of the foreach in file order --
-# fixes it; the original site of each still holds its OTHER job unchanged, so
-# there is exactly one `:=` definition of each name in this file, just moved.
-#
-# FP_ALLOWED_CHARS_RE (added alongside the FP-policy allow-list redesign)
-# is a THIRD bare, dependency-free `:=` literal with the exact
-# same shape and the exact same `make -e` exposure -- it lives here, fully
-# relocated (not merely duplicated: this is its ONLY definition in the file,
-# since unlike FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS it has no second job at any
-# other line), so its origin is already final by the time the foreach below
-# queries it. The regex it holds is documented in full where it is actually
-# used (the FP-policy allow-list block, further below).
-# Keep scalar/NEON operation ordering stable and let AArch64 lower guarded
-# sqrtf calls to a single FSQRT without an errno-checking libm fallback.
-FP_POLICY := -ffp-contract=off -fno-math-errno
-FFT_WRAPPER_ALIAS_CFLAGS := -fno-strict-aliasing
-FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
+SPATIAL_COMMON_OBJS = $(OBJ_DIR)/spatial_complex.o $(OBJ_DIR)/spatial_simd.o
+DOA_OBJS = $(OBJ_DIR)/doa_smoother.o $(OBJ_DIR)/steering.o $(OBJ_DIR)/srp.o
+BF_OBJS = $(OBJ_DIR)/bf.o
+VAD_OBJS = $(OBJ_DIR)/masker.o $(OBJ_DIR)/vad.o $(OBJ_DIR)/vad_api.o
 
-# --- Command-line override rejection (FFT_WRAPPER_ALIAS_
-# CFLAGS added later, same mechanism) -----------------------
-# CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/FP_POLICY are INTERNAL: GNU Make silently
-# ignores every one of this file's own `+=`/`:=` assignments to a variable
-# that was set on the command line (`make CFLAGS=-O3`), which would strip the
-# FP-contraction policy, the backend defines/-isystem paths, and -lm from the
-# build while still producing artifacts (verified: the compile line really
-# loses -ffp-contract=off). The supported user hooks are EXTRA_CFLAGS /
-# EXTRA_LDFLAGS (folded in above, covered by CFG_SIG, policy still appended
-# after them). A plain environment value is NOT rejected: this file's own
-# assignment folds it in normally (origin becomes "file"), the policy flags
-# still land last, and the value participates in CFG_SIG -- only "command
-# line" and the -e "environment override" origins defeat the assignments.
-#
-# FFT_WRAPPER_ALIAS_CFLAGS has the exact same exposure from a different
-# angle: it is also a plain `:=`, so a command-line
-# `make BACKEND=kiss FFT_WRAPPER_ALIAS_CFLAGS=` (empty, or any value lacking
-# -fno-strict-aliasing) used to silently win over this file's own definition
-# and strip -fno-strict-aliasing from fft_wrapper.o/fft_wrapper_ne10.o's
-# target-specific CFLAGS (see the -fno-strict-aliasing block further down) --
-# CFG_SIG still keys that build into its own distinct obj/bin directory (the
-# value is folded into CFG_SIG_PAYLOAD, so it is never a stale-cache hazard),
-# but the result is a real, fully-buildable, valid-looking archive that ships
-# the known Complex*/float* and Complex*/ne10_fft_cpx_float32_t*
-# strict-aliasing UB live.
-#
-# CORRECTED UNDERSTANDING (this paragraph used to claim $(origin $(v)) below
-# is evaluated per-name at this point in the file "regardless of where each
-# name's own `:=`/`+=` happens to live" -- this was EMPIRICALLY
-# DISPROVED in general, for the `make -e` case specifically; the claim
-# is still correct for plain "command line" origin, just not for
-# "environment override"). A plain "command line" origin IS genuinely
-# position-independent: it is resolved once, before any makefile parsing
-# begins at all, so $(origin v) reports "command line" for such a variable
-# no matter where in the file it is queried -- every command-line-override
-# case above, and every S9/S20 test in scripts/test_build_isolation.sh,
-# relies on exactly that, and it still holds. "environment override" origin
-# is NOT position-independent: GNU Make only flips a variable's origin from
-# plain "environment" to "environment override" at the point a makefile
-# assignment attempt to that SAME variable is actually parsed (and, under
-# `-e`, silently voided in the environment's favor) -- there is nothing to
-# flip before that assignment is parsed, so $(origin v) still reports merely
-# "environment" (matching neither `command` nor `override`) for any name
-# whose own assignment sits AFTER this foreach. FP_POLICY and
-# FFT_WRAPPER_ALIAS_CFLAGS both used to be defined only much further down
-# this file (see the "Bare-literal policy flags" comment directly above for
-# the fix: each name's bare `:=` literal is now duplicated-and-relocated to
-# directly above this foreach, so the origin-flip has already happened by
-# the time $(origin $(v)) is queried here, under `-e` or otherwise).
-#
-# CPPFLAGS had a THIRD, independent variant of this same class of gap,
-# despite its own assignment (`CPPFLAGS ?=` up top) already sitting well
-# before this foreach: `?=` only ever assigns when the variable's origin is
-# still "undefined" -- given an environment-original CPPFLAGS, that
-# condition is already false, so GNU Make treats the whole line as a no-op
-# and never attempts anything, meaning the origin-flip trigger (an actual
-# assignment ATTEMPT) never fires under `-e` either, no matter how early the
-# `?=` line sits (confirmed empirically the same way). Fixed by changing
-# that line from `?=` to `+=` (see its own comment up top) -- an
-# unconditional assignment attempt, same shape as CFLAGS's own `+=` lines,
-# with no behavior change to the (always-empty-by-default, currently-
-# unconsumed) value itself.
-#
-# Reusing this exact foreach (rather than a separate ad hoc check next to
-# each variable's own definition) is still the pattern the "Build-cache-
-# invalidation fix" / "THE PATTERN" comment near CFG_SIG_PAYLOAD calls for:
-# any future policy flag added the same way should route through here,
-# defined early enough (bare `:=`, or unconditional `+=` -- never `?=`) that
-# its origin is already final -- under `-e` included -- by the time this
-# foreach runs. FP_ALLOWED_CHARS_RE (the FP-policy allow-list's character
-# class, added alongside the same allow-list redesign) is the newest member: a fourth
-# bare, dependency-free `:=` literal with the identical exposure, now
-# defined directly above per the "Bare-literal policy flags" comment. A
-# command-line/`-e` override of FP_ALLOWED_CHARS_RE could otherwise widen the
-# allowed character set (e.g. to `.*`, matching anything) and silently
-# neuter the whole allow-list below -- this foreach closes that off the same
-# way it already closes the FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS cases.
-# (FP_INPUT_FLAGS/SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/
-# FP_CONFLICT_FLAGS -- the FP-policy/shell-safety checks' OTHER four internal
-# variables -- are NOT bare literals like this one; each is computed from the
-# fully-assembled CFLAGS/CXXFLAGS/CPPFLAGS (SHELL_SAFE_INPUT_FLAGS/
-# SHELL_SAFE_ALLOWLIST_RC also fold in the fully-assembled LDFLAGS -- see the
-# "link-flags character-safety coverage" comment further below) and so cannot
-# be relocated earlier the way this one was. They have their own,
-# separately-positioned override-rejection foreach immediately after their
-# own definitions further below -- see that block's comment.)
-$(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FFT_WRAPPER_ALIAS_CFLAGS FP_ALLOWED_CHARS_RE,\
-  $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
-    $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently drop this Makefile's own flag appends (FP policy, backend defines); use EXTRA_CFLAGS / EXTRA_LDFLAGS instead)))
+.DEFAULT_GOAL := all
+.PHONY: all libs lib libspatial_common.a libdoa.a libbf.a libvad.a \
+        clean bench-masker \
+        test test_spatial_third_party audit-no-bf-test-symbols \
+        print-bin-dir print-obj-dir print-spatial-common-lib-path \
+        print-doa-lib-path print-bf-lib-path print-vad-lib-path \
+        audit-no-stdio _cfg_guard
 
-# --- FP-contraction policy: unified across all four repos. Every TU THIS
-# Makefile compiles -- our own sources AND the vendored
-# KISS/NE10 C and C++ TUs alike -- builds with -ffp-contract=off, positioned
-# so nothing can override it: appended here, AFTER every prior CFLAGS/
-# CXXFLAGS append in this file (base flags, EXTRA_CFLAGS, and the
-# BACKEND-conditional NE10_DEFS/-isystem/kiss appends just above), and BEFORE
-# CFG_SIG_PAYLOAD is computed below (so it automatically participates in
-# CFG_SIG -- no separate payload entry needed, same as CFLAGS/CXXFLAGS
-# themselves). A caller's EXTRA_CFLAGS can add flags but can no longer
-# silently re-enable contraction after this file's own flags, because
-# nothing after this line ever appends to CFLAGS/CXXFLAGS again.
-#
-# (`make -e` gap fix: FP_POLICY's own bare `:=` literal now
-# lives earlier in this file, directly above the "Command-line override
-# rejection" foreach -- see that foreach's "Bare-literal policy flags"
-# comment for why. Only FP_POLICY's OTHER job -- appending it to CFLAGS/
-# CXXFLAGS, LAST, exactly as this whole comment describes -- still lives at
-# this position; there is exactly one `:=` definition of FP_POLICY in this
-# file, not two.)
-#
-# Policy scope: contraction must be off repo-wide, not just for code we own
-# -- a compiler-fused FMA in vendored scalar reference code (KISS, or NE10's
-# non-neonintrinsic .c/.cpp files) is exactly the build-order-dependent
-# numeric drift this flag exists to eliminate. This does NOT touch explicit
-# NEON intrinsics (fft_wrapper_ne10.c's vfmaq_f32/vmulq_f32, or NE10's own
-# *.neonintrinsic.c) or explicit fmaf() calls (fft_wrapper.c's/
-# fft_wrapper_ne10.c's fft_power() scalar tail, deliberately mirroring the
-# NEON path bit-for-bit -- see that function's own comment) -- those are
-# EXPLICIT fusion requests the source code asks for regardless of this flag,
-# not compiler-chosen contraction of a plain `a*b+c` expression, and
-# -ffp-contract only controls the latter. See scripts/audit_fp_contract.sh
-# for the disassembly-level verification (PASS/EXEMPT table distinguishing
-# the two) and each repo's README for the cross-repo policy note.
-#
-# Conflict detection (widened to CXXFLAGS/CPPFLAGS as well): a caller
-# passing EXTRA_CFLAGS=-Ofast/-ffast-math (both
-# of which imply -ffp-contract=fast on gcc/clang) or
-# EXTRA_CFLAGS=-ffp-contract=<anything> would either directly re-enable
-# contraction or silently do so via an implied flag, despite this repo's
-# pinned policy -- rejected outright rather than allowed to land.
-# Checked against the fully-assembled $(CFLAGS) $(CXXFLAGS) $(CPPFLAGS)
-# (each already includes EXTRA_CFLAGS folded in above, AND any
-# CFLAGS=/CXXFLAGS=/CPPFLAGS= command-line override, since a command-line-set
-# value is what every prior `+=` in this file appended to) -- BEFORE
-# FP_POLICY is appended below and BEFORE CFG_SIG is computed, so a rejected
-# build never creates an obj/bin directory.
-#
-# CORRECTED UNDERSTANDING (this used to check $(CFLAGS) alone, reasoning that
-# EXTRA_CFLAGS -- the one hook both CFLAGS and CXXFLAGS fold in identically --
-# made a CXXFLAGS-only conflict impossible to smuggle past a CFLAGS-only
-# check "for free". That reasoning missed a gap: a
-# PLAIN ENVIRONMENT CXXFLAGS (or CPPFLAGS) is deliberately allowed to fold in
-# normally by the command-line/`-e` override rejection above -- it never goes
-# through EXTRA_CFLAGS at all -- so `env CXXFLAGS=-Ofast make BACKEND=ne10
-# lib` used to sail straight through this block entirely: none of the three
-# checks below ever inspected $(CXXFLAGS), so the NE10 backend's vendored C++
-# TU, NE10_fft_generic_int32.cpp (the only C++ TU this Makefile compiles --
-# see NE10_CXXSRCS above) compiled with -Ofast fully live -- confirmed
-# empirically: the compile line showed -Ofast ahead of the
-# later -ffp-contract=off, meaning __FAST_MATH__ and every OTHER -Ofast
-# relaxation besides contraction (which the trailing flag does still turn
-# back off) were live and unchecked. The check below inspects all three
-# variables together so no combination of CFLAGS/CXXFLAGS/CPPFLAGS --
-# command-line-folded, EXTRA_CFLAGS-folded, or a plain environment value --
-# can carry any of these three patterns past this gate. This position
-# (after every CFLAGS/CXXFLAGS/CPPFLAGS append earlier in
-# this file, including the BACKEND-conditional NE10_DEFS/-isystem/kiss
-# appends, and before FP_POLICY's own append just below) is the same
-# position already relied on to see CFLAGS's fully-composed value, and is
-# equally late enough for CXXFLAGS and CPPFLAGS: CXXFLAGS's last append in
-# this file is the BACKEND-conditional block above (line ~290), and CPPFLAGS
-# is only ever assigned once, at the top of this file (`CPPFLAGS +=`) --
-# both fully resolved well before this point, with no target-specific
-# CFLAGS/CXXFLAGS append anywhere in this file happening at parse time
-# (those are recipe-scoped, see $(OWN_OBJS)/fft_wrapper*.o further below).
-# $(findstring ...) does a plain SUBSTRING search over the
-# whole concatenated text, so it false-positives on any token that merely
-# CONTAINS one of these patterns as part of a larger identifier -- e.g. a
-# harmless `-DROUND9_NOTE=-Ofastness` macro definition is not the compiler
-# flag -Ofast at all, yet the old $(findstring -Ofast,...) check rejected it
-# anyway. $(filter PATTERN...,TEXT) instead splits TEXT on whitespace into
-# WORDS and matches each whole word against PATTERN (a trailing %% is a
-# single wildcard, used here for -ffp-contract=<anything>), so it only ever
-# matches a complete flag token, never a substring buried inside an
-# unrelated token.
-FP_INPUT_FLAGS := $(CFLAGS) $(CXXFLAGS) $(CPPFLAGS)
+all libs lib: $(ARCHIVES)
+libspatial_common.a: $(SPATIAL_COMMON_LIB)
+libdoa.a: $(DOA_LIB)
+libbf.a: $(BF_LIB)
+libvad.a: $(VAD_LIB)
 
-# --- link-flags character-safety coverage (the allow-list
-# redesign below originally validated FP_INPUT_FLAGS only -- CFLAGS/CXXFLAGS/
-# CPPFLAGS -- leaving LDFLAGS (built from a plain `-lm` literal plus whatever
-# EXTRA_LDFLAGS folds in, see the `LDFLAGS += $(EXTRA_LDFLAGS)` line near the
-# top of this file) completely unchecked, even though LDFLAGS is embedded in
-# every real link recipe below ($(LINK) ... $(LDFLAGS)) exactly the same way
-# CFLAGS/CXXFLAGS are embedded in every compile recipe. Confirmed empirically:
-# `make selftest EXTRA_LDFLAGS=';echo LINK_FLAG_INJECTION'` passed every check
-# below untouched and produced a real link recipe line with the shell
-# metacharacter payload sitting live and unfiltered after the `-lm` -- the
-# exact same class of exposure the allow-list below exists to close for
-# CFLAGS/CXXFLAGS/CPPFLAGS, just left open on this one variable. Fixed by
-# introducing this union: the two checks that only care about CHARACTER
-# safety (the single-quote pre-check and the allow-list itself, immediately
-# below) now run against SHELL_SAFE_INPUT_FLAGS instead of FP_INPUT_FLAGS
-# directly, so LDFLAGS/EXTRA_LDFLAGS content goes through the exact same
-# grep-based gate with no separate/duplicated $(shell) invocation. The
-# FP-semantic conflict check (FP_CONFLICT_FLAGS, further below --
-# -Ofast/-ffast-math/-ffp-contract=% are meaningless as LINK flags, not just
-# unnecessary to check there) stays scoped to FP_INPUT_FLAGS alone, unchanged.
-SHELL_SAFE_INPUT_FLAGS := $(FP_INPUT_FLAGS) $(LDFLAGS)
+FORCE:
+.PHONY: FORCE
 
-# (SUPERSEDED by the allow-list redesign below -- kept only as
-# historical motivation) $(filter) directly above does whole-WORD
-# matching against GNU Make's OWN text representation of CFLAGS/CXXFLAGS/
-# CPPFLAGS -- but Make has zero concept of shell quoting. A value like
-# EXTRA_CFLAGS="'-Ofast'" is stored by Make as the literal 9-character text
-# '-Ofast', quote characters included, which is not equal to the bare word
-# -Ofast, so $(filter) can never match it -- yet when this same text later
-# appears on an actual compile recipe line and that line is handed to
-# $(SHELL), the shell strips the quote characters and the compiler genuinely
-# receives -Ofast as a real argv token. This was originally patched with a
-# hand-picked, 9-item DENY-list (single quote, double quote, backslash,
-# backtick, a literal "$(" sequence, semicolon, pipe, ampersand, and an
-# @-prefixed response-file token) rejecting exactly the shell-quoting/
-# escaping/expansion/response-file constructs known at the time to make
-# $(filter)'s exact-token check unreliable.
-#
-# A deny-list of this shape is structurally unable to keep up: auditing it
-# found the 9-item list does NOT catch bare glob characters
-# (*, ?, [, ]), tilde (~), or -- most seriously -- real shell REDIRECTION
-# (>, <) or process substitution (<(...)): none of these are Make's own
-# syntax, so Make cannot pre-resolve or reject them the way it happens to
-# catch ${VAR}-style expansions (GNU Make treats ${...} identically to
-# $(...) and resolves it itself before any check runs -- a different,
-# unrelated mechanism from the deny-list). If a recipe line containing an
-# unbanned '>' or '<' is ever actually executed by a real shell (not a dry
-# run), it silently redirects the compiler invocation's own stdout/stdin to
-# an arbitrary path -- a real, unconditional risk, independent of any
-# -Ofast/-ffast-math/-ffp-contract semantics, and worse than the deny-list's
-# original threat model. Separately, direct testing confirms
-# the old "$(" entry was likely DEAD CODE for well-formed input all along:
-# `make ... 'CFLAGS=-O2 $(shell echo INJECTED)'` lets GNU Make's OWN parser
-# resolve the well-formed $(...) reference at command-line-parsing time --
-# "INJECTED" lands in CFLAGS as plain text, no literal "$(" substring ever
-# reaches the check -- while an UNBALANCED `$(unbalanced` (no closing paren)
-# makes Make itself abort with its own "unterminated variable reference.
-# Stop." before any makefile-level check runs at all. Either way the
-# findstring-based "$(" check never actually fires for the cases it was
-# meant to catch.
-#
-# REDESIGN: replace the character-by-character DENY-list with a single
-# ALLOW-list covering the input as a whole. GNU Make has no native regex/
-# character-class function, so this necessarily shells out to `grep -E` --
-# a $(shell ...) call, the same technique this file already uses for
-# CFG_SIG's cksum computation below. Embedding untrusted, Make-supplied text
-# inside a constructed shell command is exactly the kind of thing that can
-# reintroduce the very problem being fixed if done carelessly, so the
-# embedding strategy is deliberately narrow and was verified directly (not
-# assumed): SHELL_SAFE_INPUT_FLAGS (CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS,
-# fully-assembled -- see the "link-flags character-safety coverage" comment
-# above for why LDFLAGS is folded in here too) is embedded SINGLE-QUOTED in
-# the shell command text below (`printf '%s' '$(SHELL_SAFE_INPUT_FLAGS)' |
-# ...`). Inside a single-quoted POSIX shell string, EVERY character is
-# literal except a single quote itself -- double quote, backslash, backtick,
-# "$(", semicolon, pipe, and ampersand are all completely inert there
-# (confirmed directly: `sh -c "printf '%s' '-O2 \`id\`' | grep ..."` does NOT
-# execute `id`). So the ONLY character that can break this embedding is a
-# literal single quote in SHELL_SAFE_INPUT_FLAGS itself (which would close
-# the quoted string early and hand whatever follows to the shell as live
-# syntax) -- which is why the single-quote check below is the ONE survivor
-# from the old 9-item deny-list, kept for this entirely different, structural
-# reason (safe shell-embedding), not merely because it's also a disallowed
-# character (the allow-list below would reject it either way). It MUST run
-# first, and MUST stay a pure $(findstring) check with zero shell
-# involvement, so it can gate the shell-embedding step that follows it.
-ifneq ($(findstring ',$(SHELL_SAFE_INPUT_FLAGS)),)
-$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/EXTRA_CFLAGS/EXTRA_LDFLAGS contains a single-quote character; this repo requires plain, unquoted, whitespace-separated compiler/linker argv tokens built only from the allowed character set (see the allow-list below) -- a single quote specifically must be rejected by this Make-native check BEFORE the allow-list's own $(shell) call can safely single-quote-embed the rest of the text)
-endif
-
-# The allow-list itself. Allowed set: letters, digits, underscore, dot,
-# slash, equals, comma, plus, minus -- plus space (the token SEPARATOR
-# between flags; SHELL_SAFE_INPUT_FLAGS is always multiple whitespace-joined
-# tokens, never a single one, so space must be permitted even though it is
-# not part of any individual flag's own character set). Chosen by auditing
-# every legitimate flag this Makefile's OWN invocations actually use before
-# finalizing it: -O0/-O2/-O3, -Wall/-Wextra, -std=gnu99, -Iinclude,
-# -isystem lib/ne10/inc (letters/digits, and slash/dot for the path),
-# -DNE10_ENABLE_DSP, -DNE10_DSP_RFFT_SCALING, -DPAR_PROBE
-# (letters/digits/underscore),
-# -DROUND9_NOTE=-Ofastness / -DTEXT=ffast-math (equals, hyphen) --
-# every one of these tokens is built ONLY from this set. Comma and plus are
-# included for headroom beyond this Makefile's current own usage (e.g.
-# -Wl,-rpath,dir / -Wa,--option pass-through flags a consumer might
-# legitimately need), on the same audit basis: neither character appears
-# anywhere in this Makefile's own flags today, so including them cannot
-# regress anything currently working, and both are inert to the shell
-# (unlike the characters actually excluded below).
-#
-# LC_ALL=C avoids any locale-dependent surprises in the [A-Za-z0-9...]
-# ranges (verified identical under C locale on this host's BSD grep/tr; the
-# same invocation is expected to behave identically under GNU grep/tr on a
-# Linux host, since POSIX bracket-expression ranges are locale-defined by
-# design and C locale pins them to the unambiguous ASCII ordering on both).
-#
-# Every one of the FORMER 9-item deny-list's targets (single quote, double
-# quote, backslash, backtick, a literal "$(", semicolon, pipe, ampersand,
-# @-response-file) is a character NOT in this allowed set, so all of them
-# are rejected by construction now -- confirmed by re-running every one of
-# that deny-list's own negative test cases in
-# scripts/test_build_isolation.sh (S23b) after removing the 8 that are now
-# redundant; only the single-quote check above survives, for the shell-
-# embedding reason given there, not because the allow-list fails to cover
-# it (a lone single quote is ALSO rejected by the allow-list on its own).
-#
-# FP_ALLOWED_CHARS_RE itself is NOT defined here -- it is a bare, early
-# `:=` literal (see the "Bare-literal policy flags" / "Command-line override
-# rejection" comments near the top of this file, where it is protected
-# against a command-line/`-e` override the exact same way FP_POLICY/
-# FFT_WRAPPER_ALIAS_CFLAGS are). Only referenced here.
-SHELL_SAFE_ALLOWLIST_RC := $(shell printf '%s' '$(SHELL_SAFE_INPUT_FLAGS)' | LC_ALL=C grep -Eq '$(FP_ALLOWED_CHARS_RE)'; echo $$?)
-ifneq ($(SHELL_SAFE_ALLOWLIST_RC),0)
-# Diagnostic-only second $(shell) call (only ever runs on the already-doomed
-# error path above, never on a passing build): deletes every ALLOWED
-# character from the same single-quote-embedded text, leaving only the
-# disallowed ones, then dedupes/sorts them into a short, stable string --
-# so the $(error ...) below names the SPECIFIC offending character(s)
-# (e.g. ">" or "~" or "*") instead of a generic "invalid format" message.
-SHELL_SAFE_DISALLOWED_CHARS := $(shell printf '%s' '$(SHELL_SAFE_INPUT_FLAGS)' | LC_ALL=C tr -d 'A-Za-z0-9_./=,+ -' | fold -w1 | LC_ALL=C sort -u | tr -d '\n')
-$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/EXTRA_CFLAGS/EXTRA_LDFLAGS contains a character outside the allowed set [A-Za-z0-9_./=,+- ] (letters/digits/underscore/dot/slash/equals/comma/plus/minus, plus space as the token separator) -- disallowed character(s) found: "$(SHELL_SAFE_DISALLOWED_CHARS)"; this repo requires plain, unquoted, whitespace-separated compiler/linker argv tokens built only from that set -- remove/replace the disallowed character(s) shown above in CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/EXTRA_CFLAGS/EXTRA_LDFLAGS)
-endif
-
-FP_CONFLICT_FLAGS := $(filter -Ofast -ffast-math -ffp-contract=%,$(FP_INPUT_FLAGS))
-ifneq ($(FP_CONFLICT_FLAGS),)
-$(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains $(FP_CONFLICT_FLAGS); this repo pins -ffp-contract=off; remove $(FP_CONFLICT_FLAGS) from CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS)
-endif
-
-# Command-line/`-e` override rejection for the FP-policy/shell-safety checks'
-# remaining FOUR internal variables (found live for the original three while
-# implementing the allow-list above; SHELL_SAFE_INPUT_FLAGS/
-# SHELL_SAFE_ALLOWLIST_RC added, same treatment, when the character-safety
-# check was widened to LDFLAGS -- see the "link-flags
-# character-safety coverage" comment above): FP_INPUT_FLAGS/
-# SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/FP_CONFLICT_FLAGS are each
-# computed from the fully-assembled CFLAGS/CXXFLAGS/CPPFLAGS (SHELL_SAFE_
-# INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC also fold in the fully-assembled
-# LDFLAGS; SHELL_SAFE_ALLOWLIST_RC via a $(shell) call keyed off
-# SHELL_SAFE_INPUT_FLAGS) -- unlike FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS/
-# FP_ALLOWED_CHARS_RE above, none of the four is a bare, dependency-free
-# literal, so none can be relocated earlier to ride in the six/seven-name
-# foreach near the top of this file (that foreach's own comment explains why
-# bare-literal-and-early is required for the `-e` case). But confirmed
-# empirically (for the original three; re-confirmed for the two
-# new ones the same way) to have the EXACT SAME command-line-override
-# exposure as every name in that foreach: e.g. `make ...
-# EXTRA_LDFLAGS=';echo INJECTED' SHELL_SAFE_ALLOWLIST_RC=0` (or the
-# equivalent with SHELL_SAFE_INPUT_FLAGS=<anything clean>, FP_INPUT_FLAGS=
-# <anything clean>, or FP_CONFLICT_FLAGS=) silently wins over this file's own
-# computed value and turns every ifneq/$(error) gate above into a complete
-# no-op -- while the REAL $(CFLAGS)/$(CXXFLAGS)/$(CPPFLAGS)/$(LDFLAGS) used in
-# every actual compile/link recipe still carry the dangerous, unvalidated
-# content unmodified. Reproduced against BOTH the current allow-list AND the
-# prior (unmodified) 9-item deny-list it replaces, so this is a PRE-EXISTING
-# gap the audit happened to surface, not a regression introduced by
-# the redesign. Fixed the same way as the `-e` gap elsewhere in this file,
-# mirrored for a LATE-computed (not early-literal) variable: the
-# override-rejection check must itself run AFTER the variable's own real
-# assignment (never before), so the origin-flip -- for both plain "command
-# line" and, under `-e`, "environment override" -- has already happened by
-# the time $(origin ...) is queried here. This is why this second foreach
-# sits HERE, immediately after FP_CONFLICT_FLAGS (the last of the four to be
-# assigned), rather than folded into the earlier foreach (which runs too
-# early in the file for any of these four to have been assigned yet, so
-# $(origin ...) would still read "environment" rather than "environment
-# override" under `-e`, exactly the gap that foreach's own history describes
-# for FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS before they were relocated).
-# SHELL_SAFE_DISALLOWED_CHARS (like the old FP_DISALLOWED_CHARS before it) is
-# deliberately NOT included here: it is pure diagnostic text folded into the
-# $(error ...) message on the failure path only, never a condition any ifneq
-# tests, so overriding it cannot bypass anything -- at worst it would garble
-# the reported character list on a build that was going to fail anyway.
-$(foreach v,FP_INPUT_FLAGS SHELL_SAFE_INPUT_FLAGS SHELL_SAFE_ALLOWLIST_RC FP_CONFLICT_FLAGS,\
-  $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
-    $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently defeat the FP-policy/shell-safety allow-list/conflict checks above, leaving the real CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS content unvalidated; this variable is internal to those checks and has no supported external use)))
-
-CFLAGS    += $(FP_POLICY)
-CXXFLAGS  += $(FP_POLICY)
-
-# --- Hash-keyed object/binary directory + full-coverage CFG_SIG ------------
-# obj/$(BACKEND)-<sig> and bin/$(BACKEND)-<sig> isolate
-# every distinct build configuration from every other one -- not just
-# BACKEND, but the exact compiler invocation that produces every object AND
-# the exact archive that invocation produces. CFG_SIG_PAYLOAD is the single
-# source string used BOTH to compute CFG_SIG (via cksum) AND, verbatim, as
-# the collision-guard manifest content (see the _cfg_guard target below) --
-# one string, two consumers, so the two can never drift apart.
-#
-# Payload coverage (USER-MANDATED): CC CXX AR RANLIB
-# CFLAGS CXXFLAGS CPPFLAGS LDFLAGS EXTRA_CFLAGS EXTRA_LDFLAGS BACKEND WERROR
-# NO_STDIO DEBUG -- every variable that can affect what a build produces,
-# even ones this particular Makefile doesn't branch on today (CPPFLAGS/
-# EXTRA_LDFLAGS/NO_STDIO/DEBUG default to an explicit empty/0 value up top so
-# they always participate in the string with a stable shape). This MUST be
-# defined here -- after CFLAGS/CXXFLAGS are final (every BACKEND-conditional
-# append above has already run), but before the first rule below that
-# mentions $(OBJ_DIR)/$(BIN_DIR)/anything derived from them (the WERROR and
-# -fno-strict-aliasing target-specific-variable lines just after this, and
-# the pattern rules further down) -- because GNU Make expands a rule's
-# target/prerequisite list (including a target-specific variable
-# assignment's target) IMMEDIATELY when that line is parsed, not deferred
-# like a recipe body. A forward reference there would silently resolve
-# using CFG_SIG's value at THAT point in the file (empty, if this line
-# hadn't run yet), landing objects in a hash-less directory instead of the
-# real one (verified empirically with a minimal reproduction).
-#
-# Deliberately NOT $(strip)'d: two builds differing only in incidental
-# whitespace (e.g. an EXTRA_CFLAGS with a stray leading space) get different
-# signatures. That's a false MISS (an unnecessary extra directory), which is
-# harmless; collapsing them with $(strip) risks a false HIT (two genuinely
-# different flag strings landing on the same signature by construction),
-# which is the one failure mode this whole mechanism exists to prevent.
-#
-# There is no parse-time comparison and nothing is ever deleted to "detect"
-# a config change (the previous scheme did a $(shell rm -rf ...)/$(shell
-# mkdir ...)/$(shell echo ...) unconditionally while the Makefile was being
-# read, which mutated the filesystem even under `make -n` and raced two
-# concurrent builds with different flags/backends against each other's
-# shared obj/$(BACKEND) directory). Under this scheme `make -n` touches
-# nothing on disk (CFG_SIG is a pure string hash) and `make BACKEND=kiss
-# -j4 & make BACKEND=ne10 -j4 & wait` (or two differing-EXTRA_CFLAGS
-# builds) can run concurrently in this same tree: each lands in its own
-# obj/<backend>-<sig>/ + bin/<backend>-<sig>/ directory pair and never
-# touches the other's objects or archive. Directory creation (and the
-# CFG_SIG collision guard) happens lazily via the _cfg_guard order-only
-# prerequisite on the rules below, not at Makefile-parse time.
-#
-# cksum (POSIX -- present on macOS/BSD/GNU/busybox, unlike shasum which is a
-# GNU coreutils extension and may be absent from slim embedded build images)
-# computes the hash. On stdin it prints "<checksum> <byte-count>" with no
-# filename field (verified on macOS's BSD cksum), so `cut -d' ' -f1` isolates
-# just the checksum.
-# Additional payload coverage: LINK (the link driver
-# affects every produced binary, and a command-line LINK= override is
-# legitimate for exotic toolchains, so it must key the build), TOOLCHAIN_CHECK
-# (the guard-skip knob must not alias a guarded build), and SRCS (the
-# SORTED source list, so ADDING or REMOVING a source file lands in a fresh
-# keyed directory; without it, a removed .c left its stale .o AND its stale
-# archive member behind under the same key, and `ar rc` on the existing
-# archive would never delete that member -- see the fresh-archive recipe
-# below for the other half of that fix).
-#
-# Build-cache-invalidation fix: FFT_WRAPPER_ALIAS_CFLAGS. The
-# -fno-strict-aliasing escape hatch applied via target-specific CFLAGS to
-# ONLY fft_wrapper.o/fft_wrapper_ne10.o (see the two target-specific-variable
-# lines and their big rationale comment further down) used to be a bare
-# literal on those two lines, invisible to this payload -- a target-specific
-# `TARGET: CFLAGS += ...` assignment does NOT retroactively change what
-# $(CFLAGS) expanded to when THIS line was evaluated (GNU Make expands a
-# `:=` payload string immediately, at parse time; target-specific values
-# only exist within that target's own recipe/prerequisite evaluation and
-# never leak back into the global $(CFLAGS) already captured here). So
-# changing that literal (or removing it) left CFG_SIG byte-for-byte
-# unchanged, `make lib` became a silent no-op, and a keyed obj/bin directory
-# built before the flag existed could go on reusing an fft_wrapper.o
-# compiled WITHOUT it forever -- defeating the whole fix with no way to
-# detect it short of a manual clean (confirmed via an isolated test; see
-# scripts/test_build_isolation.sh S19). Fixed by extracting the flag into
-# this named variable and referencing the variable -- never a literal --
-# from the target-specific lines instead. THE PATTERN: any future policy
-# flag added to a target-specific CFLAGS/CXXFLAGS line in this Makefile must
-# follow the same shape -- name it, fold the name into CFG_SIG_PAYLOAD, then
-# reference the name (not a literal) on the target-specific line -- so it
-# can never again be invisible to the hash.
-#
-# CFG_SIG-keying alone is not sufficient by itself, though: it guarantees a
-# changed value never silently reuses a stale cached object, but does not
-# stop a command-line `FFT_WRAPPER_ALIAS_CFLAGS=` override from producing a
-# real, fully-buildable archive that ships without -fno-strict-aliasing on
-# these two TUs. This plain `:=` is therefore also
-# listed in the "Command-line override rejection" foreach further above (see
-# that comment) -- a command-line origin for this name was always rejected
-# there regardless of position, but `make -e`
-# environment-override was NOT actually caught, despite this comment's
-# former (now-corrected) claim to the contrary: the foreach queries $(origin
-# FFT_WRAPPER_ALIAS_CFLAGS) at ITS OWN position in the file, and this
-# variable's bare `:=` used to sit only here -- AFTER that foreach -- so the
-# origin-flip to "environment override" that `-e` triggers on an attempted
-# makefile assignment had not happened yet when the check ran. Fixed by
-# duplicating-and-relocating just the bare `:=` literal to directly above
-# the foreach itself (see the "Bare-literal policy flags" comment there for
-# the full mechanism); the CFG_SIG_PAYLOAD reference immediately below still
-# reads this name's value, now already final by construction, and there
-# remains exactly one `:=` definition of FFT_WRAPPER_ALIAS_CFLAGS in this
-# file, just relocated. A plain-environment value (no `-e`) still folds in
-# normally (origin "file") and still participates in CFG_SIG below.
-CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) SRCS=$(sort $(OWN_SRCS) $(VENDOR_SRCS) $(VENDOR_CXXSRCS)) FFT_WRAPPER_ALIAS_CFLAGS=$(FFT_WRAPPER_ALIAS_CFLAGS)
-CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
-
-BE_SRCS    = $(OWN_SRCS) $(VENDOR_SRCS)
-BE_CXXSRCS = $(VENDOR_CXXSRCS)
-
-BE_OBJS  = $(patsubst %.c,$(OBJ_DIR)/%.o,$(notdir $(BE_SRCS))) \
-           $(patsubst %.cpp,$(OBJ_DIR)/%.o,$(notdir $(BE_CXXSRCS)))
-OWN_OBJS = $(patsubst %.c,$(OBJ_DIR)/%.o,$(notdir $(OWN_SRCS)))
-VPATH    = src lib/kiss_fft lib/ne10/modules lib/ne10/modules/dsp
-
-# -Werror opt-in, scoped to OUR OWN objects only (WERROR itself is declared
-# near the top of this file, before CFG_SIG -- see that declaration for why).
-# audio_common is the one Makefile in this project that compiles vendored
-# TUs (NE10/KISS FFT) through the exact same generic pattern rule as its own
-# wrapper sources (src/hpf.c, src/fft_wrapper*.c); those vendor bodies carry
-# pre-existing warnings that are out of scope to fix here, so a blanket
-# -Werror would fail the build on code we don't own. A target-specific
-# variable applies -Werror only when building $(OWN_OBJS), leaving
-# $(VENDOR_SRCS)/$(VENDOR_CXXSRCS) compiles unaffected.
-ifeq ($(WERROR),1)
-$(OWN_OBJS): CFLAGS += -Werror
-endif
-
-# -fno-strict-aliasing, scoped to ONLY the objects for src/fft_wrapper_ne10.c
-# and src/fft_wrapper.c (same target-specific-variable pattern as the
-# -Werror opt-in above, just unconditional and narrower -- two specific
-# objects, not a whole class of objects).
-#
-# The flag string itself lives in $(FFT_WRAPPER_ALIAS_CFLAGS) (defined up
-# above, ahead of CFG_SIG_PAYLOAD -- see the "Build-cache-invalidation fix"
-# comment there for the full story): a target-specific `CFLAGS +=` line is
-# invisible to CFG_SIG_PAYLOAD's earlier `:=` expansion, so the two lines
-# below reference the named variable rather than a literal, and that
-# variable's value is folded into CFG_SIG_PAYLOAD -- changing it (or this
-# variable's definition) now always lands in a fresh keyed directory instead
-# of silently reusing objects built under the old value. Follow this same
-# indirection for any future policy flag added to a target-specific CFLAGS/
-# CXXFLAGS line in this Makefile; do not hardcode a literal on the line.
-#
-# fft_wrapper_ne10.c's fft_forward/fft_inverse cast `Complex*` to
-# `ne10_fft_cpx_float32_t*` in place (see the "Residual strict-aliasing
-# caveat" comment in fft_wrapper_ne10.c itself for the layout-equality proof
-# and full rationale) -- two distinct struct types, so reading through one
-# after writing through the other is, strictly, type-based-alias UB even
-# though the layouts provably match.
-#
-# fft_wrapper.c's fft_power() (pre-existing) and fft_magnitude() (added in
-# this same optimization arc, later than fft_power) have the identical
-# exposure from the other direction: both cast a `Complex*` straight to
-# `const float*` and hand it to vld2q_f32 ("float32x4x2_t v =
-# vld2q_f32((const float*)(spectrum + k));") -- reading a `Complex` object
-# through a `float` lvalue is a type-based-alias violation just the same, a
-# `float` is not the effective type of the `Complex` struct object even
-# though every byte of the struct IS a float. (fft_apply_gain() in this same
-# file does the identical vld2q_f32/vst2q_f32 cast and rides along under
-# this same TU-wide flag; unlike fft_power it has no separate EXEMPT entry
-# in scripts/audit_fp_contract.sh because it's a pure multiply with no
-# fp-contraction angle to audit -- but the aliasing exposure from the cast
-# is the same for all three functions.) Until this line was added, this TU
-# compiled the exact same aliasing pattern as fft_wrapper_ne10.c WITHOUT the
-# escape hatch -- this closes that gap. This flag removes the TBAA
-# assumption for these two TUs only, formally sanctioning what was
-# previously just an -O2/no-LTO empirical argument; every other object in
-# this archive (including the rest of both backends) keeps the default
-# strict-aliasing behavior.
-$(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
-$(OBJ_DIR)/fft_wrapper.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
-
-LIB = $(BIN_DIR)/libaudio_common.a
-
-.PHONY: all lib selftest test_stft test_stft_guard test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
-all: lib
-
-lib: $(LIB)
-
-test-fast-sqrt-codegen:
-	@FP_POLICY='$(FP_POLICY)' scripts/audit_fast_sqrt_codegen.sh
-
-# --- CFG_SIG collision guard + directory creation (build hygiene) ----------
-# _cfg_guard is the single order-only prerequisite every compile/link/archive
-# rule below depends on (replacing the previous bare "| $(OBJ_DIR)"/
-# "| $(BIN_DIR)" order-only prerequisites and their own tiny `@mkdir -p $@`
-# rule). Being .PHONY, its recipe runs on every `make` invocation that needs
-# it -- not just the first time $(OBJ_DIR)/$(BIN_DIR) are created -- and GNU
-# Make builds any one target at most once per invocation even when several
-# rules list it as a prerequisite, so under `make -j` it still runs exactly
-# once, and (being an ordinary prerequisite in the dependency graph, order-
-# only or not) make schedules it to completion before any rule that depends
-# on it starts: race-free.
-#
-# It does two things:
-#   1. mkdir -p $(OBJ_DIR) $(BIN_DIR) -- idempotent, safe if two *separate*
-#      `make` processes for the very same config happen to race each other.
-#   2. Writes (first time) or verifies (every subsequent time) a one-line
-#      config.manifest in EACH of the two directories, containing the exact
-#      CFG_SIG_PAYLOAD string that produced this build's CFG_SIG. If a
-#      manifest already exists and its content does not match this build's
-#      payload, two *different* configurations hashed to the same CFG_SIG
-#      (a cksum collision) or the payload has a coverage gap (some flag that
-#      affects the build isn't in it) -- either way, objects from an
-#      unrelated config could silently be reused, so this is a hard error,
-#      never a warning. The write is temp-file-then-mv (atomic rename on the
-#      same filesystem), so a concurrent reader never observes a half-
-#      written manifest.
-#
-# `make -n` only prints this recipe (nothing is created or compared under
-# -n), and nothing here runs unless some real target needs it -- Makefile
-# parsing itself performs no I/O.
 _cfg_guard:
-	@if [ "$(BACKEND)" = "ne10" ] && [ "$(TOOLCHAIN_CHECK)" = "1" ]; then \
+	@test -n "$(CC_TARGET_SIG)" && test "$(CC_TARGET_SIG)" != unavailable || { \
+	  echo "FATAL: cannot determine compiler target; CC preprocessing with the configured flags must succeed." >&2; \
+	  exit 1; }
+	@if [ "$(TOOLCHAIN_CHECK)" = "1" ]; then \
 	  cc_m="$$($(CC) -dumpmachine 2>/dev/null)"; cxx_m="$$($(CXX) -dumpmachine 2>/dev/null)"; \
 	  if [ -z "$$cc_m" ] || [ "$$cc_m" != "$$cxx_m" ]; then \
-	    echo "FATAL: CC/CXX compile for different targets (CC='$(CC)' -> '$$cc_m', CXX='$(CXX)' -> '$$cxx_m')." >&2; \
-	    echo "  BACKEND=ne10 builds one C++ TU, so a partial cross-toolchain (only CC= passed)" >&2; \
-	    echo "  would mix host C++ objects into a cross build. Pass the FULL toolchain, e.g.:" >&2; \
-	    echo "    make BACKEND=ne10 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ AR=aarch64-linux-gnu-ar RANLIB=aarch64-linux-gnu-ranlib" >&2; \
-	    echo "  (TOOLCHAIN_CHECK=0 skips this check; it participates in CFG_SIG.)" >&2; \
-	    exit 1; \
+	    echo "FATAL: CC/CXX target mismatch (CC=$$cc_m, CXX=$$cxx_m)" >&2; exit 1; \
 	  fi; \
 	fi
-	@mkdir -p $(OBJ_DIR) $(BIN_DIR)
-	@for d in $(OBJ_DIR) $(BIN_DIR); do \
-	  m="$$d/config.manifest"; \
-	  if [ -f "$$m" ]; then \
-	    old="$$(cat "$$m")"; \
-	    if [ "$$old" != "$(CFG_SIG_PAYLOAD)" ]; then \
-	      echo "FATAL: CFG_SIG collision or coverage gap in $$m" >&2; \
-	      echo "  CFG_SIG=$(CFG_SIG)" >&2; \
-	      echo "  stored : $$old" >&2; \
-	      echo "  current: $(CFG_SIG_PAYLOAD)" >&2; \
-	      exit 1; \
-	    fi; \
-	  else \
-	    tmp="$$d/.config.manifest.tmp.$$$$"; \
-	    printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$tmp"; \
-	    mv -f "$$tmp" "$$m"; \
-	  fi; \
-	done
+	@mkdir -p "$(OBJ_DIR)" "$(BIN_DIR)"
+	@if [ -f "$(OBJ_DIR)/config.manifest" ]; then \
+	  test "$$(cat "$(OBJ_DIR)/config.manifest")" = "$(CFG_SIG_PAYLOAD)" || { \
+	    echo "FATAL: spatial CFG_SIG collision in $(OBJ_DIR)" >&2; exit 1; }; \
+	else \
+	  tmp="$(OBJ_DIR)/.config.manifest.tmp.$$$$"; \
+	  printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$tmp"; \
+	  mv -f "$$tmp" "$(OBJ_DIR)/config.manifest"; \
+	fi
 
-# Fresh-archive discipline: the archive is always built
-# from scratch into a temp file and renamed into place -- NEVER `ar rc` onto
-# an existing archive, which only ever ADDS/REPLACES members and would leave
-# a removed source's stale .o member in the delivered archive forever. The
-# rename is also atomic, so a concurrent reader (another config's consumer
-# resolving this same path) never observes a half-written archive. The other
-# half of the source-removal fix is SRCS in CFG_SIG_PAYLOAD above (a changed
-# source list keys to a fresh directory in the first place).
-# One chained shell line, NOT one recipe line per step: the temp name embeds
-# the shell's PID ($$$$ -> $$) so two same-config processes racing this rule
-# (e.g. a plain build and a publish that started before taking its lock)
-# each write their OWN temp and the final mv is an atomic
-# last-writer-wins -- and each recipe LINE runs in a fresh shell with a fresh
-# PID, so the steps must share one line to share one temp name.
-$(LIB): $(BE_OBJS) | _cfg_guard
-	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rc "$$t" $(BE_OBJS) && $(RANLIB) "$$t" && mv -f "$$t" $@
-	@echo "audio_common [$(BACKEND)] -> $@"
-
-# -MD -MP (NOT -MMD): emits $(OBJ_DIR)/<name>.d per object, listing every
-# header the TU pulled in -- INCLUDING vendored NE10/KISS headers reached via
-# -isystem, which -MMD would omit. Included near the bottom of this file via
-# `-include $(wildcard $(OBJ_DIR)/*.d)`; see that line's comment.
-$(OBJ_DIR)/%.o: %.c | _cfg_guard
+$(OBJ_DIR)/spatial_complex.o: common/utility/spatial_complex.c common/utility/spatial_complex.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
-$(OBJ_DIR)/%.o: %.cpp | _cfg_guard
-	$(CXX) $(CXXFLAGS) -MD -MP -c -o $@ $<
 
-selftest: $(LIB) test_stft test_stft_guard | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/roundtrip.o test/roundtrip.c
-	$(LINK) -o $(BIN_DIR)/roundtrip $(OBJ_DIR)/roundtrip.o $(LIB) $(LDFLAGS)
-	@echo "--- audio_common selftest [$(BACKEND)] ---"
-	@$(BIN_DIR)/roundtrip
-	# simd_kernels.h selftest: header-only, needs no FFT/archive objects.
-	# -ffp-contract=off is NOT optional here -- verified empirically that
-	# without it, this compiler auto-fuses the "plain mul/add, no FMA"
-	# scalar reference loops (e.g. sk_ema_f32_scalar) into `fmla` at -O2,
-	# which would then mismatch the deliberately-unfused NEON intrinics
-	# path (see include/simd_kernels.h's FMA-discipline doc comment).
-	# Keep strict aliasing explicit: simd_kernels.h is consumed by external
-	# board builds which must not depend on this Makefile's per-TU exceptions.
-	$(CC) $(CFLAGS) -ffp-contract=off -fstrict-aliasing -MD -MP -c -o $(OBJ_DIR)/simd_selftest.o test/simd_selftest.c
-	$(CC) $(LDFLAGS) -o $(BIN_DIR)/simd_selftest $(OBJ_DIR)/simd_selftest.o
-	@echo "--- audio_common SIMD kernel selftest [$(BACKEND)] ---"
-	@$(BIN_DIR)/simd_selftest
-	# Second pass with NR's production exp1_approx branch order
-	# (USE_OPTIMIZED_E1): fast_math.h's two orders must stay bit-identical,
-	# NaN included, so the cross-check against the kernel runs in both modes.
-	$(CC) $(CFLAGS) -DUSE_OPTIMIZED_E1 -ffp-contract=off -fstrict-aliasing -c -o $(OBJ_DIR)/simd_selftest_e1.o test/simd_selftest.c
-	$(CC) $(LDFLAGS) -o $(BIN_DIR)/simd_selftest_e1 $(OBJ_DIR)/simd_selftest_e1.o
-	@echo "--- audio_common SIMD kernel selftest [$(BACKEND)] USE_OPTIMIZED_E1 ---"
-	@$(BIN_DIR)/simd_selftest_e1
-	# simd_kernel_nn.h selftest: the NN pre/post kernels, kept out of
-	# simd_kernels.h so the traditional libraries' kernel set never moves.
-	# Header-only and the same bit-exact gate, same flags.
-	$(CC) $(CFLAGS) -ffp-contract=off -fstrict-aliasing -MD -MP -c -o $(OBJ_DIR)/simd_nn_selftest.o test/simd_nn_selftest.c
-	$(CC) $(LDFLAGS) -o $(BIN_DIR)/simd_nn_selftest $(OBJ_DIR)/simd_nn_selftest.o
-	@echo "--- audio_common NN SIMD kernel selftest [$(BACKEND)] ---"
-	@$(BIN_DIR)/simd_nn_selftest
-	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_audio_utilities.o test/test_audio_utilities.c
-	$(LINK) -o $(BIN_DIR)/test_audio_utilities $(OBJ_DIR)/test_audio_utilities.o $(LIB) $(LDFLAGS)
-	@echo "--- audio_common pre-gain/resampler test [$(BACKEND)] ---"
-	@$(BIN_DIR)/test_audio_utilities
+$(OBJ_DIR)/spatial_simd.o: common/utility/spatial_simd.c common/utility/spatial_simd.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# test_stft: audio_stft.h against reference copies of the framing code in
-# test/stft_ref/. Built twice because the envelope-normalised reference copy
-# is sized by TEST_N at compile time.
-test_stft: $(LIB) | _cfg_guard
-	@for n in 512 1024; do \
-	  $(CC) $(CFLAGS) -fstrict-aliasing -Itest -DTEST_N=$$n -MD -MP -c -o $(OBJ_DIR)/test_stft_$$n.o test/test_stft.c && \
-	  $(LINK) -o $(BIN_DIR)/test_stft_$$n $(OBJ_DIR)/test_stft_$$n.o $(LIB) $(LDFLAGS) && \
-	  echo "--- audio_common STFT/ISTFT test [$(BACKEND)] TEST_N=$$n ---" && \
-	  $(BIN_DIR)/test_stft_$$n > $(BIN_DIR)/test_stft_$$n.log && tail -n 1 $(BIN_DIR)/test_stft_$$n.log || exit 1; \
-	done
+$(OBJ_DIR)/doa_smoother.o: doa/doa_smoother.c doa/doa_smoother.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# test_stft_guard: AcStft and AcIstft in exact-size blocks that end against a guard
-# page (POSIX only; the test prints SKIP elsewhere).
-test_stft_guard: $(LIB) | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_stft_guard.o test/test_stft_guard.c
-	$(LINK) -o $(BIN_DIR)/test_stft_guard $(OBJ_DIR)/test_stft_guard.o $(LIB) $(LDFLAGS)
-	@echo "--- audio_common STFT/ISTFT guard-page test [$(BACKEND)] ---"
-	@$(BIN_DIR)/test_stft_guard
+$(OBJ_DIR)/steering.o: doa/steering.c doa/steering.h doa/srp.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-test_audio_utils: $(LIB) | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_audio_utilities.o test/test_audio_utilities.c
-	$(LINK) -o $(BIN_DIR)/test_audio_utilities $(OBJ_DIR)/test_audio_utilities.o $(LIB) $(LDFLAGS)
-	@echo "--- audio_common pre-gain/resampler test [$(BACKEND)] ---"
-	@$(BIN_DIR)/test_audio_utilities
+$(OBJ_DIR)/srp.o: doa/srp.c doa/srp.h common/utility/spatial_complex.h common/utility/spatial_simd.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# test_pool: pool-contract negative tests (F07 alignment guards, F14 HPF
-# domain validation). Same shape as selftest -- links against the same $(LIB)
-# archive so it exercises whichever backend (kiss/ne10) was built.
-test_pool: $(LIB) | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_pool_contract.o test/test_pool_contract.c
-	$(LINK) -o $(BIN_DIR)/test_pool_contract $(OBJ_DIR)/test_pool_contract.o $(LIB) $(LDFLAGS)
-	@echo "--- audio_common pool-contract test [$(BACKEND)] ---"
-	@$(BIN_DIR)/test_pool_contract
+$(OBJ_DIR)/masker.o: VAD/masker.c VAD/masker.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# test_wav: negative-corpus tests for the shared, hardened WAV parser (F06
-# remediation). Header-only like the simd_kernels.h half of `selftest` --
-# wav_io.h needs no FFT/archive objects, so this doesn't depend on $(LIB)
-# and links with a plain $(CC) (no NE10 C++ TU involved either way).
-test_wav: | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_wav_io.o test/test_wav_io.c
-	$(CC) -o $(BIN_DIR)/test_wav_io $(OBJ_DIR)/test_wav_io.o -lm
-	@echo "--- audio_common WAV I/O negative-corpus test [$(BACKEND)] ---"
-	@$(BIN_DIR)/test_wav_io
+$(OBJ_DIR)/vad.o: VAD/vad.c VAD/vad.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# test_wav_nr_style (review R01): runs the SAME writer special-values
-# corpus (test/test_wav_writer_common.h) as test_wav above, but compiled
-# with WAV_IO_WRITER_STYLE forced to WAV_IO_WRITER_NR -- test_wav's own TU
-# never sets that knob, so it only ever exercises the default
-# WAV_IO_WRITER_AEC style (see wav_io.h's WAV_IO_WRITER_STYLE doc). Header-
-# only, same shape as test_wav.
-test_wav_nr_style: | _cfg_guard
-	$(CC) $(CFLAGS) -DWAV_IO_WRITER_STYLE=WAV_IO_WRITER_NR -MD -MP -c -o $(OBJ_DIR)/test_wav_writer_nr_style.o test/test_wav_writer_nr_style.c
-	$(CC) -o $(BIN_DIR)/test_wav_writer_nr_style $(OBJ_DIR)/test_wav_writer_nr_style.o -lm
-	@echo "--- audio_common WAV writer NR-style special-values test [$(BACKEND)] ---"
-	@$(BIN_DIR)/test_wav_writer_nr_style
+$(OBJ_DIR)/vad_api.o: VAD/vad_api.c VAD/vad_api.h VAD/masker.h VAD/vad.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# test-wav-ubsan (review R01): UBSan probe for wav_write_float's PCM16
-# quantizer -- writes {1.0f,-1.0f,NAN} and must run clean under
-# -fsanitize=undefined -fno-sanitize-recover=all. Pre-fix, +1.0f drove
-# (int16_t)32768.5f (out-of-range float-to-integer conversion, UB per C99
-# 6.3.1.4p1) and this aborted; post-fix (saturating int32_t conversion +
-# non-finite sanitize) it must pass. Sanitizer flags are scoped to this one
-# target's compile+link, same pattern as $(OWN_OBJS): CFLAGS -Werror above
-# -- never applied to the main $(LIB) archive or any other test.
-test-wav-ubsan: | _cfg_guard
-	$(CC) $(CFLAGS) -fsanitize=undefined -fno-sanitize-recover=all -MD -MP -c -o $(OBJ_DIR)/test_wav_writer_ubsan.o test/test_wav_writer_ubsan.c
-	$(CC) -fsanitize=undefined -fno-sanitize-recover=all -o $(BIN_DIR)/test_wav_writer_ubsan $(OBJ_DIR)/test_wav_writer_ubsan.o -lm
-	@echo "--- audio_common WAV writer UBSan probe [$(BACKEND)] ---"
-	@$(BIN_DIR)/test_wav_writer_ubsan
+$(OBJ_DIR)/bf.o: bf/bf.c bf/bf.h common/utility/spatial_complex.h common/utility/spatial_simd.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# test_zero_heap: allocator-hook acceptance test (review F02/F08) -- proves
-# fft_init()..fft_destroy() makes zero malloc/calloc/realloc/free calls, and
-# that fft_destroy() on a pool-owned handle is idempotent. Same shape as
-# test_pool -- links against the same $(LIB) archive so it exercises whichever
-# backend (kiss/ne10) was built (KISS was already zero-heap; NE10's twiddle
-# config is now carved from the caller pool too -- see lib/ne10/VENDORED.md
-# patch P0001).
-#
-# The allocator-hook mechanism (test/zero_heap_hook.c) is platform-specific
-# and, empirically (see that file's header comment), needs different
-# packaging per platform:
-#   - macOS: dyld __DATA,__interpose only takes effect from a Mach-O image
-#     OTHER than the main executable, so the hook is built as its own small
-#     .dylib and the test links against it (rpath'd to @loader_path so it
-#     resolves next to the test binary with no env var needed).
-#   - Linux: GNU ld --wrap=<symbol> works from a plain object linked directly
-#     into the test binary; -Wl,--wrap=... is scoped to this one target only,
-#     so it never affects the main $(LIB) archive or any other test.
-ifeq ($(shell uname -s),Darwin)
-  ZERO_HEAP_HOOK_LIB   = $(BIN_DIR)/libzero_heap_hook.dylib
-  ZERO_HEAP_LDFLAGS    = -L$(BIN_DIR) -lzero_heap_hook -Wl,-rpath,@loader_path
-  ZERO_HEAP_HOOK_DEPS  = $(ZERO_HEAP_HOOK_LIB)
-else
-  ZERO_HEAP_HOOK_LIB   = $(OBJ_DIR)/zero_heap_hook.o
-  ZERO_HEAP_LDFLAGS    = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free
-  ZERO_HEAP_HOOK_DEPS  = $(ZERO_HEAP_HOOK_LIB)
-endif
+$(OBJ_DIR)/test_spatial_third_party.o: tests/test_spatial_third_party.c \
+        bf/bf.h bf/bf_test_hooks.h VAD/vad_api.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(BIN_DIR)/libzero_heap_hook.dylib: test/zero_heap_hook.c test/zero_heap_hook.h | _cfg_guard
-	$(CC) $(CFLAGS) -dynamiclib -o $@ test/zero_heap_hook.c
+# The BF_TESTING build of bf.c, compiled ONLY here. audit-no-bf-test-symbols
+# below proves the deployable archive never picks it up.
+$(OBJ_DIR)/bf_test.o: bf/bf.c bf/bf.h common/utility/spatial_complex.h \
+        common/utility/spatial_simd.h | _cfg_guard
+	$(CC) $(CFLAGS) -DBF_TESTING=1 -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/zero_heap_hook.o: test/zero_heap_hook.c test/zero_heap_hook.h | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $@ test/zero_heap_hook.c
+$(BIN_DIR)/test_spatial_third_party: $(OBJ_DIR)/test_spatial_third_party.o \
+        $(OBJ_DIR)/bf_test.o $(DOA_LIB) $(SPATIAL_COMMON_LIB) $(VAD_LIB) \
+        $(COMMON_LIB) | _cfg_guard
+	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/test_spatial_third_party.o \
+		$(OBJ_DIR)/bf_test.o $(DOA_LIB) $(SPATIAL_COMMON_LIB) $(VAD_LIB) \
+		$(COMMON_LIB) -lm
 
-test_zero_heap: $(LIB) $(ZERO_HEAP_HOOK_DEPS) | _cfg_guard
-	# -fno-builtin is NOT optional here: without it, clang recognizes
-	# malloc/calloc/realloc/free as builtin allocation functions and, when a
-	# call's returned pointer never "escapes" (isn't dereferenced/printed,
-	# only null-checked and freed), silently deletes the whole
-	# alloc+free pair as dead code at -O2 -- verified empirically while
-	# building this test (the deliberate calloc()/realloc() sanity calls in
-	# test_hook_actually_counts() were compiled away entirely). That would
-	# make this test pass for the wrong reason (no calls to observe, rather
-	# than calls correctly observed at zero).
-	$(CC) $(CFLAGS) -fno-builtin -MD -MP -c -o $(OBJ_DIR)/test_fft_zero_heap.o test/test_fft_zero_heap.c
-ifeq ($(shell uname -s),Darwin)
-	$(LINK) -o $(BIN_DIR)/test_fft_zero_heap $(OBJ_DIR)/test_fft_zero_heap.o $(LIB) $(LDFLAGS) $(ZERO_HEAP_LDFLAGS)
-else
-	$(LINK) -o $(BIN_DIR)/test_fft_zero_heap $(OBJ_DIR)/test_fft_zero_heap.o $(ZERO_HEAP_HOOK_LIB) $(LIB) $(LDFLAGS) $(ZERO_HEAP_LDFLAGS)
-endif
-	@echo "--- audio_common allocator-hook zero-heap test [$(BACKEND)] ---"
-	@$(BIN_DIR)/test_fft_zero_heap
+# Diagnostic only, never part of `test`: it reports timings, so it has no
+# pass/fail and would make the gate depend on how loaded the machine is.
+# Run it ON THE TARGET -- see the file header for why a host number decides
+# nothing here.
+$(OBJ_DIR)/bench_masker.o: tests/bench_masker.c VAD/masker.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# test_ne10_force_c (F11): builds test/test_ne10_c_parity.c TWICE -- once
-# against the normal NE10 backend (calls the `_neon`-suffixed kernels) and
-# once with SIMD=0 (fft_wrapper_ne10.c routes every FFT call through NE10's
-# `_c` scalar kernels instead) -- then diffs the two runs' dumped outputs.
-# NE10-specific: BACKEND=ne10 is forced in both sub-makes below
-# regardless of how this invocation of `make` itself resolved BACKEND, and
-# nothing here touches a BACKEND=kiss build.
-#
-# Two full sub-`make`s (via $(MAKE) BACKEND=ne10 ...) rebuild the archive
-# for each EXTRA_CFLAGS value rather than trying to build both variants in
-# one invocation: EXTRA_CFLAGS is baked into $(OBJ_DIR)'s AND $(BIN_DIR)'s
-# own path via CFG_SIG (see the hash-keyed directory section above), so the
-# two sub-makes automatically land in two DIFFERENT bin/ne10-<sig>/
-# directories -- the second sub-make's archive/objects are a real fresh
-# build, not a stale reuse of the first's, with nothing needing to be wiped
-# in between, and (the actual bug this rewrite fixes)
-# the FORCED-C sub-make's rebuild of libaudio_common.a can never overwrite
-# the normal NEON build's archive, because the two now live in different
-# directories instead of the same flat bin/ne10/.
-#
-# Each variant's bin dir is resolved at RECIPE time (not parsed/cached) via
-# `$(MAKE) ... print-bin-dir`, so this target never has to guess or
-# reconstruct a keyed path itself -- it just asks the sub-make that built it.
-test_ne10_force_c:
-	@$(MAKE) BACKEND=ne10 _ne10_parity_bin
-	@bd_neon="$$($(MAKE) -s --no-print-directory BACKEND=ne10 print-bin-dir)"; \
-	 $(MAKE) BACKEND=ne10 SIMD=0 _ne10_parity_bin; \
-	 bd_c="$$($(MAKE) -s --no-print-directory BACKEND=ne10 SIMD=0 print-bin-dir)"; \
-	 if [ "$$bd_neon" = "$$bd_c" ]; then \
-	   echo "FATAL: test_ne10_force_c: NEON and forced-C variants resolved to the SAME bin dir ($$bd_neon) -- CFG_SIG did not separate them" >&2; \
-	   exit 1; \
-	 fi; \
-	 echo "--- audio_common NE10 NEON-vs-C parity [test_ne10_force_c] ---"; \
-	 echo "  NEON     bin dir: $$bd_neon"; \
-	 echo "  forced-C bin dir: $$bd_c"; \
-	 "$$bd_neon/test_ne10_c_parity" "$$bd_neon/test_ne10_c_parity_neon.dump"; \
-	 "$$bd_c/test_ne10_c_parity"    "$$bd_c/test_ne10_c_parity_c.dump"; \
-	 $(CC) -O2 -Wall -Wextra -o "$$bd_c/ne10_parity_compare" test/ne10_parity_compare.c -lm; \
-	 "$$bd_c/ne10_parity_compare" "$$bd_neon/test_ne10_c_parity_neon.dump" "$$bd_c/test_ne10_c_parity_c.dump"
+$(BIN_DIR)/bench_masker: $(OBJ_DIR)/bench_masker.o $(VAD_LIB) $(COMMON_LIB) \
+        | _cfg_guard
+	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/bench_masker.o $(VAD_LIB) $(COMMON_LIB) -lm
 
-# _ne10_parity_bin: internal plumbing target invoked (via $(MAKE) BACKEND=ne10
-# [EXTRA_CFLAGS=...] _ne10_parity_bin) by test_ne10_force_c above; same shape
-# as test_pool/test_wav/etc. Because BIN_DIR is now CFG_SIG-keyed, the two
-# sub-make invocations (plain NE10 vs SIMD=0) each
-# land in their OWN bin/ne10-<sig>/test_ne10_c_parity -- no cp-to-rename
-# dance is needed any more to keep one variant's binary from being clobbered
-# by the other's rebuild.
-_ne10_parity_bin: $(LIB) | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_ne10_c_parity.o test/test_ne10_c_parity.c
-	$(LINK) -o $(BIN_DIR)/test_ne10_c_parity $(OBJ_DIR)/test_ne10_c_parity.o $(LIB) $(LDFLAGS)
+# BENCH_NFFT defaults to the integrator's grid (256/128 @ 16 kHz -> F=129),
+# not to a round number: the stage proportions move with F.
+BENCH_NFFT ?= 256
+bench-masker: $(BIN_DIR)/bench_masker
+	"$(abspath $(BIN_DIR))/bench_masker" $(BENCH_NFFT)
 
-# --- Query targets -----------------------------------------------------------
-# Consumers (AEC/NR Makefiles, docs_smoke.sh, scripts) resolve THIS build's
-# actual output paths at recipe time instead of hardcoding
-# bin/<backend>/libaudio_common.a -- e.g.
-# `ac="$$(make -s -C ../../audio_common BACKEND=$$BACKEND print-lib-path)"`.
-# $(abspath ...) is fine here even though it prints an absolute path: the
-# prohibition on absolute paths is about paths landing in COMMITTED files
-# (or generated manifests), not runtime `make` stdout -- and an absolute
-# path is exactly what a caller in a different, unknown-relative-depth
-# directory needs to reliably -I/-L/link against. Parse-time itself never
-# writes stdout (only $(info) above does, and that's gated off for these
-# goals); these targets' only output is the one recipe-time @echo line.
+audit-no-bf-test-symbols: $(BF_LIB)
+	@if nm "$(BF_LIB)" | grep -q 'bf_test_'; then \
+	  echo "FAIL: test-only symbol present in deployable $(BF_LIB)" >&2; \
+	  exit 1; \
+	fi
+	@echo "audit-no-bf-test-symbols: clean"
+
+test: audit-no-bf-test-symbols $(BIN_DIR)/test_spatial_third_party
+	"$(abspath $(BIN_DIR))/test_spatial_third_party"
+
+test_spatial_third_party: $(BIN_DIR)/test_spatial_third_party
+
+$(SPATIAL_COMMON_LIB): $(SPATIAL_COMMON_OBJS) | _cfg_guard
+	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
+	@echo "spatial-common [$(BACKEND), SIMD=$(SIMD)] -> $@"
+
+$(DOA_LIB): $(DOA_OBJS) | _cfg_guard
+	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
+	@echo "doa [$(BACKEND), SIMD=$(SIMD)] -> $@"
+
+$(BF_LIB): $(BF_OBJS) | _cfg_guard
+	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
+	@echo "bf [$(BACKEND), SIMD=$(SIMD)] -> $@"
+
+$(VAD_LIB): $(VAD_OBJS) | _cfg_guard
+	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
+	@echo "vad [$(BACKEND), SIMD=$(SIMD)] -> $@"
+
 print-bin-dir:
 	@echo $(abspath $(BIN_DIR))
 print-obj-dir:
 	@echo $(abspath $(OBJ_DIR))
-print-lib-path:
-	@echo $(abspath $(LIB))
-print-fp-policy:
-	@echo $(FP_POLICY)
+print-spatial-common-lib-path:
+	@echo $(abspath $(SPATIAL_COMMON_LIB))
+print-doa-lib-path:
+	@echo $(abspath $(DOA_LIB))
+print-bf-lib-path:
+	@echo $(abspath $(BF_LIB))
+print-vad-lib-path:
+	@echo $(abspath $(VAD_LIB))
 
-# --- publish v4: immutable, content-addressed release under $(DIST_ROOT) ---
-# Layout per backend:
-#
-#   $(DIST_ROOT)/<backend>/<cfg_sig>-<content12>/
-#       <artifacts...>     immutable after first publish
-#       MANIFEST.txt       immutable, DETERMINISTIC (config + tool identities
-#                          + per-file SHA-256 only -- no commit/date, so the
-#                          same release id always has the same MANIFEST bytes
-#                          and republish can verify it byte-for-byte)
-#       ATTEST/            append-only provenance: EXACTLY one new
-#                          attest-<utc>-<commit>[-dirty]-<seq>.txt per
-#                          publish EVENT (incl. idempotent republishes),
-#                          carrying event_id/git_commit (FULL 40-hex OID)/
-#                          git_dirty/date_utc/allow_dirty_publish -- "which
-#                          checkout published this" lives here, not in
-#                          MANIFEST. Installed via the helper's
-#                          --excl-install mode (write-temp + link(2), the
-#                          atomic no-clobber equivalent of O_CREAT|O_EXCL);
-#                          a name collision (same second, same commit)
-#                          regenerates the event id with the next <seq> and
-#                          retries -- an existing attestation is NEVER
-#                          overwritten (a bare mv -f used to let same-second
-#                          republishes silently clobber the prior record).
-#                          Attestations are UNSIGNED: they provide
-#                          traceability, not authenticity -- anyone with
-#                          filesystem access could forge one, so do not
-#                          present ATTEST/ as tamper-proof under an attacker
-#                          model (MANIFEST byte-verification is the
-#                          integrity check; ATTEST is the provenance log).
-#   $(DIST_ROOT)/<backend>/current -> <rel_id>   (atomic swap, see below)
-#
-# Republish of an existing release id verifies EVERY staged file -- the
-# artifacts AND MANIFEST.txt -- byte-for-byte against the stored release
-# (missing/differing file = FATAL: content-address collision or on-disk
-# tampering), then appends a new attestation and repoints `current`. Nothing
-# in an existing release dir is ever modified or deleted (ATTEST/ gains
-# files; artifacts/MANIFEST never change after first publish).
-#
-# Dirty/untracked policy (split into two dimensions): publish FATALs by
-# default when this checkout (a) has
-# uncommitted TRACKED changes (`git status --porcelain -uno` non-empty),
-# (b) contains ANY untracked, non-ignored file (`git ls-files --others
-# --exclude-standard` non-empty), or (c) has no git identity at all.
-# (c) is UNCONDITIONAL -- no escape hatch admits an identity-less
-# checkout, because neither the commit nor the untracked enumeration can
-# be named for it. The two escape hatches for (a)/(b) are separate and
-# orthogonal: ALLOW_DIRTY_PUBLISH=1 admits tracked changes and records
-# dirty_diff_sha256 (sha256 of `git diff --binary HEAD`);
-# ALLOW_UNTRACKED_PUBLISH=1 admits untracked files and records
-# untracked_tree_sha256 over sorted fixed-field records (see the knob
-# comment up top for the exact encoding and its fail-closed I/O
-# semantics -- the tracked diff hash says nothing about
-# untracked bytes, so two different untracked source states must not
-# share a provenance record). An untracked path that is neither a regular
-# file nor a symlink (an embedded git checkout, a fifo, ...) cannot be
-# hashed deterministically and is always refused by name.
-#
-# `current` is swapped with tools/atomic_symlink_swap.c (built at publish
-# time with $(HOSTCC), never the possibly-cross $(CC)): symlink to a
-# PID-suffixed temp + rename(2), which never follows symlinks -- truly
-# atomic on macOS AND GNU/Linux, with no missing-`current` window and no
-# destructive fallback (`mv -fT` doesn't exist on BSD/macOS, and
-# the previous rm+mv fallback both left a window and fired on ANY mv error).
-#
-# Locking: `publish` is a DRIVER that takes the per-backend mkdir
-# lock FIRST and only then recursively builds+stages via _publish_impl -- so
-# two concurrent same-config publishes can no longer race each other's
-# object/archive writes during the prerequisite build (the previous shape
-# built $(PUBLISH_ARTIFACTS) before its recipe ever took the lock). The
-# loser fails fast having written nothing. _publish_impl is INTERNAL:
-# invoking it directly skips the lock.
-PUBLISH_ARTIFACTS = $(LIB)
-DIST_BACKEND_DIR  = $(DIST_ROOT)/$(BACKEND)
-DIST_LOCK         = $(DIST_ROOT)/.lock.$(BACKEND)
-
-.PHONY: publish _publish_impl
-# Dry-run guard: this
-# recipe mentions $(MAKE), so GNU make executes it for real under -n/-q/-t
-# (all three share that rule) -- which used to mkdir $(DIST_ROOT)
-# persistently and take/release the real publish lock on every dry run.
-# The word-scan below detects those flags in MAKEFLAGS and branches:
-#   -t  prints a one-line note and exits 0 WITHOUT recursing (recursing
-#       let standard touch semantics bump the mtimes of hpf.o
-#       and the delivered archive -- real writes. publish is a phony
-#       ACTION, not a build product; touching its artifact prerequisites
-#       without attesting would fabricate state, so touch mode is an
-#       explicit no-op here). Checked FIRST: in a COMBINED invocation like
-#       `make -nt publish`, recursing for -n would hand the child make
-#       both flags and GNU make then really applies touch semantics
-#       (reproduced) -- so any t wins over n, conservatively;
-#   -q  exits 1 directly (question mode's documented "needs updating"
-#       answer -- publish is phony, so it always would run -- no output);
-#   -n  exec a recursion-only path (the child make inherits -n and merely
-#       PRINTS _publish_impl's commands).
-# All three are now ZERO-WRITE: no DIST_ROOT, no lock, no stage/helper/
-# MANIFEST/ATTEST writes, and no artifact mtime changes. MAKEFLAGS parsing
-# (verified against GNU make 3.81: 17 flag combinations incl. long forms):
-# bundled no-dash short flags may appear as the first word ("n", "sn") OR
-# as separate dashed words ("-n" after a long option); long options start
-# with "--"; a literal "--" separates flags from command-line variable
-# overrides (which can themselves contain n/q/t -- BACKEND=ne10 -- hence
-# the explicit skips). Normal invocations keep lock-FIRST unchanged.
-publish:
-	+@has_n=0; has_q=0; has_t=0; \
-	for w in $(MAKEFLAGS); do \
-	  case "$$w" in --) break ;; --*|*=*) continue ;; -n|-q|-t) ;; -*) continue ;; esac; \
-	  case "$$w" in *n*) has_n=1 ;; esac; \
-	  case "$$w" in *q*) has_q=1 ;; esac; \
-	  case "$$w" in *t*) has_t=1 ;; esac; \
-	done; \
-	if [ "$$has_t" = 1 ]; then echo "publish: -t (touch) is a no-op here -- publish is an action, not a build product; nothing was touched"; exit 0; fi; \
-	if [ "$$has_q" = 1 ]; then exit 1; fi; \
-	if [ "$$has_n" = 1 ]; then exec $(MAKE) --no-print-directory _publish_impl; fi; \
-	mkdir -p $(DIST_ROOT); \
-	if ! mkdir "$(DIST_LOCK)" 2>/dev/null; then \
-	  echo "FATAL: publish lock $(DIST_LOCK) already held (concurrent 'make publish BACKEND=$(BACKEND)'?)" >&2; \
-	  exit 1; \
-	fi; \
-	trap 'rmdir "$(DIST_LOCK)" 2>/dev/null' EXIT INT TERM; \
-	$(MAKE) --no-print-directory _publish_impl
-
-_publish_impl: $(PUBLISH_ARTIFACTS)
-	@set -e; \
-	work="$$(mktemp -d)"; \
-	tmp="$(DIST_BACKEND_DIR)/.stage.$$$$"; \
-	trap 'rm -rf "$$tmp" "$$work"' EXIT INT TERM; \
-	hash_untracked() { \
-	  LC_ALL=C sort | while IFS= read -r p; do \
-	    fp="$$1$$p"; \
-	    ph="$$(printf '%s' "$$p" | shasum -a 256 | cut -d' ' -f1)"; \
-	    [ "$${#ph}" -eq 64 ] || { printf 'X %s\n' "$$p"; continue; }; \
-	    if [ -L "$$fp" ]; then \
-	      tgt="$$(readlink "$$fp")" || { printf 'X %s\n' "$$p"; continue; }; \
-	      th="$$(printf '%s' "$$tgt" | shasum -a 256 | cut -d' ' -f1)"; \
-	      [ "$${#th}" -eq 64 ] || { printf 'X %s\n' "$$p"; continue; }; \
-	      printf 'L %s %s\n' "$$ph" "$$th"; \
-	    elif [ -f "$$fp" ]; then \
-	      m="$$(stat -f '%Lp' "$$fp" 2>/dev/null || stat -c '%a' "$$fp" 2>/dev/null)"; \
-	      ch="$$(shasum -a 256 "$$fp" 2>/dev/null | cut -d' ' -f1)"; \
-	      { [ -n "$$m" ] && [ "$${#ch}" -eq 64 ]; } || { printf 'X %s\n' "$$p"; continue; }; \
-	      printf 'F %s %s %s\n' "$$m" "$$ph" "$$ch"; \
-	    else printf 'X %s\n' "$$p"; fi; \
-	  done; \
-	}; \
-	commit="$$(git rev-parse HEAD 2>/dev/null || echo unknown)"; \
-	if [ "$$commit" = "unknown" ]; then \
-	  echo "FATAL: publish refused -- audio_common has no git identity here (not a git checkout)." >&2; \
-	  echo "  Without an identity the attestation cannot name the source state OR enumerate untracked" >&2; \
-	  echo "  content, so NO escape hatch admits this (ALLOW_DIRTY_PUBLISH used to). Publish" >&2; \
-	  echo "  from a real checkout or a scratch clone with a disposable commit instead." >&2; \
-	  exit 1; \
-	fi; \
-	dirty=0; [ -n "$$(git status --porcelain -uno 2>/dev/null)" ] && dirty=1; \
-	unt_list="$$(git ls-files --others --exclude-standard 2>/dev/null)"; \
-	untracked=0; [ -n "$$unt_list" ] && untracked=1; \
-	adp=0; [ "$(ALLOW_DIRTY_PUBLISH)" = "1" ] && adp=1; \
-	aup=0; [ "$(ALLOW_UNTRACKED_PUBLISH)" = "1" ] && aup=1; \
-	if [ "$$adp" != "1" ] && [ "$$dirty" = "1" ]; then \
-	  echo "FATAL: publish refused -- audio_common working tree is dirty (uncommitted TRACKED changes)." >&2; \
-	  echo "  Commit (or clone a clean checkout) for a board deliverable, or pass ALLOW_DIRTY_PUBLISH=1" >&2; \
-	  echo "  for a dev publish -- the escape hatch is recorded in the attestation." >&2; \
-	  exit 1; \
-	fi; \
-	if [ "$$aup" != "1" ] && [ "$$untracked" = "1" ]; then \
-	  echo "FATAL: publish refused -- audio_common contains UNTRACKED (non-ignored) files (they can change the artifact without a trace in the tracked diff):" >&2; \
-	  printf '%s\n' "$$unt_list" | head -5 | sed 's/^/    /' >&2; \
-	  echo "  Track/remove them for a board deliverable, or pass ALLOW_UNTRACKED_PUBLISH=1 -- the escape" >&2; \
-	  echo "  hatch is recorded in the attestation with untracked_tree_sha256 over their exact contents." >&2; \
-	  exit 1; \
-	fi; \
-	ddiff=""; [ "$$dirty" = "1" ] && ddiff="$$(git diff --binary HEAD 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"; \
-	uhash=""; \
-	if [ "$$untracked" = "1" ]; then \
-	  printf '%s\n' "$$unt_list" | hash_untracked "./" > "$$work/untracked.records"; \
-	  if grep -q '^X ' "$$work/untracked.records"; then \
-	    echo "FATAL: publish refused -- an untracked path cannot be hashed deterministically (embedded git checkout / special file / I/O failure) and so cannot enter the provenance record:" >&2; \
-	    grep '^X ' "$$work/untracked.records" | sed 's/^X /    /' >&2; \
-	    exit 1; \
-	  fi; \
-	  uhash="$$(shasum -a 256 < "$$work/untracked.records" | cut -d' ' -f1)"; \
-	fi; \
-	dateutc="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
-	stamp='$(ATTEST_STAMP)'; [ -n "$$stamp" ] || stamp="$$(date -u +%Y%m%dT%H%M%SZ)"; \
-	$(HOSTCC) -O2 -o "$$work/swapln" tools/atomic_symlink_swap.c || { echo "FATAL: could not build the atomic symlink-swap helper with HOSTCC=$(HOSTCC) (pass HOSTCC=<host compiler>)" >&2; exit 1; }; \
-	mkdir -p "$(DIST_BACKEND_DIR)"; \
-	rm -rf "$$tmp"; mkdir -p "$$tmp"; \
-	cp $(PUBLISH_ARTIFACTS) "$$tmp/"; \
-	shas="$$( cd "$$tmp" && for f in *; do shasum -a 256 "$$f"; done )"; \
-	content12="$$(printf '%s\n' "$$shas" | sort | shasum -a 256 | cut -c1-12)"; \
-	rel_id="$(CFG_SIG)-$$content12"; \
-	rel_dir="$(DIST_BACKEND_DIR)/$$rel_id"; \
-	{ echo "repo=audio_common"; \
-	  echo "release_id=$$rel_id"; \
-	  echo "backend=$(BACKEND)"; \
-	  echo "cfg_sig=$(CFG_SIG)"; \
-	  echo "cc=$(CC)"; echo "cxx=$(CXX)"; echo "ar=$(AR)"; echo "ranlib=$(RANLIB)"; echo "link=$(LINK)"; \
-	  echo "cflags=$(CFLAGS)"; echo "cxxflags=$(CXXFLAGS)"; \
-	  echo "extra_cflags=$(EXTRA_CFLAGS)"; \
-	  echo "werror=$(WERROR)"; echo "no_stdio=$(NO_STDIO)"; echo "debug=$(DEBUG)"; \
-	  echo "$$shas"; \
-	} > "$$tmp/MANIFEST.txt"; \
-	suffix=""; [ "$$dirty" = "1" ] && suffix="-dirty"; \
-	echo "== publish: backend-symbol audit (staged archive) =="; \
-	if [ "$(BACKEND)" = "ne10" ]; then \
-	  nm "$$tmp/libaudio_common.a" | grep -Eq '_?ne10_fft_r2c_1d_float32_neon' || { echo "FATAL: staged ne10 archive missing ne10_fft_r2c_1d_float32_neon" >&2; exit 1; }; \
-	  ar -t "$$tmp/libaudio_common.a" | grep -q kiss_fft.o && { echo "FATAL: staged ne10 archive unexpectedly contains kiss_fft.o" >&2; exit 1; }; \
-	  true; \
-	else \
-	  nm "$$tmp/libaudio_common.a" | grep -Eq '_?kiss_fft_alloc' || { echo "FATAL: staged kiss archive missing kiss_fft symbols" >&2; exit 1; }; \
-	  ar -t "$$tmp/libaudio_common.a" | grep -qi ne10 && { echo "FATAL: staged kiss archive unexpectedly contains an ne10 object" >&2; exit 1; }; \
-	  true; \
-	fi; \
-	if [ -d "$$rel_dir" ]; then \
-	  for f in "$$tmp"/*; do \
-	    bn="$$(basename "$$f")"; \
-	    cmp -s "$$f" "$$rel_dir/$$bn" || { echo "FATAL: existing release $$rel_id differs from staged content for $$bn (content-address collision, or the stored release/MANIFEST was modified on disk)" >&2; exit 1; }; \
-	  done; \
-	  rm -rf "$$tmp"; \
-	  echo "audio_common: $$rel_id already published (byte-verified, incl. MANIFEST) -- appending attestation + repointing current"; \
-	else \
-	  mkdir "$$tmp/ATTEST"; \
-	  mv "$$tmp" "$$rel_dir"; \
-	fi; \
-	mkdir -p "$$rel_dir/ATTEST"; \
-	n=1; \
-	while :; do \
-	  attest_name="attest-$$stamp-$$commit$$suffix-$$(printf '%03d' "$$n").txt"; \
-	  { echo "event_id=$${attest_name%.txt}"; \
-	    echo "repo=audio_common"; \
-	    echo "release_id=$$rel_id"; \
-	    echo "cfg_sig=$(CFG_SIG)"; \
-	    echo "backend=$(BACKEND)"; \
-	    echo "git_commit=$$commit"; echo "git_dirty=$$dirty"; \
-	    [ -n "$$ddiff" ] && echo "dirty_diff_sha256=$$ddiff"; \
-	    echo "git_untracked=$$untracked"; \
-	    [ -n "$$uhash" ] && echo "untracked_tree_sha256=$$uhash"; \
-	    echo "date_utc=$$dateutc"; \
-	    echo "allow_dirty_publish=$$adp"; \
-	    echo "allow_untracked_publish=$$aup"; \
-	  } > "$$work/attest.txt"; \
-	  rc=0; "$$work/swapln" --excl-install "$$work/attest.txt" "$$rel_dir/ATTEST/$$attest_name" || rc=$$?; \
-	  [ "$$rc" -eq 0 ] && break; \
-	  [ "$$rc" -eq 2 ] || { echo "FATAL: could not install attestation $$attest_name" >&2; exit 1; }; \
-	  n=$$((n+1)); \
-	  [ "$$n" -le 999 ] || { echo "FATAL: 999 attestation name collisions for $$stamp-$$commit (runaway?)" >&2; exit 1; }; \
-	done; \
-	"$$work/swapln" "$$rel_id" "$(DIST_BACKEND_DIR)/current"; \
-	echo "audio_common: published $(BACKEND)/$$rel_id -> $(DIST_BACKEND_DIR)/current (attested: $$attest_name)"
+audit-no-stdio: libs
+	@for lib in $(ARCHIVES); do \
+	  hits=$$(nm -A "$$lib" | awk '{ n=$$NF; if (n ~ /^_?(fprintf|vfprintf|printf|puts|fputs|stderr|__stderrp|fputc|fwrite)$$/) print }'); \
+	  if [ -n "$$hits" ]; then echo "FAIL: stdio symbols in $$lib"; echo "$$hits"; exit 1; fi; \
+	done
+	@echo "spatial libraries: NO_STDIO audit PASS"
 
 clean:
-	# F12 build hygiene: nuke the obj and bin roots wholesale (BOTH backends'
-	# output dirs, every CFG_SIG subdirectory each), not just
-	# $(OBJ_DIR)/$(BIN_DIR) for whatever BACKEND/config this invocation
-	# happens to resolve to -- a bare `make clean` (no BACKEND=) used to
-	# leave other configs' stale builds sitting untouched. Uses the
-	# OBJ_ROOT/BIN_ROOT knobs so `clean` with an override scrubs
-	# THAT tree, never the real obj/ and bin/. dist/ is NOT removed by clean:
-	# published releases are meant to survive a
-	# dev-tree clean; `rm -rf dist/` is a manual, deliberate action, not
-	# part of the normal edit/build/clean loop.
-	rm -rf $(OBJ_ROOT) $(BIN_ROOT)
+	rm -rf "$(OBJ_ROOT)" "$(BIN_ROOT)"
 
-# --- Header dependency tracking (build hygiene) -----------------------------
-# Every compile line above passes -MD -MP, which emits a $(OBJ_DIR)/<name>.d
-# GNU-Make fragment per object, listing every header that object's TU pulled
-# in -- INCLUDING vendored NE10/KISS headers reached via -isystem (-MD, not
-# -MMD, which would omit -isystem/system headers and defeat "touch a
-# vendored NE10 header -> its object rebuilds"). -MP additionally emits a
-# phony no-prerequisites rule per header, so a deleted/renamed header doesn't
-# fail the build with "No rule to make target" against a stale .d fragment.
-# $(wildcard ...) makes this evaluate to nothing (not an error) before any
-# objects exist yet for this CFG_SIG (a clean tree, or this config's first
-# build).
 -include $(wildcard $(OBJ_DIR)/*.d)

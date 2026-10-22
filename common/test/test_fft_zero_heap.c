@@ -1,0 +1,316 @@
+/*
+ * test_fft_zero_heap.c - allocator-hook test for the static-memory paths.
+ *
+ *   - fft_get_mem_size / fft_init / fft_destroy make no malloc, calloc,
+ *     realloc or free call, including inside the vendored NE10 code
+ *     (lib/ne10/VENDORED.md).
+ *   - fft_destroy on a pool-owned handle is a no-op however often it is
+ *     called.
+ *   - the audio_stft.h objects never touch the allocator.
+ *
+ * The hook (zero_heap_hook.c) is described there; this file only uses its
+ * zh_* counter API.
+ *
+ * test_hook_actually_counts() first shows that a deliberate allocator call is
+ * observed, so the zero-call assertions rest on a working hook.
+ */
+#include "audio_stft.h"
+#include "fft_wrapper.h"
+#include "utility/mem_align.h"
+#include "zero_heap_hook.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+static int g_fail = 0;
+
+#define CHECK(cond, msg) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "FAIL: %s (%s:%d)\n", (msg), __FILE__, __LINE__); \
+        g_fail = 1; \
+    } \
+} while (0)
+
+/* Proves the hook mechanism actually intercepts calls (not a silent no-op)
+ * before any of the zero-heap assertions below get to lean on it. */
+static void test_hook_actually_counts(void) {
+    long mc, cc, rc, fc;
+
+    zh_reset_counters();
+    void* p = malloc(64);
+    CHECK(p != NULL, "sanity malloc(64) must succeed");
+    zh_get_counters(&mc, &cc, &rc, &fc);
+    CHECK(mc == 1, "allocator hook must observe the deliberate malloc() call");
+    free(p);
+    zh_get_counters(&mc, &cc, &rc, &fc);
+    CHECK(fc == 1, "allocator hook must observe the deliberate free() call");
+
+    zh_reset_counters();
+    void* q = calloc(4, 16);
+    CHECK(q != NULL, "sanity calloc(4,16) must succeed");
+    zh_get_counters(&mc, &cc, &rc, &fc);
+    CHECK(cc == 1, "allocator hook must observe the deliberate calloc() call");
+    q = realloc(q, 128);
+    CHECK(q != NULL, "sanity realloc(.., 128) must succeed");
+    zh_get_counters(&mc, &cc, &rc, &fc);
+    CHECK(rc == 1, "allocator hook must observe the deliberate realloc() call");
+    free(q);
+
+    zh_reset_counters();
+}
+
+/* ═══════════════════════════ zero-heap sequence ═══════════════════════════ */
+
+#define ZH_FFT_SIZE 512
+#define ZH_N_FREQS  (ZH_FFT_SIZE / 2 + 1)
+#define ZH_FRAMES   100
+#define ZH_CYCLES   1000
+
+static float   g_time_in[ZH_FFT_SIZE];
+static Complex g_spec_buf[ZH_N_FREQS];
+static float   g_time_out[ZH_FFT_SIZE];
+
+static void fill_synthetic(float* buf, int n, int phase_offset) {
+    for (int i = 0; i < n; i++) {
+        buf[i] = sinf(2.0f * 3.14159265f * 7.0f * (float)(i + phase_offset) / (float)n) + 0.25f;
+    }
+}
+
+/* One init -> ZH_FRAMES frames (forward+inverse+scratch variants) -> destroy
+ * pass over an already-allocated pool. Returns 1 on success, 0 otherwise.
+ * Does not touch the allocator counters itself -- callers arm/read them
+ * around this call. */
+static int run_zero_heap_pass(void* pool, size_t pool_sz) {
+    FftHandle* h = fft_init(pool, pool_sz, ZH_FFT_SIZE);
+    if (!h) return 0;
+
+    for (int f = 0; f < ZH_FRAMES; f++) {
+        fill_synthetic(g_time_in, ZH_FFT_SIZE, f);
+        fft_forward(h, g_time_in, g_spec_buf);
+        fft_inverse(h, g_spec_buf, g_time_out);
+
+        fill_synthetic(g_time_in, ZH_FFT_SIZE, f + 1);
+        fft_forward_scratch(h, g_time_in, g_spec_buf);
+        fft_inverse_scratch(h, g_spec_buf, g_time_out);
+    }
+
+    fft_destroy(h);
+    return 1;
+}
+
+static void test_zero_heap_init_to_destroy(void) {
+    size_t sz = fft_get_mem_size(ZH_FFT_SIZE);
+    CHECK(sz > 0, "fft_get_mem_size(512) must be > 0");
+    if (sz == 0) return;
+
+    void* pool = NULL;
+    CHECK(posix_memalign(&pool, 16, sz) == 0 && pool != NULL, "posix_memalign for zero-heap pool");
+    if (!pool) return;
+
+    memset(pool, 0xA5, sz);  /* dirty-pool: prove fft_init doesn't rely on a fresh/zeroed block */
+
+    zh_reset_counters();
+    int ok = run_zero_heap_pass(pool, sz);
+    long mc, cc, rc, fc;
+    zh_get_counters(&mc, &cc, &rc, &fc);
+
+    CHECK(ok, "fft_init must succeed on a dirty pool of the reported size");
+    CHECK(mc == 0, "fft_init..fft_destroy (100 frames) must call malloc() zero times");
+    CHECK(cc == 0, "fft_init..fft_destroy (100 frames) must call calloc() zero times");
+    CHECK(rc == 0, "fft_init..fft_destroy (100 frames) must call realloc() zero times");
+    CHECK(fc == 0, "fft_init..fft_destroy (100 frames) must call free() zero times");
+
+    /* Repeat the whole init/destroy cycle many times on the SAME pool. */
+    zh_reset_counters();
+    int all_ok = 1;
+    for (int i = 0; i < ZH_CYCLES; i++) {
+        if (!run_zero_heap_pass(pool, sz)) { all_ok = 0; break; }
+    }
+    zh_get_counters(&mc, &cc, &rc, &fc);
+    CHECK(all_ok, "1000x fft_init/fft_destroy cycles on the same pool must all succeed");
+    CHECK(mc == 0 && cc == 0 && rc == 0 && fc == 0,
+          "1000x fft_init/fft_destroy cycles on the same pool must still call the allocator zero times");
+
+    free(pool);
+}
+
+/* fft_destroy on a pool-owned handle is idempotent and never touches the
+ * allocator. */
+static void test_destroy_idempotent(void) {
+    size_t sz = fft_get_mem_size(ZH_FFT_SIZE);
+    if (sz == 0) { CHECK(0, "fft_get_mem_size(512) must be > 0"); return; }
+
+    void* pool = NULL;
+    CHECK(posix_memalign(&pool, 16, sz) == 0 && pool != NULL, "posix_memalign for idempotent-destroy pool");
+    if (!pool) return;
+
+    FftHandle* h = fft_init(pool, sz, ZH_FFT_SIZE);
+    CHECK(h != NULL, "fft_init must succeed for idempotent-destroy test");
+
+    zh_reset_counters();
+    for (int i = 0; i < 1000; i++) {
+        fft_destroy(h);   /* repeat on the SAME handle -- must never double-release */
+    }
+    CHECK(zh_counters_all_zero(), "1000x fft_destroy() on one pool-owned handle must call the allocator zero times");
+
+    free(pool);
+}
+
+/* ══════════════════ dirty-pool vs zero-pool byte-identity ══════════════════ */
+
+static void test_dirty_pool_matches_zero_pool(void) {
+    size_t sz = fft_get_mem_size(ZH_FFT_SIZE);
+    if (sz == 0) { CHECK(0, "fft_get_mem_size(512) must be > 0"); return; }
+
+    void *pool_dirty = NULL, *pool_zero = NULL;
+    CHECK(posix_memalign(&pool_dirty, 16, sz) == 0 && pool_dirty != NULL, "posix_memalign dirty pool");
+    CHECK(posix_memalign(&pool_zero,  16, sz) == 0 && pool_zero  != NULL, "posix_memalign zero pool");
+    if (!pool_dirty || !pool_zero) { free(pool_dirty); free(pool_zero); return; }
+
+    memset(pool_dirty, 0xA5, sz);
+    memset(pool_zero,  0x00, sz);
+
+    fill_synthetic(g_time_in, ZH_FFT_SIZE, 0);
+    float saved_in[ZH_FFT_SIZE];
+    memcpy(saved_in, g_time_in, sizeof(saved_in));
+
+    FftHandle* hd = fft_init(pool_dirty, sz, ZH_FFT_SIZE);
+    CHECK(hd != NULL, "fft_init on dirty pool must succeed");
+    Complex spec_dirty[ZH_N_FREQS];
+    float out_dirty[ZH_FFT_SIZE];
+    if (hd) {
+        fft_forward(hd, saved_in, spec_dirty);
+        fft_inverse(hd, spec_dirty, out_dirty);
+    }
+
+    FftHandle* hz = fft_init(pool_zero, sz, ZH_FFT_SIZE);
+    CHECK(hz != NULL, "fft_init on zero-filled pool must succeed");
+    Complex spec_zero[ZH_N_FREQS];
+    float out_zero[ZH_FFT_SIZE];
+    if (hz) {
+        fft_forward(hz, saved_in, spec_zero);
+        fft_inverse(hz, spec_zero, out_zero);
+    }
+
+    if (hd && hz) {
+        CHECK(memcmp(spec_dirty, spec_zero, sizeof(spec_dirty)) == 0,
+              "first-frame spectrum must be byte-identical: dirty-prefilled pool vs zero-filled pool");
+        CHECK(memcmp(out_dirty, out_zero, sizeof(out_dirty)) == 0,
+              "first-frame time-domain output must be byte-identical: dirty-prefilled pool vs zero-filled pool");
+    }
+
+    fft_destroy(hd);
+    fft_destroy(hz);
+    free(pool_dirty);
+    free(pool_zero);
+}
+
+/* ═══════════════════════ heap vs pool bit-identity ═══════════════════════ */
+
+static void test_heap_vs_pool_bit_identical(void) {
+    fill_synthetic(g_time_in, ZH_FFT_SIZE, 3);
+    float saved_in[ZH_FFT_SIZE];
+    memcpy(saved_in, g_time_in, sizeof(saved_in));
+
+    FftHandle* h_heap = fft_create(ZH_FFT_SIZE);
+    CHECK(h_heap != NULL, "fft_create(512) must succeed");
+
+    size_t sz = fft_get_mem_size(ZH_FFT_SIZE);
+    void* pool = NULL;
+    CHECK(posix_memalign(&pool, 16, sz) == 0 && pool != NULL, "posix_memalign for heap-vs-pool comparison");
+    FftHandle* h_pool = pool ? fft_init(pool, sz, ZH_FFT_SIZE) : NULL;
+    CHECK(h_pool != NULL, "fft_init(512) must succeed for heap-vs-pool comparison");
+
+    if (h_heap && h_pool) {
+        Complex spec_heap[ZH_N_FREQS], spec_pool[ZH_N_FREQS];
+        float out_heap[ZH_FFT_SIZE], out_pool[ZH_FFT_SIZE];
+
+        fft_forward(h_heap, saved_in, spec_heap);
+        fft_forward(h_pool, saved_in, spec_pool);
+        CHECK(memcmp(spec_heap, spec_pool, sizeof(spec_heap)) == 0,
+              "forward spectrum must be byte-identical: fft_create (heap) vs fft_init (pool)");
+
+        fft_inverse(h_heap, spec_heap, out_heap);
+        fft_inverse(h_pool, spec_pool, out_pool);
+        CHECK(memcmp(out_heap, out_pool, sizeof(out_heap)) == 0,
+              "inverse time-domain output must be byte-identical: fft_create (heap) vs fft_init (pool)");
+    }
+
+    fft_destroy(h_heap);
+    fft_destroy(h_pool);
+    free(pool);
+}
+
+/* audio_stft.h objects: init, push, flush and reset on a pool never touch the allocator. */
+static void test_stft_zero_heap(void) {
+    int mode;
+
+    for (mode = 0; mode < 2; ++mode) {
+        AcStftConfig cfg;
+        size_t sa, ss;
+        void *ma = NULL, *ms = NULL;
+        float in[ZH_FFT_SIZE / 2], out[ZH_FFT_SIZE / 2];
+        float re[2 * ZH_N_FREQS], im[2 * ZH_N_FREQS];
+        long mc, cc, rc, fc;
+        int t, ok = 0;
+
+        ac_stft_config_default(&cfg, ZH_FFT_SIZE);
+        cfg.center = mode;
+        cfg.ola = mode ? AC_OLA_ENV_NORM : AC_OLA_ACCUMULATE;
+        cfg.spec_scale = mode ? 1.0f : 0.5f;
+        cfg.ispec_scale = mode ? 1.0f : 2.0f;
+        sa = ac_stft_get_mem_size(&cfg);
+        ss = ac_istft_get_mem_size(&cfg);
+        CHECK(sa > 0 && ss > 0, "audio_stft mem sizes must be > 0");
+        if (sa == 0 || ss == 0) return;
+        CHECK(posix_memalign(&ma, 16, sa) == 0 && posix_memalign(&ms, 16, ss) == 0,
+              "posix_memalign for audio_stft pools");
+        if (!ma || !ms) return;
+        memset(ma, 0xA5, sa);
+        memset(ms, 0xA5, ss);
+
+        zh_reset_counters();
+        {
+            AcStft* a = ac_stft_init(ma, sa, &cfg);
+            AcIstft* s = ac_istft_init(ms, ss, &cfg);
+            ok = (a != NULL && s != NULL);
+            for (t = 0; ok && t < ZH_FRAMES; ++t) {
+                int n, f;
+                fill_synthetic(in, ZH_FFT_SIZE / 2, t);
+                n = ac_stft_push_planar(a, in, re, im);
+                for (f = 0; f < n; ++f)
+                    ac_istft_push_planar(s, re + f * ZH_N_FREQS, im + f * ZH_N_FREQS, out);
+                ac_stft_flush_planar(a, re, im);
+                ac_istft_flush(s, out);
+                if (t == ZH_FRAMES / 2) { ac_stft_reset(a); ac_istft_reset(s); }
+            }
+        }
+        zh_get_counters(&mc, &cc, &rc, &fc);
+        CHECK(ok, "audio_stft init on a dirty pool must succeed");
+        CHECK(mc == 0 && cc == 0 && rc == 0 && fc == 0,
+              "audio_stft init, push, flush and reset must call the allocator zero times");
+        free(ma);
+        free(ms);
+    }
+}
+
+/* ═══════════════════════════════════ main ════════════════════════════════ */
+
+int main(void) {
+    test_hook_actually_counts();
+    test_zero_heap_init_to_destroy();
+    test_destroy_idempotent();
+    test_dirty_pool_matches_zero_pool();
+    test_heap_vs_pool_bit_identical();
+    test_stft_zero_heap();
+
+    if (g_fail) {
+        printf(">>> FAIL\n");
+        return 1;
+    }
+    printf("ALL PASS\n>>> PASS\n");
+    return 0;
+}
