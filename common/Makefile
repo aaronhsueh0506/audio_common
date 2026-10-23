@@ -330,7 +330,7 @@ $(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test_stft test_stft_guard test_heap_alignment test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
+.PHONY: all lib selftest test test-full test-isolation test_stft test_stft_guard test_heap_alignment test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
 all: lib
 
 lib: $(LIB)
@@ -474,12 +474,19 @@ test_pool: $(LIB) | _cfg_guard
 
 # test_wav: negative-corpus tests for the shared WAV parser. Header-only like the
 # simd_kernels.h half of `selftest`: wav_io.h needs no FFT/archive objects, so this does
-# not depend on $(LIB) and links with a plain $(CC).
+# not depend on $(LIB) and links with a plain $(CC). The corpus runs twice, plain and built with
+# -fsanitize=undefined -fno-sanitize-recover=all: an unsaturated +-1.0f in the PCM16 quantizer would be an
+# out-of-range float-to-integer conversion (UB per C99 6.3.1.4p1) that the value checks alone cannot see.
+# The sanitizer flags are scoped to that one compile and link.
 test_wav: | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_wav_io.o test/test_wav_io.c
 	$(CC) -o $(BIN_DIR)/test_wav_io $(OBJ_DIR)/test_wav_io.o -lm
 	@echo "--- common WAV I/O negative-corpus test [$(BACKEND)] ---"
-	@$(BIN_DIR)/test_wav_io
+	@TMPDIR=$(abspath $(BIN_DIR)) $(BIN_DIR)/test_wav_io
+	$(CC) $(CFLAGS) -fsanitize=undefined -fno-sanitize-recover=all -MD -MP -c -o $(OBJ_DIR)/test_wav_io_ubsan.o test/test_wav_io.c
+	$(CC) -fsanitize=undefined -fno-sanitize-recover=all -o $(BIN_DIR)/test_wav_io_ubsan $(OBJ_DIR)/test_wav_io_ubsan.o -lm
+	@echo "--- common WAV I/O corpus under UBSan [$(BACKEND)] ---"
+	@TMPDIR=$(abspath $(BIN_DIR)) $(BIN_DIR)/test_wav_io_ubsan
 
 # test_wav_nr_style: runs the same writer special-values corpus
 # (test/test_wav_writer_common.h) as test_wav, compiled with WAV_IO_WRITER_STYLE forced
@@ -489,18 +496,10 @@ test_wav_nr_style: | _cfg_guard
 	$(CC) $(CFLAGS) -DWAV_IO_WRITER_STYLE=WAV_IO_WRITER_NR -MD -MP -c -o $(OBJ_DIR)/test_wav_writer_nr_style.o test/test_wav_writer_nr_style.c
 	$(CC) -o $(BIN_DIR)/test_wav_writer_nr_style $(OBJ_DIR)/test_wav_writer_nr_style.o -lm
 	@echo "--- common WAV writer NR-style special-values test [$(BACKEND)] ---"
-	@$(BIN_DIR)/test_wav_writer_nr_style
+	@TMPDIR=$(abspath $(BIN_DIR)) $(BIN_DIR)/test_wav_writer_nr_style
 
-# test-wav-ubsan: UBSan probe for wav_write_float's PCM16 quantizer. It writes
-# {1.0f,-1.0f,NAN} and must run clean under -fsanitize=undefined
-# -fno-sanitize-recover=all (an unsaturated +1.0f would be an out-of-range
-# float-to-integer conversion, UB per C99 6.3.1.4p1). The sanitizer flags are scoped to
-# this target's compile and link, never the main archive or another test.
-test-wav-ubsan: | _cfg_guard
-	$(CC) $(CFLAGS) -fsanitize=undefined -fno-sanitize-recover=all -MD -MP -c -o $(OBJ_DIR)/test_wav_writer_ubsan.o test/test_wav_writer_ubsan.c
-	$(CC) -fsanitize=undefined -fno-sanitize-recover=all -o $(BIN_DIR)/test_wav_writer_ubsan $(OBJ_DIR)/test_wav_writer_ubsan.o -lm
-	@echo "--- common WAV writer UBSan probe [$(BACKEND)] ---"
-	@$(BIN_DIR)/test_wav_writer_ubsan
+# test-wav-ubsan: the UBSan run of the WAV corpus, which test_wav already performs.
+test-wav-ubsan: test_wav
 
 # test_zero_heap: allocator-hook acceptance test. It proves fft_init()..fft_destroy() makes no
 # malloc/calloc/realloc/free call (NE10's twiddle config is carved from the caller's pool; see
@@ -550,11 +549,12 @@ endif
 # kernels), then diffs the dumped outputs. Two full sub-makes rebuild the archive per variant: SIMD is
 # part of CFG_SIG, so they land in different bin/ne10-<sig>/ directories and the forced-C rebuild
 # cannot overwrite the normal archive. Each variant's bin dir is asked of its sub-make
-# (`print-bin-dir`) at recipe time.
+# (`print-bin-dir`) at recipe time. Both variants pin SIMD explicitly: a command-line SIMD=0 would
+# otherwise reach both sub-makes through MAKEFLAGS and collapse them into one bin dir.
 test_ne10_force_c:
 ifeq ($(NE10_TARGET_NEON),1)
-	@$(MAKE) BACKEND=ne10 _ne10_parity_bin
-	@bd_neon="$$($(MAKE) -s --no-print-directory BACKEND=ne10 print-bin-dir)"; \
+	@$(MAKE) BACKEND=ne10 SIMD=1 _ne10_parity_bin
+	@bd_neon="$$($(MAKE) -s --no-print-directory BACKEND=ne10 SIMD=1 print-bin-dir)"; \
 	 $(MAKE) BACKEND=ne10 SIMD=0 _ne10_parity_bin; \
 	 bd_c="$$($(MAKE) -s --no-print-directory BACKEND=ne10 SIMD=0 print-bin-dir)"; \
 	 if [ "$$bd_neon" = "$$bd_c" ]; then \
@@ -578,6 +578,31 @@ endif
 _ne10_parity_bin: $(LIB) | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_ne10_c_parity.o test/test_ne10_c_parity.c
 	$(LINK) -o $(BIN_DIR)/test_ne10_c_parity $(OBJ_DIR)/test_ne10_c_parity.o $(LIB) $(LDFLAGS)
+
+# --- Test tiers ---------------------------------------------------------------
+# `make test` is the default tier: the unit and contract tests plus the core scenarios of the
+# build-isolation suite. `make test-full` adds what the default tier leaves out because another check
+# already covers it or because it only guards `make publish`: the standalone `test_ne10_force_c`
+# and the publish scenarios of the isolation suite (S7p, S11, S13-S18). The standalone `test_stft`,
+# `test_stft_guard`, `test_heap_alignment` and `test_audio_utils` are not listed: `selftest` runs
+# them. The isolation suite needs the AEC repo as a sibling checkout and runs the same for any SIMD
+# setting, because it builds both itself. Steps run one after another, so the isolation suite never
+# races another target for the real obj/ and bin/ directories it snapshots.
+LEAN_TESTS = selftest test_pool test_wav test_wav_nr_style test_zero_heap test-fast-sqrt-codegen
+
+test:
+	@$(MAKE) --no-print-directory $(LEAN_TESTS)
+	@$(MAKE) --no-print-directory test-isolation ISOL_TIER=core
+
+test-full:
+	@$(MAKE) --no-print-directory $(LEAN_TESTS) test_ne10_force_c
+	@$(MAKE) --no-print-directory test-isolation ISOL_TIER=full
+
+# The suite starts its own makes with explicit SIMD settings, so the caller's MAKEFLAGS must not reach
+# them: a command-line SIMD=0 would otherwise override the SIMD=1 configuration it compares against.
+ISOL_TIER ?= core
+test-isolation:
+	@env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL ISOL_TIER=$(ISOL_TIER) scripts/test_build_isolation.sh
 
 # --- Query targets -----------------------------------------------------------
 # Consumers (AEC/NR Makefiles, docs_smoke.sh, scripts) resolve this build's output paths

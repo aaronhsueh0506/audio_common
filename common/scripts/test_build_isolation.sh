@@ -9,31 +9,35 @@
 # Two normal configs are exercised side by side wherever a scenario needs "config A" and "config B":
 # SIMD=1 (the default) and SIMD=0. They differ in CFG_SIG and in compiled objects.
 #
+# Tiers (ISOL_TIER, default core): `core` runs every scenario that guards the build-isolation design
+# itself. `full` adds the scenarios marked [full] below, which exercise `make publish` internals
+# (content addressing, attestation, locking, dirty-tree policy) and cost about half the run time.
+#
 # Scenario index:
 #   S1   A->B->A across SIMD=1 / SIMD=0, plus the -O0/-O3 delivered-object repro
 #   S2   same-second SIMD=1 <-> SIMD=0 switching (scratch clone)
 #   S3   parallel differing-config builds
 #   S4   test_ne10_force_c isolation
 #   S5   consumer correctness, drives AEC (scratch clones of common and AEC)
-#   S7p  producer publish (content-addressed dist/ layout; throwaway DIST_ROOT)
+#   S7p  [full] producer publish (content-addressed dist/ layout; throwaway DIST_ROOT)
 #   S8   CFG_SIG collision guard; OBJ_ROOT/BIN_ROOT is build-content neutral
 #   S9   command-line override rejection (CFLAGS, CXXFLAGS, LDFLAGS, FP_POLICY)
 #   S10  archive freshness: a stale member does not survive a rebuild
-#   S11  publish immutability and content addressing:
+#   S11  [full] publish immutability and content addressing:
 #          S11a in-tree republish is byte-verified and only grows ATTEST/
 #          S11b a tampered MANIFEST is detected
 #          S11c a content change in a sandbox copy yields a new release id
 #   S12  toolchain coherence guard (CC/CXX target mismatch) and TOOLCHAIN_CHECK=0
-#   S13  atomic `current` symlink swap hammer; --excl-install no-clobber mode
-#   S14  lock-before-build: a concurrent publish loser builds nothing
-#   S15  `make -n`/`-q`/`-t publish` write nothing (S15b: combined flags against a stale archive)
-#   S16  ATTEST uniqueness under forced same-second collisions
-#   S17  dirty/untracked checkout publish policy:
+#   S13  [full] atomic `current` symlink swap hammer; --excl-install no-clobber mode
+#   S14  [full] lock-before-build: a concurrent publish loser builds nothing
+#   S15  [full] `make -n`/`-q`/`-t publish` write nothing (S15b: combined flags against a stale archive)
+#   S16  [full] ATTEST uniqueness under forced same-second collisions
+#   S17  [full] dirty/untracked checkout publish policy:
 #          S17a clean default, b dirty refused, c dirty + hatch, d untracked, e untracked bytes
 #          change the hash, f untracked symlink, g build-relevant untracked source, h unhashable
 #          path, i encoding-collision pair hashes differently, j unreadable file, k mode change,
 #          l identity-less checkout refused unconditionally
-#   S18  interruption safety: EXIT/INT/TERM remove the whole scratch tree
+#   S18  [full] interruption safety: EXIT/INT/TERM remove the whole scratch tree
 #   S19  FFT_WRAPPER_ALIAS_CFLAGS is CFG_SIG-keyed
 #   S20  FFT_WRAPPER_ALIAS_CFLAGS command-line override rejection
 #   S21  the same under `make -e` (environment override)
@@ -74,13 +78,20 @@
 #     gives identical bytes). "Is this the same delivered artifact as its own keyed object?" is a sha
 #     comparison, via member_sha()/file_sha().
 #
-# Usage: ./scripts/test_build_isolation.sh   (from common/ or anywhere; paths are resolved from this
-# script's own location). The AEC repo must be a sibling of audiolib and a git checkout.
+# Usage: [ISOL_TIER=core|full] ./scripts/test_build_isolation.sh   (from common/ or anywhere; paths are
+# resolved from this script's own location). The AEC repo must be a sibling of audiolib and a git
+# checkout. `make test-isolation` and the `test`/`test-full` tiers of common/Makefile run it.
 #
 # ISOL_INTERRUPT_PROBE (internal, S18 only): when set, this script runs as a child re-invocation of
 # itself in "interruption probe" mode instead of running the suite; see the probe block below.
 
 set -euo pipefail
+
+ISOL_TIER="${ISOL_TIER:-core}"
+case "$ISOL_TIER" in
+  core|full) ;;
+  *) echo "FATAL: ISOL_TIER must be 'core' or 'full' (got '$ISOL_TIER')" >&2; exit 1 ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -351,6 +362,7 @@ FAILURES=()
 pass() { PASS_COUNT=$((PASS_COUNT + 1)); echo "  PASS: $*"; }
 fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); FAILURES+=("$*"); echo "  FAIL: $*" >&2; }
 
+echo "isolation suite tier: $ISOL_TIER"
 echo "############################################################"
 echo "# S1: A->B->A across SIMD=1 / SIMD=0 + -O0/-O3 delivered-object repro"
 echo "############################################################"
@@ -760,6 +772,8 @@ ok=1
 [ "$ok" -eq 1 ] && pass "S5: A->B->A at the AEC level -- nm shows the matching NE10 kernel set every time" \
   || fail "S5: A->B->A at the AEC level -- wrong/stale NE10 kernel set in one of the three aec_wav builds"
 
+# --- publish tier: runs only with ISOL_TIER=full (S7p) ---
+if [ "$ISOL_TIER" = full ]; then
 echo "############################################################"
 echo "# S7p: producer-publish (v4 layout; throwaway DIST_ROOT)"
 echo "############################################################"
@@ -860,6 +874,8 @@ while read -r sha fname; do
 done < <(grep -E '^[0-9a-f]{64}  ' "$S7P_DIST/ne10/$final_target/MANIFEST.txt")
 [ "$manifest_ok" -eq 1 ] && pass "S7p: final current release's MANIFEST is self-consistent" \
   || fail "S7p: final current release's MANIFEST does not match its own files"
+
+fi  # ISOL_TIER=full
 
 echo "############################################################"
 echo "# S8: CFG_SIG collision guard"
@@ -1025,6 +1041,8 @@ real_lib_mtime_after="$(mtime "$real_lib")"
   pass "S10: the REAL archive sha+mtime unchanged across the whole scenario" \
   || fail "S10: the REAL archive CHANGED during S10 (scratch isolation failed)"
 
+# --- publish tier: runs only with ISOL_TIER=full (S11) ---
+if [ "$ISOL_TIER" = full ]; then
 echo "############################################################"
 echo "# S11: publish immutability / content-addressing"
 echo "############################################################"
@@ -1194,6 +1212,8 @@ HPF_SHA_AFTER_S11="$(file_sha "$AC_DIR/src/hpf.c")"
 [ "$HPF_SHA_BEFORE_S11" = "$HPF_SHA_AFTER_S11" ] && pass "S11c: the REAL repo's src/hpf.c is byte-identical to its pre-scenario state" \
   || fail "S11c: the REAL repo's src/hpf.c CHANGED during S11 (sandbox isolation failed)"
 
+fi  # ISOL_TIER=full
+
 echo "############################################################"
 echo "# S12: toolchain coherence guard (CC/CXX target mismatch)"
 echo "############################################################"
@@ -1237,6 +1257,8 @@ else
 fi
 
 
+# --- publish tier: runs only with ISOL_TIER=full (S13-S18) ---
+if [ "$ISOL_TIER" = full ]; then
 echo "############################################################"
 echo "# S13: atomic \`current\` symlink swap hammer + --excl-install"
 echo "############################################################"
@@ -1922,6 +1944,8 @@ run_s18_mode exit "" 0
 run_s18_mode term TERM 143
 run_s18_mode intr INT 130
 
+fi  # ISOL_TIER=full
+
 echo "############################################################"
 echo "# S19: FFT_WRAPPER_ALIAS_CFLAGS is CFG_SIG-keyed (build-cache-"
 echo "# invalidation regression guard)"
@@ -2412,43 +2436,27 @@ s25_check_rejected "process-subst"    '<(echo hi)'    '()<'
 # appended directly in two target-specific recipes, never folded through LDFLAGS/EXTRA_LDFLAGS, and its
 # `@` is outside the allowed set. A plain filesystem rpath path is the realistic use.
 #
-# "Runs selftest to completion" is judged against a reference from the same run: selftest is first run
-# with no EXTRA_LDFLAGS, and the run with the link flag must report the same TOTAL CHECKS lines
-# (simd_selftest prints one per pass, so the whole sorted set is compared) and the same number of ALL
-# PASS lines. A link flag changes how the binaries link, never which checks run, and a pinned count
-# goes stale whenever a selftest item is added or removed. Both runs use the scratch roots
-# (EXTRA_LDFLAGS is in CFG_SIG, so they get separate keyed directories) and the real obj/bin see
-# neither.
-S25_REF_LOG="$SCRATCH_ROOT/s25/log_reference_selftest"
+# The carrier is test_pool, test_stft and test_audio_utils: small binaries that link the NE10 archive,
+# so the flag has to reach real link lines without running the whole selftest twice. The run with the
+# link flag is judged against a reference from the same run (the carrier first run with no
+# EXTRA_LDFLAGS) and must print the same per-test result lines: a link flag changes how the binaries
+# link, never which checks run, and a pinned count goes stale whenever a test item is added or removed.
+# Both runs use the scratch roots (EXTRA_LDFLAGS is in CFG_SIG, so they get separate keyed directories)
+# and the real obj/bin see neither.
+S25_CARRIER="test_pool test_stft test_audio_utils"
+S25_REF_LOG="$SCRATCH_ROOT/s25/log_reference_carrier"
 S25_POS_LOG="$SCRATCH_ROOT/s25/log_positive_rpath"
-# Sorted TOTAL CHECKS lines of one log, newline-folded; empty when there is none.
-s25_total_checks() { { grep -E '^TOTAL CHECKS: [1-9][0-9]*$' "$1" || true; } | LC_ALL=C sort | tr '\n' ' '; }
-s25_all_pass_count() { grep -c '^ALL PASS' "$1" || true; }
-if ! env -u EXTRA_LDFLAGS make BACKEND=ne10 OBJ_ROOT="$S25_OBJ_ROOT" BIN_ROOT="$S25_BIN_ROOT" selftest >"$S25_REF_LOG" 2>&1; then
-  fail "S25: reference selftest (no EXTRA_LDFLAGS) unexpectedly FAILED -- cannot judge the positive control"
+if ! env -u EXTRA_LDFLAGS make BACKEND=ne10 OBJ_ROOT="$S25_OBJ_ROOT" BIN_ROOT="$S25_BIN_ROOT" $S25_CARRIER >"$S25_REF_LOG" 2>&1; then
+  fail "S25: reference carrier run (no EXTRA_LDFLAGS) unexpectedly FAILED -- cannot judge the positive control"
   cat "$S25_REF_LOG" >&2
-elif env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=ne10 OBJ_ROOT="$S25_OBJ_ROOT" BIN_ROOT="$S25_BIN_ROOT" selftest >"$S25_POS_LOG" 2>&1; then
-  s25_ref_checks="$(s25_total_checks "$S25_REF_LOG")"
-  s25_pos_checks="$(s25_total_checks "$S25_POS_LOG")"
-  s25_ref_passn="$(s25_all_pass_count "$S25_REF_LOG")"
-  s25_pos_passn="$(s25_all_pass_count "$S25_POS_LOG")"
-  if [ -n "$s25_ref_checks" ] && [ "$s25_ref_checks" = "$s25_pos_checks" ] \
-     && [ "$s25_ref_passn" -ge 1 ] && [ "$s25_ref_passn" = "$s25_pos_passn" ]; then
-    # The counts go in an INFO line, not the PASS text, so the PASS message stays stable
-    # when a selftest item is added or removed.
-    echo "  INFO: S25: reference and link-flag selftest runs both report ${s25_ref_checks}with $s25_ref_passn ALL PASS line(s)"
-    pass "S25: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, real rpath/library-path link flag) builds AND runs selftest to completion with the same TOTAL CHECKS and ALL PASS count as the reference run"
-  else
-    fail "S25: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' selftest succeeded but its TOTAL CHECKS / ALL PASS differ from the same-run reference (reference: '$s25_ref_checks' x$s25_ref_passn ALL PASS; with flag: '$s25_pos_checks' x$s25_pos_passn ALL PASS)"
-    cat "$S25_POS_LOG" >&2
-  fi
-  # Every test binary's own result lines, in order -- not only the ones that print TOTAL CHECKS
-  # / ALL PASS (roundtrip, test_stft*, test_stft_guard and test_audio_utilities print neither).
+elif env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=ne10 OBJ_ROOT="$S25_OBJ_ROOT" BIN_ROOT="$S25_BIN_ROOT" $S25_CARRIER >"$S25_POS_LOG" 2>&1; then
+  pass "S25: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, real rpath/library-path link flag) builds AND runs the carrier tests ($S25_CARRIER) to completion"
+  # Every test binary's own result lines, in order.
   s25_results() { grep -E '^(--- .* ---$|PASS |>>> PASS|ALL PASS|TOTAL CHECKS: |test_stft(_guard)? PASS|GUARD\| |round-trip: |static vs heap: |fft_magnitude vs )' "$1" || true; }
   if [ -n "$(s25_results "$S25_REF_LOG")" ] && [ "$(s25_results "$S25_REF_LOG")" = "$(s25_results "$S25_POS_LOG")" ]; then
-    pass "S25: the link-flag selftest run prints exactly the reference run's per-test result lines (no test binary skipped)"
+    pass "S25: the link-flag carrier run prints exactly the reference run's per-test result lines (no test binary skipped)"
   else
-    fail "S25: the link-flag selftest run's per-test result lines differ from the reference run's"
+    fail "S25: the link-flag carrier run's per-test result lines differ from the reference run's"
     diff <(s25_results "$S25_REF_LOG") <(s25_results "$S25_POS_LOG") >&2 || true
   fi
   # ...and the flag really reached the link lines: every echoed link into the flag config's bin
@@ -2458,8 +2466,8 @@ elif env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=ne10 OBJ_RO
   s25_n_links="$(printf '%s' "$s25_links" | grep -c . || true)"
   s25_n_flag="$(printf '%s' "$s25_links" | grep -cF -- '-Wl,-rpath,/usr/lib -L/usr/lib' || true)"
   [ "$s25_n_links" -ge 1 ] && [ "$s25_n_flag" = "$s25_n_links" ] && \
-    pass "S25: every echoed selftest link line carries the EXTRA_LDFLAGS link flag" \
-    || fail "S25: EXTRA_LDFLAGS did not reach the selftest link lines ($s25_n_flag of $s25_n_links echoed link lines carry it)"
+    pass "S25: every echoed carrier link line carries the EXTRA_LDFLAGS link flag" \
+    || fail "S25: EXTRA_LDFLAGS did not reach the carrier link lines ($s25_n_flag of $s25_n_links echoed link lines carry it)"
 else
   fail "S25: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, legitimate link flag) unexpectedly FAILED"
   cat "$S25_POS_LOG" >&2

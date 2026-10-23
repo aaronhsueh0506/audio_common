@@ -7,6 +7,8 @@
  * injectable failures (funopen on BSD/macOS, fopencookie on glibc; that group prints SKIP elsewhere),
  * wav_open_write() argument and header-field validation, and the oversize abandon path.
  * Each failure is printed and sets a global flag; main() reports ALL PASS or FAIL at the end.
+ * `make test_wav` also builds this file with -fsanitize=undefined, so the writer's float-to-int16 quantizer
+ * is checked for out-of-range conversions as well as for values.
  */
 /* glibc declares fopencookie / cookie_io_functions_t only behind _GNU_SOURCE,
  * which must be defined before the first system header. */
@@ -16,6 +18,7 @@
 
 #include "wav_io.h"
 #include "test_wav_writer_common.h"
+#include "test_tmp_path.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,9 +95,9 @@ static void bb_riff_header(ByteBuf* b, uint32_t riff_size) {
  * heap-allocated path (caller must unlink() + free() it). Returns NULL on
  * failure. */
 static char* write_temp_wav(const ByteBuf* b) {
-    char* path = (char*)malloc(64);
+    char* path = (char*)malloc(TEST_TMP_PATH_MAX);
     if (!path) return NULL;
-    snprintf(path, 64, "/tmp/audio_common_test_wav_io_XXXXXX");
+    test_tmp_template(path, TEST_TMP_PATH_MAX, "audio_common_test_wav_io");
     int fd = mkstemp(path);
     if (fd < 0) { free(path); return NULL; }
     FILE* fp = fdopen(fd, "wb");
@@ -518,8 +521,8 @@ static void test_write_read_roundtrip_byte_exact(void) {
      * at the .5 boundary. +1.0f is left to the special-values test below,
      * where it saturates. */
     const float in_samples[6] = { 0.0f, 0.5f, -0.5f, 0.999969482421875f /* 32767/32768 */, -1.0f, 0.99993896484375f /* 32766/32768 */ };
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_io_wr_XXXXXX");
+    char path[TEST_TMP_PATH_MAX];
+    test_tmp_template(path, sizeof(path), "audio_common_test_wav_io_wr");
     int fd = mkstemp(path);
     CHECK(fd >= 0, "setup: mkstemp for write/read round-trip");
     if (fd >= 0) close(fd);  /* wav_open_write will fopen() the same path */
@@ -598,8 +601,8 @@ static void test_write_float_mode_bitexact_and_riff_size(void) {
     in_samples[7] = 0.5f;
     in_samples[8] = -0.5f;
 
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_writer_f32_XXXXXX");
+    char path[TEST_TMP_PATH_MAX];
+    test_tmp_template(path, sizeof(path), "audio_common_test_wav_writer_f32");
     int fd = mkstemp(path);
     CHECK(fd >= 0, "setup: mkstemp for float-mode bit-exact/RIFF-size test");
     if (fd >= 0) close(fd);
@@ -657,8 +660,8 @@ static void test_write_float_mode_bitexact_and_riff_size(void) {
 static void test_write_zero_and_negative_n_is_noop(void) {
     const float dummy[1] = { 0.25f };
 
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_writer_nzero_XXXXXX");
+    char path[TEST_TMP_PATH_MAX];
+    test_tmp_template(path, sizeof(path), "audio_common_test_wav_writer_nzero");
     int fd = mkstemp(path);
     CHECK(fd >= 0, "setup: mkstemp for n<=0 no-op test");
     if (fd >= 0) close(fd);
@@ -682,8 +685,8 @@ static void test_write_zero_and_negative_n_is_noop(void) {
  * so the 44-byte header is unaffected, and w->fp is made unbuffered (_IONBF) so each 2-byte fwrite
  * reaches write(2) and fails at the third sample instead of at a later flush. */
 static void test_write_error_on_short_write(void) {
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_writer_shortwr_XXXXXX");
+    char path[TEST_TMP_PATH_MAX];
+    test_tmp_template(path, sizeof(path), "audio_common_test_wav_writer_shortwr");
     int fd = mkstemp(path);
     CHECK(fd >= 0, "setup: mkstemp for short-write test");
     if (fd < 0) return;
@@ -820,9 +823,9 @@ static FILE* make_fake_stream(FakeStreamState* state) {
  * fwrite maps to one fake_stream_write() call. *out_path must be unlink()ed and free()d by the
  * caller. Returns NULL on any setup failure. */
 static WavWriter* make_writer_over_fake_stream(FakeStreamState* state, char** out_path) {
-    char* path = (char*)malloc(64);
+    char* path = (char*)malloc(TEST_TMP_PATH_MAX);
     if (!path) return NULL;
-    snprintf(path, 64, "/tmp/audio_common_test_wav_io_fake_XXXXXX");
+    test_tmp_template(path, TEST_TMP_PATH_MAX, "audio_common_test_wav_io_fake");
     int fd = mkstemp(path);
     if (fd < 0) { free(path); return NULL; }
     close(fd);
@@ -936,8 +939,8 @@ static void test_finalize_write_injectable_failures(void) {
  * whose block_align or byte_rate could never fit the on-disk WAV header
  * fields (mirrors wav_finalize_write's own pathological-size checks). */
 static void test_open_write_rejects_invalid_args(void) {
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_io_badopen_XXXXXX");
+    char path[TEST_TMP_PATH_MAX];
+    test_tmp_template(path, sizeof(path), "audio_common_test_wav_io_badopen");
     int fd = mkstemp(path);
     CHECK(fd >= 0, "setup: mkstemp for wav_open_write invalid-argument tests");
     if (fd >= 0) close(fd);
@@ -973,8 +976,8 @@ static void test_open_write_rejects_invalid_args(void) {
  * 0x80000000 mono PCM16 samples alone computes a data_sz64 of 0x100000000
  * bytes, one past the 32-bit on-disk data-chunk-size field's range. */
 static void test_finalize_write_rejects_oversize_samples_written(void) {
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_io_oversize_XXXXXX");
+    char path[TEST_TMP_PATH_MAX];
+    test_tmp_template(path, sizeof(path), "audio_common_test_wav_io_oversize");
     int fd = mkstemp(path);
     CHECK(fd >= 0, "setup: mkstemp for oversize-finalize test");
     if (fd >= 0) close(fd);

@@ -4,6 +4,34 @@ All notable changes to audio_common. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The README states the
 current behaviour only; how it got there is recorded here.
 
+## [Unreleased] — 2026-10-24 — Test tiers
+
+- `make test` (default tier) and `make test-full` aggregate the suite; `make test-isolation` runs the
+  build-isolation suite. Before, `common` had no aggregate target and the isolation suite (about 85% of a full
+  run's CPU time) was started by hand.
+- `scripts/test_build_isolation.sh` takes `ISOL_TIER=core|full` (default `core`). The `make publish`
+  scenarios (S7p, S11, S13-S18, about 110 of 225 assertions and half of the run time) run only in `full`.
+  The default tier no longer catches a regression in publish locking, MANIFEST/ATTEST handling or the dirty-tree
+  policy; `make test-full` does.
+- Isolation S25 checks that `EXTRA_LDFLAGS` reaches the link lines with `test_pool test_stft test_audio_utils`
+  instead of running `selftest` twice. It no longer compares `simd_selftest`'s `TOTAL CHECKS` between the two runs.
+- The `simd_selftest` and `simd_nn_selftest` microbenchmarks (report-only, about 90% of those binaries' run
+  time) are opt-in through `SK_SELFTEST_BENCH=1`; `SK_SELFTEST_SKIP_BENCH` and `SKN_SELFTEST_SKIP_BENCH` are gone.
+- `test_wav` also runs `test_wav_io.c` built with `-fsanitize=undefined`, replacing the separate
+  `test_wav_writer_ubsan.c` (removed). It checks the same {1, -1, NaN} inputs and the rest of the writer corpus;
+  `test-wav-ubsan` remains as an alias of `test_wav`.
+- `test_ne10_force_c` is not in `make test` (isolation S4 runs it); it is in `make test-full` and still builds
+  on its own. `test_stft`, `test_stft_guard`, `test_heap_alignment` and `test_audio_utils` are not listed in either
+  tier because `selftest` runs them.
+
+## [Unreleased] — Test fixes
+
+- The WAV tests (`test_wav`, `test_wav_nr_style`, `test-wav-ubsan`) build their temp files under `$TMPDIR` (the
+  Makefile points it at the build directory) instead of a hard-coded `/tmp`, so a failing run leaves nothing outside
+  the build tree.
+- `test_ne10_force_c` pins `SIMD=1` for its NEON variant. A command-line `SIMD=0` used to reach both sub-makes,
+  put both variants in one bin directory and abort the target.
+
 ## [Unreleased] — Source comments condensed
 
 Source and header comments in `common/` were cut to short contracts; design notes that lived only in those

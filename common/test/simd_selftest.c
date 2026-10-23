@@ -4,8 +4,9 @@
  * Every sk_<name> kernel (NEON when available, else scalar) and sk_<name>_scalar() run on identical
  * copies of random input (LCG bit patterns plus a special-value pool, NaN excluded) over a matrix of
  * n and trials, and the full outputs (plus accumulator/state buffers) are memcmp'd. A mismatch prints
- * kernel/n/trial/index and both bit patterns and exits 1: there is no tolerance. A microbenchmark per
- * kernel follows (n=257, ~200k reps, CLOCK_MONOTONIC). test_fast_math_special_values() pins
+ * kernel/n/trial/index and both bit patterns and exits 1: there is no tolerance. With SK_SELFTEST_BENCH
+ * set, a report-only microbenchmark per kernel follows (n=257, ~200k reps, CLOCK_MONOTONIC); it asserts
+ * nothing and dominates the run time, so it is off by default. test_fast_math_special_values() pins
  * fast_math.h's special-value table and the NEON sk_fast_sqrt_f32 lane equivalents.
  */
 #include "utility/simd_kernels.h"
@@ -1909,7 +1910,7 @@ int main(void) {
     test_cmag_edge();
     test_asym_ema_edge();
 
-    if (!getenv("SK_SELFTEST_SKIP_BENCH") && !getenv("SKN_SELFTEST_SKIP_BENCH")) {
+    if (getenv("SK_SELFTEST_BENCH")) {
         printf("\n--- microbenchmarks (n=%d, %d reps) ---\n", BENCH_N, BENCH_REPS);
         bench_ema();
         bench_capply_gain();

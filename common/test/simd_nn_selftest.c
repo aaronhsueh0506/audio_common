@@ -5,7 +5,8 @@
  * identical inputs over n = 0..17 and the DSP sizes the NN pre/post code uses, with canaries on both
  * sides of every output. Arithmetic kernels draw finite values (plus +-0, denormals and, where safe,
  * +-Inf); the predicate kernel draws every class. ERB arithmetic counts both-NaN payload differences
- * instead of failing on them; every other difference prints and exits 1.
+ * instead of failing on them; every other difference prints and exits 1. SK_SELFTEST_BENCH=1 adds a
+ * report-only timing section.
  */
 #include "utility/simd_kernel_nn.h"
 
@@ -688,7 +689,7 @@ int main(void) {
     test_erb_band_accumulate_nch();
     printf("ERB both-NaN payload differences: %llu (classification matched)\n",
            g_erb_nan_payload_differences);
-    if (!getenv("SKN_SELFTEST_SKIP_BENCH")) bench();
+    if (getenv("SK_SELFTEST_BENCH")) bench();
     printf("ALL PASS simd_kernel_nn (SK_HAVE_NEON=%d)\n", SK_HAVE_NEON);
     return 0;
 }

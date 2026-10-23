@@ -22,6 +22,8 @@ make               # build the archive (NE10 FFT backend)
 make SIMD=0        # force every optional SIMD path to scalar (NE10 scalar C kernels)
 make selftest      # round-trip + static==heap byte-equality check
 make test_audio_utils  # pre-gain + all supported resample-rate pairs
+make test          # default test tier (see Tests)
+make test-full     # default tier plus the publish checks and the standalone NEON-vs-C FFT parity
 ```
 
 Output: `bin/ne10-<config-hash>/libaudio_common.a` (keyed by the exact
@@ -30,6 +32,27 @@ compiler-flag signature — two configs, e.g. differing only in `SIMD` or
 `make print-lib-path` (same flags as your build) to get this build's exact
 archive path, or `make publish` for a stable `dist/ne10/current/` handoff path.
 Consumers add `-I<here>/include` and `-I<here>` (for `utility/...` headers), then link the archive.
+
+## Tests
+
+`make test` is the default tier. It runs `selftest`, `test_pool`, `test_wav`, `test_wav_nr_style`,
+`test_zero_heap` and `test-fast-sqrt-codegen`, then the core scenarios of the build-isolation suite
+(`scripts/test_build_isolation.sh`, `make test-isolation`). `selftest` already runs `test_stft`,
+`test_stft_guard`, `test_heap_alignment` and `test_audio_utils`; the targets stay available for running one
+of them alone. `test_wav` runs the WAV corpus twice, plain and built with `-fsanitize=undefined`.
+`test-wav-ubsan` is the same run under another name.
+
+`make test-full` runs the same unit tests plus `test_ne10_force_c` (NEON-vs-scalar FFT parity within a
+tolerance; the isolation suite's S4 also runs it) and the full isolation suite, which adds the `make publish`
+scenarios (content addressing, attestation, locking, dirty-tree policy, interruption safety). Run it before
+cutting a release or changing `publish`.
+
+- The isolation suite needs the AEC repo as a sibling git checkout and does not depend on `SIMD=`: it builds
+  both SIMD configurations itself, so `make SIMD=0 test` and `make test` run it identically. `ISOL_TIER=core|full`
+  selects the scenarios when it is run directly (`make test-isolation ISOL_TIER=full`).
+- `simd_selftest` and `simd_nn_selftest` assert bit-exactness and print no timing by default. Set
+  `SK_SELFTEST_BENCH=1` to add their report-only microbenchmarks, e.g. `SK_SELFTEST_BENCH=1 make selftest`.
+- `test/run_selftest_ubsan.sh` runs `simd_selftest` under UBSan; it is not part of either tier.
 
 ## Pre-gain and resampling
 

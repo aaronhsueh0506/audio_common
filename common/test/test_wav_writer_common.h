@@ -16,6 +16,8 @@
 #include <math.h>
 #include <unistd.h>
 
+#include "test_tmp_path.h"
+
 /* Returns 1 if any check failed (each failure is printed to stderr as it
  * happens), 0 if every check passed. */
 static inline int test_wav_writer_special_values_corpus(void) {
@@ -55,8 +57,8 @@ static inline int test_wav_writer_special_values_corpus(void) {
     };
 #endif
 
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_writer_special_XXXXXX");
+    char path[TEST_TMP_PATH_MAX];
+    test_tmp_template(path, sizeof(path), "audio_common_test_wav_writer_special");
     int fd = mkstemp(path);
     WCHECK(fd >= 0, "setup: mkstemp for writer special-values corpus");
     if (fd < 0) return fail;
