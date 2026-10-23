@@ -422,14 +422,23 @@ void srp(SRP* s, const Complex* const* X, const int* mask)
     /* Candidate-major traversal exposes contiguous frequency bins to NEON.
      * Per-angle accumulation still visits f in ascending order, and each
      * bin still visits p/a in ascending order, preserving scalar results. */
+    const int band = s->f_end - s->f_start + 1;
     for (int a = 0; a < A; ++a) {
-        memset(s->score_scratch, 0, (size_t)F * sizeof(float));
+        /* score_scratch is public: the first angle zeroes all F bins so
+         * callers see zeros outside the searched band, and later angles
+         * rewrite only the band they accumulate into.  An empty band keeps
+         * the full clear on every angle. */
+        if (a == 0 || band <= 0)
+            memset(s->score_scratch, 0, (size_t)F * sizeof(float));
+        else
+            memset(s->score_scratch + s->f_start, 0,
+                   (size_t)band * sizeof(float));
         for (int p = 0; p < s->num_pairs; ++p) {
             spatial_pair_score_accumulate(
                 s->pair_phat[p] + s->f_start,
                 s->pair_steer[a][p] + s->f_start,
                 s->score_scratch + s->f_start,
-                s->f_end - s->f_start + 1);
+                band);
         }
         for (int f = s->f_start; f <= s->f_end; ++f) {
             float score;

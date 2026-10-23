@@ -4,6 +4,15 @@ All notable changes to audio_common. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The README states the
 current behaviour only; how it got there is recorded here.
 
+## [Unreleased] — 2026-10-23 — FFT handle shares its input staging
+
+- The preserving `fft_forward`/`fft_inverse` stage their input in one block per handle instead of
+  two (they never run at once and hand nothing back in it), so `fft_get_mem_size` drops by
+  `4 * fft_size` bytes (256: 8,176 -> 7,152; 512: 15,600 -> 13,552; 1024: 30,448 -> 26,352 on
+  AArch64; 8,128 -> 7,104, 15,552 -> 13,504, 30,400 -> 26,304 on ARM32) and the heap path makes
+  one allocation fewer. Outputs are bit-identical; `ac_stft`/`ac_istft` pools with their own FFT
+  shrink by the same amount.
+
 ## [Unreleased] — 2026-10-23 — `ck_field_size_reps()` is shared
 
 - `mem_align.h` gains `ck_field_size_reps()` (checked `total += ALIGN16(count * elem_size) * reps`),

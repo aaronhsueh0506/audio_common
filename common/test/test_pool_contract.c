@@ -131,16 +131,16 @@ static void test_fft_size_whitelist(void) {
 
     /* Native pointer widths change the handle/config fields in the pool. */
 #if UINTPTR_MAX == UINT32_MAX
-    CHECK(fft_get_mem_size(256)  == 8128,  "ARM32 FFT256 pool size");
-    CHECK(fft_get_mem_size(512)  == 15552, "ARM32 FFT512 pool size");
-    CHECK(fft_get_mem_size(1024) == 30400, "ARM32 FFT1024 pool size");
+    CHECK(fft_get_mem_size(256)  == 7104,  "ARM32 FFT256 pool size");
+    CHECK(fft_get_mem_size(512)  == 13504, "ARM32 FFT512 pool size");
+    CHECK(fft_get_mem_size(1024) == 26304, "ARM32 FFT1024 pool size");
     CHECK(ac_memreq_abi_hash(UINT32_C(0)) == UINT32_C(0xa6439712), "ARM32 ABI hash zero seed");
     CHECK(ac_memreq_abi_hash(UINT32_C(2166136261)) == UINT32_C(0xa37437b7), "ARM32 ABI hash FNV seed");
     CHECK(ac_memreq_abi_hash(UINT32_MAX) == UINT32_C(0x1a2aa061), "ARM32 ABI hash max seed");
 #else
-    CHECK(fft_get_mem_size(256)  == 8176,  "NE10 fft_get_mem_size(256) must be 8176");
-    CHECK(fft_get_mem_size(512)  == 15600, "NE10 fft_get_mem_size(512) must be 15600");
-    CHECK(fft_get_mem_size(1024) == 30448, "NE10 fft_get_mem_size(1024) must be 30448");
+    CHECK(fft_get_mem_size(256)  == 7152,  "NE10 fft_get_mem_size(256) must be 7152");
+    CHECK(fft_get_mem_size(512)  == 13552, "NE10 fft_get_mem_size(512) must be 13552");
+    CHECK(fft_get_mem_size(1024) == 26352, "NE10 fft_get_mem_size(1024) must be 26352");
     CHECK(ac_memreq_abi_hash(UINT32_C(0)) == UINT32_C(0), "ARM64 ABI hash zero seed unchanged");
     CHECK(ac_memreq_abi_hash(UINT32_C(2166136261)) == UINT32_C(2166136261), "ARM64 ABI hash FNV seed unchanged");
     CHECK(ac_memreq_abi_hash(UINT32_MAX) == UINT32_MAX, "ARM64 ABI hash max seed unchanged");

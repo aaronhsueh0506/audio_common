@@ -49,6 +49,10 @@ as a whole from this point on.
   commit).
 - Archive filenames are unchanged (`libaudio_common.a` still comes out of
   `common/`'s build) -- only the directory path producing them moved.
+- `srp()` clears all `F` bins of `score_scratch` only for the first angle and
+  just the searched band for later ones (an empty band keeps the full clear),
+  removing unused stores; outputs and the public scratch contents are
+  unchanged.
 
 ### Removed
 - The never-enabled compile-time switches `SRP_USE_UNIQUE_PAIRS` (srp.c; no

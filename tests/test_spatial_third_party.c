@@ -273,6 +273,115 @@ static int test_srp_precompute_equivalence(void) {
     return 1;
 }
 
+/* score_scratch is public and the scoring loop only rewrites the searched
+ * band for angles after the first: after srp() the scratch must be exactly
+ * zero outside the band whatever the caller left in it, and S_theta /
+ * best_score / bin_best_idx must match a per-angle scalar reference, for the
+ * configured band, a shrunk one, a single bin, an empty one and the restored
+ * one. */
+static int srp_scratch_band_case(SRP* s, Complex* const* ch, const int* mask,
+                                 int dirty_nan) {
+    enum { MAXF = 128 };
+    const int F = s->F;
+    const int A = s->num_angles;
+    const int band = s->f_end - s->f_start + 1;
+    float S_ref[72];
+    float best_ref[MAXF];
+    int idx_ref[MAXF];
+    float last_ref[MAXF];
+    static const float zero = 0.0f;
+
+    for (int f = 0; f < F; ++f)
+        s->score_scratch[f] = dirty_nan ? NAN : random_signed();
+    srp(s, (const Complex* const*)ch, mask);
+
+    for (int f = 0; f < F; ++f) {
+        best_ref[f] = -1e30f;
+        idx_ref[f] = -1;
+        last_ref[f] = 0.0f;
+    }
+    for (int a = 0; a < A; ++a) {
+        float score[MAXF];
+        memset(score, 0, sizeof(score));
+        for (int p = 0; p < s->num_pairs; ++p) {
+            spatial_pair_score_accumulate_scalar(
+                s->pair_phat[p] + s->f_start,
+                s->pair_steer[a][p] + s->f_start,
+                score + s->f_start, band);
+        }
+        S_ref[a] = 0.0f;
+        for (int f = s->f_start; f <= s->f_end; ++f) {
+            last_ref[f] = score[f];
+            if (mask && !mask[f]) continue;
+            S_ref[a] += score[f];
+            if (score[f] > best_ref[f]) {
+                best_ref[f] = score[f];
+                idx_ref[f] = a;
+            }
+        }
+    }
+    CHECK(memcmp(s->S_theta, S_ref, (size_t)A * sizeof(float)) == 0,
+          "SRP S_theta must match the per-angle scalar reference");
+    CHECK(memcmp(s->best_score, best_ref, (size_t)F * sizeof(float)) == 0,
+          "SRP best_score must match the per-angle scalar reference");
+    CHECK(memcmp(s->bin_best_idx, idx_ref, (size_t)F * sizeof(int)) == 0,
+          "SRP bin_best_idx must match the per-angle scalar reference");
+    for (int f = 0; f < F; ++f) {
+        const int in_band = f >= s->f_start && f <= s->f_end;
+        const float* want = in_band ? &last_ref[f] : &zero;
+        CHECK(memcmp(&s->score_scratch[f], want, sizeof(float)) == 0,
+              "SRP score_scratch must hold the last angle's band scores "
+              "and exact zeros outside the band");
+    }
+    return 1;
+}
+
+static int test_srp_score_scratch_band_contract(void) {
+    SRP_Config cfg;
+    SRP* s;
+    Complex* storage;
+    Complex* ch[4];
+    int mask[65];
+    int os, oe;
+
+    s = make_test_srp(&cfg);
+    CHECK(s != NULL, "create SRP");
+    os = s->f_start;
+    oe = s->f_end;
+    storage = (Complex*)malloc((size_t)cfg.M * cfg.F * sizeof(Complex));
+    CHECK(storage != NULL, "allocate SRP channels");
+    for (int m = 0; m < cfg.M; ++m) {
+        ch[m] = storage + (size_t)m * cfg.F;
+        for (int f = 0; f < cfg.F; ++f) {
+            ch[m][f].r = random_signed();
+            ch[m][f].i = random_signed();
+        }
+    }
+    for (int f = 0; f < cfg.F; ++f) mask[f] = (f % 3) != 0;
+
+    CHECK(srp_scratch_band_case(s, ch, NULL, 0), "configured band");
+    CHECK(srp_scratch_band_case(s, ch, mask, 1), "configured band, masked");
+    s->f_start = os + 2;
+    s->f_end = oe - 3;
+    CHECK(srp_scratch_band_case(s, ch, NULL, 0), "shrunk band");
+    CHECK(srp_scratch_band_case(s, ch, mask, 1), "shrunk band, masked");
+    s->f_start = s->f_end = os + 4;
+    CHECK(srp_scratch_band_case(s, ch, NULL, 1), "single-bin band");
+    s->f_start = os + 5;
+    s->f_end = os + 3;
+    CHECK(srp_scratch_band_case(s, ch, NULL, 0), "empty band");
+    s->f_start = os + 2;
+    s->f_end = os + 1;
+    CHECK(srp_scratch_band_case(s, ch, NULL, 1), "empty band, zero width");
+    s->f_start = os;
+    s->f_end = oe;
+    CHECK(srp_scratch_band_case(s, ch, NULL, 1), "restored band");
+
+    free(storage);
+    srp_destroy(s);
+    return 1;
+}
+
 /* srp_get_mem_size()/srp_init() pool-first pair (Phase A.1): a caller-owned
  * pool larger than the queried size must have every byte beyond
  * srp_get_mem_size(cfg) left untouched, an undersized or misaligned pool
@@ -1583,6 +1692,8 @@ static int run_all_tests(void) {
     CHECK(test_bf_vector_kernels_scalar_vs_dispatch(),
           "BF vector-kernel SIMD test");
     CHECK(test_srp_precompute_equivalence(), "SRP optimization test");
+    CHECK(test_srp_score_scratch_band_contract(),
+          "SRP score-scratch band contract test");
     CHECK(test_srp_init_pool_poison_and_bounds(),
           "SRP pool-first poison/bounds test");
     CHECK(test_srp_heap_vs_pool_byte_equal(),

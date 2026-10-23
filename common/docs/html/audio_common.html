@@ -100,7 +100,8 @@ for (int f = 0; f &lt; n; ++f)
         +──────────────┬──────────────────────+
                        v
    FftHandle { NE10 r2c cfg+twiddle
-               + 內部 scratch + n_freqs }         ← 全部在同一塊記憶體
+               + 內部 scratch + 共用 input staging
+               + n_freqs }                        ← 全部在同一塊記憶體
                        |
    fft_forward:  time_in float32[N] ──(backend rfft, 未正規化)──> freq_out Complex[N/2+1]
    fft_inverse:  freq_in Complex[N/2+1] ──(backend irfft × 1/N)──> time_out float32[N]
@@ -168,9 +169,9 @@ ac_istft_push 吐出(逐幀)           —(無幀)   0 , hop    hop     ← 第 
 <h2>State 表(跨呼叫 state)</h2>
 <div class="tblwrap"><table>
 <tr><th>state</th><th>大小</th><th>誰存放</th><th>內容</th></tr>
-<tr><td><code>FftHandle</code>(後端 cfg + twiddle + scratch)</td><td>NE10:688 + 21×fft_size B(對齊前;標頭文件公式)</td><td>C struct(caller pool 經 <code>fft_init</code>,或 heap 經 <code>fft_create</code>)</td><td>plan 期常數(twiddle);<b>呼叫間無可變 state</b>——forward/inverse 為純轉換</td></tr>
-<tr><td><code>AcStft</code></td><td>實測(<code>get_mem_size</code>,自帶 FFT 與窗 / 借用兩者):N=256:12,368 / 3,168 B;N=512:23,888 / 6,240 B;N=1024:46,928 / 12,384 B</td><td>C struct(pool)</td><td>最近 N 個樣本的歷史、加窗暫存 <code>seg[N]</code>、FFT 輸出 staging <code>spec[N/2+1]</code>、幀計數(飽和於 3);窗與 FFT 自帶時另佔 pool</td></tr>
-<tr><td><code>AcIstft</code></td><td>ACCUMULATE:與 <code>AcStft</code> 同尺寸;ENV_NORM 多一個 <code>env[N]</code>:N=512:25,936 / 8,288 B(自帶 / 借用)</td><td>C struct(pool)</td><td>OLA 累加器 <code>acc[N]</code>(原點 = 下一段輸出)、(ENV_NORM)平方窗包絡 <code>env[N]</code>、反向 FFT 輸出 <code>time[N]</code>、輸入 staging <code>spec[N/2+1]</code>、幀計數(飽和於 2)</td></tr>
+<tr><td><code>FftHandle</code>(後端 cfg + twiddle + scratch)</td><td>NE10:688 + 21×fft_size B(對齊前;標頭文件公式),另加 input staging 4×fft_size + 8 B(preserving forward／inverse 共用一塊;<code>fft_get_mem_size(256)</code> = 7,152 B)</td><td>C struct(caller pool 經 <code>fft_init</code>,或 heap 經 <code>fft_create</code>)</td><td>plan 期常數(twiddle);<b>呼叫間無可變 state</b>——forward/inverse 為純轉換</td></tr>
+<tr><td><code>AcStft</code></td><td>實測(<code>get_mem_size</code>,自帶 FFT 與窗 / 借用兩者):N=256:11,344 / 3,168 B;N=512:21,840 / 6,240 B;N=1024:42,832 / 12,384 B</td><td>C struct(pool)</td><td>最近 N 個樣本的歷史、加窗暫存 <code>seg[N]</code>、FFT 輸出 staging <code>spec[N/2+1]</code>、幀計數(飽和於 3);窗與 FFT 自帶時另佔 pool</td></tr>
+<tr><td><code>AcIstft</code></td><td>ACCUMULATE:與 <code>AcStft</code> 同尺寸;ENV_NORM 多一個 <code>env[N]</code>:N=512:23,888 / 8,288 B(自帶 / 借用)</td><td>C struct(pool)</td><td>OLA 累加器 <code>acc[N]</code>(原點 = 下一段輸出)、(ENV_NORM)平方窗包絡 <code>env[N]</code>、反向 FFT 輸出 <code>time[N]</code>、輸入 staging <code>spec[N/2+1]</code>、幀計數(飽和於 2)</td></tr>
 <tr><td><code>Hpf</code>(biquad DF2-transposed)</td><td><code>hpf_get_mem_size()</code>(小,固定)</td><td>C struct(pool/heap)</td><td>2 階濾波器延遲線(跨樣本 state;<code>hpf_reset</code> 清除)</td></tr>
 <tr><td><code>AudioResampler</code></td><td><code>audio_resampler_get_mem_size(in,out,ch)</code></td><td>C struct(pool/heap)</td><td>polyphase 串流歷史(block 邊界不變式;<code>reset</code> 只在換流時呼叫)</td></tr>
 <tr><td>fast_math / simd_kernels</td><td>—</td><td>header-only、無 state</td><td>純函式(LUT 為編譯期常數)</td></tr>

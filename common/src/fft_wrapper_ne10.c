@@ -62,8 +62,15 @@ struct FftHandle {
     int n_freqs;                        // fft_size/2 + 1
 
     ne10_fft_r2c_cfg_float32_t r2c_cfg; // Single config (forward & inverse)
-    ne10_float32_t*            real_buf; // [fft_size] real work buffer
-    ne10_fft_cpx_float32_t*    cpx_buf;  // [n_freqs] complex work buffer
+
+    /* Input staging for the preserving calls. Forward uses real_buf, inverse
+     * uses cpx_buf, and each call fully overwrites its view before the kernel
+     * reads it and hands nothing back in it (both kernels write straight into
+     * the caller's output), so no call needs the previous call's contents and
+     * the two views share one block. n_freqs complex values (4*fft_size + 8
+     * bytes) always cover fft_size floats (4*fft_size bytes). */
+    ne10_float32_t*            real_buf; // [fft_size] view of the shared block
+    ne10_fft_cpx_float32_t*    cpx_buf;  // [n_freqs] shared block, owned (heap path)
 
     int pool_owned;  // 1 if placed via fft_init (no free of handle/bufs in destroy)
 };
@@ -89,20 +96,19 @@ FftHandle* fft_create(int fft_size) {
         return NULL;
     }
 
-    // Allocate work buffers
-    h->real_buf = (ne10_float32_t*)calloc(fft_size, sizeof(ne10_float32_t));
+    // Allocate the shared staging block
     h->cpx_buf = (ne10_fft_cpx_float32_t*)calloc(h->n_freqs, sizeof(ne10_fft_cpx_float32_t));
-
-    if (!h->real_buf || !h->cpx_buf) {
+    if (!h->cpx_buf) {
         fft_destroy(h);
         return NULL;
     }
+    h->real_buf = (ne10_float32_t*)(void*)h->cpx_buf;
 
     return h;
 }
 
 /* --- construction (static pool, heap-free) ---------------------------------
- * The handle, the work buffers (real_buf/cpx_buf) and the NE10 R2C/C2R twiddle
+ * The handle, the shared staging block (real_buf/cpx_buf) and the NE10 R2C/C2R twiddle
  * config are all carved from the caller's block. Stock NE10 cannot place its
  * config in caller memory, so the vendored copy adds
  * ne10_fft_r2c_mem_size_float32 / ne10_fft_init_r2c_float32_ext
@@ -114,8 +120,7 @@ size_t fft_get_mem_size(int fft_size) {
     int n_freqs = fft_size / 2 + 1;
     size_t total = 0;
     total = ck_field_size(total, 1, sizeof(FftHandle));
-    total = ck_field_size(total, (size_t)fft_size, sizeof(ne10_float32_t));        /* real_buf */
-    total = ck_field_size(total, (size_t)n_freqs, sizeof(ne10_fft_cpx_float32_t)); /* cpx_buf  */
+    total = ck_field_size(total, (size_t)n_freqs, sizeof(ne10_fft_cpx_float32_t)); /* real_buf + cpx_buf */
     /* NE10 R2C/C2R twiddle config: last field. */
     total = ck_add_size(total, ck_align16_size((size_t)ne10_fft_r2c_mem_size_float32(fft_size)));
     return MEM_SIZE_INVALID(total) ? 0 : total;
@@ -139,10 +144,9 @@ FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
     h->n_freqs = fft_size / 2 + 1;
     h->pool_owned = 1;
 
-    // Work buffers from the caller's block.
-    h->real_buf = (ne10_float32_t*)cursor;
-    cursor += ALIGN16((size_t)fft_size * sizeof(ne10_float32_t));
+    // Shared staging block from the caller's block.
     h->cpx_buf = (ne10_fft_cpx_float32_t*)cursor;
+    h->real_buf = (ne10_float32_t*)(void*)h->cpx_buf;
     cursor += ALIGN16((size_t)h->n_freqs * sizeof(ne10_fft_cpx_float32_t));
 
     // R2C config, carved from the same block. The init function validates the
@@ -164,14 +168,13 @@ FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
 void fft_destroy(FftHandle* h) {
     if (!h) return;
 
-    // Pool path: the handle, the work buffers and the config live in the
+    // Pool path: the handle, the staging block and the config live in the
     // caller's block and nothing was allocated, so this is a no-op, however
     // often it is called.
     if (h->pool_owned) return;
 
     if (h->r2c_cfg) { ne10_fft_destroy_r2c_float32(h->r2c_cfg); h->r2c_cfg = NULL; }
-    if (h->real_buf) free(h->real_buf);
-    if (h->cpx_buf) free(h->cpx_buf);
+    if (h->cpx_buf) free(h->cpx_buf);  // real_buf is a view of it
 
     free(h);
 }

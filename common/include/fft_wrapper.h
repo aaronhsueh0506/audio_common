@@ -41,7 +41,9 @@ extern "C" {
  * --------------------------------------------------------------------------- */
 #include "ac_complex.h"   /* Complex { float r; float i; } */
 
-/* Opaque FFT handle */
+/* Opaque FFT handle. Calls on one handle must not overlap in time: the
+ * preserving forward and inverse calls share one staging block, and every call
+ * uses the handle's NE10 work buffer. Distinct handles are independent. */
 typedef struct FftHandle FftHandle;
 
 /**
