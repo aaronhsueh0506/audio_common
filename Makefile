@@ -2,14 +2,10 @@
 #
 #   make SIMD=0|1
 #
-# BACKEND (ne10, the only FFT backend) follows common/AEC/NR's build identity
-# even though these frequency-domain algorithms do not execute an FFT
-# themselves.  Their public API uses common's backend-neutral Complex type.
-# SIMD selects the shared scalar/NEON spatial kernels.
-#
-# common/ is a sibling directory inside this same repo (not a separate git
-# checkout), so its path is a fixed relative COMMON_DIR rather than a
-# wildcard-searched, possibly-submodule-nested one.
+# BACKEND (ne10, the only FFT backend) follows common's build identity even though these
+# frequency-domain algorithms run no FFT themselves; their public API uses common's
+# backend-neutral Complex type. SIMD selects the shared scalar/NEON spatial kernels.
+# common/ is a subdirectory of this repo, so COMMON_DIR is a fixed relative path.
 
 CC ?= cc
 CXX ?= c++
@@ -95,34 +91,30 @@ DOA_LIB = $(BIN_DIR)/libdoa.a
 BF_LIB = $(BIN_DIR)/libbf.a
 VAD_LIB = $(BIN_DIR)/libvad.a
 
-# Every deployable archive, in one place: `all`, `libs` and the NO_STDIO
-# audit all read this, so a new archive cannot be added to the build while
-# quietly escaping the gate.
+# Every deployable archive in one place: `all`, `libs` and the NO_STDIO audit all read this, so a
+# new archive cannot join the build while escaping the gate.
 ARCHIVES = $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB) $(VAD_LIB)
 
-# The archives above need only common's HEADERS. The test BINARY links, so
-# it needs the archive itself.
+# The archives above need only common's headers; the test binary links, so it needs the archive itself.
 #
-# ⚠ common keys its output directory on FIFTEEN variables, not just
-# BACKEND/SIMD -- DEBUG=1 and NO_STDIO=1 each land in a different hash dir
-# (measured). Forwarding a subset would resolve, and link, the WRONG archive
-# with no diagnostic. So every knob this Makefile accepts is forwarded, and
-# COMMON_LIB is an input a caller can supply directly (the 4ch Makefile
-# already has the resolved path in hand and passes it).
-# Same set the 4ch Makefile forwards to its producers. CFLAGS/CXXFLAGS are
-# deliberately absent: common refuses them from the command line because
-# overriding would drop its own FP-policy and backend appends.
+# common keys its output directory on many variables, not just BACKEND/SIMD (DEBUG=1 and NO_STDIO=1
+# each land in a different hash dir). Forwarding a subset would resolve and link the wrong archive
+# with no diagnostic, so every knob this Makefile accepts is forwarded. A caller that already holds
+# the resolved path (the 4ch pipeline Makefile) supplies COMMON_LIB directly. CFLAGS/CXXFLAGS are
+# not forwarded: common refuses them on the command line because overriding would drop its
+# FP-policy and backend appends.
 COMMON_FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) \
          CC='$(CC)' CXX='$(CXX)' AR='$(AR)' RANLIB='$(RANLIB)' \
          EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) \
-         TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
+         TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG) \
+         $(if $(filter command line,$(origin OBJ_ROOT)),OBJ_ROOT='$(abspath $(OBJ_ROOT))') \
+         $(if $(filter command line,$(origin BIN_ROOT)),BIN_ROOT='$(abspath $(BIN_ROOT))')
 COMMON_LIB ?= $(shell $(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(COMMON_FWD) print-lib-path)
 ifeq ($(strip $(COMMON_LIB)),)
 $(error cannot resolve the common archive; pass COMMON_LIB= explicitly)
 endif
 
-# print-lib-path only ECHOES; nothing builds the archive. Without this rule the
-# test link would reference a file no target ever asked anyone to produce.
+# print-lib-path only echoes; without this rule nothing would ever build the archive the test links.
 $(COMMON_LIB): FORCE
 	+$(MAKE) -C $(COMMON_DIR) $(COMMON_FWD) lib
 	@test -f '$@' || { echo "FATAL: common did not produce $@" >&2; exit 1; }
@@ -213,10 +205,8 @@ $(BIN_DIR)/test_spatial_third_party: $(OBJ_DIR)/test_spatial_third_party.o \
 		$(OBJ_DIR)/bf_test.o $(DOA_LIB) $(SPATIAL_COMMON_LIB) $(VAD_LIB) \
 		$(COMMON_LIB) -lm
 
-# Diagnostic only, never part of `test`: it reports timings, so it has no
-# pass/fail and would make the gate depend on how loaded the machine is.
-# Run it ON THE TARGET -- see the file header for why a host number decides
-# nothing here.
+# Diagnostic only, never part of `test`: it reports timings, so it has no pass/fail and would make
+# the gate depend on machine load. Run it on the target (see tests/bench_masker.c).
 $(OBJ_DIR)/bench_masker.o: tests/bench_masker.c VAD/masker.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
@@ -224,8 +214,7 @@ $(BIN_DIR)/bench_masker: $(OBJ_DIR)/bench_masker.o $(VAD_LIB) $(COMMON_LIB) \
         | _cfg_guard
 	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/bench_masker.o $(VAD_LIB) $(COMMON_LIB) -lm
 
-# BENCH_NFFT defaults to the integrator's grid (256/128 @ 16 kHz -> F=129),
-# not to a round number: the stage proportions move with F.
+# BENCH_NFFT defaults to the integrator's grid (256/128 @ 16 kHz -> F=129): stage proportions move with F.
 BENCH_NFFT ?= 256
 bench-masker: $(BIN_DIR)/bench_masker
 	"$(abspath $(BIN_DIR))/bench_masker" $(BENCH_NFFT)

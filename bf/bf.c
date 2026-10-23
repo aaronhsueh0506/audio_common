@@ -11,90 +11,33 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/*
- * RLS numerical-hardening constants (not part of the original supplied
- * algorithm -- see third_party/README.md).
- *
- * BF_WA_LEAK: leak on the adaptive weight state g->wa, applied as
- * `wa = BF_WA_LEAK * wa + update` instead of the unleaked `wa += update`.
- * Chosen far slower than the RLS covariance's own forgetting time constant
- * (1/(1-lambda), a few hundred UPDATES at the shipped lambda=0.995) so it is
- * negligible across any normal utterance/adaptation timescale and only
- * bounds wa's growth over many continuous-operation UPDATES with no
- * forgetting mechanism otherwise (e.g. sustained DOA mismatch or
- * non-stationary noise).
- *
- * This does NOT apply every hop: it is inside the `do_adapt_this_frame`
- * block below, itself gated on the caller's `allow_adapt_in` (typically
- * `vad_out == 0` -- RLS adapts only on non-target-speech frames),
- * `adapt_interval` (optionally skips further frames), and this bin's own
- * mask-freeze. Time constant 1/(1-BF_WA_LEAK) = 100000 UPDATES, not hops --
- * the wall-clock equivalent is 100000 / (fraction of hops where this bin
- * actually updates), so it is slower than a naive "every hop" reading would
- * suggest whenever speech/masking reduces the update rate (which is the
- * safe direction: a slower safety net, not a faster one).
- */
+/* RLS numerical-hardening constants.
+ * BF_WA_LEAK: wa = BF_WA_LEAK * wa + update. Its time constant, 1/(1-BF_WA_LEAK) updates (not hops), is far slower
+ * than the RLS forgetting time, so it only bounds wa growth over long continuous runs. The leak is applied only
+ * inside the adapt block (allow_adapt_in, adapt_interval and the per-bin mask freeze all gate it). */
 #define BF_WA_LEAK 0.99999f
 
-/*
- * RLS per-bin divergence guard + diagonal loading (real recording repro:
- * pipeline_failed at frame ~2800-3300, ~20-27s in, at every checked-in grid
- * and both scalar/SIMD).
- *
- * The per-bin covariance downdate below, P = (P - gain*q) / lambda, has no
- * compensating floor/ceiling: dividing by lambda < 1 every adapted frame
- * amplifies P's diagonal unless the gain*q correction exactly cancels it.
- * Under sustained low excitation at a bin (the blocking-output u carries
- * little energy there -- e.g. no interferer in that direction/frequency for
- * an extended stretch of real audio, which short synthetic tests rarely
- * exercise), the correction underflows in float32 while the /lambda growth
- * does not, so P's diagonal drifts upward without bound over enough frames
- * and eventually overflows to inf -- corrupting gain/wa/bf_spectrum and
- * tripping the caller's isfinite() gate (FOUR_AEC_NR_RES_DSP_ERROR).
- *
- * Two independent guards, both per-bin (not a whole-BF reset, which would
- * discard every OTHER bin's adaptation over one bin's fault):
- *
- *   1. BF_P_DIAG_FLOOR/CEIL: clamp every bin's P diagonal after each
- *      update, every frame -- proactive, keeps P inside a numerically safe
- *      range well before it could reach inf. CEIL is chosen generously
- *      large relative to P's identity initial condition (1.0) so it never
- *      engages anywhere near a real converged operating point.
- *   2. The isfinite(upu_real) && upu_real > 0 check before this bin's
- *      update uses last frame's (possibly already-corrupted) P: reactive,
- *      catches whatever the floor/ceil didn't (e.g. corruption from a
- *      source other than diagonal growth) and recovers by resetting only
- *      this bin's P to identity and wa to zero, skipping this bin's update
- *      for the current frame instead of propagating a poisoned gain.
- */
+/* Per-bin RLS divergence guards (a whole-BF reset would discard every other bin's adaptation):
+ * 1. BF_P_DIAG_FLOOR/CEIL clamp each bin's P diagonal after every update; CEIL is far above any converged value.
+ * 2. If isfinite(upu_real) && upu_real > 0 fails before an update, that bin's P is reset to identity, wa to zero,
+ *    and its update is skipped for the frame.
+ * Without them, P = (P - gain*q) / lambda can grow to inf under sustained low excitation. */
 #define BF_P_DIAG_FLOOR 1e-6f
 #define BF_P_DIAG_CEIL  1e6f
-
-/* ===================== adapt-interval derivation ===================== */
 
 int bf_effective_adapt_interval(
     int enable_fix_mode, int fixed_align_notebook, int adapt_interval)
 {
     int effective = adapt_interval > 0 ? adapt_interval : 1;
 
-    /* In fixed notebook-alignment mode the adaptive update runs frame by
-     * frame, for baseline matching. */
+    /* Fixed notebook-alignment mode updates every frame. */
     if (enable_fix_mode && fixed_align_notebook) {
         effective = 1;
     }
     return effective;
 }
 
-/* ===================== pool-first memory layout ===================== */
-
-/*
- * Bump allocator carving BF's flat pool into typed sub-blocks. This is a
- * private, file-local reimplementation of 4aec_nr_res.c's PoolCursor/
- * pool_carve() helper (that file keeps its own copy file-private too, per
- * its own header comment) -- not shared/exported -- so bf_get_mem_size()
- * and bf_init() below carve in exact lockstep, the same relationship
- * aec_get_mem_size()/aec_init() maintain in AEC/c_impl/src/aec.c.
- */
+/* Bump allocator over BF's flat pool; bf_get_mem_size() and bf_init() carve in lockstep. */
 typedef struct PoolCursor {
     uint8_t* ptr;
     size_t remaining;
@@ -116,14 +59,7 @@ static void* pool_carve(PoolCursor* cursor, size_t count,
     return out;
 }
 
-/*
- * Total byte requirement for a BF instance of shape (M, F). Deliberately
- * independent of num_angles/cfg: neither affects BF's own storage --
- * num_angles only indexes into the caller-owned a_array (never carved from
- * this pool), and cfg's fields are plain scalars copied straight into the
- * struct. Carve order below MUST stay in lockstep with bf_init()'s carve
- * order.
- */
+/* Total bytes for shape (M, F); independent of num_angles and cfg. The carve order must match bf_init(). */
 size_t bf_get_mem_size(int M, int F) {
     size_t total;
     size_t fM;
@@ -133,28 +69,19 @@ size_t bf_get_mem_size(int M, int F) {
 
     total = ck_align16_size(sizeof(BF));
 
-    /* P (M, M, F): Complex**[M] -> Complex*[M*M] -> Complex[M*M*F].
-     * Frequency is the contiguous axis so one matrix element across four
-     * bins can be updated by one NEON vector without gather/scatter. */
+    /* P (M, M, F): frequency is the contiguous axis, so one NEON vector spans four bins. */
     total = ck_field_size(total, (size_t)M, sizeof(Complex**));
     fM = ck_mul_size((size_t)F, (size_t)M);
     mM = ck_mul_size((size_t)M, (size_t)M);
     total = ck_field_size(total, mM, sizeof(Complex*));
     total = ck_field_size(total, ck_mul_size(fM, (size_t)M), sizeof(Complex));
 
-    /* wa (M, F): Complex*[M] -> Complex[M*F] */
     total = ck_field_size(total, (size_t)M, sizeof(Complex*));
     total = ck_field_size(
         total, ck_mul_size((size_t)M, (size_t)F), sizeof(Complex));
 
-    /* scratch: flat Complex[(M+3)*F]. */
     {
-        /* (size_t)M + 3, not (size_t)(M + 3): the latter computes M + 3 in
-         * `int` arithmetic before the cast, which is signed-overflow UB if a
-         * caller ever passes M within 3 of INT_MAX (M is always the fixed
-         * channel count in practice, but this is a public entry point).
-         * (size_t)M + 3 promotes M to size_t (safe: M > 0 is already
-         * checked above) before the add, so it can never overflow. */
+        /* (size_t)M + 3 widens before the add, so a large M cannot overflow int. */
         size_t scratch_count = ck_mul_size((size_t)M + 3, (size_t)F);
         total = ck_field_size(total, scratch_count, sizeof(Complex));
     }
@@ -162,13 +89,7 @@ size_t bf_get_mem_size(int M, int F) {
     return MEM_SIZE_INVALID(total) ? 0 : total;
 }
 
-/*
- * Caller-pool construction: places the BF struct at mem[0] and carves every
- * backing array (P/wa/scratch) out of the same block -- no malloc called.
- * Applies the exact same validation bf_create() below does. `a_array`
- * remains a BORROWED pointer, exactly like bf_create(): owned by the
- * caller (typically SRP), never carved from this pool or freed here.
- */
+/* Caller-pool construction with bf_create()'s validation. `a_array` is borrowed: owned by the caller, never carved or freed here. */
 BF* bf_init(void* mem, size_t mem_size, int M, int F,
               int num_angles, Complex*** a_array,
               const BF_Config* cfg) {
@@ -181,16 +102,15 @@ BF* bf_init(void* mem, size_t mem_size, int M, int F,
     if (!mem || !cfg || !a_array || M <= 0 || F <= 0 || num_angles <= 0 ||
         !isfinite(cfg->lambda) || cfg->lambda <= 0.0f ||
         cfg->lambda > 1.0f ||
-        !isfinite(cfg->mu)) {
+        !isfinite(cfg->mu) ||
+        (cfg->enable_fix_mode && !isfinite(cfg->fixed_doa_rad))) {
         return NULL;
     }
 
     need = bf_get_mem_size(M, F);
     if (need == 0 || !MEM_IS_ALIGNED16(mem) || mem_size < need) return NULL;
 
-    /* Only the region bf_get_mem_size() actually budgeted is touched --
-     * a caller-supplied pool larger than `need` keeps any trailing bytes
-     * beyond it untouched (see test_bf_init_pool_poison_and_bounds). */
+    /* Only the budgeted region is touched; trailing bytes of a larger pool are left alone. */
     memset(mem, 0, need);
     g = (BF*)mem;
 
@@ -215,9 +135,7 @@ BF* bf_init(void* mem, size_t mem_size, int M, int F,
     mM = ck_mul_size((size_t)M, (size_t)M);
     if (MEM_SIZE_INVALID(fM) || MEM_SIZE_INVALID(mM)) return NULL;
 
-    /* P (M, M, F): pointer table -> matrix-element pointer table -> flat
-     * frequency planes. Per-bin identity state of logical shape
-     * P[F][M][M], stored with frequency contiguous for SIMD. */
+    /* P: pointer tables over flat frequency planes, per-bin identity initial state. */
     {
         Complex*** p_top = (Complex***)pool_carve(
             &cursor, (size_t)M, sizeof(Complex**));
@@ -241,8 +159,6 @@ BF* bf_init(void* mem, size_t mem_size, int M, int F,
         }
     }
 
-    /* wa (M, F): pointer table -> flat data. Already zeroed by the memset
-     * above. */
     {
         Complex** wa_top = (Complex**)pool_carve(
             &cursor, (size_t)M, sizeof(Complex*));
@@ -256,9 +172,6 @@ BF* bf_init(void* mem, size_t mem_size, int M, int F,
         }
     }
 
-    /* scratch: one flat block, already zeroed by the memset above --
-     * pointer arithmetic copied verbatim from the previous calloc'd
-     * version. */
     {
         size_t count = ck_mul_size((size_t)M + 3, (size_t)F);
         g->scratch = (Complex*)pool_carve(&cursor, count, sizeof(Complex));
@@ -269,8 +182,7 @@ BF* bf_init(void* mem, size_t mem_size, int M, int F,
         g->scratch_u = g->scratch_spec + F;
     }
 
-    /* Lockstep proof: bf_get_mem_size()'s walk and the carves above must
-     * consume exactly `need` bytes, no more, no less. */
+    /* The carves must consume exactly `need` bytes. */
     if (cursor.remaining != 0) return NULL;
 
     g->initialized = 0;
@@ -285,8 +197,6 @@ BF* bf_init(void* mem, size_t mem_size, int M, int F,
 
     return g;
 }
-
-/* ===================== create ===================== */
 
 BF* bf_create(int M, int F, int num_angles,
                 Complex*** a_array,
@@ -310,9 +220,7 @@ BF* bf_create(int M, int F, int num_angles,
     return g;
 }
 
-/* Reset one bin's RLS state to the same fresh-start condition bf_create()
- * gives every bin (P = identity, wa = 0). Used by the per-bin divergence
- * guards in the RLS update below; see BF_P_DIAG_FLOOR/CEIL's comment. */
+/* Reset one bin's RLS state to the fresh-start condition (P = identity, wa = 0). */
 static void bf_reset_bin(BF* g, int f)
 {
     for (int i = 0; i < g->M; i++) {
@@ -326,9 +234,7 @@ static void bf_reset_bin(BF* g, int f)
     g->bin_resets += 1;
 }
 
-/* One-bin scalar reference for the RLS recurrence. Keep its operation order
- * identical to the pre-SIMD implementation: the four-bin NEON path below is
- * required to match this state transition byte-for-byte on every lane. */
+/* One-bin scalar RLS recurrence; the four-bin NEON path below applies the same state transition per lane. */
 static void bf_rls_update_bin_scalar(
     BF* g,
     int f,
@@ -445,9 +351,8 @@ static void bf_rls_update_bin_scalar(
 }
 
 #if SK_HAVE_NEON
-/* Four independent frequency bins, one bin per NEON lane. Channel/matrix
- * accumulation order remains i/k=0..3, exactly matching the scalar helper;
- * no horizontal reduction, reciprocal estimate, or FMA is used. */
+/* Four independent bins, one per NEON lane, same accumulation order as the scalar helper;
+ * no horizontal reduction, reciprocal estimate or FMA. */
 static void bf_rls_update_four_neon(
     BF* g,
     int f,
@@ -503,9 +408,7 @@ static void bf_rls_update_four_neon(
         upu_r = vaddq_f32(upu_r, vdupq_n_f32(g->lambda));
     }
 
-    /* The scalar branch owns all exceptional semantics. Falling back before
-     * any store makes mixed valid/invalid groups exactly equivalent to four
-     * independent scalar calls. */
+    /* Any exceptional lane falls back to the scalar helper before any store. */
     vst1q_f32(upu_lane, upu_r);
     for (int lane = 0; lane < 4; ++lane) {
         if (!isfinite(upu_lane[lane]) || upu_lane[lane] <= 0.0f ||
@@ -631,14 +534,17 @@ static void bf_rls_update_bins(
     const int* mask,
     int force_scalar)
 {
+    /* Bins whose mask bit is set are frozen (skipped) only in mask-freeze
+     * mode; elsewhere the mask is ignored. */
+    const int* frozen = use_mask_freeze ? mask : NULL;
     int f = 0;
 #if SK_HAVE_NEON
     if (!force_scalar && g->M == 4) {
         for (; f + 4 <= g->F; f += 4) {
             int vector_eligible = 1;
-            if (use_mask_freeze && mask) {
+            if (frozen) {
                 for (int lane = 0; lane < 4; ++lane) {
-                    if (mask[f + lane]) {
+                    if (frozen[f + lane]) {
                         vector_eligible = 0;
                         break;
                     }
@@ -650,7 +556,7 @@ static void bf_rls_update_bins(
                     use_notebook_update, use_mu_scaling);
             } else {
                 for (int lane = 0; lane < 4; ++lane) {
-                    if (!(use_mask_freeze && mask && mask[f + lane])) {
+                    if (!frozen[f + lane]) {
                         bf_rls_update_bin_scalar(
                             g, f + lane, u_flat, bf_spec,
                             use_notebook_update, use_mu_scaling);
@@ -662,7 +568,7 @@ static void bf_rls_update_bins(
 #endif
     (void)force_scalar;
     for (; f < g->F; ++f) {
-        if (!(use_mask_freeze && mask && mask[f])) {
+        if (!(frozen && frozen[f])) {
             bf_rls_update_bin_scalar(
                 g, f, u_flat, bf_spec,
                 use_notebook_update, use_mu_scaling);
@@ -670,13 +576,14 @@ static void bf_rls_update_bins(
     }
 }
 
-/* ===================== DOA index ===================== */
-
 static int doa2index(float doa_rad, int num_angles)
 {
-    if (isnan(doa_rad)) return 0;
+    if (!isfinite(doa_rad)) return 0;
 
     float deg = doa_rad * 180.0f / M_PI;
+    /* Keeps the wrap loops below short and finite for huge angles. */
+    if (!isfinite(deg)) return 0;
+    if (fabsf(deg) >= 1.0e6f) deg = fmodf(deg, 360.0f);
 
     while (deg < 0.0f)   deg += 360.0f;
     while (deg >= 360.0f) deg -= 360.0f;
@@ -692,7 +599,29 @@ static int doa2index(float doa_rad, int num_angles)
     return idx;
 }
 
-/* ===================== process ===================== */
+/* Mic-0 passthrough frame: output = X[0], no adaptation, exported response
+ * = unit weight on channel 0. */
+static void bf_bypass_frame(
+    BF* g,
+    const Complex* const* X,
+    Complex* bf_out,
+    Complex* effective_weights)
+{
+    for (int f = 0; f < g->F; f++) {
+        bf_out[f] = X[0][f];
+        if (effective_weights) {
+            for (int m = 0; m < g->M; ++m) {
+                effective_weights[m * g->F + f].r = m == 0 ? 1.0f : 0.0f;
+                effective_weights[m * g->F + f].i = 0.0f;
+            }
+        }
+    }
+
+    g->doa_used = NAN;
+    g->adaptive = 0;
+    g->frame_idx += 1;
+}
+
 static void bf_process_with_weights_impl(
     BF* g,
     const Complex* const* X,
@@ -706,77 +635,39 @@ static void bf_process_with_weights_impl(
     float doa_use;
     int doa_idx;
     Complex** a;   // (M,F)
-    int allow_adapt = 0;
+    const int allow_adapt = allow_adapt_in ? 1 : 0;
     int use_notebook_update = 0;
     int use_mask_freeze = 1;
     int use_mu_scaling = 1;
 
-    /* ---------- BF bypass ---------- */
     if (!g->enable) {
-        for (int f = 0; f < g->F; f++) {
-            bf_out[f] = X[0][f];
-            if (effective_weights) {
-                for (int m = 0; m < g->M; ++m) {
-                    effective_weights[m * g->F + f].r =
-                        m == 0 ? 1.0f : 0.0f;
-                    effective_weights[m * g->F + f].i = 0.0f;
-                }
-            }
-        }
-
-        g->doa_used = NAN;
-        g->adaptive = 0;
-        g->frame_idx += 1;
+        bf_bypass_frame(g, X, bf_out, effective_weights);
         return;
     }
 
-    /* fixed_align_notebook=1 is used only for fixed-mode baseline matching. */
+    /* fixed_align_notebook=1 selects the notebook-style update and disables the mask freeze and mu scaling. */
     if (g->enable_fix_mode && g->fixed_align_notebook) {
         use_notebook_update = 1;
         use_mask_freeze = 0;
         use_mu_scaling = 0;
     }
 
-    /* ---------- DOA logic ---------- */
-    /*
-     * Policy:
-     *
-     * - In auto mode, doa_s is already the final smoothed + held DOA
-     *   prepared by SRP/DOA logic.
-     * - BF applies no DOA hold policy of its own.
-     * - If doa_s is still NAN, it means no usable DOA exists yet, so
-     *   bypass to mic-0 and do not adapt.
-     * - Fixed mode is handled inside BF (baseline experiments).
-     * - allow_adapt_in is provided by caller, usually (vad_out == 0),
-     *   so RLS adaptation updates only on non-target-speech frames.
-     */
+    /* DOA policy:
+     * - Auto mode: doa_s is the final smoothed and held DOA from the caller; BF holds nothing itself.
+     * - doa_s == NAN means no usable DOA yet: bypass to mic 0 and do not adapt.
+     * - allow_adapt_in is supplied by the caller (typically vad_out == 0). */
     if (g->enable_fix_mode) {
         doa_use = g->fixed_doa_rad;
         g->current_doa = doa_use;
         g->first_doa_found = 1;
-        allow_adapt = allow_adapt_in ? 1 : 0;
     } else {
         if (isnan(doa_s)) {
-            for (int f = 0; f < g->F; f++) {
-                bf_out[f] = X[0][f];
-                if (effective_weights) {
-                    for (int m = 0; m < g->M; ++m) {
-                        effective_weights[m * g->F + f].r =
-                            m == 0 ? 1.0f : 0.0f;
-                        effective_weights[m * g->F + f].i = 0.0f;
-                    }
-                }
-            }
-
-            g->doa_used = NAN;
-            g->adaptive = 0;
-            g->frame_idx += 1;
+            bf_bypass_frame(g, X, bf_out, effective_weights);
             return;
         }
 
         doa_use = doa_s;
         g->current_doa = doa_use;
-        allow_adapt = allow_adapt_in ? 1 : 0;
 
         if (!g->first_doa_found) {
             g->first_doa_found = 1;
@@ -788,43 +679,24 @@ static void bf_process_with_weights_impl(
     doa_idx = doa2index(doa_use, g->num_angles);
     a = g->a_array[doa_idx];   // (M,F)
 
-    /* ---------- temp buffers ---------- */
     Complex* das = g->scratch_das;
     Complex* wu = g->scratch_wu;
     Complex* bf_spec = g->scratch_spec;
     Complex (*u)[g->F] =
         (Complex (*)[g->F])g->scratch_u;
 
-    /* ---------- DAS beamforming ---------- */
     spatial_conj_beamform(
         (const Complex* const*)a,
         (const Complex* const*)X,
         g->M, g->F, 1.0f / (float)g->M, das);
 
-    /* ---------- Blocking output: projection form ---------- */
-    /*
-     * Original blocking matrix:
-     *   B = I - a a^H / (a^H a)
-     *   u = B^H x
-     *
-     * Equivalent projection form:
-     *   u = x - a * (a^H x / a^H a)
-     *
-     * In the DAS block above:
-     *   das[f] = a^H x / M
-     *
-     * Therefore:
-     *   a^H x / a^H a = das[f] * M / denom
-     *
-     * This avoids explicitly building B[f][M][M] and reduces the
-     * blocking-output calculation from O(F*M*M) to O(F*M).
-     */
+    /* Blocking output in projection form, u = x - a * (a^H x / a^H a), with a^H x = das[f] * M.
+     * O(F*M) instead of building the F x M x M blocking matrix. */
     spatial_bf_projection(
         (const Complex* const*)a,
         (const Complex* const*)X,
         das, g->M, g->F, &u[0][0]);
 
-    /* ---------- wu = conj(wa)^T u ---------- */
     {
         const Complex* u_channels[g->M];
         for (int m = 0; m < g->M; ++m) u_channels[m] = u[m];
@@ -833,16 +705,10 @@ static void bf_process_with_weights_impl(
             u_channels, g->M, g->F, 1.0f, wu);
     }
 
-    /* ---------- bf = das - wu ---------- */
     spatial_complex_sub_array(das, wu, bf_spec, g->F);
     memcpy(bf_out, bf_spec, (size_t)g->F * sizeof(Complex));
 
-    /*
-     * Export the response represented by the CURRENT wa, before the RLS
-     * update below mutates it:
-     *
-     * y = a^H x/M - wa^H (x - a(a^H x)/denom)
-     */
+    /* Export the response of the current wa (before the RLS update): y = a^H x/M - wa^H (x - a(a^H x)/denom). */
     if (effective_weights) {
         spatial_bf_effective_weights(
             (const Complex* const*)a,
@@ -850,17 +716,7 @@ static void bf_process_with_weights_impl(
             g->M, g->F, effective_weights);
     }
 
-    /*
-     * Adaptive update interval:
-     * BF output is still computed every frame using the current weights.
-     * Only the RLS weight update is skipped on non-update frames.
-     *
-     * Example:
-     *   adapt_interval = 2
-     *   frame 0: update RLS
-     *   frame 1: skip RLS
-     *   frame 2: update RLS
-     */
+    /* The BF output is computed every frame; adapt_interval only skips the RLS update on non-update frames. */
     int do_adapt_this_frame = allow_adapt;
 
     if (do_adapt_this_frame && g->adapt_interval > 1) {
@@ -897,9 +753,7 @@ void bf_process_with_weights(BF* g,
 }
 
 #ifdef BF_TESTING
-/* Test-only oracle entry declared in bf_test_hooks.h. It shares every
- * production stage and forces only the RLS recurrence to its scalar path.
- * Production libbf.a is compiled without BF_TESTING. */
+/* Scalar-recurrence entry compiled only with BF_TESTING; absent from the production library. */
 void bf_test_process_with_weights_scalar_rls(
     BF* g,
     const Complex* const* X,
@@ -953,10 +807,7 @@ void bf_destroy(BF* g)
 {
     if (!g) return;
 
-    /* Pool path (owned_heap == NULL, bf_init()): the caller owns the
-     * memory (struct + every array carved from it) -- nothing to free
-     * here. Heap path (bf_create()): a single posix_memalign()'d block
-     * backs everything, so one free() tears it all down. */
+    /* Pool path (owned_heap == NULL): the caller owns the memory. Heap path: one block, one free(). */
     if (g->owned_heap) free(g->owned_heap);
 }
 

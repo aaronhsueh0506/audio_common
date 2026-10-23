@@ -20,13 +20,10 @@ typedef struct {
 
 typedef struct VADApi VADApi;
 
-/* Heap constructor. */
 VADApi* vad_api_create(const VADApiConfig* cfg);
 
-/* Caller-pool constructor. One pool backs the VADApi plus its masker and VAD
- * sub-objects, so an integrator sizes and owns exactly one block. `mem` must
- * be 16-byte aligned and `mem_size` at least vad_api_get_mem_size(cfg), else
- * NULL. vad_api_destroy() will not free caller-owned memory. */
+/* Caller-pool constructor: one pool backs the VADApi, masker and VAD. `mem` must be 16-byte aligned and
+ * `mem_size` >= vad_api_get_mem_size(cfg), else NULL. vad_api_destroy() does not free caller-owned memory. */
 size_t  vad_api_get_mem_size(const VADApiConfig* cfg);
 VADApi* vad_api_init(const VADApiConfig* cfg, void* mem, size_t mem_size);
 

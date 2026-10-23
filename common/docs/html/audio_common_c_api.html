@@ -53,7 +53,7 @@ pre code{background:none;padding:0}
 <tr><td><code>audio_pre_gain.h</code></td><td><b>整合者面向</b></td><td>輸入電平調整</td></tr>
 <tr><td><code>mem_align.h</code></td><td>半公開</td><td>只有「自己也要從同一塊 pool 切物件」或自算 pool 總需求時。單純呼叫別人的 <code>_get_mem_size</code>+<code>_init</code> <b>不需要</b></td></tr>
 <tr><td><code>simd_kernels.h</code></td><td class="dead">內部/共用核心</td><td>一般整合者<b>不呼叫</b>。只有自己寫的熱迴圈剛好與某個核心形狀完全一致時才考慮</td></tr>
-<tr><td><code>simd_kernel_nn.h</code></td><td class="dead">內部/共用核心</td><td>神經網路模型前後處理與重取樣器專用的 <code>skn_*</code> 核心(與 <code>simd_kernels.h</code> 分開管理,傳統 AEC/NR 不引用)。一般整合者<b>不呼叫</b></td></tr>
+<tr><td><code>simd_kernel_nn.h</code></td><td class="dead">內部/共用核心</td><td>神經網路模型前後處理與 <code>audio_stft.h</code> 專用的 <code>skn_*</code> 核心(與 <code>simd_kernels.h</code> 分開管理,傳統 AEC/NR 不引用)。一般整合者<b>不呼叫</b></td></tr>
 <tr><td><code>fast_math.h</code></td><td class="dead">內部/共用</td><td>同上。<b>超出定義域回固定邊界常數而非 IEEE 語意</b>(例:<code>fast_sqrt(NaN)</code> 回 <code>0.0f</code>)</td></tr>
 <tr><td><code>wav_io.h</code></td><td class="dead">離線工具專用</td><td><b>不適合即時/嵌入式路徑</b>(用 stdio + malloc,每樣本一次 fread/fwrite)</td></tr>
 </table></div>
@@ -96,7 +96,7 @@ fft_destroy(fft);</pre>
 <h3>FFT 後端</h3>
 <div class="tblwrap"><table>
 <tr><th>BACKEND</th><th>說明</th></tr>
-<tr><td><code>ne10</code></td><td>ARM NEON,<b>嵌入式交付品</b>。靠編譯期巨集 <code>NE10_DSP_RFFT_SCALING</code> 自動做 <code>1/N</code>——該巨集在 Makefile 裡<b>強制打開,不可關掉</b></td></tr>
+<tr><td><code>ne10</code></td><td>NE10,<b>嵌入式交付品</b>。靠編譯期巨集 <code>NE10_DSP_RFFT_SCALING</code> 自動做 <code>1/N</code>——該巨集在 Makefile 裡<b>強制打開,不可關掉</b></td></tr>
 </table></div>
 <div class="warn"><b>NE10 是唯一的 FFT 後端</b>,<code>BACKEND=ne10</code> 是預設也是唯一接受的值,依 ARM32／ARM64 編譯目標自動選路;有 NEON 且 SIMD=1 時走 NEON FFT,其餘走 C FFT。NEON 與 <code>SIMD=0</code>(NE10 純量 C 核心)的輸出只在浮點捨入內一致;位元級回歸比對必須兩邊同 <code>SIMD</code> 設定。</div>
 
@@ -164,7 +164,7 @@ audio_pre_gain_destroy(g);</pre>
 <tr><td>聲道</td><td>mono</td><td>多聲道,per-channel gain 表</td></tr>
 <tr><td>Clipping</td><td>無</td><td>選配 <code>enable_clip</code> + <code>clip_value</code></td></tr>
 <tr><td>執行期改值</td><td><b>可以</b>(<code>set_db</code>)</td><td><b>不行</b>——沒有 retune 路徑,改值要重建 instance</td></tr>
-<tr><td>怪癖</td><td>—</td><td><code>global_gain</code> 剛好為 <code>0</code> 會被<b>改寫成 1.0</b> 而非靜音(沿用舊行為)。要靜音請用 <code>enable</code> 旗標</td></tr>
+<tr><td>怪癖</td><td>—</td><td><code>global_gain</code> 剛好為 <code>0</code> 會被<b>改寫成 1.0</b> 而非靜音。要靜音請用 <code>enable</code> 旗標</td></tr>
 </table></div>
 <div class="warn"><b>Gain 設定會直接改變 AEC 行為。</b>把 pre-gain 調到讓 ref 常態接近滿刻度,會觸發 AEC 的飽和偵測(<code>saturation_threshold</code> 預設 0.95)並讓線性模型失準 → ERLE 下降。調 gain 之後請重新確認回音消除量。</div>
 
@@ -181,7 +181,7 @@ if (audio_resampler_process(r, in, in_frames, out, cap,
 <tr><td>合法取樣率</td><td>僅 <code>8000 / 16000 / 24000 / 32000 / 48000</code>;最多 <b>8 聲道</b></td></tr>
 <tr><td>單位</td><td><code>input_frames</code>／<code>output_capacity_frames</code> 是 <b>frame 數,不是樣本數</b>;buffer 是<b>交錯</b> float32</td></tr>
 <tr><td>推進</td><td><b>不能假設一次吃完 input</b>。一定要用 <code>consumed</code>／<code>produced</code> 推進</td></tr>
-<tr><td>輸出容量</td><td>用 <code>audio_resampler_output_bound()</code>。<b>自己按比例算會偶發少一個 frame</b>(實測 48k→16k、480 frames:bound 161、實際 160)</td></tr>
+<tr><td>輸出容量</td><td>用 <code>audio_resampler_output_bound()</code>。<b>自己按比例算會偶發少一個 frame</b>(例:48k→16k、480 frames:bound 161、實際 160)</td></tr>
 <tr><td>重疊</td><td>不同 rate 時 in/out <b>不可重疊</b>;<b>相同 rate 是精確 memmove 直通,此時重疊安全</b></td></tr>
 <tr><td><code>reset()</code></td><td>只在真的要丟棄整段串流歷史時呼叫(換檔/重啟),<b>不要在一般 block 邊界呼叫</b></td></tr>
 <tr><td>延遲</td><td><code>audio_resampler_latency_input_frames()</code>,以<b>輸入 frame</b> 為單位</td></tr>

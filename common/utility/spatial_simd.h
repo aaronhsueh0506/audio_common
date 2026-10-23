@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-/* Scalar golden and compile-time-dispatched PHAT cross-spectrum kernels. */
+/* Scalar and compile-time-dispatched PHAT cross-spectrum kernels. */
 void spatial_phat_cross_scalar(const Complex* x_i,
                                const Complex* x_j,
                                Complex* out,

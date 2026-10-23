@@ -1,13 +1,10 @@
 /*
- * roundtrip.c - common FFT self-test.
- *
- * Exercises the public fft_wrapper API:
- *   1. forward -> inverse must return the original signal (correct 1/N scaling).
- *   2. the static-memory path (fft_get_mem_size / fft_init) must be
- *      byte-identical to the heap path (fft_create).
- *   3. interleaved forward/inverse calls on one handle (which share its
- *      input staging) give the results a fresh handle gives, never change a
- *      result the caller still holds, and never modify their inputs.
+ * roundtrip.c - common FFT self-test of the public fft_wrapper API:
+ *   1. forward -> inverse returns the original signal (correct 1/N scaling).
+ *   2. the static-memory path (fft_get_mem_size / fft_init) is byte-identical to the heap path.
+ *   3. interleaved forward/inverse calls on one handle (which share its input staging) give the
+ *      results a fresh handle gives, never change a result the caller still holds, and never
+ *      modify their inputs.
  */
 #include "fft_wrapper.h"
 #include <stdio.h>

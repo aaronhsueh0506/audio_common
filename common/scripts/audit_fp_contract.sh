@@ -112,9 +112,7 @@ for BACKEND in $BACKENDS; do
     echo "# BACKEND=$BACKEND"
     echo "############################################################"
 
-    # Build common first (NR's two-phase dispatch needs COMMON_LIB
-    # resolved the same way its own Makefile resolves it -- see NR's
-    # Makefile "Consumer two-phase common resolution" comment).
+    # Build common first; NR's two-phase dispatch needs COMMON_LIB resolved the same way.
     make -C "$AC_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD lib >/dev/null
     AC_OBJDIR="$(make -C "$AC_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD print-obj-dir)"
     AC_LIB="$(make -C "$AC_DIR" -s --no-print-directory BACKEND="$BACKEND" $MAKE_FWD print-lib-path)"

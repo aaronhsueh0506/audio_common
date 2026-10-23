@@ -1,12 +1,6 @@
-/* NR-specific scalar/NEON kernel bodies.
- * Dispatch stays in NR: ANR_VECTOR = SK_HAVE_NEON && !ANR_REFERENCE_KERNELS.
- * Keeping that independent reference switch lets tests compare scalar and
- * NEON kernels under the same shared FFT/backend configuration.
- *
- * Finite inputs are byte-identical to scalar twins; NaN payloads may differ,
- * but classification must match. Preserve separate multiply/add rounding
- * with -ffp-contract=off. Partial pointer overlap is unsupported unless stated.
- */
+/* NR scalar/NEON kernel bodies. Dispatch lives in NR (ANR_VECTOR = SK_HAVE_NEON && !ANR_REFERENCE_KERNELS).
+ * Finite inputs give identical results in both twins; NaN payloads may differ but the classification matches.
+ * Built with -ffp-contract=off to keep multiply and add separately rounded. Partial pointer overlap is unsupported unless stated. */
 
 #ifndef SIMD_NR_H
 #define SIMD_NR_H
@@ -19,17 +13,14 @@
 extern "C" {
 #endif
 
-/* A build uses one twin; differential tests also call the other. */
 #if defined(__GNUC__) || defined(__clang__)
 #define SKR_TWIN static inline __attribute__((unused))
 #else
 #define SKR_TWIN static inline
 #endif
 
-/* Ordered minimum: start from values[0] and replace on a strict '<'. A NaN never
- * replaces and a NaN in values[0] is never replaced; among equal values the earliest
- * stays, so +0 and -0 keep their position-dependent identity.
- */
+/* Ordered minimum: start from values[0] and replace on a strict '<'. NaN never replaces and a NaN in values[0] is never replaced;
+ * among equal values the earliest stays (+0 and -0 keep their position-dependent identity). */
 static inline float skr_min_ordered_scalar(const float* values, int n) {
     float minimum = values[0];
     for (int i = 1; i < n; ++i)
@@ -42,12 +33,9 @@ SKR_TWIN float32x4_t skr_vmin_lt(float32x4_t a, float32x4_t b) {
     return vbslq_f32(vcltq_f32(b, a), b, a);   /* b where b < a, else a */
 }
 
-/* Minimum through independent lane-wise running minima, seeded from the first vectors. A NaN
- * after the seed never replaces a minimum, exactly like the scalar rule, so only the seed needs
- * a NaN check. The result equals the ordered minimum whenever the seed holds no NaN and the
- * minimum is not a zero: equal non-zero floats have equal bits, so the order of comparison
- * cannot change it. Returns false (result untouched) otherwise, which needs the scalar rule.
- */
+/* Minimum via lane-wise running minima seeded from the first vectors. A NaN after the seed never replaces a minimum, so only the seed
+ * needs a NaN check. Equals the ordered minimum unless the seed holds a NaN or the minimum is a zero; in those cases returns false
+ * (result untouched) and the scalar rule applies. */
 SKR_TWIN bool skr_min_ordered_fast_neon(const float* values, int n, float* result) {
     if (n < 4) return false;
     float32x4_t a0, a1, a2, a3;
@@ -92,13 +80,10 @@ SKR_TWIN float skr_min_ordered_neon(const float* values, int n) {
 }
 #endif /* SK_HAVE_NEON */
 
-/* Keep the fused four-bin gather/scatter and deferred rescans: splitting
- * into single-bin calls reloads shared data and changes throughput. */
+/* Fused four-bin gather/scatter with deferred rescans (single-bin calls would reload shared data). */
 
-/* Ring write and incremental minimum for bins [0, n): store the new smoothed power S in slot
- * ring_pos of each bin's row (row k starts at ring[k * L]), keep S_min when S is a new minimum,
- * and rescan the row only when the evicted value was at most S_min * (1 + 1e-6).
- */
+/* Ring write and incremental minimum for bins [0, n): store the new smoothed power S in slot ring_pos of each bin's row (row k starts at ring[k * L]),
+ * keep S_min when S is a new minimum, and rescan the row only when the evicted value was at most S_min * (1 + 1e-6). */
 static inline void skr_ring_min_elem(float* s_min, float new_s, float* row,
                                      int ring_pos, bool* rescan) {
     float old_val = row[ring_pos];
@@ -123,7 +108,7 @@ SKR_TWIN void skr_ring_min_scalar(float* s_min, const float* s,
 }
 
 #if SK_HAVE_NEON
-/* Block of bins processed before the deferred rescans; bounds the pending-bin list. */
+/* Bins processed before the deferred rescans; bounds the pending-bin list. */
 #define SKR_RING_MIN_BLOCK 128
 
 /* Per 4-bit lane mask: ascending numbers of the set lanes (unused entries 0) and their count. */
@@ -135,10 +120,7 @@ static const uint16_t skr_lane_list[16][4] = {
 static const uint8_t skr_lane_count[16] = {0, 1, 1, 2, 1, 2, 2, 3,
                                            1, 2, 2, 3, 2, 3, 3, 4};
 
-/* Same result as the scalar twin (except the payload bits of a NaN): the compare and select run
- * on four bins at once, the bins that need a rescan are collected without a data-dependent
- * branch and rescanned after each block.
- */
+/* Compare and select run on four bins at once; bins needing a rescan are collected branch-free and rescanned after each block. */
 SKR_TWIN void skr_ring_min_neon(float* s_min, const float* s, float* ring,
                                 int L, int ring_pos, int n) {
     const float32x4_t growth = vdupq_n_f32(1.0f + 1e-6f);
@@ -184,14 +166,10 @@ SKR_TWIN void skr_ring_min_neon(float* s_min, const float* s, float* ring,
 }
 #endif /* SK_HAVE_NEON */
 
-/* Below this floor, consumer epsilons dominate the PSD and posterior gating can prevent
- * recovery, so such bins restart with an ungated update.
- */
+/* Below this floor consumer epsilons dominate the PSD and posterior gating can block recovery, so such bins restart ungated. */
 #define SKR_NOISE_PSD_INERT 1e-20f
 
-/* Restart inert bins with p=0 so a returning signal can update the floor. The update keeps
- * the non-fused order alpha_d*N + (1-alpha_d)*power; other bins are left unchanged.
- */
+/* Restart inert bins with p=0 so a returning signal can update the floor: alpha_d*N + (1-alpha_d)*power, unfused; other bins unchanged. */
 static inline void skr_restart_inert_elem(float* noise, float power, float alpha_d) {
     if (*noise < SKR_NOISE_PSD_INERT)
         *noise = alpha_d * *noise + (1.0f - alpha_d) * power;
@@ -221,8 +199,7 @@ SKR_TWIN void skr_restart_inert_neon(float* noise, const float* power,
 }
 #endif /* SK_HAVE_NEON */
 
-/* Clamp v to [1e-10,700]. Recover xi/(1+xi) directly when v underflows;
- * otherwise reuse v/(gamma+eps). Output arrays must not overlap inputs. */
+/* Clamp v to [1e-10, 700]. Recover xi/(1+xi) directly when v underflows; otherwise reuse v/(gamma+eps). Outputs must not overlap inputs. */
 static inline void skr_gain_prepare_elem(float v_in, float gamma, float xi, float* v_out,
                                          float* ratio_out) {
     float v = v_in;
@@ -255,7 +232,7 @@ SKR_TWIN void skr_gain_prepare_neon(const float* v_in, const float* gamma, const
         float32x4_t ratio_div = vdivq_f32(v_raw, vaddq_f32(vld1q_f32(gamma + k), eps));
         float32x4_t ratio;
         if (vmaxvq_u32(below_eps) == 0) {
-            /* No lane needs the direct-xi fallback; skip its division and select. */
+            /* No lane needs the direct-xi fallback: skip its division and select. */
             ratio = ratio_div;
         } else {
             float32x4_t xi_k = vld1q_f32(xi + k);
@@ -272,8 +249,7 @@ SKR_TWIN void skr_gain_prepare_neon(const float* v_in, const float* gamma, const
 }
 #endif /* SK_HAVE_NEON */
 
-/* Final log-gain blend/store. Production calls the NEON twins under
- * ANR_VECTOR; scalar twins provide the differential reference. */
+/* Final log-gain blend/store (NEON twins under ANR_VECTOR; scalar twins otherwise). */
 typedef struct {
     float log_g_min;
     float g_min;
@@ -285,13 +261,12 @@ typedef struct {
     bool  dd_from_gmmse;
 } SkrFinalGainParams;
 
-/* log_mmse: log(G_H1 + eps) in, blended and smoothed log gain out. emitted: that log gain clamped
- * to [log_g_min, 0], ready for exp(). prev_log is read only when smooth is set.
- */
+/* log_mmse: log(G_H1 + eps) in, blended and smoothed log gain out. emitted: that log gain clamped to [log_g_min, 0], ready for exp().
+ * prev_log is read only when smooth is set. */
 static inline void skr_final_blend_elem(const SkrFinalGainParams* g, float posterior,
                                         float prev_log, float* log_mmse, float* emitted) {
     float p = posterior;
-    /* Keep lift*p*(1-p) unfused and in the same order as the NEON twin. */
+    /* lift*p*(1-p) stays unfused, in the NEON twin's order. */
     if (g->cross_band_prior) p = p + g->prior_lift * p * (1.0f - p);
     float log_gain = p * *log_mmse + (1.0f - p) * g->log_g_min;
     if (g->smooth) {
@@ -312,9 +287,7 @@ SKR_TWIN void skr_final_blend_scalar(const SkrFinalGainParams* g,
                              emitted + k);
 }
 
-/* exp_gain: exp() of the clamped log gain in, final gain out. The log gain outside
- * [log_g_min, 0] takes g_min / 1 and the matching saved log gain.
- */
+/* exp_gain: exp() of the clamped log gain in, final gain out. A log gain outside [log_g_min, 0] takes g_min / 1 and the matching saved log gain. */
 static inline void skr_final_store_elem(const SkrFinalGainParams* g, float log_gain,
                                         float conditional, float power, float* exp_gain,
                                         float* saved_log, float* previous_gain,

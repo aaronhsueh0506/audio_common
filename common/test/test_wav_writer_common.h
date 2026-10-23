@@ -1,16 +1,11 @@
 /*
- * test_wav_writer_common.h - writer special-values test body shared by
- * test_wav_io.c (default WAV_IO_WRITER_AEC) and test_wav_writer_nr_style.c
- * (WAV_IO_WRITER_NR).
+ * test_wav_writer_common.h - writer special-values test body shared by test_wav_io.c (default
+ * WAV_IO_WRITER_AEC) and test_wav_writer_nr_style.c (WAV_IO_WRITER_NR). Include after "wav_io.h".
  *
- * It checks the PCM16 quantizer at the +-1.0f boundary (AEC style:
- * (int16_t)32768.5f would be an out-of-range conversion) and for NaN / +-Inf
- * input, which must be replaced by zero because NaN passes every ordered
- * comparison of the clamp.
- *
- * One body covers both styles; the expected int16 values differ (round half
- * away from zero plus saturate versus truncation) and are selected by
- * WAV_IO_WRITER_STYLE. Include it after "wav_io.h".
+ * It checks the PCM16 quantizer at the +-1.0f boundary ((int16_t)32768.5f would be an out-of-range
+ * conversion) and for NaN / +-Inf input, which must become zero because NaN passes every ordered
+ * comparison of the clamp. The expected int16 values differ by style (round half away from zero plus
+ * saturate versus truncation) and are selected by WAV_IO_WRITER_STYLE.
  */
 #ifndef TEST_WAV_WRITER_COMMON_H
 #define TEST_WAV_WRITER_COMMON_H

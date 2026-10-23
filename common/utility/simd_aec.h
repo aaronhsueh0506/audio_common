@@ -1,25 +1,8 @@
-/**
- * AEC-specific scalar/NEON micro-kernels.
- *
- * Filtering, spectral statistics, stationarity and saturation kernels.
- * AEC modules retain their stateful wrappers; generic kernels and the
- * SK_HAVE_NEON switch are provided by simd_kernels.h.
- *
- * For finite inputs every NEON entry point must be byte-identical to its
- * scalar reference. Multi-NaN expressions may select different NaN
- * payloads, but must agree on NaN classification; the self-test
- * (AEC/c_impl/test/simd_selftest_aec.c) reports those separately from hard
- * failures.
- *
- * Keep the scalar operation order: explicit fmaf calls stay fused, ordinary
- * multiply/add expressions stay separate, and including translation units
- * must use -ffp-contract=off. Estimate reciprocal/sqrt instructions and
- * reassociation are not allowed.
- *
- * Partial pointer overlap is unsupported. sk_mask_zero_f32 is explicitly
- * in-place. Complex NEON access must use sk__cquad_load/sk__cquad_store from
- * simd_kernels.h so strict-aliasing remains valid.
- */
+/** AEC-specific scalar/NEON micro-kernels: filtering, spectral statistics, stationarity and saturation. Stateful wrappers stay in AEC;
+ * generic kernels and the SK_HAVE_NEON switch come from simd_kernels.h.
+ * For finite inputs every NEON entry point matches its scalar twin exactly; multi-NaN expressions may pick different NaN payloads but agree on classification.
+ * Operation order is fixed: explicit fmaf stays fused, ordinary mul/add stay separate (-ffp-contract=off), no reciprocal/sqrt estimates, no reassociation.
+ * Partial pointer overlap is unsupported (sk_mask_zero_f32 is in place). Complex NEON access goes through sk__cquad_load/sk__cquad_store. */
 
 #ifndef SIMD_AEC_H
 #define SIMD_AEC_H
@@ -32,12 +15,9 @@
 extern "C" {
 #endif
 
-/* Shared per-element helpers preserve the same operation order in scalar
- * kernels and NEON scalar tails. Generic fast-sqrt helpers stay in
- * simd_kernels.h. */
+/* Per-element helpers shared by the scalar kernels and the NEON scalar tails. */
 
-/* numpy complex64 |z| (np.abs of a complex64) — scaled hypot with an explicit
- * fmaf; correctly rounded, so identical on every IEEE-754 target. */
+/* numpy complex64 |z|: scaled hypot with an explicit fmaf (correctly rounded). */
 static inline float sk__cabs_np_elem(float re, float im) {
     float ar = re < 0.0f ? -re : re;
     float ai = im < 0.0f ? -im : im;
@@ -57,20 +37,17 @@ static inline float sk__cmag2_np_elem(float re, float im) {
 }
 
 #if SK_HAVE_NEON
-/* Compare/select reproduces the scalar ternaries, including NaN signs and
- * unordered comparisons. vabsq/vminq/vmaxq would change that contract.
- * Zero-magnitude lanes calculate 0/0 internally, then select exact +0.0f.
- * Finite inputs (including signed zero) remain byte-identical to scalar;
- * the dedicated NaN corpus checks non-finite behavior. */
+/* Compare/select reproduces the scalar ternaries, including NaN signs and unordered compares (vabsq/vminq/vmaxq would change them).
+ * Zero-magnitude lanes compute 0/0 internally and then select +0.0f. */
 static inline float32x4_t sk__cabs_np_neon4(float32x4_t re, float32x4_t im) {
     float32x4_t zero = vdupq_n_f32(0.0f);
-    uint32x4_t re_neg = vcltq_f32(re, zero);           /* re < 0.0f */
-    uint32x4_t im_neg = vcltq_f32(im, zero);           /* im < 0.0f */
-    float32x4_t ar = vbslq_f32(re_neg, vnegq_f32(re), re);  /* re<0?-re:re */
-    float32x4_t ai = vbslq_f32(im_neg, vnegq_f32(im), im);  /* im<0?-im:im */
-    uint32x4_t gt = vcgtq_f32(ar, ai);                 /* ar > ai */
-    float32x4_t larger  = vbslq_f32(gt, ar, ai);       /* ar>ai?ar:ai */
-    float32x4_t smaller = vbslq_f32(gt, ai, ar);       /* ar>ai?ai:ar */
+    uint32x4_t re_neg = vcltq_f32(re, zero);
+    uint32x4_t im_neg = vcltq_f32(im, zero);
+    float32x4_t ar = vbslq_f32(re_neg, vnegq_f32(re), re);
+    float32x4_t ai = vbslq_f32(im_neg, vnegq_f32(im), im);
+    uint32x4_t gt = vcgtq_f32(ar, ai);
+    float32x4_t larger  = vbslq_f32(gt, ar, ai);
+    float32x4_t smaller = vbslq_f32(gt, ai, ar);
     float32x4_t ratio = vdivq_f32(smaller, larger);
     float32x4_t m = vmulq_f32(larger,
                        vsqrtq_f32(vfmaq_f32(vdupq_n_f32(1.0f), ratio, ratio)));
@@ -82,10 +59,9 @@ static inline float32x4_t sk__cmag2_np_neon4(float32x4_t re, float32x4_t im) {
     float32x4_t m = sk__cabs_np_neon4(re, im);
     return vmulq_f32(m, m);
 }
-#endif /* SK_HAVE_NEON */
+#endif
 
-/* ═══════════════════════════════ kernel 1 ══════════════════════════════════
- * sk_cabs_np_f32 — out[i] = numpy |z[i]|. */
+/* sk_cabs_np_f32: out[i] = numpy |z[i]|. */
 
 static inline void sk_cabs_np_f32_scalar(const Complex *z, float *out, int n) {
     int i;
@@ -96,10 +72,6 @@ static inline void sk_cabs_np_f32_scalar(const Complex *z, float *out, int n) {
 static inline void sk_cabs_np_f32(const Complex *z, float *out, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        /* sk__cquad_load (simd_kernels.h) -- memcpy-based Complex-quad
-         * load, NOT a direct Complex*->float* cast fed to vld2q_f32 (that
-         * cast is a strict-aliasing violation, see simd_kernels.h's
-         * "Complex-quad NEON load/store" section for the full writeup). */
         float32x4x2_t v = sk__cquad_load(z + i);
         float32x4_t r = sk__cabs_np_neon4(v.val[0], v.val[1]);
         vst1q_f32(out + i, r);
@@ -112,8 +84,7 @@ static inline void sk_cabs_np_f32(const Complex *z, float *out, int n) {
 }
 #endif
 
-/* ═══════════════════════════════ kernel 2 ══════════════════════════════════
- * sk_cmag2_np_f32 — out[i] = numpy |z[i]|**2. */
+/* sk_cmag2_np_f32: out[i] = numpy |z[i]|**2. */
 
 static inline void sk_cmag2_np_f32_scalar(const Complex *z, float *out, int n) {
     int i;
@@ -124,8 +95,6 @@ static inline void sk_cmag2_np_f32_scalar(const Complex *z, float *out, int n) {
 static inline void sk_cmag2_np_f32(const Complex *z, float *out, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        /* sk__cquad_load -- see sk_cabs_np_f32 above for the aliasing
-         * rationale. */
         float32x4x2_t v = sk__cquad_load(z + i);
         float32x4_t m2 = sk__cmag2_np_neon4(v.val[0], v.val[1]);
         vst1q_f32(out + i, m2);
@@ -138,9 +107,7 @@ static inline void sk_cmag2_np_f32(const Complex *z, float *out, int n) {
 }
 #endif
 
-/* ═══════════════════════════════ kernel 3 ══════════════════════════════════
- * sk_cmag2_np_acc_f32 — acc[i] += numpy |z[i]|**2 (the PBFDAF x2_partition_sum
- * / far-power accumulation pattern: acc[k] += cmag2_np(...)). */
+/* sk_cmag2_np_acc_f32: acc[i] += numpy |z[i]|**2 (far-power accumulation). */
 
 static inline void sk_cmag2_np_acc_f32_scalar(const Complex *z, float *acc, int n) {
     int i;
@@ -151,8 +118,6 @@ static inline void sk_cmag2_np_acc_f32_scalar(const Complex *z, float *acc, int 
 static inline void sk_cmag2_np_acc_f32(const Complex *z, float *acc, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        /* sk__cquad_load -- see sk_cabs_np_f32 above for the aliasing
-         * rationale. */
         float32x4x2_t v = sk__cquad_load(z + i);
         float32x4_t m2 = sk__cmag2_np_neon4(v.val[0], v.val[1]);
         float32x4_t a = vld1q_f32(acc + i);
@@ -166,18 +131,9 @@ static inline void sk_cmag2_np_acc_f32(const Complex *z, float *acc, int n) {
 }
 #endif
 
-/* ═══════════════════════════════ kernel 7 ══════════════════════════════════
- * sk_wupdate_nlms_f32 — the PBFDAF NLMS coarse-filter W-update, per-bin, for
- * ONE partition (the outer loop-over-partitions stays scalar at the call
- * site; this kernel vectorizes over the K frequency bins of a single
- * partition). Verbatim from pbfdaf_process_with_far_cmag2() in pbfdkf.c:
- *   cxr = xr, cxi = -xi;                                  // conj(X)
- *   gr = fmaf(er, cxr, -(ei * cxi));
- *   gi = fmaf(er, cxi,  (ei * cxr));                      // grad = err*conj(X)
- *   W[k].r += mu_eff[k] * gr;                             // NOT fmaf
- *   W[k].i += mu_eff[k] * gi;                             // NOT fmaf
- * The grad computation is explicit fmaf (fused); the final mu_eff*grad
- * combine is a plain separate multiply then add (needs -ffp-contract=off). */
+/* sk_wupdate_nlms_f32: NLMS coarse-filter W update for ONE partition, vectorized over the K bins:
+ *   gr = fmaf(er, xr, -(ei * -xi)); gi = fmaf(er, -xi, ei * xr)  (err * conj(X), fused)
+ *   W[k].r += mu_eff[k] * gr; W[k].i += mu_eff[k] * gi  (separate multiply then add). */
 
 static inline void sk_wupdate_nlms_f32_scalar(Complex *W, const Complex *X,
                                                const Complex *err,
@@ -200,8 +156,6 @@ static inline void sk_wupdate_nlms_f32(Complex *W, const Complex *X,
                                         const float *mu_eff, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        /* sk__cquad_load/sk__cquad_store -- see sk_cabs_np_f32 above for
-         * the aliasing rationale. */
         float32x4x2_t ev = sk__cquad_load(err + i);
         float32x4_t er = ev.val[0], ei = ev.val[1];
         float32x4x2_t xv = sk__cquad_load(X + i);
@@ -235,19 +189,9 @@ static inline void sk_wupdate_nlms_f32(Complex *W, const Complex *X,
 }
 #endif
 
-/* ═══════════════════════════════ kernel 8 ══════════════════════════════════
- * sk_wupdate_kf_f32 — the PBFDKF Kalman W-update, per-bin, for ONE
- * partition. Verbatim from pbfdkf_update_weights() in pbfdkf.c:
- *   kr = mu[k] * xr;             ki = -(mu[k] * xi);        // K = mu*conj(X)
- *   ksr = kr * mu_scale[k];      ksi = ki * mu_scale[k];     // K *= mu_scale
- *   W[k].r += fmaf(ksr, er, -(ksi * ei));
- *   W[k].i += fmaf(ksr, ei,  (ksi * er));                   // W += K*err
- * The K/K*=mu_scale steps are plain separate multiplies (no add involved,
- * so no fusion risk there either way); the final `W += fmaf(...)` step is
- * itself two operations — the fmaf (fused, explicit) producing the K*err
- * increment, THEN a separate plain add onto the existing W[k] (the source
- * writes `+=`, not a second fmaf) — replicated here as vfmaq_f32 followed
- * by a separate vaddq_f32. */
+/* sk_wupdate_kf_f32: Kalman W update for ONE partition:
+ *   (ksr, ksi) = mu[k] * conj(X) * mu_scale[k] (plain multiplies); W.r += fmaf(ksr, er, -(ksi * ei)) and W.i += fmaf(ksr, ei, ksi * er), each a fused product followed by a separate add
+ *   (vfmaq_f32 then vaddq_f32). */
 
 static inline void sk_wupdate_kf_f32_scalar(Complex *W, const Complex *X,
                                              const Complex *err,
@@ -273,8 +217,6 @@ static inline void sk_wupdate_kf_f32(Complex *W, const Complex *X,
                                       const float *mu_scale, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        /* sk__cquad_load/sk__cquad_store -- see sk_cabs_np_f32 above for
-         * the aliasing rationale. */
         float32x4x2_t xv = sk__cquad_load(X + i);
         float32x4_t xr = xv.val[0], xi = xv.val[1];
         float32x4_t muv = vld1q_f32(mu + i);
@@ -313,18 +255,8 @@ static inline void sk_wupdate_kf_f32(Complex *W, const Complex *X,
 }
 #endif
 
-/* ═══════════════════════════════ kernel 13 ═════════════════════════════════
- * sk_pairwise_sum_f32 — numpy-1.26-bit-exact pairwise float32 sum
- * (n<=8 serial; n<=128 8-accumulator leaf; recursive split with
- * half -= half%8).
- *
- * NEON leaf math (verified by hand): q0 holds running column-sums for
- * acc[0..3], q1 for acc[4..7] (same 8-wide grouping as the scalar leaf).
- * `t = vpaddq_f32(q0,q1)` = [acc0+acc1, acc2+acc3, acc4+acc5, acc6+acc7].
- * `u = vpaddq_f32(t,t)` = [ (acc0+acc1)+(acc2+acc3), (acc4+acc5)+(acc6+acc7),
- * <repeat> ]. `u[0]+u[1]` therefore equals
- * `((acc0+acc1)+(acc2+acc3)) + ((acc4+acc5)+(acc6+acc7))` — the exact same
- * grouping as the scalar leaf's `r`. */
+/* sk_pairwise_sum_f32: numpy pairwise float32 sum (n <= 8 serial; n <= 128 eight-accumulator leaf; recursive split with half -= half % 8).
+ * The NEON leaf holds acc[0..3] in q0 and acc[4..7] in q1 and combines them with two vpaddq_f32, in the scalar leaf's grouping. */
 
 static inline float sk__pairwise_sum_leaf_scalar(const float *a, size_t n) {
     float acc[8];
@@ -397,10 +329,7 @@ static inline float sk_pairwise_sum_f32(const float *a, size_t n) {
 }
 #endif
 
-/* ═══════════════════════════════ kernel 14 ═════════════════════════════════
- * sk_sum_sq_pairwise_f32 — same tree as kernel 13, over squared elements.
- * Identical structure/split/combine order; the leaf accumulates
- * a[i+j]*a[i+j] instead of a[i+j]. */
+/* sk_sum_sq_pairwise_f32: the same tree over squared elements. */
 
 static inline float sk__sum_sq_leaf_scalar(const float *a, size_t n) {
     float acc[8];
@@ -475,38 +404,10 @@ static inline float sk_sum_sq_pairwise_f32(const float *a, size_t n) {
 }
 #endif
 
-/* ═══════════════════════════════ kernel 16 ═════════════════════════════════
- * sk_coherence_ema_gate_f32 — post-filter coherence Γ²(Ŷ,Y) EMA update + the
- * ERLE coh-gate threshold, FUSED into one per-bin pass. Fuses the two per-bin
- * loops (over the same [0,nb) range) of aec_post.c
- * aec_post_compute_coherence() —
- *
- *   loop 1 (per k): pr = er*nr + ei*ni;  pi = ei*nr - er*ni;   // echo *
- *                     conj(near), plain mul/add — source does NOT call
- *                     fmaf for this cross-product.
- *                   sye_re[k] = omaf*sye_re[k] + af*pr;         // plain
- *                   sye_im[k] = omaf*sye_im[k] + af*pi;         // mul/mul/add,
- *                                                                NOT fmaf
- *                   syy[k] = (1.0f-a)*syy[k] + af*abs_echo[k]^2;  // source
- *                   see[k] = (1.0f-a)*see[k] + af*abs_near[k]^2;  // recomputes
- *                     "(1.0f-a)" inline here instead of reusing the `omaf`
- *                     local — bit-identical to omaf regardless (same `a`,
- *                     same deterministic IEEE subtract), so this kernel
- *                     computes omaf once and reuses it for all four EMAs.
- *   loop 2 (per k): sye2 = sye_re[k]^2 + sye_im[k]^2;           // plain
- *                                                                mul/mul/add
- *                   denom = syy[k]*see[k];
- *                   if (denom<1e-30f) denom=1e-30f;             // compare+
- *                     select, not vmaxq (signed-zero risk per header note)
- *                   g2 = sye2/denom;
- *                   mask[k] = (g2 >= threshold) ? 1u : 0u;
- *
- * FUSION SAFETY: loop 2 at index k reads ONLY sye_re[k]/sye_im[k]/syy[k]/
- * see[k] — the values loop 1 just wrote at that SAME index k, never a
- * different index (no cross-bin term anywhere in either loop). So merging
- * into one per-k pass (update-then-gate) is order-preserving: loop 1's
- * write at k happens-before loop 2's read at k in both the original 2-loop
- * form and this fused form. */
+/* sk_coherence_ema_gate_f32: post-filter coherence EMA update and the ERLE coherence-gate threshold fused into one per-bin pass.
+ * Loop 1 (per k): cross term pr = er*nr + ei*ni, pi = ei*nr - er*ni (plain mul/add); EMAs of sye_re/sye_im/syy/see with weight af and (1-a) computed once.
+ * Loop 2 (per k): sye2 = sye_re^2 + sye_im^2; denom = max(syy*see, 1e-30f) by compare plus select; mask[k] = (sye2/denom >= threshold).
+ * Fusion is order-preserving: loop 2 at k reads only values loop 1 just wrote at the same k. */
 
 static inline void sk__coherence_ema_gate_elem(
     float *sye_re, float *sye_im, float *syy, float *see,
@@ -559,8 +460,6 @@ static inline void sk_coherence_ema_gate_f32(
     float32x4_t va = vdupq_n_f32(alpha), vomaf = vdupq_n_f32(omaf);
     float32x4_t vfloor = vdupq_n_f32(1.0e-30f);
     for (; i + 4 <= n; i += 4) {
-        /* sk__cquad_load (read-only side of this kernel) -- see
-         * sk_cabs_np_f32 above for the aliasing rationale. */
         float32x4x2_t ev = sk__cquad_load(echo + i);
         float32x4_t er = ev.val[0], ei = ev.val[1];
         float32x4x2_t nv = sk__cquad_load(near_spec + i);
@@ -625,17 +524,7 @@ static inline void sk_coherence_ema_gate_f32(
 }
 #endif
 
-/* ═══════════════════════════════ kernel 17 ═════════════════════════════════
- * sk_ema_delta_f32 — state[i] = state[i] + alpha*(x[i]-state[i]) (the
- * "delta-form" EMA — distinct from kernel 4's alpha*state+beta*x shape:
- * different rounding path, NOT interchangeable bit-for-bit). Verbatim from
- * AEC/c_impl/src/aec_post.c aec_post_compute_comfort_noise()'s
- * y2_smoothed update:
- *   p->y2_smoothed[k] = p->y2_smoothed[k]
- *                     + y2a * (p->near_psd[k] - p->y2_smoothed[k]);
- * Source computes this as a separate subtract, a separate multiply, then a
- * separate add — no fmaf call at this line — so NOT fused here either (needs
- * -ffp-contract=off to stay that way, same discipline as kernel 4). */
+/* sk_ema_delta_f32: state[i] = state[i] + alpha*(x[i]-state[i]) with a separate subtract, multiply and add (delta form; not interchangeable with sk_ema_f32). */
 
 static inline void sk_ema_delta_f32_scalar(float *state, const float *x,
                                             float alpha, int n) {
@@ -670,15 +559,8 @@ static inline void sk_ema_delta_f32(float *state, const float *x,
 }
 #endif
 
-/* ═══════════════════════════════ kernel 18 ═════════════════════════════════
- * sk_n2_track_f32 — the CNG N2-tracking data-dependent update. Verbatim from
- * AEC/c_impl/src/aec_post.c aec_post_compute_comfort_noise():
- *   track = (fresh*y2s[k] + retain*n2[k]) * g_up;  // mul, mul, add, mul —
- *                                                     all plain, no fmaf
- *   up    = n2[k] * g_up;
- *   n2[k] = (y2s[k] < n2[k]) ? track : up;          // exact IEEE '<'
- *                                                       compare+select
- */
+/* sk_n2_track_f32: CNG N2 tracking:
+ *   track = (fresh*y2s[k] + retain*n2[k]) * g_up; up = n2[k] * g_up; n2[k] = (y2s[k] < n2[k]) ? track : up  (plain ops, exact IEEE '<'). */
 
 static inline void sk_n2_track_f32_scalar(float *n2, const float *y2s,
                                            float fresh, float retain,
@@ -722,16 +604,8 @@ static inline void sk_n2_track_f32(float *n2, const float *y2s,
 }
 #endif
 
-/* ═══════════════════════════════ kernel 19 ═════════════════════════════════
- * sk_n2_initial_track_f32 — the CNG N2-initial slow-tracking data-dependent
- * update. Verbatim from AEC/c_impl/src/aec_post.c
- * aec_post_compute_comfort_noise():
- *   slow = n2i[k] + ia*(n2[k]-n2i[k]);        // plain sub/mul/add, no fmaf
- *   n2i[k] = (n2[k] > n2i[k]) ? slow : n2[k];  // exact IEEE '>' compare+select,
- *                                                 comparing against the
- *                                                 ORIGINAL n2i[k] (captured
- *                                                 before the overwrite)
- */
+/* sk_n2_initial_track_f32: CNG N2-initial slow tracking:
+ *   slow = n2i[k] + ia*(n2[k]-n2i[k]); n2i[k] = (n2[k] > n2i[k]) ? slow : n2[k], comparing against the original n2i[k]. */
 
 static inline void sk_n2_initial_track_f32_scalar(float *n2i, const float *n2,
                                                     float alpha, int n) {
@@ -770,11 +644,7 @@ static inline void sk_n2_initial_track_f32(float *n2i, const float *n2,
 }
 #endif
 
-/* ═══════════════════════════════ kernel 20 ═════════════════════════════════
- * sk_mask_zero_f32 — out[i] = mask[i] ? 0.0f : out[i] (in-place, byte mask,
- * C truthiness: any nonzero byte triggers the zero — matches a plain
- * `if (mask[k]) x[k] = 0.0f;` source loop verbatim, e.g.
- * AEC/c_impl/src/aec_post.c's stationarity R²-zeroing step). */
+/* sk_mask_zero_f32: out[i] = mask[i] ? 0.0f : out[i], in place; any nonzero mask byte zeroes the element. */
 
 static inline void sk_mask_zero_f32_scalar(float *x, const unsigned char *mask,
                                             int n) {
@@ -803,46 +673,13 @@ static inline void sk_mask_zero_f32(float *x, const unsigned char *mask, int n) 
 }
 #endif
 
-/* ═══════════════════════════════ kernel 21 ═════════════════════════════════
- * sk_pairwise_sum_tailfold_f32 — numpy-style pairwise float32 sum, variant
- * "A". The numpy pairwise tree (8-accumulator leaf for n<=128, recursive
- * split above); used for the far-end hop energy and the linear-output block
- * energies.
- *
- * Two structural differences from kernel 13's sk_pairwise_sum_f32 (so this
- * is a genuinely different value-function, not a restyling):
- *   1. There is no outer n<=8 gate ahead of the n<=128 leaf. The leaf is
- *      entered directly for any n<=128 and branches internally on
- *      `n < 8` (strict). Consequence: at n==8 this kernel takes the
- *      8-accumulator tree-combine path, whereas kernel 13's OUTER n<=8
- *      check (inclusive) diverts n==8 to a plain sequential sum instead —
- *      different rounding, different bits.
- *   2. In the n in (8,128] leaf, the n%8 remainder tail is folded ONE
- *      ELEMENT AT A TIME straight into the already-combined `res` root
- *      (`res += a[i]` per leftover element), not accumulated into a
- *      separate running total and added once at the end the way kernel
- *      13's leaf does (`return r + s;`). Whenever there is more than one
- *      leftover element these two tail strategies round differently.
- *
- * The small-n (n<8) serial path here starts its accumulator at 0.0f and
- * adds every element, `s = 0.0f; for (i=0;i<n;++i) s += a[i];` — see
- * kernel 22 for the OTHER small-n convention (res = a[0], then fold from
- * i=1) used by the four other pairwise-sum call sites, which is a third
- * distinct value-function: it differs from this one only on signed-zero
- * inputs (e.g. n=1 with a[0]=-0.0f: this kernel returns
- * 0.0f + (-0.0f) = +0.0f; kernel 22 returns -0.0f unchanged), see kernel 22's
- * comment.
- *
- * NEON leaf: identical q0/q1 accumulation + vpaddq_f32×2 combine order to
- * kernel 13's leaf (bit-identical group-of-8 sums), then the same
- * one-at-a-time tail fold applied to the scalar `res` (not to q0/q1) to
- * match the scalar tree above exactly. */
+/* sk_pairwise_sum_tailfold_f32: numpy-style pairwise float32 sum, variant A (far-end hop energy, linear-output block energies).
+ * Differs from sk_pairwise_sum_f32: the n <= 128 leaf is entered directly (n == 8 takes the eight-accumulator path), and the n % 8 tail is folded
+ * one element at a time into the combined root. The n < 8 path starts at 0.0f, so a lone -0.0f gives +0.0f.
+ * The NEON leaf uses the same q0/q1 accumulation and vpaddq_f32 combine as sk_pairwise_sum_f32, then the scalar tail fold. */
 
-/* gcc for 32-bit targets cannot bound n by 128 at the tail loop once the
- * recursion is inlined into a caller holding a fixed-size array, and reports
- * the loop as a -Waggressive-loop-optimizations error; the leaf is only
- * reached with n<=128. The pragma is scoped to this leaf and does not touch
- * code generation. */
+/* gcc for 32-bit targets cannot bound n by 128 at the tail loop after inlining and reports -Waggressive-loop-optimizations; the leaf is only reached with n <= 128.
+ * The pragma is scoped to this leaf and does not change code generation. */
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Waggressive-loop-optimizations"
@@ -922,28 +759,9 @@ static inline float sk_pairwise_sum_tailfold_f32(const float *a, size_t n) {
 }
 #endif
 
-/* ═══════════════════════════════ kernel 22 ═════════════════════════════════
- * sk_pairwise_sum_tailfold_b_f32 — numpy-style pairwise float32 sum, variant
- * "B". Used for the filter-analyzer floor accumulation, the fullband ERLE and
- * ERL sums, the reverb energy ratio and the suppression-gain slice sums.
- *
- * Same 8<=n<=128 leaf shape, tail-fold, and n/2-rounded-down-to-a-multiple-
- * of-8 split as kernel 21 (sk_pairwise_sum_tailfold_f32) — differs ONLY in
- * the small-n (n<8) path and the explicit n==0 case:
- *   - n==0 returns 0.0f explicitly (kernel 21 also returns 0.0f for n==0,
- *     via its 0.0f-initialized accumulator with a zero-iteration loop —
- *     same result, different code path, no observable difference).
- *   - n in [1,7]: `res = a[0]; for (i=1;i<n;++i) res = res + a[i];` — the
- *     accumulator STARTS AT a[0] (a plain copy, no addition performed for
- *     the first element), rather than starting at 0.0f and adding a[0] the
- *     way kernel 21 does. These two conventions are bit-identical for
- *     every finite/normal nonzero a[0], but diverge on signed zero: with
- *     a[0] = -0.0f and n==1, this kernel returns -0.0f (copied through
- *     untouched); kernel 21 returns 0.0f + (-0.0f) = +0.0f (IEEE-754
- *     round-to-nearest: an unlike-signed zero sum rounds to +0). For n=1 and for
- *     an all -0.0f array of length 5, kernel 21 and kernel 22 disagree with
- *     each other (each stays internally bit-identical scalar-vs-NEON), so two
- *     distinct kernels are required here, not one shared implementation. */
+/* sk_pairwise_sum_tailfold_b_f32: variant B (floor accumulation, fullband ERLE and ERL sums, reverb ratio, suppression-gain slices).
+ * Same leaf, tail fold and split as variant A; differs only in the n < 8 path: n == 0 returns 0.0f and n in [1,7] starts the accumulator at a[0],
+ * so a lone -0.0f is returned unchanged (variant A returns +0.0f). */
 
 static inline float sk_pairwise_sum_tailfold_b_f32_scalar(const float *a, size_t n) {
     if (n == 0) return 0.0f;
@@ -1011,50 +829,11 @@ static inline float sk_pairwise_sum_tailfold_b_f32(const float *a, size_t n) {
 }
 #endif
 
-/* ═══════════════════════════════ kernel 23 ═════════════════════════════════
- * sk_noise_spectrum_update_f32 — the StationarityEstimator per-bin noise
- * floor tracker. Verbatim from
- * AEC/c_impl/src/stationarity_estimator.c noise_spectrum_update()'s steady-
- * state branch (block_counter > avg_init):
- *   if (pb > pn) {                                    // rising
- *       denom = max(pb, 1e-30f);
- *       alpha_inc = alpha * (pn / denom);
- *       if (apply_mask10 && (10.0f*pn < pb)) alpha_inc *= 0.1f;
- *       noise = pn + alpha_inc*(pb - pn);
- *   } else {                                           // falling (incl. ==)
- *       upd = pn + alpha*(pb - pn);
- *       noise = max(upd, min_noise);
- *   }
- *
- * Unlike kernels 18/19 (sk_n2_track_f32 / sk_n2_initial_track_f32), this is
- * a NESTED 2-way-inside-2-way conditional (the apply_mask10 scale-down lives
- * inside the rising branch) -- one level more complex than those two, so it
- * gets a dedicated correctness callout instead of a one-line "same shape as
- * 18/19" note:
- *   - `apply_mask10` is a call-level (not per-lane) boolean, computed once
- *     per hop by the caller (`block_counter > init_phase`) -- broadcasting
- *     it to an all-ones/all-zeros mask and ANDing with the per-lane
- *     `10*pn<pb` compare is a faithful vectorization of the scalar `if
- *     (apply_mask10) { if (...) ... }` nesting, not an approximation.
- *   - `max(pb, 1e-30f)` and the final `max(upd, min_noise)` are compare
- *     (`>`) + vbslq_f32 select, NEVER vmaxq_f32/vminq_f32 (this header's
- *     signed-zero tie-break rule) -- both source comparisons are strict
- *     `>`, so a tie (pb==1e-30f or upd==min_noise) takes the same side as
- *     the scalar ternary on both paths.
- *   - the shared `pb - pn` subtraction is textually identical in both the
- *     rising and falling branches of the SOURCE, so computing it once
- *     (`vdiff`) ahead of the two-branch compute-both-then-select is genuine
- *     CSE, not reassociation.
- *   - `vdivq_f32` (SK_HAVE_NEON == AArch64-only, see this header's own NaN-
- *     semantics section) is correctly-rounded IEEE-754 binary32 on this
- *     repo's target toolchain, matching the scalar `/` bit-for-bit --
- *     already relied on at kernel 1/16's cabs_np/coherence-gate call sites,
- *     not a new assumption for this kernel.
- * Every comparison here is over the FINITE domain per this file's NaN-
- * semantics contract (production's line of defense is WAV/API ingress
- * sanitization); a speculative rising-branch divide for an about-to-be-
- * discarded falling lane is masked out by the final vbslq_f32 select, never
- * observed. */
+/* sk_noise_spectrum_update_f32: StationarityEstimator per-bin noise floor tracker (steady-state branch):
+ *   if (pb > pn) { alpha_inc = alpha * (pn / max(pb, 1e-30f)); if (apply_mask10 && 10*pn < pb) alpha_inc *= 0.1f; noise = pn + alpha_inc*(pb - pn); }
+ *   else { noise = max(pn + alpha*(pb - pn), min_noise); }
+ * apply_mask10 is a call-level boolean broadcast to a mask. The maxes are compare (>) plus select, never vmaxq_f32; both branches are computed
+ * and the speculative divide of a discarded lane is masked out by the final select. Inputs are finite by contract. */
 
 static inline float sk__noise_spectrum_update_elem(float pb, float pn,
                                                      float alpha, int apply_mask10,
@@ -1095,11 +874,9 @@ static inline void sk_noise_spectrum_update_f32(float *noise, const float *spect
     for (; k + 4 <= n; k += 4) {
         float32x4_t vpb = vld1q_f32(spectrum + k);
         float32x4_t vpn = vld1q_f32(noise + k);
-        float32x4_t vdiff = vsubq_f32(vpb, vpn); /* pb-pn: textually identical
-                                                   * in BOTH scalar branches. */
-        /* rising, computed unconditionally */
+        float32x4_t vdiff = vsubq_f32(vpb, vpn); /* pb-pn, shared by both branches */
         uint32x4_t gt_eps = vcgtq_f32(vpb, veps);
-        float32x4_t vdenom = vbslq_f32(gt_eps, vpb, veps);   /* max(pb,1e-30f) */
+        float32x4_t vdenom = vbslq_f32(gt_eps, vpb, veps);
         float32x4_t vratio = vdivq_f32(vpn, vdenom);
         float32x4_t valpha_inc = vmulq_f32(valpha, vratio);
         {
@@ -1108,11 +885,9 @@ static inline void sk_noise_spectrum_update_f32(float *noise, const float *spect
             valpha_inc = vbslq_f32(mask10, scaled, valpha_inc);
         }
         float32x4_t vrising = vaddq_f32(vpn, vmulq_f32(valpha_inc, vdiff));
-        /* falling, computed unconditionally */
         float32x4_t vupd = vaddq_f32(vpn, vmulq_f32(valpha, vdiff));
         uint32x4_t gt_floor = vcgtq_f32(vupd, vminn);
-        float32x4_t vfalling = vbslq_f32(gt_floor, vupd, vminn);  /* max(upd,min_noise) */
-        /* top-level select */
+        float32x4_t vfalling = vbslq_f32(gt_floor, vupd, vminn);
         uint32x4_t rising_sel = vcgtq_f32(vpb, vpn);
         vst1q_f32(noise + k, vbslq_f32(rising_sel, vrising, vfalling));
     }
@@ -1128,54 +903,12 @@ static inline void sk_noise_spectrum_update_f32(float *noise, const float *spect
 }
 #endif
 
-/* ═══════════════════════════════ kernel 24 ═════════════════════════════════
- * sk_erl_bin_update_f32 — the ErlEstimator per-bin minimum-statistics update,
- * FUSED into one per-bin masked pass. Verbatim from
- * AEC/c_impl/src/erl_estimator.c erl_estimator_update()'s loop 1,
- * for k = 1..n_bins-2:
- *
- *   if (x2[k] > x2_min) {
- *       new_erl = y2[k] / x2[k];                          // float32 divide
- *       if (new_erl < erl[k]) {
- *           hold_counters[k-1] = hold_hops;                // int32 arm
- *           delta = 0.1f * (new_erl - erl[k]);             // plain sub/mul,
- *           erl[k] = erl[k] + delta;                       //   NOT fmaf
- *           if (erl[k] < ERL_MIN_ERL) erl[k] = ERL_MIN_ERL; // compare+select
- *       }
- *   }
- *
- * Caller offsets: called with erl/x2/y2 all advanced by +1 (so lane j of the
- * kernel's arrays is source index k=j+1) and hold_counters passed UNSHIFTED
- * -- hold_counters[j] already IS hold_counters[k-1] once erl/x2/y2 are
- * pre-offset by the caller (k-1 = (j+1)-1 = j), so no k-1 arithmetic happens
- * inside the kernel itself.
- *
- * FUSION SAFETY / masking: the int32 hold_counters store and the float32 erl
- * blend+floor only both happen when BOTH `x2[k]>x2_min` AND `new_erl<erl[k]`
- * hold — cond1 (x2>x2_min) and cond2 (new_erl<erl[k], against the ORIGINAL
- * erl[k], read once before any blend) are computed as two independent lane
- * masks and ANDed into a single combined mask that gates BOTH the erl store
- * and the hold_counters store identically, matching the scalar's nested `if`
- * exactly (never one store gated by cond1 alone and the other by the full
- * AND, or vice versa). The floor step is likewise computed for all lanes and
- * only becomes visible through that same top-level mask — not a second,
- * independently-gated store; matches the scalar form where the floor `if` is
- * nested INSIDE the same `if (new_erl<erl[k])` body as the hold_counters
- * write, not a sibling conditional.
- *
- * Speculative divide: `new_erl = y2[j]/x2[j]` is computed for every lane
- * unconditionally (incl. lanes that fail cond1, e.g. x2[j]==0 -> new_erl is
- * Inf or NaN) — same masked-speculative-compute pattern as kernel 23's
- * rising-branch divide: cond1 being false for that lane forces the combined
- * mask false regardless of what cond2 evaluates to on a NaN/Inf new_erl
- * (vcltq_f32 is unordered-false for NaN, exactly like scalar `<`), so the
- * speculative result never reaches erl[] or hold_counters[]. A NaN new_erl
- * specifically can NEVER be selected at all: cond2 requires new_erl<erl[k]
- * to hold, and IEEE `<` is unordered-false for a NaN operand on either side
- * -- so mask=true implies new_erl is a genuine (non-NaN) ordered value.
- * Per this header's NaN-semantics contract real inputs are finite (WAV/API
- * ingress sanitized); this is belt-and-suspenders equivalence, verified by
- * the selftest's dedicated NaN corpus, not a claim of new NaN-safety scope. */
+/* sk_erl_bin_update_f32: ErlEstimator per-bin minimum-statistics update, fused into one masked pass, for k = 1..n_bins-2:
+ *   if (x2[k] > x2_min) { new_erl = y2[k] / x2[k]; if (new_erl < erl[k]) { hold_counters[k-1] = hold_hops;
+ *     erl[k] += 0.1f * (new_erl - erl[k]); erl[k] = max(erl[k], ERL_MIN_ERL) by compare plus select; } }
+ * The caller advances erl/x2/y2 by +1 and passes hold_counters unshifted. The two conditions are separate lane masks (the second against the
+ * original erl[k]) ANDed into one mask that gates both the erl and the hold_counters store. The divide is speculative for every lane;
+ * a NaN or Inf new_erl never passes the ordered `<`, so it is never stored. */
 
 static inline void sk__erl_bin_update_elem(float *erl, int *hold,
                                             float x2v, float y2v,
@@ -1218,9 +951,9 @@ static inline void sk_erl_bin_update_f32(float *erl, int *hold,
         float32x4_t verl = vld1q_f32(erl + j);
         int32x4_t   vhold = vld1q_s32(hold + j);
 
-        uint32x4_t cond1 = vcgtq_f32(vx2, vx2min);        /* x2>x2_min */
-        float32x4_t vnew_erl = vdivq_f32(vy2, vx2);       /* speculative */
-        uint32x4_t cond2 = vcltq_f32(vnew_erl, verl);     /* new_erl<erl, orig erl */
+        uint32x4_t cond1 = vcgtq_f32(vx2, vx2min);
+        float32x4_t vnew_erl = vdivq_f32(vy2, vx2);
+        uint32x4_t cond2 = vcltq_f32(vnew_erl, verl);
         uint32x4_t mask = vandq_u32(cond1, cond2);
 
         float32x4_t diff     = vsubq_f32(vnew_erl, verl);
@@ -1247,12 +980,8 @@ static inline void sk_erl_bin_update_f32(float *erl, int *hold,
 }
 #endif
 
-/* ═══════════════════════════════ kernel 25 ═════════════════════════════════
- * Decrement every int counter, saturating at INT_MIN. A zero floor would
- * alter diagnostic/raw counter values; INT_MIN preserves all practical
- * trajectories while removing signed-overflow UB in indefinitely running
- * streams. The NEON subtract is well-defined modulo 2^32 and its wrapped
- * value is masked off for lanes already at INT_MIN. */
+/* Decrement every int counter, saturating at INT_MIN (a zero floor would alter raw counter values and INT_MIN avoids signed-overflow UB).
+ * The NEON subtract wraps modulo 2^32 and the wrapped value is masked off for lanes already at INT_MIN. */
 
 static inline void sk_dec1_floorintmin_s32_scalar(int *x, int n) {
     int i;
@@ -1267,12 +996,9 @@ static inline void sk_dec1_floorintmin_s32(int *x, int n) {
     int32x4_t vone    = vdupq_n_s32(1);
     for (; i + 4 <= n; i += 4) {
         int32x4_t v    = vld1q_s32(x + i);
-        uint32x4_t mask = vcgtq_s32(v, vintmin);       /* x[i]>INT_MIN */
-        int32x4_t  dec  = vsubq_s32(v, vone);          /* speculative, wraps
-                                                          * (well-defined) at
-                                                          * the INT_MIN lane,
-                                                          * never selected */
-        int32x4_t  result = vbslq_s32(mask, dec, v);   /* else unchanged */
+        uint32x4_t mask = vcgtq_s32(v, vintmin);
+        int32x4_t  dec  = vsubq_s32(v, vone);
+        int32x4_t  result = vbslq_s32(mask, dec, v);
         vst1q_s32(x + i, result);
     }
     for (; i < n; ++i)
@@ -1284,38 +1010,10 @@ static inline void sk_dec1_floorintmin_s32(int *x, int n) {
 }
 #endif
 
-/* ═══════════════════════════════ kernel 26 ═════════════════════════════════
- * sk_erl_hold_expire_f32 — bins whose hold counter has expired double toward
- * ERL_MAX_ERL. Taken from AEC/c_impl/src/erl_estimator.c
- * erl_estimator_update()'s loop 3, for k = 1..n_bins-2:
- *   if (hold_counters[k-1] <= 0) {
- *       doubled = 2.0f * erl[k];
- *       erl[k] = (doubled < ERL_MAX_ERL) ? doubled : ERL_MAX_ERL;
- *   }
- * Same caller-offset convention as kernel 24: erl advanced by +1 (lane j ==
- * source k=j+1), hold_counters passed UNSHIFTED (hold[j] == hold_counters[k-1]
- * once erl is pre-offset). hold_counters here are the values loop 2
- * (sk_dec1_floorintmin_s32) JUST decremented-or-floored -- this kernel must run
- * strictly after kernel 25's call completes, not fused with it or with
- * kernel 24.
- *
- * `hold <= 0` is an exact int32 compare (vcleq_s32, no float involved).
- * `2.0f*erl[k]` is a plain multiply (vmulq_f32), not vaddq_f32(erl,erl) --
- * bit-identical for all finite erl[k] either way, but kept as a literal
- * multiply to mirror the source token-for-token. The `<ERL_MAX_ERL` clamp is
- * compare(vcltq_f32)+select(vbslq_f32), never vminq_f32, per this header's
- * signed-zero tie-break rule (erl[k] is always >=ERL_MIN_ERL>0 in practice,
- * so the tie-break never actually engages here, but the rule is applied
- * uniformly regardless of whether a given call site can prove it moot).
- * Note this kernel's `doubled` can never surface a NaN-vs-NaN payload
- * ambiguity the way kernel 24's blend can: whenever `doubled` is NaN (e.g.
- * erl[k] itself started NaN), `doubled<ERL_MAX_ERL` is unordered-false on
- * BOTH scalar and NEON, so both deterministically select the fixed constant
- * ERL_MAX_ERL instead of the NaN — never the NaN payload itself — so this
- * kernel's selected output is always one of {unchanged erl[k] bits, doubled
- * (only ever selected when finite and < ERL_MAX_ERL), ERL_MAX_ERL}, none of
- * which is a NaN payload race; still exercised by the selftest's NaN corpus
- * for completeness, not because a divergence is expected there. */
+/* sk_erl_hold_expire_f32: bins whose hold counter expired double toward ERL_MAX_ERL, for k = 1..n_bins-2:
+ *   if (hold_counters[k-1] <= 0) { doubled = 2.0f * erl[k]; erl[k] = (doubled < ERL_MAX_ERL) ? doubled : ERL_MAX_ERL; }
+ * Same caller-offset convention as sk_erl_bin_update_f32. It must run after sk_dec1_floorintmin_s32 has updated the counters, not fused with either.
+ * The clamp is compare plus select (never vminq_f32); a NaN `doubled` fails the compare on both paths and selects ERL_MAX_ERL. */
 
 static inline void sk__erl_hold_expire_elem(float *erl, int hold, float max_erl) {
     if (hold <= 0) {
@@ -1341,7 +1039,7 @@ static inline void sk_erl_hold_expire_f32(float *erl, const int *hold,
     for (; j + 4 <= n; j += 4) {
         float32x4_t verl  = vld1q_f32(erl + j);
         int32x4_t   vhold = vld1q_s32(hold + j);
-        uint32x4_t mask = vcleq_s32(vhold, vzero);        /* hold<=0 */
+        uint32x4_t mask = vcleq_s32(vhold, vzero);
         float32x4_t doubled = vmulq_f32(vtwo, verl);
         uint32x4_t lt = vcltq_f32(doubled, vmax);
         float32x4_t clamped = vbslq_f32(lt, doubled, vmax);
@@ -1358,60 +1056,13 @@ static inline void sk_erl_hold_expire_f32(float *erl, const int *hold,
 }
 #endif
 
-/* ═══════════════════════════════ kernel 27 ═════════════════════════════════
- * sk_no_audible_echo_gain_f32 — the per-bin soft-blend body of
- * AEC/c_impl/src/suppression_gain.c gain_to_no_audible_echo(), for the
- * configuration where soft_blend_enabled and soft_blend_per_bin are both
- * set. Transcribed statement-for-statement from that loop:
- *
- *   enr_bin = echo[k] / (nearend[k] + 1.0f);
- *   sig     = (enr_bin - thr) / softness;
- *   if (sig < -50.0f) sig = -50.0f;
- *   if (sig >  50.0f) sig =  50.0f;
- *   ne_wb   = 1.0f / (1.0f + fast_exp(sig));
- *   <tab>_k = ne_wb * nearend_<tab>[k] + (1.0f - ne_wb) * normal_<tab>[k];
- *   enr = echo[k] / (nearend[k] + 1.0f);
- *   emr = echo[k] / (masker[k]  + 1.0f);
- *   g = 1.0f;
- *   if (enr > enr_tr_k && emr > emr_tr_k) {
- *       d_lin     = enr_su_k - enr_tr_k;
- *       denom_lin = d_lin < 1e-30f ? 1e-30f : d_lin;
- *       g_lin     = (enr_su_k - enr) / denom_lin;
- *       denom_emr = emr < 1e-30f ? 1e-30f : emr;
- *       g_emr     = emr_tr_k / denom_emr;
- *       g         = g_lin > g_emr ? g_lin : g_emr;
- *   }
- *   out[k] = g;
- *
- * `enr_bin` and `enr` are the same expression over the same operands and so
- * the same bits; both are written out, mirroring the source, and left to
- * the compiler to fold.
- *
- * The sigmoid's exponential is sk__fast_exp_vec (simd_kernels.h's validated
- * lane-for-lane twin of fast_math.h's fast_exp, itself domain-safe for NaN
- * and any magnitude), so this kernel exists only where that does --
- * SK_HAVE_NEON and not USE_STANDARD_MATH; every other build takes the
- * scalar entry point, which calls sk__fast_exp_elem, the equally verbatim
- * scalar twin fast_math.h's own selftest three-way-checks.
- *
- * The blend, the two ratios and the two quotients are plain
- * vmulq/vaddq/vsubq/vdivq with no vfmaq anywhere: the scalar source has no
- * fmaf call, and AArch64 FDIV is correctly rounded, so each lane rounds
- * exactly where the scalar expression does.
- *
- * Every one of the four selects is compare(vcltq/vcgtq)+select(vbslq), never
- * vminq/vmaxq, per this header's rule -- FMIN/FMAX propagate a NaN operand
- * and break +-0.0 ties toward the ordered result, while a C ternary's `<`
- * and `>` are unordered-false and therefore fall to the OTHER operand. The
- * final `g_lin > g_emr` max is where that matters most: a NaN g_lin (an
- * enr_su_k - enr of 0/0, or a NaN reaching the tables) must yield g_emr,
- * which vmaxq_f32 would not do. The two 1e-30f denominator clamps and the
- * two +-50.0f sigmoid clamps follow the same rule so the kernel is
- * unconditionally bit-exact rather than bit-exact-on-the-reachable-domain.
- *
- * `cond` computes both arms speculatively. The discarded arm can divide by
- * zero and produce an Inf or NaN, which is harmless -- no lane's selected
- * result depends on it, and no FP exception is enabled. */
+/* sk_no_audible_echo_gain_f32: per-bin soft-blend body of the no-audible-echo gain (soft_blend_enabled and soft_blend_per_bin set):
+ *   enr = echo/(nearend+1); sig = clamp((enr - thr)/softness, -50, 50); ne_wb = 1/(1 + fast_exp(sig));
+ *   blended threshold_k = ne_wb * nearend_k + (1 - ne_wb) * normal_k for each of the three thresholds; emr = echo/(masker+1);
+ *   g = 1; if (enr > enr_tr_k && emr > emr_tr_k) g = max((enr_su_k - enr)/max(enr_su_k - enr_tr_k, 1e-30f), emr_tr_k/max(emr, 1e-30f)).
+ * The exp is sk__fast_exp_vec, so the kernel exists only with SK_HAVE_NEON and not USE_STANDARD_MATH; other builds use the scalar entry point.
+ * No vfmaq anywhere. All selects are compare plus select (never vminq/vmaxq), so a NaN g_lin yields g_emr as the C ternary does.
+ * Both arms are computed speculatively; the discarded arm may produce Inf or NaN, which is never selected. */
 
 static inline float sk__no_audible_echo_gain_elem(
     float nearend, float echo, float masker,
@@ -1474,8 +1125,8 @@ static inline void sk_no_audible_echo_gain_f32(
         float32x4_t mk = vld1q_f32(masker + k);
         float32x4_t enr_bin = vdivq_f32(ec, vaddq_f32(ne, one));
         float32x4_t sig = vdivq_f32(vsubq_f32(enr_bin, vthr), vsoft);
-        sig = vbslq_f32(vcltq_f32(sig, vlo), vlo, sig);   /* sig<-50 ? -50 : sig */
-        sig = vbslq_f32(vcgtq_f32(sig, vhi), vhi, sig);   /* sig> 50 ?  50 : sig */
+        sig = vbslq_f32(vcltq_f32(sig, vlo), vlo, sig);
+        sig = vbslq_f32(vcgtq_f32(sig, vhi), vhi, sig);
         {
             float32x4_t ne_wb = vdivq_f32(one, vaddq_f32(one, sk__fast_exp_vec(sig)));
             float32x4_t inv   = vsubq_f32(one, ne_wb);
@@ -1518,19 +1169,8 @@ static inline void sk_no_audible_echo_gain_f32(
 }
 #endif
 
-/* ═══════════════════════════ sk_max_abs_f32 ════════════════════════════════
- * Largest |x[i]| of n floats, the running maximum seeded at +0.0f and raised
- * only by a strictly larger magnitude:
- *   m = 0.0f; for i: { a = fabsf(x[i]); if (a > m) m = a; }
- * A NaN (quiet or signaling) never compares greater, so it never raises the
- * maximum, at any index including 0; n == 0 gives 0.0f. np.max(np.abs(x))
- * instead returns NaN when any element is NaN; the two agree on every
- * NaN-free input (an infinity gives +inf). The NEON form keeps the compare +
- * select of the scalar test (never vmaxq/vmaxnmq: the former propagates NaN,
- * the latter quiets a signaling NaN into the result). The lane accumulators
- * only ever hold values that passed the compare, so they are never NaN and
- * the final horizontal maximum is exact in any lane order; the seed and the
- * magnitudes are non-negative, so no signed zero can differ. */
+/* sk_max_abs_f32: largest |x[i]|: m = 0.0f; for i: a = fabsf(x[i]); if (a > m) m = a. A NaN never raises the maximum; n == 0 gives 0.0f.
+ * (np.max(np.abs(x)) returns NaN on NaN input; the two agree on NaN-free input.) NEON keeps compare plus select, not vmaxq/vmaxnmq. */
 
 static inline float sk_max_abs_f32_scalar(const float *x, int n) {
     float m = 0.0f;
@@ -1572,18 +1212,11 @@ static inline float sk_max_abs_f32(const float *x, int n) {
 }
 #endif
 
-/* ═════════════════════ sk_noise_floor_track_f32 ═══════════════════════════════
- * Per-bin tracker of a stationary noise floor with a hold counter:
- *   if (psd[k] < floor[k])        { floor[k] = psd[k]; count[k] = 0; }
- *   else if (count[k] >= hold)    { ramp = floor[k] * growth;
- *                                   floor[k] = (ramp > min_floor) ? ramp : min_floor; }
- *   else                          { count[k] += 1; }
- * The NEON form evaluates the three arms for every lane and selects with the
- * same compares: `<` and `>` are unordered-false for a NaN operand exactly as
- * in the scalar test (a NaN psd or floor takes the hold/ramp arms), the ramp
- * clamp is compare + select rather than vmaxq, and the speculative count + 1
- * wraps harmlessly in a lane that does not select it (the scalar increment
- * only runs for count < hold). */
+/* sk_noise_floor_track_f32: per-bin stationary noise-floor tracker with a hold counter:
+ *   if (psd[k] < floor[k]) { floor[k] = psd[k]; count[k] = 0; }
+ *   else if (count[k] >= hold) { ramp = floor[k] * growth; floor[k] = (ramp > min_floor) ? ramp : min_floor; }
+ *   else { count[k] += 1; }
+ * NEON evaluates all arms and selects with the same compares (NaN psd or floor takes the hold/ramp arms); the speculative count + 1 wraps harmlessly. */
 
 static inline void sk__noise_floor_track_elem(float *fl, int *cnt, float psd,
                                               float growth, float min_floor,
@@ -1641,12 +1274,7 @@ static inline void sk_noise_floor_track_f32(float *fl, int *cnt, const float *ps
 }
 #endif
 
-/* ═══════════════════════════ sk_raise_to_f32 ═══════════════════════════════
- * In-place per-bin lower bound given by an array:
- *   if (x[k] < lo[k]) x[k] = lo[k];
- * The compare is unordered-false when either operand is NaN, so x is then left
- * as it is, and a tie leaves x untouched (a signed zero is never swapped); the
- * NEON compare + select reproduces both. `x` and `lo` must not overlap. */
+/* sk_raise_to_f32: in-place per-bin lower bound, if (x[k] < lo[k]) x[k] = lo[k]. NaN operands and ties leave x untouched. x and lo must not overlap. */
 
 static inline void sk_raise_to_f32_scalar(float *x, const float *lo, int n) {
     int k;
@@ -1671,11 +1299,7 @@ static inline void sk_raise_to_f32(float *x, const float *lo, int n) {
 }
 #endif
 
-/* ═════════════════════════ sk_stationary_mask_u8 ═════════════════════════════
- * Bins that are flagged stationary and have no hangover left:
- *   m[k] = (flags[k] != 0) && (hang[k] == 0)      -- stored as a 0/1 byte
- * Returns how many bins are set. `mask` may be NULL when only the count is
- * wanted. Pure integer logic, exact in any order. */
+/* sk_stationary_mask_u8: m[k] = (flags[k] != 0) && (hang[k] == 0) as a 0/1 byte; returns the number of set bins. `mask` may be NULL when only the count is wanted. */
 
 static inline int sk__stationary_elem(unsigned char flag, int32_t hang) {
     return flag != 0 && hang == 0;
@@ -1698,8 +1322,7 @@ static inline int sk_stationary_mask_u8(const unsigned char *flags,
                                         const int32_t *hang,
                                         unsigned char *mask, int n) {
     int k = 0, count = 0;
-    /* each byte lane of the accumulator gains at most 1 per step, so it is
-     * folded into the count before it could pass 255 */
+    /* each byte lane gains at most 1 per step, so it is folded into the count before it can pass 255 */
     while (k + 16 <= n) {
         int steps = (n - k) / 16, j;
         uint8x16_t acc = vdupq_n_u8(0);
@@ -1733,10 +1356,7 @@ static inline int sk_stationary_mask_u8(const unsigned char *flags,
 #endif
 
 
-/* ═══════════════ Inline filter, statistics and detector kernels ══════════ */
-
-/* Per-bin H-error leakage refresh; returns the number of diverged bins.
- * The caller applies the final H-error clamp. */
+/* Per-bin H-error leakage refresh; returns the number of diverged bins. The caller applies the final H-error clamp. */
 static inline int sk_h_error_refresh_f32_scalar(
     float *h, const float *e2, const float *coarse, const float *erl,
     float lc, float ld, float floor, int disallow, int n) {
@@ -1862,8 +1482,7 @@ static inline void sk_erle_release_f32(
                                threshold, decay, n - k);
 }
 
-/* Each counter corresponds to psd[k+1]; psd has n+2 elements.
- * Greater-than selects preserve the scalar neighbour-NaN rule. */
+/* Each counter corresponds to psd[k+1]; psd has n+2 elements. Greater-than selects keep the scalar neighbour-NaN rule. */
 static inline void sk_peak_counters_i64_scalar(
     int64_t *counters, const float *psd, float ratio, int n) {
     for (int k = 0; k < n; ++k) {
@@ -1943,8 +1562,7 @@ static inline void sk_stationarity_hangover_i32(
 #endif
 }
 
-/* In-place three-bin logical AND of canonical 0/1 flags; endpoints mirror
- * the adjacent interior. */
+/* In-place three-bin logical AND of canonical 0/1 flags; endpoints copy the adjacent interior. */
 static inline void sk_stationarity_smooth_u8_scalar(unsigned char *f, int n) {
     if (n >= 3) {
         unsigned char prev = f[0], cur = f[1], first = 0, last = 0;
@@ -2091,4 +1709,4 @@ static inline void sk_saturation_counts_f32(
 }
 #endif
 
-#endif /* SIMD_AEC_H */
+#endif

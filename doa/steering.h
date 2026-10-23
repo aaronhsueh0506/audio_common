@@ -7,14 +7,12 @@
 extern "C" {
 #endif
 
-/* geometry API */
 ArrayGeometry* array_geometry_create(int M);
 ArrayGeometry* array_geometry_create_uca(int M, float radius);
 ArrayGeometry* array_geometry_create_ula(int M, float spacing);
 ArrayGeometry* array_geometry_create_custom(int M, const float* x, const float* y);
 void array_geometry_destroy(ArrayGeometry* g);
 
-/* angle / steering API */
 float* srp_create_uniform_angles(int num_angles);
 
 Complex*** srp_build_steering(

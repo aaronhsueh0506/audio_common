@@ -20,41 +20,29 @@ typedef struct {
 
     VadConfig cfg;
 
-    /* ---------- median state ---------- */
     int med_buf[9];
     int med_pos;
 
-    /* ---------- hangover state ---------- */
     int state;
     int hang_cnt;
 
-    /* ---------- output state ---------- */
     int vad_raw;
     int vad_out;
 
-    /* Non-NULL only on the vad_create() heap path: the block backing this
-     * struct, freed by vad_destroy(). NULL on the vad_init() caller-pool
-     * path, where the caller owns the memory and vad_destroy() must not free
-     * it. Same precedent as BF's owned_heap. */
+    /* Non-NULL only on the vad_create() path: the block backing this struct, freed by vad_destroy(). */
     void* owned_heap;
 
 } MaskVAD;
 
 
-/* Heap constructor. */
 MaskVAD* vad_create(const VadConfig* cfg);
 
-/* Caller-pool constructor. vad_get_mem_size() returns the byte requirement;
- * vad_init() places the struct at mem[0]. `mem` must be 16-byte aligned and
- * `mem_size` at least that requirement, else NULL. The caller owns the memory
- * and vad_destroy() will not free it. */
+/* Caller-pool constructor: `mem` must be 16-byte aligned and `mem_size` >= vad_get_mem_size(), else NULL.
+ * The caller owns the memory; vad_destroy() does not free it. */
 size_t   vad_get_mem_size(void);
 MaskVAD* vad_init(void* mem, size_t mem_size, const VadConfig* cfg);
 
-/* per-frame step */
-/* Whether vad_init()/vad_create() will accept this config. Exported so a
- * caller that sizes before it constructs -- vad_get_mem_size() takes no
- * config -- can ask the same question the constructor will. */
+/* Whether vad_init()/vad_create() accept this config; usable before sizing, since vad_get_mem_size() takes no config. */
 int vad_config_is_valid(const VadConfig* cfg);
 
 void vad_step(MaskVAD* v,

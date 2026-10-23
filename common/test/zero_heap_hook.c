@@ -1,26 +1,13 @@
 /*
  * zero_heap_hook.c - allocator call-counting hook for test_fft_zero_heap.c.
  *
- * Counts every process-wide call to malloc / calloc / realloc / free, so the
- * test can show there is no allocator call at all around fft_init() ..
- * fft_destroy() (a paired alloc and free would also count).
- *
- * Mechanism, chosen at compile time (test_hook_actually_counts() in
- * test_fft_zero_heap.c checks that the hook fires):
- *
- *   - macOS: dyld's `__DATA,__interpose` section. dyld skips the main
- *     executable's own image, so the tuples must live in a separate image:
- *     the Makefile builds this file as a small dylib that the test links
- *     against. It then intercepts the calls of every other object in the
- *     process, including the vendored NE10 code. The linker moves the
- *     section into `__DATA_CONST`; dyld matches it by section name, so that
- *     is harmless.
- *
- *   - Linux: GNU ld `--wrap=<symbol>`. It works from a plain object linked
- *     into the test binary; the Makefile passes
- *     -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free for the
- *     test_zero_heap target only.
- *
+ * Counts every process-wide call to malloc / calloc / realloc / free, so the test can show that no
+ * allocator call (a paired alloc and free would also count) happens around fft_init() .. fft_destroy().
+ *   - macOS: dyld `__DATA,__interpose`. dyld skips the main executable's own image, so the Makefile
+ *     builds this file as a small dylib that the test links against; it then intercepts every other
+ *     object in the process, including the vendored NE10 code.
+ *   - Linux: GNU ld `--wrap=<symbol>` (-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free,
+ *     passed for the test_zero_heap target only) works from a plain object linked into the test.
  * This file is not part of libaudio_common.a.
  */
 #include "zero_heap_hook.h"

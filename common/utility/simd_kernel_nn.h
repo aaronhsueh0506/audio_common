@@ -1,29 +1,9 @@
-/**
- * NEON/scalar float32 kernels for the neural-network pre/post-processing
- * (DeepFilterNet2, Align-ULCNet, GTCRN, RNNoise-ERB and DeepVQE).
- *
- * Kept apart from simd_kernels.h on purpose: that header is the traditional
- * AEC/NR libraries' kernel set, and nothing added here may change what those
- * libraries compile. This header includes simd_kernels.h only to share its
- * NEON switch (SK_HAVE_NEON), its Complex layout pins and its Complex-quad
- * load/store helpers; it adds no symbol to it.
- *
- * Contract:
- *   - Every NEON entry point is byte-identical to its _scalar twin for finite
- *     inputs, except that ERB arithmetic only pins NaN classification, not
- *     payload bits, when both results are NaN (including finite overflow).
- *     Selection/copy kernels retain bit identity. The predicate kernels
- *     (skn_all_finite_*) agree for every input, NaN and Inf included.
- *   - Scalar operation order is preserved; ordinary mul/add stays unfused
- *     (vmulq_f32 + vaddq_f32, never vfmaq_f32), and every including
- *     translation unit is compiled with -ffp-contract=off.
- *   - No reciprocal/sqrt estimates, no reassociation. vdivq_f32 is the
- *     correctly rounded IEEE divide, identical to the scalar '/'.
- *   - SIMD_KERNELS_FORCE_SCALAR selects the scalar twins.
- *   - Arguments do not alias unless a kernel says so.
- *
- * test/simd_nn_selftest.c is the bit-exactness gate for every kernel here.
- */
+/** NEON/scalar float32 kernels for the neural-network pre/post-processing stages.
+ * Kept apart from simd_kernels.h; it shares that header's NEON switch (SK_HAVE_NEON), Complex layout checks and Complex-quad load/store helpers.
+ * Contract: every NEON entry point matches its _scalar twin for finite inputs (ERB arithmetic pins NaN classification, not payload bits);
+ * skn_all_finite_* agree for every input. Operation order is fixed: mul/add stay unfused (no vfmaq_f32), no reciprocal/sqrt estimates,
+ * no reassociation; every including unit is compiled with -ffp-contract=off. SIMD_KERNELS_FORCE_SCALAR selects the scalar twins.
+ * Arguments do not alias unless a kernel says so. */
 
 #ifndef SIMD_KERNEL_NN_H
 #define SIMD_KERNEL_NN_H
@@ -37,9 +17,7 @@
 extern "C" {
 #endif
 
-/* A float view of a Complex array for the NEON loads below. GCC/Clang get a
- * may_alias type so strict aliasing stays valid; the scalar twins read the
- * struct members and need no view. */
+/* Float view of a Complex array for NEON loads (may_alias on GCC/Clang keeps strict aliasing valid). */
 #if SK_HAVE_NEON
 #if defined(__GNUC__) || defined(__clang__)
 typedef float skn__alias_float __attribute__((__may_alias__));
@@ -48,18 +26,8 @@ typedef float skn__alias_float;
 #endif
 #endif
 
-/* ═══════════════════════════════ skn_all_finite ═══════════════════════════
- * 1 when every element is finite, 0 otherwise.
- *
- * The accelerator-output gates (a NaN-prefilled tensor must come back fully
- * written and finite before it may become recurrent state) scan tens of
- * thousands of floats per frame. An early-exit `if (!isfinite(x)) return 0`
- * loop does not vectorize; this one keeps the running maximum of the masked
- * exponent field over sixteen lanes per step. The masked field never exceeds
- * 0x7f800000 and reaches it only for Inf or NaN -- exactly isfinite()'s
- * false set -- so the answer is identical to the scalar loop's for every bit
- * pattern. It exits at the first 64-element block holding a non-finite
- * value. */
+/* skn_all_finite: 1 when every element is finite, else 0. Keeps the running maximum of the masked exponent field over sixteen lanes
+ * per step (an early-exit isfinite() loop does not vectorize) and exits at the first 64-element block holding an Inf or NaN. */
 
 static inline int skn_all_finite_f32_scalar(const float *x, size_t n) {
     size_t i;
@@ -112,8 +80,7 @@ static inline int skn_all_finite_f32(const float *x, size_t n) {
     return skn__all_finite_view((const skn__alias_float *)(const void *)x, n);
 }
 
-/* Complex is two contiguous floats (pinned in simd_kernels.h), so the array
- * is 2n floats and the classification does not care which is which. */
+/* Complex is two contiguous floats (checked in simd_kernels.h), so the array is 2n floats. */
 static inline int skn_all_finite_cf32(const Complex *x, size_t n) {
     return skn__all_finite_view((const skn__alias_float *)(const void *)x, 2u * n);
 }
@@ -126,17 +93,8 @@ static inline int skn_all_finite_cf32(const Complex *x, size_t n) {
 }
 #endif
 
-/* ═══════════════════════════ skn_all_finite_rows_f32 ══════════════════════
- * 1 when every element of `rows` rows of `width` floats, `stride` floats
- * apart, is finite: skn_all_finite_f32_scalar applied to each row.
- *
- * The NEON path is a single fused multi-row scan, not row-by-row calls into
- * skn_all_finite_f32: the largest masked exponent field seen across every
- * row reaches 0x7f800000 only for Inf or NaN -- exactly isfinite()'s false
- * set -- so the answer is identical to the scalar loop's for every bit
- * pattern. A row's last quad is read again from its end when the width is
- * no multiple of four, which a maximum does not mind.
- */
+/* skn_all_finite_rows_f32: 1 when every element of `rows` rows of `width` floats, `stride` floats apart, is finite.
+ * The NEON path scans all rows in one fused pass; a row's last quad is re-read from its end when width is not a multiple of four. */
 
 static inline int skn_all_finite_rows_f32_scalar(const float *base,
                                                   size_t rows, size_t stride,
@@ -185,8 +143,7 @@ static inline int skn_all_finite_rows_f32(const float *base, size_t rows,
 }
 #endif
 
-/* ═══════════════════════════════ skn_fill_f32 ═════════════════════════════
- * x[i] = value. The NaN prefill of accelerator-writable tensors. */
+/* skn_fill_f32: x[i] = value. */
 
 static inline void skn_fill_f32_scalar(float *x, size_t n, float value) {
     size_t i;
@@ -212,9 +169,7 @@ static inline void skn_fill_f32(float *x, size_t n, float value) {
 }
 #endif
 
-/* ═══════════════════════════════ skn_mul_f32 ══════════════════════════════
- * dst[i] = a[i] * b[i]. Window application and per-bin gain application.
- * dst may be exactly a or exactly b (same-index read-then-write). */
+/* skn_mul_f32: dst[i] = a[i] * b[i]; dst may be exactly a or exactly b. */
 
 static inline void skn_mul_f32_scalar(float *dst, const float *a,
                                       const float *b, size_t n) {
@@ -243,9 +198,7 @@ static inline void skn_mul_f32(float *dst, const float *a, const float *b,
 }
 #endif
 
-/* ═══════════════════════════ skn_power_scale_f32 ══════════════════════════
- * p[k] = (re[k]*re[k] + im[k]*im[k]) * scale -- the ERB feature power, in
- * that exact association (two products, their sum, then the scale). */
+/* skn_power_scale_f32: p[k] = (re[k]*re[k] + im[k]*im[k]) * scale, in that association. */
 
 static inline void skn_power_scale_f32_scalar(float *p, const float *re,
                                               const float *im, size_t n,
@@ -275,11 +228,7 @@ static inline void skn_power_scale_f32(float *p, const float *re,
 }
 #endif
 
-/* ═══════════════════════════ skn_mag_eps_f32 ══════════════════════════════
- * out[k] = sqrtf((re[k]*re[k] + im[k]*im[k]) + eps) -- the magnitude with a
- * floor term inside the root, in that exact association (two products, their
- * sum, then eps, then the correctly rounded IEEE square root, which is what
- * vsqrtq_f32 and sqrtf both are). out may be exactly re or im. */
+/* skn_mag_eps_f32: out[k] = sqrtf((re[k]*re[k] + im[k]*im[k]) + eps), correctly rounded root; out may be exactly re or im. */
 
 static inline void skn_mag_eps_f32_scalar(float *out, const float *re,
                                           const float *im, size_t n,
@@ -308,10 +257,7 @@ static inline void skn_mag_eps_f32(float *out, const float *re,
 }
 #endif
 
-/* ══════════════════════ skn_(de)interleave[_scale]_cf32 ═══════════════════
- * Complex (AoS) <-> split re/im arrays. The _scale forms multiply each part
- * by `scale` on the way; the plain forms are exact moves (no arithmetic, so
- * NaN payloads pass through untouched). */
+/* skn_(de)interleave[_scale]_cf32: Complex (AoS) <-> split re/im. The _scale forms multiply by `scale`; the plain forms are exact moves. */
 
 static inline void skn_deinterleave_cf32_scalar(const Complex *in, float *re,
                                                 float *im, size_t n) {
@@ -411,11 +357,7 @@ static inline void skn_interleave_scale_cf32(const float *re, const float *im,
 }
 #endif
 
-/* ═══════════════════════════ skn_div_floor_f32 ════════════════════════════
- * out[i] = num[i] / (den[i] > floor ? den[i] : floor) -- the WOLA envelope
- * normalisation. The select is a greater-than compare plus bit select, not
- * vmaxq_f32, so a NaN denominator takes the floor exactly as the scalar
- * ternary does. */
+/* skn_div_floor_f32: out[i] = num[i] / (den[i] > floor ? den[i] : floor). Uses a compare plus bit select (not vmaxq_f32) so a NaN denominator takes the floor. */
 
 static inline void skn_div_floor_f32_scalar(float *out, const float *num,
                                             const float *den, size_t n,
@@ -452,19 +394,10 @@ static inline void skn_div_floor_f32(float *out, const float *num,
 }
 #endif
 
-/* ═══════════════════════════ skn_ctaps_mac_f32 ════════════════════════════
- * Per-bin complex tap filter: for every bin k in [0, n),
- *   acc = 0; for t in 0..taps-1 (in that order):
- *     acc.re += xr*cr - xi*ci;   acc.im += xi*cr + xr*ci;
- * with (xr, xi) = (src_re[t][k], src_im[t][k]) and (cr, ci) the tap's
- * coefficient read from `coef` laid out [bin][tap][re,im] (stride 2*taps
- * floats per bin). One source row per tap, each already offset to bin 0 of
- * the range, so a caller shifts a frequency tap by moving the row pointer.
- * DeepVQE's CCM and DeepFilterNet2's deep filter are both this loop.
- * out_re/out_im must not alias any source or coef. Every bin takes all
- * `taps` taps: a bin with out-of-range taps is the caller's to handle. The
- * four bins of a NEON step read their coefficients through lane loads,
- * because the tap stride (10 or 18 floats) is not a vector multiple. */
+/* skn_ctaps_mac_f32: per-bin complex tap filter. For each bin k in [0, n), acc = sum over t = 0..taps-1 (in order) of
+ *   acc.re += xr*cr - xi*ci; acc.im += xi*cr + xr*ci, with (xr, xi) = (src_re[t][k], src_im[t][k]) and (cr, ci) from `coef`
+ * laid out [bin][tap][re,im] (stride 2*taps floats). One source row per tap, already offset to bin 0 of the range.
+ * out_re/out_im must not alias any source or coef. Every bin takes all `taps` taps. */
 
 static inline void skn__ctaps_mac_range(float *out_re, float *out_im,
                                         size_t k0, size_t n, size_t taps,
@@ -534,22 +467,9 @@ static inline void skn_ctaps_mac_f32(float *out_re, float *out_im, size_t n,
 }
 #endif
 
-/* ═══════════════════════ skn_erb_forward_banded_f32 ═══════════════════════
- * erb_work[b] += sum over bins k in [k0[b], k1[b]) ascending of
- * power[k] * erb_fwd[k * n_bands + b]; erb_work is NOT zeroed here (the
- * caller zeroes it once before calling). n_bands must be a multiple of 4.
- * Four adjacent bands advance together, each with its own accumulator
- * carried in a local float across the whole range: the bin-major walk
- * updates the accumulators in memory and every update waits for the
- * previous one's store. This loop has no NEON intrinsics of its own (the
- * four-band grouping is for register-level overlap, not vectorization), so
- * there is a single implementation, used unconditionally by both SIMD=0 and
- * SIMD=1 builds -- unlike the rest of this header, it has no _scalar twin or
- * #if SK_HAVE_NEON split, because its original (DeepFilterNet2's
- * erb_forward_banded, byte-for-byte identical in DeepFilterNet3) never had
- * one either. Every power must already be finite; a non-finite power is the
- * caller's dense fallback to handle, not this kernel's (a zero weight
- * outside a band's range then adds nothing to a non-finite row). */
+/* skn_erb_forward_banded_f32: erb_work[b] += sum over k in [k0[b], k1[b]) ascending of power[k] * erb_fwd[k * n_bands + b].
+ * erb_work is NOT zeroed here. n_bands must be a multiple of 4. Four adjacent bands advance together with local accumulators.
+ * A single implementation serves SIMD=0 and SIMD=1 (no _scalar twin). Every power must be finite; the caller handles non-finite power. */
 
 static inline void skn_erb_forward_banded_f32(const float *power,
                                                const float *erb_fwd,
@@ -587,17 +507,9 @@ static inline void skn_erb_forward_banded_f32(const float *power,
     }
 }
 
-/* ═══════════════════════ skn_erb_expand_mask_f32 ═══════════════════════════
- * bin_gain[k] = sum over bands b ascending of erb_inv[b * n_bins + k] *
- * band_gain[b], written densely (bin_gain is zeroed on entry); erb_inv is
- * band-major [n_bands][n_bins], so a band's own loop runs contiguously over
- * its nonzero bins [inv_lo[b], inv_hi[b]); a non-finite band_gain takes the
- * band's whole row instead (inv_lo/inv_hi are then ignored for that band).
- * The NEON step processes four bins at a time and may run up to three bins
- * past a band's span -- the weights there are zero, and a zero product
- * never turns a stored +0 into -0, so a finite gain's result is unaffected;
- * a non-finite gain still takes the whole row, exactly as the scalar twin.
- * DeepFilterNet2 and DeepFilterNet3 share this exactly. */
+/* skn_erb_expand_mask_f32: bin_gain[k] = sum over bands b ascending of erb_inv[b * n_bins + k] * band_gain[b] (bin_gain zeroed on entry);
+ * erb_inv is band-major [n_bands][n_bins] and a band covers its nonzero bins [inv_lo[b], inv_hi[b]). A non-finite band_gain takes the band's whole row.
+ * The NEON step may run up to three bins past a band's span; the weights there are zero, so finite gains are unaffected. */
 
 static inline void skn_erb_expand_mask_f32_scalar(const float *band_gain,
                                                     const float *erb_inv,
@@ -661,10 +573,8 @@ static inline void skn_erb_expand_mask_f32(const float *band_gain,
 }
 #endif
 
-/* banded[b] = sum_k table[k*n_bands+b]*x[k], starting at zero.
- * The table is bin-major [n_bins][n_bands]. Each band folds ascending k
- * with separate multiply/add rounding; bands and channels never reduce
- * across lanes. The output is overwritten. */
+/* banded[b] = sum_k table[k*n_bands+b]*x[k], starting at zero; table is bin-major [n_bins][n_bands]. Each band folds ascending k with
+ * separate multiply/add rounding; the output is overwritten. */
 
 static inline void skn_erb_band_accumulate_f32_scalar(const float *x,
                                                         const float *table,
@@ -679,14 +589,8 @@ static inline void skn_erb_band_accumulate_f32_scalar(const float *x,
     }
 }
 
-/* Multi-channel form of skn_erb_band_accumulate_f32_scalar: each band/channel
- * keeps the same ascending-k, unfused fold. Load each table quad once per
- * bin and reuse it across channels; do not de-fuse into per-channel calls.
- *
- * x and banded contain n_ch pointers; n_ch is in [1, SKN_ERB_NCH_MAX].
- * The NEON path groups 16 bands, then four, then scalar tails. Its literal
- * per-channel dispatch keeps accumulators in registers; a runtime-sized
- * register array spills and loses the fused throughput. */
+/* Multi-channel form of the above: same ascending-k unfused fold per band and channel; each table quad is loaded once per bin and reused across channels.
+ * x and banded hold n_ch pointers, n_ch in [1, SKN_ERB_NCH_MAX]. The NEON path groups 16 bands, then four, then scalar tails. */
 
 #define SKN_ERB_NCH_MAX 4
 #define SKN_ERB_BAND_QUADS 4
@@ -706,22 +610,13 @@ static inline void skn_erb_band_accumulate_nch_f32_scalar(
 }
 
 #if SK_HAVE_NEON
-/* One specialization per channel count NCH in [1, SKN_ERB_NCH_MAX], NCH a
- * literal substituted at the call site below -- so every loop bound in here
- * (over c in [0, NCH) and over q in [0, 4)) is a compile-time constant and
- * every sum[c][q] accumulator folds into its own NEON register, exactly
- * like the original hardcoded-3-channel erb_band3_neon. The outer `for`
- * block loop itself still has a runtime trip count (n_bands varies), which
- * is fine: it is the two loops *inside* one iteration that must be literal
- * for register promotion, and both are. */
+/* One specialization per channel count NCH (a literal at the call site) so the inner loop bounds are compile-time constants and accumulators stay in registers. */
 #define SKN_ERB_NCH_IMPL(NCH)                                               \
 static inline void skn_erb_band_accumulate_nch_f32_neon_##NCH(              \
     const float *const *x, const float *table, int n_bins, int n_bands,    \
     float *const *banded) {                                                 \
     int b = 0;                                                              \
-    /* Full blocks of exactly SKN_ERB_BAND_QUADS quads (16 bands): every    \
-     * q in [0, SKN_ERB_BAND_QUADS) is read and stored, so this never reads \
-     * past the valid band range. */                                       \
+    /* Full blocks of SKN_ERB_BAND_QUADS quads (16 bands); never reads past the valid band range. */                                       \
     for (; b + 4 * SKN_ERB_BAND_QUADS <= n_bands; b += 4 * SKN_ERB_BAND_QUADS) { \
         float32x4_t sum[NCH][SKN_ERB_BAND_QUADS];                           \
         for (int c = 0; c < NCH; ++c)                                       \
@@ -740,10 +635,7 @@ static inline void skn_erb_band_accumulate_nch_f32_neon_##NCH(              \
             for (int q = 0; q < SKN_ERB_BAND_QUADS; ++q)                    \
                 vst1q_f32(banded[c] + b + 4 * q, sum[c][q]);                \
     }                                                                        \
-    /* One quad (4 bands) at a time for what a full block could not cover. \
-     * Still only NCH accumulators, still a literal loop bound, so it      \
-     * folds into registers the same way the single-channel kernel's does. \
-     */                                                                      \
+    /* One quad (4 bands) at a time for what a full block cannot cover. */                                                                      \
     for (; b + 4 <= n_bands; b += 4) {                                      \
         float32x4_t sum[NCH];                                               \
         for (int c = 0; c < NCH; ++c) sum[c] = vdupq_n_f32(0.0f);           \
@@ -755,7 +647,7 @@ static inline void skn_erb_band_accumulate_nch_f32_neon_##NCH(              \
         }                                                                    \
         for (int c = 0; c < NCH; ++c) vst1q_f32(banded[c] + b, sum[c]);      \
     }                                                                        \
-    /* Last fewer-than-4 bands, scalar -- never reads past n_bands. */       \
+    /* Last fewer-than-4 bands, scalar. */       \
     for (; b < n_bands; ++b) {                                              \
         float sum[NCH];                                                     \
         for (int c = 0; c < NCH; ++c) sum[c] = 0.0f;                        \

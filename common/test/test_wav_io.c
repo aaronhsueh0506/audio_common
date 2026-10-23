@@ -1,23 +1,12 @@
 /*
- * test_wav_io.c - negative-corpus tests for the shared WAV parser and writer
- * (include/wav_io.h).
+ * test_wav_io.c - negative-corpus tests for the shared WAV parser and writer (include/wav_io.h).
  *
- * The test does not set WAV_IO_WRITER_STYLE, so it gets the default
- * WAV_IO_WRITER_AEC writer; the style does not affect the reader.
- *
- * Every malformed input must make wav_open_read() return NULL without
- * crashing (no out-of-bounds read, no division by zero, no use of a NULL or
- * freed FILE*). Every well-formed input must parse.
- *
- * It also covers the writer: wav_finalize_write() failure paths (fseek,
- * fwrite, fclose) through a FILE* with injectable failures (funopen on
- * BSD/macOS, fopencookie on glibc; the group is skipped with a SKIP message
- * elsewhere, and the rest of the file is portable C99/POSIX), the argument
- * and header-field validation of wav_open_write(), and the oversize abandon
- * path of wav_finalize_write().
- *
- * Every failure is printed and sets a global flag; main() reports ALL PASS or
- * FAIL at the end.
+ * The default WAV_IO_WRITER_AEC writer is used (the style does not affect the reader). Every malformed
+ * input must make wav_open_read() return NULL without crashing; every well-formed input must parse.
+ * Writer coverage: wav_finalize_write() failure paths (fseek, fwrite, fclose) through a FILE* with
+ * injectable failures (funopen on BSD/macOS, fopencookie on glibc; that group prints SKIP elsewhere),
+ * wav_open_write() argument and header-field validation, and the oversize abandon path.
+ * Each failure is printed and sets a global flag; main() reports ALL PASS or FAIL at the end.
  */
 /* glibc declares fopencookie / cookie_io_functions_t only behind _GNU_SOURCE,
  * which must be defined before the first system header. */
@@ -48,14 +37,9 @@ static int g_fail = 0;
 } while (0)
 
 /* ═══════════════════════════ raw-byte WAV builder ═════════════════════════
- * Minimal growable byte buffer + little-endian field pushers, so each test
- * can hand-construct (and deliberately corrupt) a WAV header byte-for-byte
- * -- exactly the kind of malformed input a real file or a hostile input
- * could produce, which no "write a valid WAV, then edit WavInfo" API could
- * express. Little-endian is the native byte order on every platform this
- * code targets (same assumption wav_io.h itself already makes by fread'ing
- * multi-byte fields directly into typed variables).
- */
+ * Growable byte buffer plus little-endian field pushers, so each test can hand-construct (and
+ * corrupt) a WAV header byte for byte. Little-endian is assumed, as in wav_io.h, which reads
+ * multi-byte fields directly into typed variables. */
 typedef struct {
     uint8_t* buf;
     size_t len;
@@ -96,10 +80,8 @@ static void bb_fmt_chunk(ByteBuf* b, uint32_t fmt_chunk_sz, uint16_t audio_forma
     bb_u16(b, bits_per_sample);
 }
 
-/* Appends "RIFF" + riff_size + "WAVE". riff_size isn't validated by
- * wav_open_read (see file header doc / wav_io.h's own doc comment) so its
- * exact value doesn't matter for these tests; a plausible placeholder
- * (0xFFFFFFFF-safe small value) is fine. */
+/* Appends "RIFF" + riff_size + "WAVE"; wav_open_read does not validate riff_size, so the tests pass a
+ * plausible placeholder. */
 static void bb_riff_header(ByteBuf* b, uint32_t riff_size) {
     bb_str4(b, "RIFF");
     bb_u32(b, riff_size);
@@ -694,19 +676,11 @@ static void test_write_zero_and_negative_n_is_noop(void) {
     unlink(path);
 }
 
-/* Forces a short fwrite inside wav_write_float's PCM16 loop (via
- * RLIMIT_FSIZE) and checks that write_error is set, samples_written stops at
- * the count actually on disk, and the process survives (SIGXFSZ is ignored
- * first; by default it terminates the process).
- *
- * Order matters:
- *   1. The rlimit is applied only after wav_open_write() returns, so it does
- *      not affect the 44-byte placeholder header.
- *   2. w->fp is made unbuffered (setvbuf _IONBF) before the rlimit is applied
- *      and any sample is written. Buffered 2-byte fwrites would all succeed
- *      into libc's buffer and fail only at a later flush; unbuffered, each
- *      reaches write(2), so the failure shows at the third sample.
- */
+/* Forces a short fwrite inside wav_write_float's PCM16 loop (via RLIMIT_FSIZE) and checks that
+ * write_error is set, samples_written stops at the count on disk, and the process survives (SIGXFSZ is
+ * ignored first; by default it terminates the process). The rlimit is applied after wav_open_write()
+ * so the 44-byte header is unaffected, and w->fp is made unbuffered (_IONBF) so each 2-byte fwrite
+ * reaches write(2) and fails at the third sample instead of at a later flush. */
 static void test_write_error_on_short_write(void) {
     char path[64];
     snprintf(path, sizeof(path), "/tmp/audio_common_test_wav_writer_shortwr_XXXXXX");
@@ -756,20 +730,12 @@ static void test_write_error_on_short_write(void) {
 }
 
 /* ══════════ wav_finalize_write() injectable-failure coverage ══════════════
- * wav_finalize_write() checks every fseek / fwrite / fclose result and any
- * write_error flagged by an earlier short write. The RLIMIT_FSIZE test above
- * reaches only fwrite failures during wav_write_float; failures of fseek,
- * fclose and of the header writes at finalize time need a FILE* whose
- * read / write / seek / close callbacks can be made to fail independently:
- *   - funopen(3) on BSD/macOS;
- *   - fopencookie(3) on glibc.
- * HAVE_FAKE_STREAM selects the one the platform offers; otherwise
- * test_finalize_write_injectable_failures() prints a SKIP line.
- *
- * Each test builds a WavWriter with wav_open_write() on a temp file, so the
- * 44-byte placeholder header is really written, then replaces the public
- * w->fp with a fake stream before calling wav_finalize_write().
- */
+ * wav_finalize_write() checks every fseek / fwrite / fclose result and any write_error from an earlier
+ * short write. The RLIMIT_FSIZE test above reaches only fwrite failures during wav_write_float; the
+ * rest need a FILE* whose callbacks fail independently (funopen(3) on BSD/macOS, fopencookie(3) on
+ * glibc; HAVE_FAKE_STREAM selects one, otherwise test_finalize_write_injectable_failures() prints
+ * SKIP). Each test builds a WavWriter on a temp file so the 44-byte header is really written, then
+ * replaces w->fp with a fake stream before calling wav_finalize_write(). */
 
 typedef struct {
     int fail_write_after;  /* -1 = never fail; else fail the write call that
@@ -849,15 +815,10 @@ static FILE* make_fake_stream(FakeStreamState* state) {
 #endif
 
 #if HAVE_FAKE_STREAM
-/* Builds a WavWriter over a real temp file (so the placeholder header is
- * genuinely on disk), then swaps its fp to a fake stream driven by `state`
- * (see make_fake_stream() above), set unbuffered so every
- * wav_finalize_write() fwrite call maps directly to one fake_stream_write()
- * call (a buffered stream would just memcpy small writes into libc's
- * internal buffer and defer the real write(2)-equivalent call to
- * flush/close time, same caveat documented above
- * test_write_error_on_short_write()). *out_path must be unlink()ed + free()d
- * by the caller. Returns NULL on any setup failure. */
+/* Builds a WavWriter over a real temp file (header genuinely on disk), then swaps its fp to an
+ * unbuffered fake stream driven by `state` (see make_fake_stream()), so every wav_finalize_write()
+ * fwrite maps to one fake_stream_write() call. *out_path must be unlink()ed and free()d by the
+ * caller. Returns NULL on any setup failure. */
 static WavWriter* make_writer_over_fake_stream(FakeStreamState* state, char** out_path) {
     char* path = (char*)malloc(64);
     if (!path) return NULL;

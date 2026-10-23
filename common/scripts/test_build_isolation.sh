@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# test_build_isolation.sh — build-isolation regression suite for common.
+# test_build_isolation.sh — build-isolation suite for common.
 #
-# Exercises the CFG_SIG-keyed obj/bin directory design in common's Makefile and the
-# two-phase AC_LIB consumer resolution in AEC/c_impl against the failure modes it exists to
-# prevent: one configuration's objects or archive delivered under another's key, stale
-# archive members, publish tampering, and unsafe flag text reaching the shell.
+# Exercises the CFG_SIG-keyed obj/bin directory design in common's Makefile and the two-phase
+# COMMON_LIB consumer resolution in AEC/c_impl against the failure modes it exists to prevent: one
+# configuration's objects or archive delivered under another's key, stale archive members, publish
+# tampering, and unsafe flag text reaching the shell.
 #
-# Two normal configs are exercised side by side wherever a scenario needs "config A" and
-# "config B": SIMD=1 (the default) and SIMD=0. They differ in CFG_SIG and in compiled objects.
+# Two normal configs are exercised side by side wherever a scenario needs "config A" and "config B":
+# SIMD=1 (the default) and SIMD=0. They differ in CFG_SIG and in compiled objects.
 #
 # Scenario index:
 #   S1   A->B->A across SIMD=1 / SIMD=0, plus the -O0/-O3 delivered-object repro
@@ -46,70 +46,57 @@
 # S6 (Audio_ALG/pipelines consumer-resolution parity) belongs to that repo's own suite.
 #
 # Safety contract:
-#   - One scratch root per run, SCRATCH_ROOT="$(mktemp -d)", removed by a single EXIT trap.
-#     TMPDIR is exported inside it so child makes' own mktemp workdirs land there too. Every
-#     scratch path is a fixed path under "$SCRATCH_ROOT/<scenario>/" created inline with
-#     `mkdir -p`, never inside a `$(...)` (cleanup state registered in a subshell is lost).
-#   - A cross-suite mutex (SUITE_LOCK under the invoking TMPDIR, the same path the
-#     Audio_ALG/pipelines suite uses) refuses to run two instances at once: both assert
-#     real-tree invariants a concurrent run would trample. A lock whose holder pid is dead
-#     is reclaimed once.
-#   - The real obj/ and bin/ only ever see the two normal configs S1 builds. Every probe or
-#     tamper config builds under a scratch OBJ_ROOT/BIN_ROOT. A snapshot of the real
-#     obj/+bin/ taken after S1 is re-verified byte for byte at the end.
-#   - The real dist/ is never touched: every publish passes an explicit DIST_ROOT under
-#     scratch, and a sentinel digest of dist/ is re-checked at the end.
-#   - No git-tracked file in $AC_DIR or the AEC repo is touched, not even its mtime; mtime
-#     bumps happen on scratch clones. tree_state_hash() (status --porcelain plus
-#     diff --binary HEAD) of both repos must be equal at the end.
-#   - No sleep. Forcing a source strictly newer than an artifact uses
-#     `touch -r <artifact> -A 01 <source>`, and mtime() reads fractional seconds.
-#   - Interruption safe: cleanup() is the only EXIT-trap resident and INT/TERM exit through
-#     it with 130/143 (S18 tests this).
+#   - One scratch root per run, SCRATCH_ROOT="$(mktemp -d)", removed by a single EXIT trap. TMPDIR is
+#     exported inside it so child makes' mktemp workdirs land there too. Every scratch path is a fixed
+#     path under "$SCRATCH_ROOT/<scenario>/" created inline with `mkdir -p`, never inside a `$(...)`
+#     (cleanup state registered in a subshell is lost).
+#   - A cross-suite mutex (SUITE_LOCK under the invoking TMPDIR, the same path the Audio_ALG/pipelines
+#     suite uses) refuses to run two instances at once: both assert real-tree invariants a concurrent
+#     run would trample. A lock whose holder pid is dead is reclaimed once.
+#   - The real obj/ and bin/ only ever see the two normal configs S1 builds. Every probe or tamper
+#     config builds under a scratch OBJ_ROOT/BIN_ROOT. A snapshot of the real obj/+bin/ taken after S1
+#     is re-verified byte for byte at the end.
+#   - The real dist/ is never touched: every publish passes a scratch DIST_ROOT, and a sentinel digest
+#     of dist/ is re-checked at the end.
+#   - No git-tracked file in $AC_DIR or the AEC repo is touched, not even its mtime; mtime bumps happen
+#     on scratch clones. tree_state_hash() (status --porcelain plus diff --binary HEAD) of both repos
+#     must be equal at the end.
+#   - No sleep. Forcing a source strictly newer than an artifact uses `touch -r <artifact> -A 01
+#     <source>`, and mtime() reads fractional seconds.
+#   - Interruption safe: cleanup() is the only EXIT-trap resident and INT/TERM exit through it with
+#     130/143 (S18 tests this).
 #
-# Design rules (do not violate when editing this script):
+# Design rules (keep when editing this script):
 #   - No `make clean` inside any scenario: distinct configs must coexist without a clean.
-#   - Every path is resolved with `make -s ... print-bin-dir` / `print-obj-dir` /
-#     `print-lib-path`, with the exact flag set (including OBJ_ROOT/BIN_ROOT) under test,
-#     never a hand-reconstructed path.
-#   - "Was this rebuilt?" is an mtime comparison, never a sha comparison (recompiling
-#     identical inputs gives identical bytes). "Is this the same delivered artifact as its
-#     own keyed object?" is a sha comparison, via member_sha()/file_sha().
+#   - Every path is resolved with `make -s ... print-bin-dir` / `print-obj-dir` / `print-lib-path`,
+#     with the exact flag set (including OBJ_ROOT/BIN_ROOT) under test, never hand-reconstructed.
+#   - "Was this rebuilt?" is an mtime comparison, never a sha comparison (recompiling identical inputs
+#     gives identical bytes). "Is this the same delivered artifact as its own keyed object?" is a sha
+#     comparison, via member_sha()/file_sha().
 #
-# Usage: ./scripts/test_build_isolation.sh   (from common/ or anywhere; paths are
-# resolved from this script's own location). The AEC and NR repos must be siblings of
-# common, and AEC must be a git checkout.
+# Usage: ./scripts/test_build_isolation.sh   (from common/ or anywhere; paths are resolved from this
+# script's own location). The AEC repo must be a sibling of audiolib and a git checkout.
 #
-# ISOL_INTERRUPT_PROBE (internal, used only by S18): when set, this script runs as a child
-# re-invocation of itself in "interruption probe" mode instead of running the suite; see the
-# block after the SCRATCH_ROOT/trap setup below.
+# ISOL_INTERRUPT_PROBE (internal, S18 only): when set, this script runs as a child re-invocation of
+# itself in "interruption probe" mode instead of running the suite; see the probe block below.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 AC_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-# AC_DIR is now audiolib/common (nested one level deeper than the old
-# top-level audio_common/), so AEC is two levels up from AC_DIR, not one.
-# AUDIOLIB_REPO_DIR is the actual git repo TOPLEVEL (audiolib/ itself, the
-# whole merged tree: common/, doa/, bf/, VAD/, tests/, gain/). AC_DIR
-# (audiolib/common) is just a subdirectory of it, not a git repo of its own
-# any more -- adopt_worktree_clone() below must be given THIS, never AC_DIR,
-# wherever the old call site wanted "a clone of common" (see that function's
-# doc comment for why and the two-step pattern every such call site uses).
+# AUDIOLIB_REPO_DIR is the git toplevel (audiolib/); AC_DIR (audiolib/common) is only a subdirectory, so
+# adopt_worktree_clone() must be given AUDIOLIB_REPO_DIR, never AC_DIR (see its doc comment for the
+# two-step pattern). AEC is a sibling of audiolib.
 AUDIOLIB_REPO_DIR="$(cd "$AC_DIR/.." && pwd)"
 AEC_REPO_DIR="$(cd "$AC_DIR/../../AEC" && pwd)"
 AEC_DIR="$(cd "$AEC_REPO_DIR/c_impl" && pwd)"
-# (NR_DIR removed: nothing in this suite uses NR, and the `cd` aborted the whole run under
-# set -e whenever NR was not a sibling checkout.)
 
 # --- single scratch root, single trap ------------------
 SCRATCH_ROOT="$(mktemp -d)"
-# SUITE_LOCK_HELD must exist (as "0") before ANYTHING that could exit through
-# cleanup() runs -- including the ISOL_INTERRUPT_PROBE early-return branch
-# immediately below, which (being a probe CHILD, not a real suite run) never
-# reaches the regression mutex block that would otherwise set this to "1" --
-# `set -u` would otherwise fault on cleanup()'s own reference to it.
+# SUITE_LOCK_HELD must exist (as "0") before anything can exit through cleanup(), including the
+# ISOL_INTERRUPT_PROBE branch below, which never reaches the mutex block that sets it to "1": `set -u`
+# would fault on cleanup()'s reference otherwise.
 SUITE_LOCK_HELD=0
 SUITE_LOCK=""
 cleanup() {
@@ -123,37 +110,20 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# --- S18 interruption probe: MUST be checked early, before any suite logic --
-#, and BEFORE the mktemp-shim setup
-# below: probe mode's `set +e` (see the comment inside the branch) needs to
-# take effect before ANY further command runs in this process, since a
-# signal can arrive during the shim's own file writes just as easily as
-# during the probe's own fifo dance -- moving the whole shim setup after
-# this check keeps probe mode's error-handling window as small as possible.
-# When invoked with ISOL_INTERRUPT_PROBE set, this is a CHILD re-invocation
-# of this very script, spawned by the S18 scenario body further down. It
-# signals its own SCRATCH_ROOT back to the parent over a fifo (the write is
-# also the readiness signal), then either exits immediately (mode "exit") or
-# blocks forever on a second fifo that nobody ever writes to, so a
-# parent-delivered INT/TERM is what interrupts it -- exactly mirroring how
-# this script could be interrupted mid-scenario in real use. It does NOT
-# need its own mktemp shim (below): its own `mktemp -d` for SCRATCH_ROOT
-# above already inherited the PARENT's shim via PATH (set before the parent
-# spawned it), which is what lands this SCRATCH_ROOT inside the parent's
-# chosen probe TMPDIR in the first place.
+# --- S18 interruption probe: check this early, before any suite logic and before the mktemp-shim
+# setup, so probe mode's `set +e` takes effect before any further command runs (a signal can arrive
+# during the shim's own file writes). With ISOL_INTERRUPT_PROBE set this is a child re-invocation of
+# this script, spawned by the S18 scenario below. It signals its SCRATCH_ROOT back to the parent over
+# a fifo (the write doubles as the readiness signal), then either exits at once (mode "exit") or blocks
+# on a second fifo nobody writes, so a parent-delivered INT/TERM is what interrupts it, as in a real
+# mid-scenario interruption. Its own `mktemp -d` inherited the parent's shim via PATH, which lands this
+# SCRATCH_ROOT in the parent's probe TMPDIR.
 if [ -n "${ISOL_INTERRUPT_PROBE:-}" ]; then
-  # `set +e` for the rest of probe mode (regression review, found while
-  # validating THIS script): with `errexit` still active, a SIGTERM/SIGINT
-  # that arrives while this process is blocked in a syscall (opening the
-  # fifo, or the `read` below) can surface as EINTR turning into that
-  # command's own non-zero return -- and errexit reacts to THAT directly
-  # (running the EXIT trap with the interrupted command's status) before
-  # bash ever services the pending INT/TERM trap, so the child would exit
-  # with the wrong code and skip straight to cleanup with a stale $?
-  # (verified empirically on this host's bash 3.2 to be flaky under load:
-  # which command absorbs the signal-interrupted return varies run to run).
-  # Disabling errexit here removes the whole race: the INT/TERM traps
-  # installed above are what decide this process's exit code, unconditionally.
+  # `set +e` for the rest of probe mode: with errexit active, a SIGTERM/SIGINT arriving while this
+  # process is blocked in a syscall (opening the fifo, or the `read` below) can surface as that
+  # command's non-zero return, and errexit then runs the EXIT trap with a stale $? before bash services
+  # the pending INT/TERM trap, giving the wrong exit code (flaky under load on bash 3.2). Without
+  # errexit the INT/TERM traps installed above decide the exit code unconditionally.
   set +e
   mkdir -p "$SCRATCH_ROOT/probe"
   : > "$SCRATCH_ROOT/probe/canary_a"
@@ -162,20 +132,11 @@ if [ -n "${ISOL_INTERRUPT_PROBE:-}" ]; then
   if [ "$ISOL_INTERRUPT_PROBE" = "exit" ]; then
     exit 0
   fi
-  # Open the hold-fifo O_RDWR (never blocks on open(), since we hold both
-  # ends ourselves). Block via `wait` on a background reader of that fd,
-  # NOT a direct foreground `read <&9` -- verified empirically (bash 3.2) to
-  # matter: a signal arriving while this shell is itself blocked inside a
-  # foreground `read` builtin can leave the pending INT/TERM trap action
-  # un-run (the interrupted `read` just falls through to whatever comes
-  # next), and a SECOND, deferred delivery of that same signal then fires
-  # AFTER `cleanup()` has already reset the trap to its default disposition
-  # -- killing the process mid-`rm -rf` instead of letting cleanup finish.
-  # `wait` is bash's OWN documented interruptible blocking primitive (see
-  # bash(1), SIGNALS: "SIGINT is caught and handled so that the wait builtin
-  # is interruptible") and does not exhibit this: 8/8 clean runs under both
-  # SIGTERM and SIGINT in isolated repro, vs. a flaky ~1-in-3 failure rate
-  # with a direct `read <&9`.
+  # Open the hold-fifo O_RDWR (never blocks on open(), since we hold both ends). Block via `wait` on a
+  # background reader of that fd, not a foreground `read <&9`: a signal arriving during a foreground
+  # `read` can leave the pending INT/TERM trap action un-run, and a second deferred delivery then fires
+  # after cleanup() has reset the trap, killing the process mid-`rm -rf`. `wait` is bash's documented
+  # interruptible blocking primitive (bash(1), SIGNALS) and does not show this.
   exec 9<>"$ISOL_PROBE_FIFO.hold"
   cat <&9 >/dev/null &
   catpid=$!
@@ -184,17 +145,12 @@ if [ -n "${ISOL_INTERRUPT_PROBE:-}" ]; then
 fi
 
 # --- cross-suite mutex -----------------------------------
-# Placed immediately after the ISOL_INTERRUPT_PROBE early-return above (so a
-# probe CHILD -- itself a full re-invocation of this script, spawned by S18 --
-# never reaches this and never contends for the lock its own PARENT already
-# holds) and BEFORE `export TMPDIR=...` below (so `${TMPDIR:-/tmp}` here still
-# resolves to the INVOKING environment's TMPDIR, not the scratch-local one
-# this script is about to export over it). Two instances of this suite -- or
-# of the Audio_ALG/pipelines counterpart, which uses this EXACT SAME lock
-# path/name -- must never run concurrently: both assert real-tree invariants
-# (S1's real SIMD=1/SIMD=0 archives, the final-guard snapshot below, the dist/
-# sentinel, tree_state_hash()) that a second concurrent run's own real-tree
-# activity would trample.
+# Placed after the ISOL_INTERRUPT_PROBE early return (a probe child never contends for the lock its
+# parent holds) and before `export TMPDIR=...` below, so `${TMPDIR:-/tmp}` still resolves to the
+# invoking environment's TMPDIR. Two instances of this suite, or of the Audio_ALG/pipelines
+# counterpart (same lock path), must never run concurrently: both assert real-tree invariants (S1's
+# real archives, the final-guard snapshot, the dist/ sentinel, tree_state_hash()) that a concurrent
+# run would trample.
 SUITE_LOCK="${TMPDIR:-/tmp}/audio_dsp_isolation_suite.lock"
 if mkdir "$SUITE_LOCK" 2>/dev/null; then
   printf '%s\n' "$$" > "$SUITE_LOCK/pid"
@@ -203,11 +159,9 @@ else
   holder_pid="$(cat "$SUITE_LOCK/pid" 2>/dev/null || true)"
   reclaimed=0
   if [ -n "$holder_pid" ] && ! kill -0 "$holder_pid" 2>/dev/null; then
-    # Stale lock: the recorded holder pid is confirmed dead. Reclaim once --
-    # TOCTOU: two reclaimers can race this exact rm -rf/mkdir pair; only one
-    # mkdir wins, and the loser must NOT steal the winner's fresh lock, so
-    # this is a single retry (not a loop) and the loser falls through to the
-    # FATAL below on failure.
+    # Stale lock: the recorded holder pid is confirmed dead. Reclaim once. Two reclaimers can race this
+    # rm -rf/mkdir pair and only one mkdir wins; the loser must not steal the winner's fresh lock, so
+    # this is a single retry (not a loop) and the loser falls through to the FATAL below.
     rm -rf -- "$SUITE_LOCK" 2>/dev/null || true
     if mkdir "$SUITE_LOCK" 2>/dev/null; then
       printf '%s\n' "$$" > "$SUITE_LOCK/pid"
@@ -228,19 +182,11 @@ mkdir "$SCRATCH_ROOT/tmp"
 # EVERYTHING this run creates, including after an interruption -- see S18.
 export TMPDIR="$SCRATCH_ROOT/tmp"
 
-# macOS-specific gotcha (found while validating this rewrite): BSD `mktemp`'s
-# bare `-d` / no-template form resolves via _CS_DARWIN_USER_TEMP_DIR FIRST
-# (see mktemp(1): "If no arguments are passed or if only the -d flag is
-# passed mktemp behaves as if -t tmp was supplied", and -t's own fallback
-# order puts $TMPDIR behind that Darwin-specific dir) -- so exporting TMPDIR
-# alone does NOT redirect a child process's own bare `mktemp -d` (e.g. this
-# Makefile's own `publish` recipe: `work="$(mktemp -d)"`, or S18's child
-# re-invocation's own `SCRATCH_ROOT="$(mktemp -d)"`) into our scratch tree.
-# A tiny shim ahead of the real mktemp on PATH closes this gap: it forwards
-# to the real /usr/bin/mktemp, injecting `-p "$TMPDIR"` whenever the caller
-# didn't already give an explicit template or -p (verified empirically: a
-# bare `TMPDIR=/some/dir mktemp -d` on this host ignores TMPDIR entirely
-# without this shim).
+# macOS: BSD `mktemp -d` with no template resolves via _CS_DARWIN_USER_TEMP_DIR before $TMPDIR
+# (mktemp(1)), so exporting TMPDIR alone does not redirect a child's bare `mktemp -d` (the Makefile's
+# publish recipe `work="$(mktemp -d)"`, S18's child `SCRATCH_ROOT="$(mktemp -d)"`) into scratch. A tiny
+# shim ahead of the real mktemp on PATH forwards to /usr/bin/mktemp, injecting `-p "$TMPDIR"` when the
+# caller gave no template or -p.
 mkdir "$SCRATCH_ROOT/shimbin"
 cat > "$SCRATCH_ROOT/shimbin/mktemp" <<'EOF'
 #!/bin/sh
@@ -280,9 +226,8 @@ members_not_matching() {
     if [ ! -f "$od/$m" ] || ! cmp -s <(ar -p "$lib" "$m") "$od/$m"; then printf '%s ' "$m"; fi
   done < <(ar -t "$lib")
 }
-# Fractional seconds -- two
-# genuinely separate real writes are distinguishable without an artificial
-# delay. GNU fallback loses the fractional part (not exercised on this host).
+# Fractional seconds, so two separate writes are distinguishable without a delay. The GNU fallback
+# loses the fractional part.
 mtime()      { stat -f '%Fm' "$1" 2>/dev/null || stat -c %Y "$1"; }
 
 # Tree-state hash: status --porcelain ALONE misses a content
@@ -291,77 +236,34 @@ tree_state_hash() {
   { git -C "$1" status --porcelain; git -C "$1" diff --binary HEAD; } 2>/dev/null | shasum -a 256 | awk '{print $1}'
 }
 
-# adopt_worktree_clone <src-repo-dir> <clone-dir> --
-# clone <src-repo-dir> (fully read-only on the source -- the explicitly
-# allowed exception to "no mutating git commands against real repos"), then
-# overlay every currently-MODIFIED TRACKED file on top and adopt them as ONE
-# throwaway commit INSIDE THE SCRATCH CLONE ONLY, so the clone gets a
-# genuinely CLEAN git identity that still reflects today's (possibly
-# uncommitted) worktree content. A plain `git clone` alone only reproduces
-# the source's last COMMIT -- it transfers committed objects, never
-# uncommitted working-tree bytes -- so a bare clone would carry the OLD
-# Makefile instead of the regression one under test. The clone is a disposable
-# git repository living entirely under $SCRATCH_ROOT, destroyed by the EXIT
-# trap; its own history never touches the source repo's .git in any way (a
-# distinct clone, never pushed/fetched back).
+# adopt_worktree_clone <src-repo-dir> <clone-dir>
+# Clones <src-repo-dir> (read-only on the source), overlays every currently modified tracked file and
+# every untracked non-ignored file, and adopts them as ONE throwaway commit inside the scratch clone
+# only, so the clone has a clean git identity that still reflects today's (possibly uncommitted)
+# worktree. A bare `git clone` reproduces only the last commit and would carry the old Makefile instead
+# of the one under test. The clone is disposable under $SCRATCH_ROOT; its history never touches the
+# source repo's .git.
 #
-# CONTRACT: <src-repo-dir> MUST be the git repository's own TOPLEVEL
-# directory (enforced below), never a subdirectory of a larger repo --
-# `git diff --name-only HEAD` emits paths relative to the repo ROOT while
-# `git ls-files --others` emits paths relative to CWD, and the overlay loop
-# below assumes both are relative to $src itself; if $src were a subdirectory
-# the two streams would disagree and `cp "$src/$relf" ...` would silently
-# miss or mis-place files. Since common's old top-level content moved one
-# level deeper to audiolib/common/ (audiolib/ is now the actual git repo
-# root; common/ is just a subdirectory of it, alongside doa/, bf/, VAD/,
-# tests/, gain/), every call site that wants "a clone of common" must clone
-# $AUDIOLIB_REPO_DIR (audiolib's own toplevel) and then address the clone's
-# common/ subdirectory -- NOT call this function with $AC_DIR
-# (audiolib/common) directly, which the toplevel guard below now rejects
-# loudly instead of failing confusingly deep inside `git clone`. The
-# two-step pattern every such call site uses:
+# CONTRACT: <src-repo-dir> must be the git repository's own toplevel (enforced below):
+# `git diff --name-only HEAD` emits repo-root-relative paths while `git ls-files --others` emits
+# cwd-relative ones, and the overlay loop assumes both are relative to $src. Common lives in
+# audiolib/common, so every call site that wants "a clone of common" clones $AUDIOLIB_REPO_DIR and
+# addresses the clone's common/ subdirectory (`make -C` and `git -C` handle a non-toplevel directory):
 #   FOO_ROOT="$SCRATCH_ROOT/<scenario>/audiolib_clone..."
 #   adopt_worktree_clone "$AUDIOLIB_REPO_DIR" "$FOO_ROOT"
 #   FOO_CLONE="$FOO_ROOT/common"
-# FOO_CLONE is then used exactly as any clone path was before (make -C, file
-# touches/sed edits, git -C status/diff/ls-files) -- it is just a path, and
-# both `make -C` and `git -C` handle a non-toplevel directory transparently
-# by walking up to find the Makefile/.git.
 #
-# Cloning the WHOLE audiolib repo (not just common/) is also what makes the
-# result CORRECT for the dirty/untracked scenarios (S17 and friends), not
-# merely a workaround for "common isn't a repo any more". Confirmed
-# empirically against the real checkout (NOT the "scopes to its own
-# directory already" shape one might guess from the nesting):
-#   * `git status --porcelain -uno` / `git diff --binary HEAD` (the
-#     Makefile's own tracked-dirty gate, called with no pathspec) are
-#     scope-INDEPENDENT of cwd -- invoked from a `make -C
-#     <audiolib-clone>/common` recipe, they still report dirty/diff state
-#     for the clone's ENTIRE repo (all of doa/, bf/, VAD/, tests/, gain/,
-#     common/), not just common/, and with repo-root-relative paths. `git -C
-#     <dir> ...` behaves identically to `cd <dir> && git ...` here, so this
-#     script's own `git -C "$dst" status/diff` assertions already match the
-#     Makefile's internal computation with NO extra pathspec needed -- adding
-#     one (e.g. `-- .`) would make this script disagree with how the real
-#     Makefile actually behaves, i.e. a false green, not a fix.
-#   * `git ls-files --others --exclude-standard` (the untracked gate, and
-#     hash_untracked's input) IS cwd-scoped: run with cwd under common/, it
-#     only ever lists untracked files inside common/, never doa/'s etc.
-# So: adopt_worktree_clone's own `git diff --name-only --no-renames HEAD` /
-# `git ls-files --others --exclude-standard` calls below, with $src now the
-# WHOLE audiolib worktree, see every directory's current uncommitted state,
-# and the conditional commit absorbs ALL of it (doa/, bf/, VAD/, tests/,
-# gain/, common/) into one disposable commit -- so the clone is clean at that
-# HEAD (asserted below). Any dirt a scenario injects afterward strictly under
-# common/ is then the ONLY difference from HEAD, exactly mirroring what
-# `make -C <clone>/common publish` itself computes.
+# Cloning the whole repo also keeps the dirty/untracked scenarios (S17 and friends) valid. The
+# Makefile's tracked-dirty gate (`git status --porcelain -uno` / `git diff --binary HEAD`) is
+# cwd-independent and covers the entire repo, so this script's `git -C "$dst"` assertions match it with
+# no pathspec (adding `-- .` would make them disagree with the Makefile). The untracked gate
+# (`git ls-files --others --exclude-standard`, also hash_untracked's input) is cwd-scoped to common/.
+# The adoption commit absorbs all of today's state, so the clone is clean at HEAD (asserted below) and
+# dirt a scenario injects under common/ is the only difference.
 #
-# Round-7 fix (P1b, the actual finding): the commit is CONDITIONAL -- `git
-# add -A`, then commit only if `git diff --cached --quiet --exit-code` says
-# something is actually staged. The regression shape committed unconditionally,
-# so at a clean tip (no local modifications relative to HEAD) the empty
-# commit exited 1 and `set -e` killed the whole suite. Modelled on the
-# Audio_ALG/pipelines suite's (correct) version of this same helper.
+# The commit is conditional (`git add -A`, then commit only if `git diff --cached --quiet --exit-code`
+# says something is staged): an unconditional commit exits 1 on a clean tip and `set -e` would kill
+# the suite.
 adopt_worktree_clone() {
   local src="$1" dst="$2" relf top
   top="$(git -C "$src" rev-parse --show-toplevel 2>/dev/null)" || {
@@ -404,14 +306,11 @@ adopt_worktree_clone() {
   fi
 }
 
-# Real-tree final guard: per-file "path sha256 mtime"
-# snapshot of everything under the real obj/ and bin/, plus a separate
-# top-level keyed-directory listing -- captured in S1 below, the moment this
-# suite's own intentional real-tree normal-config builds (SIMD=1 + SIMD=0) are
-# done, and re-verified at the very end: every snapshotted file must still
-# be sha+mtime identical; a genuinely NEW directory is allowed (INFO/WARN,
-# not FAIL -- but after the regression S12 fix there should be none), while a
-# new file inside an ALREADY-snapshotted directory is a FAIL.
+# Real-tree final guard: a per-file "path sha256 mtime" snapshot of everything under the real obj/ and
+# bin/, plus a top-level keyed-directory listing, captured in S1 once this suite's intentional
+# real-tree normal-config builds (SIMD=1 + SIMD=0) are done and re-verified at the very end: every
+# snapshotted file must be sha+mtime identical; a new directory is allowed (INFO/WARN), a new file
+# inside an already-snapshotted directory is a FAIL.
 real_tree_snapshot() {
   ( cd "$AC_DIR" && for root in obj bin; do
       [ -d "$root" ] || continue
@@ -495,11 +394,10 @@ for pair in "SIMD=1:$lib_a" "SIMD=0:$lib_b"; do
     || fail "S1: $cfg archive missing NE10_fft.o or fft_wrapper_ne10.o"
 done
 
-# The reviewer's literal repro: EXTRA_CFLAGS=-O0 vs -O3 must never let one config's compiled
-# object be delivered under the other's archive member (mtime staleness across differing
-# flag sets). These are throwaway probe configs, not one of the normal configs the real
-# obj/bin hold, so they build under a scratch OBJ_ROOT/BIN_ROOT, and every print-* query
-# below is resolved against the same scratch roots.
+# EXTRA_CFLAGS=-O0 vs -O3 must never let one config's compiled object be delivered under the other's
+# archive member (mtime staleness across differing flag sets). These probe configs are not the normal
+# configs the real obj/bin hold, so they build under a scratch OBJ_ROOT/BIN_ROOT, and every print-*
+# query below uses the same scratch roots.
 mkscratch s1
 S1_OBJ_ROOT="$SCRATCH_ROOT/s1/obj"
 S1_BIN_ROOT="$SCRATCH_ROOT/s1/bin"
@@ -531,22 +429,18 @@ echo "############################################################"
 # default-rooted obj/ and bin/ are the scratch space, so no OBJ_ROOT/BIN_ROOT override is
 # needed and no real tracked file is touched.
 mkscratch s2
-# Two-step clone (see adopt_worktree_clone's doc comment): common is no
-# longer its own git repo (it moved under audiolib/), so audiolib itself is
-# cloned whole and S2_CLONE is pointed at the clone's common/ subdir.
+# Two-step clone (see adopt_worktree_clone): audiolib is cloned whole and S2_CLONE points at the
+# clone's common/ subdir.
 S2_ROOT="$SCRATCH_ROOT/s2/audiolib_clone"
 adopt_worktree_clone "$AUDIOLIB_REPO_DIR" "$S2_ROOT"
 S2_CLONE="$S2_ROOT/common"
-# mtime-only touch (content-neutral) of the CLONE's probed sources: forces a recompile probe
-# without changing what is inside the files.
-#
-# The probed objects must be ones whose bytes DIFFER between SIMD=1 and SIMD=0. hpf.o does not
-# (it compiles to the same bytes under both), so "member sha == own keyed object" held for it
-# whatever the build did -- a vacuous probe. audio_stft.o and fft_wrapper_ne10.o do differ. The
-# check is therefore two-sided: each archive's member equals its own keyed object AND the two
-# configs' members differ from each other. The second half is what catches a shared object
-# directory, where make would find the SIMD=1 object up to date and never recompile it for
-# SIMD=0 (both archives then carry the SIMD=1 object and the equality half alone still holds).
+# mtime-only touch (content-neutral) of the CLONE's probed sources forces a recompile probe. The
+# probed objects must have bytes that differ between SIMD=1 and SIMD=0: hpf.o compiles identically
+# under both, so "member sha == own keyed object" would hold for it whatever the build did.
+# audio_stft.o and fft_wrapper_ne10.o do differ. The check is two-sided: each archive's member equals
+# its own keyed object AND the two configs' members differ from each other. The second half catches a
+# shared object directory, where make finds the SIMD=1 object up to date and never recompiles it for
+# SIMD=0.
 touch "$S2_CLONE/src/audio_stft.c" "$S2_CLONE/src/fft_wrapper_ne10.c"
 make -C "$S2_CLONE" -s SIMD=1 lib >/dev/null
 make -C "$S2_CLONE" -s SIMD=0 lib >/dev/null
@@ -572,15 +466,11 @@ echo "############################################################"
 echo "# S3: parallel differing-config builds"
 echo "############################################################"
 mkscratch s3
-# Both configs build concurrently under ONE scratch OBJ_ROOT/BIN_ROOT pair: the property is
-# that differing configs sharing a tree run side by side, each in its own keyed directory,
-# and for that they must share the roots. (With separate roots for the two sides no shared
-# directory could ever be contended, and an object directory shared across configs would go
-# unseen. The real tree's default config is already built and is covered by S1.) The two
-# configs must also compile to different bytes -- SIMD=0 vs SIMD=1 -- for the member-vs-own-
-# object comparison below to be able to see a cross-config delivery at all: -DPAR_PROBE alone
-# changes no object, and hpf.o is identical under SIMD=0 and SIMD=1, so comparing it proves
-# nothing.
+# Both configs build concurrently under ONE scratch OBJ_ROOT/BIN_ROOT pair: differing configs sharing a
+# tree must run side by side, each in its own keyed directory (separate roots could never contend, and
+# a shared object directory would go unseen). The configs must also compile to different bytes --
+# SIMD=0 vs SIMD=1 -- for the member-vs-own-object comparison to see a cross-config delivery:
+# -DPAR_PROBE alone changes no object, and hpf.o is identical under both.
 S3_OBJ_ROOT="$SCRATCH_ROOT/s3/obj"
 S3_BIN_ROOT="$SCRATCH_ROOT/s3/bin"
 S3_LOG_A="$SCRATCH_ROOT/s3/log_a"
@@ -623,13 +513,9 @@ make -s BACKEND=ne10 lib >/dev/null
 sha_before="$(file_sha "$ne10_lib")"
 mtime_before="$(mtime "$ne10_lib")"
 
-# test_ne10_force_c's own internal NEON+forced-C sub-makes
-# are throwaway diagnostic builds, never one of the real tree's normal
-# configs -- run the WHOLE invocation under a scratch OBJ_ROOT/BIN_ROOT (both
-# of its internal sub-makes inherit these, being ordinary command-line
-# variable overrides forwarded automatically to $(MAKE) recursive calls), so
-# it can never touch the real ne10-<sig>/ directory at all, regardless of
-# what it does internally.
+# test_ne10_force_c builds its NEON and forced-C variants with internal sub-makes, so the whole
+# invocation runs under a scratch OBJ_ROOT/BIN_ROOT (forwarded to the sub-makes as ordinary
+# command-line variables) and never touches the real ne10-<sig>/ directory.
 mkscratch s4
 S4_OBJ_ROOT="$SCRATCH_ROOT/s4/obj"
 S4_BIN_ROOT="$SCRATCH_ROOT/s4/bin"
@@ -681,67 +567,38 @@ s4_c_n="$( { nm "$s4_bin_c" 2>/dev/null || echo NM_FAILED; } | grep -c 'ne10_fft
 echo "############################################################"
 echo "# S5: consumer correctness (drives AEC; regression: scratch clones)"
 echo "############################################################"
-# this scenario used to build in the REAL AEC repo and
-# mtime-touch REAL tracked common sources (hpf.c, fast_math.h,
-# wav_io.h, NE10_dsp.h). It now runs against a disposable clone of EACH
-# repo: an common clone (the producer whose sources get the mtime
-# bumps) and a clone of the whole AEC repo (builds run in <clone>/c_impl).
-# The clones' own default-rooted obj/ and bin/ are the scratch space.
+# S5 runs against disposable clones of both repos: a clone of audiolib (the producer, whose sources get
+# mtime bumps) and a clone of the whole AEC repo (builds run in <clone>/c_impl). The clones'
+# default-rooted obj/ and bin/ are the scratch space.
 #
-# CRITICAL invocation rule: EVERY make call into the AEC clone passes
-# COMMON_DIR="$S5_AC_CLONE" explicitly (alongside the COMMON_LIB= this
-# scenario already threads through) -- AEC's `$(COMMON_LIB): FORCE` rule
-# re-invokes `$(MAKE) -C $(COMMON_DIR) ... lib` using that invocation's own
-# COMMON_DIR, and if it were left to its wildcard default it would fall
-# back to the REAL common (reintroducing exactly the real-tree writes this
-# regression change removes). A command-line COMMON_DIR= does propagate to
-# that recursive sub-make (command-line-origin variables travel via
-# MAKEFLAGS), but it is passed explicitly on every call here anyway -- an
-# invocation this correctness-critical should not lean on propagation
-# subtleties.
-#
-# Regression note (found while re-verifying this scenario against the
-# audiolib/common nesting): this scenario's make invocations used to pass
-# the PRE-rename variable names AC_LIB=/AC_DIR= (from when audio_common was
-# AEC's consumer-facing variable name). Those names no longer exist in
-# AEC's Makefile (renamed to COMMON_LIB/COMMON_DIR). A stale AC_LIB=/AC_DIR=
-# on the make command line is not an error -- GNU Make accepts unknown
-# command-line variables silently -- so `make all` silently fell back to
-# COMMON_DIR's own wildcard default (which happened to still resolve
-# correctly here, via the "audiolib" sibling-symlink trick a few lines
-# below, itself only built for the C-preprocessor wav_io.h lookup) while a
-# later `make print-obj-dir COMMON_LIB=... COMMON_DIR=...`-shaped call
-# (not a two-phase-dispatch target, so it does NOT auto-resolve COMMON_LIB
-# the way `all` does) computed a DIFFERENT CFG_SIG from an empty COMMON_LIB
-# -- the two calls' obj dir keys silently diverged, and the header-
-# dependency probe below could never find its target object. All 13 call
-# sites in this scenario now pass COMMON_LIB=/COMMON_DIR=.
+# Every make call into the AEC clone passes COMMON_DIR="$S5_AC_CLONE" explicitly alongside COMMON_LIB=:
+# AEC's `$(COMMON_LIB): FORCE` rule re-invokes `$(MAKE) -C $(COMMON_DIR) ... lib`, and left to its
+# wildcard default that would fall back to the real common. A command-line COMMON_DIR= does propagate
+# to that sub-make, but an invocation this correctness-critical should not lean on propagation.
+# COMMON_LIB= is passed on every call too: a non-dispatch target such as print-obj-dir does not
+# auto-resolve it the way `all` does, and an empty COMMON_LIB computes a different CFG_SIG, so the obj
+# dir keys of two calls would diverge.
 mkscratch s5
-# Two-step clone for common (see adopt_worktree_clone's doc comment):
-# audiolib is cloned whole into S5_AUDIOLIB_ROOT and S5_AC_CLONE is pointed
-# at its common/ subdir. Named "audiolib_clone", distinct from the
-# "audiolib" sibling-directory symlink trick a few lines below (which is a
-# bare mkdir+symlink, not a clone), so the two paths never collide.
+# Two-step clone (see adopt_worktree_clone): audiolib is cloned whole into S5_AUDIOLIB_ROOT and
+# S5_AC_CLONE points at its common/ subdir. The name "audiolib_clone" is distinct from the "audiolib"
+# sibling-directory symlink below.
 S5_AUDIOLIB_ROOT="$SCRATCH_ROOT/s5/audiolib_clone"
 S5_AEC_CLONE="$SCRATCH_ROOT/s5/aec_clone"
 adopt_worktree_clone "$AUDIOLIB_REPO_DIR" "$S5_AUDIOLIB_ROOT"
 S5_AC_CLONE="$S5_AUDIOLIB_ROOT/common"
 adopt_worktree_clone "$AEC_REPO_DIR" "$S5_AEC_CLONE"
 
-# AEC's own c_impl/example/wav_io.h shim locates the canonical
-# audiolib/common/include/wav_io.h via a HARDCODED relative __has_include
-# path ("../../../audiolib/common/include/wav_io.h" from c_impl/example/,
-# i.e. it expects a sibling directory named "audiolib" with "common"
-# inside it -- never through any -I path this scenario could forward).
-# The AEC clone's sibling here is $SCRATCH_ROOT/s5/, so an "audiolib" dir
-# with a "common" symlink inside it, pointing at the common clone,
-# satisfies that lookup without editing any tracked source.
+# AEC's c_impl/example/wav_io.h shim finds the canonical audiolib/common/include/wav_io.h through a
+# hardcoded relative __has_include path ("../../../audiolib/common/include/wav_io.h" from
+# c_impl/example/), i.e. a sibling directory named "audiolib" with "common" inside it, never through an
+# -I path. The AEC clone's sibling is $SCRATCH_ROOT/s5/, so an "audiolib" dir holding a "common"
+# symlink to the common clone satisfies the lookup without editing a tracked source.
 mkdir -p "$SCRATCH_ROOT/s5/audiolib"
 ln -s "$S5_AC_CLONE" "$SCRATCH_ROOT/s5/audiolib/common"
 cd "$S5_AEC_CLONE/c_impl"
 
-# AEC's `all` auto-builds the common clone's lib via the $(AC_LIB):
-# FORCE rule -- no manual pre-build of the AC clone is needed.
+# AEC's `all` auto-builds the common clone's lib via the $(COMMON_LIB): FORCE rule -- no manual
+# pre-build of the common clone is needed.
 ac_a="$(make -s -C "$S5_AC_CLONE" print-lib-path)"
 make -s all COMMON_LIB="$ac_a" COMMON_DIR="$S5_AC_CLONE" >/dev/null
 bindir_a="$(make -s print-bin-dir COMMON_LIB="$ac_a" COMMON_DIR="$S5_AC_CLONE")"
@@ -749,90 +606,55 @@ aecwav="$bindir_a/aec_wav"
 [ -f "$aecwav" ] && pass "S5: aec_wav built" || fail "S5: aec_wav missing after initial build"
 mtime_1="$(mtime "$aecwav")"
 
-# Backdate aec_wav (regression review, found while validating THIS script;
-# regression: aec_wav is now the AEC CLONE's own build artifact, so this
-# backdate no longer touches anything real at all): GNU Make
-# 3.81's own prerequisite-newer-than-target check truncates to whole
-# seconds, so aec_wav's relink decision (against $(AC_LIB)'s freshly
-# rebuilt, real "now" mtime) can silently NOT fire if aec_wav's own existing
-# mtime happens to truncate to that SAME integer second -- reproduced
-# empirically: a real, later archive rebuild whose timestamp nonetheless
-# landed in the same second as aec_wav's last link, so make itself declined
-# to relink. A safe backdate (5 minutes), called ONLY right before each of
-# the three relink-triggering builds further below (never before the no-op
-# check just below, which must see aec_wav's NATURAL, untouched mtime to
-# mean anything), removes the collision with certainty -- the same way
-# `touch -r/-A 01` removes it for a source-vs-object comparison one line
-# later in each case, just applied to the TARGET side of a target-vs-
-# prerequisite comparison this script cannot touch the prerequisite's own
-# real timestamp for (that prerequisite is a real rebuild's output, not our
-# own touch).
+# Backdate aec_wav (a clone artifact, freely mutable): GNU Make 3.81 compares prerequisite and target
+# mtimes truncated to whole seconds, so aec_wav's relink can silently not fire when its mtime falls in
+# the same integer second as the freshly rebuilt archive. A 5-minute backdate, applied only right
+# before each of the three relink-triggering builds (never before the no-op check, which must see
+# aec_wav's natural mtime), removes the collision. It goes on the target side of the comparison
+# because the prerequisite's timestamp is a real rebuild's output this script cannot touch.
 backdate_aecwav() { touch -A -0500 "$aecwav"; }
 
-# no-op rebuild -> NOT relinked. No sleep needed: nothing is
-# touched here, so aec_wav's mtime cannot change regardless of how much
-# wall-clock time elapses between the two `make` calls.
+# no-op rebuild -> NOT relinked. No sleep needed: nothing is touched, so aec_wav's mtime cannot change
+# however long the two `make` calls are apart.
 make -s all COMMON_LIB="$ac_a" COMMON_DIR="$S5_AC_CLONE" >/dev/null
 mtime_2="$(mtime "$aecwav")"
 [ "$mtime_1" = "$mtime_2" ] && pass "S5: aec_wav NOT relinked on a no-op rebuild" \
   || fail "S5: aec_wav relinked with nothing changed"
 
-# touch the common CLONE's src/hpf.c (mtime-only, content-neutral) ->
-# hpf.o recompiles AND aec_wav relinks. common's own CFG_SIG (a hash of
-# its COMPILER INVOCATION, not file content) does not change from a source
-# edit, so its archive path stays the same -- only its mtime should advance.
+# touch the common CLONE's src/hpf.c (mtime-only, content-neutral) -> hpf.o recompiles AND aec_wav
+# relinks. common's CFG_SIG hashes its compiler invocation, not file content, so the archive path
+# stays the same and only its mtime advances.
 #
-# regression review: deterministic strictly-newer bump replaces `sleep 1; touch
-# hpf.c`. Resolve hpf.o's path FIRST (it already exists from earlier
-# scenarios), then set hpf.c's mtime to hpf_o's CURRENT mtime + 1s via BSD
-# `touch -r/-A` -- this guarantees make ITSELF sees the source as newer than
-# the object (make's own dependency check truncates to whole seconds on this
-# GNU Make 3.81, so the +1s bump is load-bearing, not just extra caution).
+# Deterministic strictly-newer bump instead of `sleep 1; touch`: resolve hpf.o's path first (it exists
+# from earlier scenarios), then set hpf.c's mtime to hpf_o's current mtime + 1s via BSD `touch -r/-A`.
+# The +1s is load-bearing: make's dependency check truncates to whole seconds on GNU Make 3.81.
 #
-# Verifying "did it actually recompile" afterward is a SEPARATE problem from
-# "did make decide to": found empirically while validating this rewrite that
-# comparing two mtime snapshots OF THE SAME output file, taken moments apart
-# by this SCRIPT itself (not by make), can land in the very same whole
-# second when the whole edit-recompile-relink chain runs fast and back-to-
-# back (no human/sleep delay between steps) -- a real false-negative, not a
-# hypothetical one (reproduced: common's own archive rebuilt with a
-# real, later timestamp that nonetheless truncated to the SAME integer
-# second as its prior build, so make itself also declined to relink aec_wav
-# next). So "recompiled?" is verified from make's own build LOG instead of
-# an mtime diff: this Makefile still echoes "common [$(BACKEND)] ->
-# $@" whenever the archive rule actually runs (even under -s, since a plain
-# `@echo` line's own output is never silenced -- only the recipe-echo
-# itself is), so its presence/absence in a captured log is a timing-proof
-# signal for "did the archive (and therefore hpf.o) actually rebuild".
+# "Did it recompile" is verified from make's build LOG, not an mtime diff: two mtime snapshots of the
+# same output taken by this script can land in the same whole second when the edit-recompile-relink
+# chain runs back to back. This Makefile echoes "common [$(BACKEND)] -> $@" whenever the archive rule
+# runs (a plain `@echo` is not silenced by -s), so its presence in a captured log is a timing-proof
+# signal that the archive (and hence hpf.o) rebuilt.
 ac_objdir="$(make -s -C "$S5_AC_CLONE" print-obj-dir)"
 hpf_o="$ac_objdir/hpf.o"
 # Age every file of both clones by the same 10 minutes (relative mtime order preserved, .git
-# untouched). From here on the only files newer than aec_wav are the ones each step below
-# makes newer, so "aec_wav relinked" can only be caused by that step's change. (Without
-# this, backdate_aecwav alone makes aec_wav older than ALL its freshly built prerequisites
-# and the relink checks below pass whether or not anything changed.)
+# untouched). From here on the only files newer than aec_wav are the ones each step below makes newer,
+# so "aec_wav relinked" can only be caused by that step's change. (Without this, backdate_aecwav alone
+# makes aec_wav older than all its freshly built prerequisites and the relink checks would pass
+# whether or not anything changed.)
 find "$S5_AC_CLONE" "$S5_AEC_CLONE" -name .git -prune -o -type f -exec touch -A -1000 {} +
-# Backdate the CLONE's archive before forcing the recompile (regression,
-# found while validating the clone conversion -- reproduced empirically):
-# the +1s hpf.c bump reliably makes make recompile hpf.o, but the fresh
-# hpf.o's wall-clock "now" mtime can land in the very SAME whole second as
-# the archive's own prior build -- in the clone everything above ran
-# back-to-back within one second, unlike the regression real-tree version
-# where the archive came from S1/S2 many seconds earlier -- and GNU Make
-# 3.81's whole-second dependency check then skips the re-archive entirely
-# (hpf.o rebuilt, archive stale, no echo line). Same fix as S11c's sandbox:
-# backdate the archive (a clone artifact, freely mutable) by a safe margin
-# so it is unambiguously older than whatever second the recompile lands on.
+# Backdate the CLONE's archive before forcing the recompile: the +1s hpf.c bump reliably makes make
+# recompile hpf.o, but the fresh hpf.o's mtime can land in the same whole second as the archive's
+# prior build (everything in the clone ran back to back), and GNU Make 3.81's whole-second check then
+# skips the re-archive (hpf.o rebuilt, archive stale, no echo line). Backdating the archive (a clone
+# artifact) by a safe margin makes it unambiguously older.
 touch -A -0500 "$ac_a"
 hpf_o_mtime_before="$(mtime "$hpf_o")"
 touch -r "$hpf_o" -A 01 "$S5_AC_CLONE/src/hpf.c"
 S5_LOG_HPF="$SCRATCH_ROOT/s5/log_hpf"
 make -s -C "$S5_AC_CLONE" lib >"$S5_LOG_HPF" 2>&1
-# Two conditions: hpf.o's own (fractional-second) mtime advanced = the
-# recompile genuinely happened (the backdate above would re-archive even
-# without it, so the echo line alone would no longer prove this), AND the
-# archive-rebuild echo line = the rebuilt object propagated into the
-# delivered archive.
+# Two conditions: hpf.o's own (fractional-second) mtime advanced = the recompile happened (the backdate
+# above would re-archive even without it, so the echo line alone would not prove this), AND the
+# archive-rebuild echo line = the rebuilt object reached the delivered archive.
 if [ "$(mtime "$hpf_o")" != "$hpf_o_mtime_before" ] && grep -q "^common \[ne10\] ->" "$S5_LOG_HPF"; then
   pass "S5: hpf.c edit recompiled common's hpf.o (object mtime advanced) and the archive rebuilt"
 else
@@ -848,14 +670,12 @@ make -s all COMMON_LIB="$ac_a" COMMON_DIR="$S5_AC_CLONE" >"$S5_LOG_RELINK" 2>&1
 grep -q "^aec_wav \[ne10\] ->" "$S5_LOG_RELINK" && pass "S5: touching the common clone's src/hpf.c relinked aec_wav" \
   || fail "S5: aec_wav NOT relinked after common's hpf.o changed (no relink line in the log)"
 
-# Header-only test 1: touch fast_math.h -> AEC objects that include it
-# (the AEC post-filter and suppression_gain.c) recompile, then aec_wav relinks. Same
-# deterministic source bump; same log-based relink verification (AEC has no
-# per-object echo, but a relink only happens if SOME object actually
-# changed, and this is the only header touched in this step).
+# Header-only test 1: touch fast_math.h -> AEC objects that include it recompile, then aec_wav relinks.
+# Same deterministic source bump and log-based relink verification (AEC has no per-object echo, but a
+# relink only happens if some object changed, and this is the only header touched in this step).
 aec_objdir="$(make -s print-obj-dir COMMON_LIB="$ac_a" COMMON_DIR="$S5_AC_CLONE")"
-# An AEC object that includes fast_math.h, found from the .d files rather than by name (the
-# AEC object that consumes it has been renamed before; a hardcoded name aborts the suite).
+# An AEC object that includes fast_math.h, found from the .d files rather than by name (object names
+# change; a hardcoded name would abort the suite).
 s5_fm_o="$({ grep -l '/fast_math\.h' "$aec_objdir"/*.d 2>/dev/null || true; } | sed -n '1s/\.d$/.o/p')"
 S5_LOG_FASTMATH="$SCRATCH_ROOT/s5/log_fastmath"
 if [ -f "$s5_fm_o" ]; then
@@ -888,11 +708,10 @@ else
   fail "S5: no AEC object in $aec_objdir lists wav_io.h in its .d file -- the header-dependency probe cannot run"
 fi
 
-# NE10 vendored header touch -> NE10 objects recompile (common level).
-# NE10_dsp.h (not the top-level NE10.h umbrella -- verified via NE10_fft.o's own -MD -MP .d
-# fragment that NE10_fft.c pulls in NE10_dsp.h/NE10_types.h/NE10_macros.h transitively but
-# never NE10.h itself; only this repo's own fft_wrapper_ne10.c includes the top-level NE10.h
-# directly). Verified from the same "common [ne10] -> ..." log line.
+# NE10 vendored header touch -> NE10 objects recompile (common level). NE10_dsp.h, not the top-level
+# NE10.h umbrella: NE10_fft.o's -MD -MP .d fragment shows NE10_fft.c pulls in
+# NE10_dsp.h/NE10_types.h/NE10_macros.h but never NE10.h, which only fft_wrapper_ne10.c includes
+# directly. Verified from the same "common [ne10] -> ..." log line.
 ac_ne10_objdir="$(make -s -C "$S5_AC_CLONE" print-obj-dir)"
 S5_LOG_NE10H="$SCRATCH_ROOT/s5/log_ne10h"
 if [ -f "$ac_ne10_objdir/NE10_fft.o" ]; then
@@ -925,7 +744,7 @@ make -s SIMD=1 all COMMON_LIB="$ac_a2" COMMON_DIR="$S5_AC_CLONE" >/dev/null
 bd_a2="$(make -s SIMD=1 print-bin-dir COMMON_LIB="$ac_a2" COMMON_DIR="$S5_AC_CLONE")"
 
 # grep -c (not -q): under pipefail, `nm | grep -q` can fail a match when grep exits before nm has
-# finished writing (SIGPIPE on nm, measured at about 1 in 300 on this host); grep -c reads to EOF.
+# finished writing (SIGPIPE on nm); grep -c reads to EOF.
 # nm's own failure (unreadable file, not an object) yields -1, which fails both the "> 0" and
 # the "== 0" expectation; `nm | grep -c` alone would print 0 and let the SIMD=0 check pass.
 s5_neon_refs() {
@@ -946,16 +765,10 @@ echo "# S7p: producer-publish (v4 layout; throwaway DIST_ROOT)"
 echo "############################################################"
 cd "$AC_DIR"
 mkscratch s7p
-# regression: ALLOW_DIRTY_PUBLISH=1 on every publish call in this script -- a
-# dev tree is legitimately dirty (these very review changes are
-# uncommitted), and the policy itself is exercised on purpose in S17.
-# regression: ALLOW_UNTRACKED_PUBLISH=1 rides along on every one of those same
-# calls (EXCEPT S17's own policy sub-cases, which deliberately test each
-# knob in isolation) -- the untracked dimension is a NEW default refusal,
-# and a dev tree can legitimately carry untracked files that have nothing
-# to do with what each of these scenarios is actually testing. DIST_ROOT
-# stays a throwaway scratch path: the real dist/ is
-# never read, written, or removed.
+# ALLOW_DIRTY_PUBLISH=1 and ALLOW_UNTRACKED_PUBLISH=1 ride on every publish call in this script (except
+# S17's policy sub-cases, which test each knob in isolation): a dev tree is legitimately dirty and may
+# carry untracked files unrelated to what each scenario tests. DIST_ROOT stays a throwaway scratch
+# path: the real dist/ is never read, written, or removed.
 S7P_DIST="$SCRATCH_ROOT/s7p/dist"
 
 S7P_LOG_FIRST="$SCRATCH_ROOT/s7p/log_first"
@@ -1012,15 +825,11 @@ second_release_id="$(readlink "$S7P_DIST/ne10/current" || true)"
   pass "S7p: the SIMD=0 publish is a separate release and became current ($first_release_id -> $second_release_id)" \
   || fail "S7p: the SIMD=0 publish did not produce a distinct current release ($first_release_id -> $second_release_id)"
 
-# Concurrent same-config publish: v4's lock-FIRST driver means a genuine
-# race resolves to exactly one winner in practice (see S14 for a version of
-# this built around a fresh, slow-to-build config that makes "exactly one
-# winner" non-flaky); here, since this config is already built, a wide
-# scheduling gap between the two backgrounded callers could plausibly let
-# both complete in turn -- so this check stays deliberately lenient (as it
-# always has been): either one caller fails fast with "already held", or
-# both complete; either way `current` must end up pointing at a COMPLETE,
-# self-consistent release.
+# Concurrent same-config publish: the lock-first driver means a real race resolves to exactly one
+# winner in practice (S14 uses a fresh, slow-to-build config so "exactly one winner" is not flaky).
+# Here the config is already built, so a wide scheduling gap could let both callers complete in turn;
+# the check stays lenient: either one caller fails fast with "already held", or both complete. Either
+# way `current` must end up pointing at a complete, self-consistent release.
 S7P_LOG_A="$SCRATCH_ROOT/s7p/log_a"
 S7P_LOG_B="$SCRATCH_ROOT/s7p/log_b"
 ( make -s publish DIST_ROOT="$S7P_DIST" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 >"$S7P_LOG_A" 2>&1 ) & cp1=$!
@@ -1060,10 +869,8 @@ mkscratch s8
 S8_OBJ_ROOT="$SCRATCH_ROOT/s8/obj"
 S8_BIN_ROOT="$SCRATCH_ROOT/s8/bin"
 
-# Fresh scratch build of the REAL worktree's normal config -- exercises
-# the CURRENT (possibly-uncommitted) Makefile without ever touching the real
-# obj/ tree (the regression script mutated the REAL obj dir
-# here -- the actual finding this rewrite fixes).
+# Fresh scratch build of the real worktree's normal config: exercises the current (possibly
+# uncommitted) Makefile without touching the real obj/ tree.
 make -s BACKEND=ne10 OBJ_ROOT="$S8_OBJ_ROOT" BIN_ROOT="$S8_BIN_ROOT" lib >/dev/null
 s8_objdir="$(make -s BACKEND=ne10 OBJ_ROOT="$S8_OBJ_ROOT" BIN_ROOT="$S8_BIN_ROOT" print-obj-dir)"
 s8_lib="$(make -s BACKEND=ne10 OBJ_ROOT="$S8_OBJ_ROOT" BIN_ROOT="$S8_BIN_ROOT" print-lib-path)"
@@ -1090,29 +897,16 @@ real_manifest_mtime_after="$(mtime "$real_manifest")"
   pass "S8: the REAL keyed obj dir's config.manifest sha+mtime unchanged (tamper was scratch-only)" \
   || fail "S8: the REAL keyed obj dir's config.manifest CHANGED (scratch isolation failed)"
 
-# Knob byte-neutrality: OBJ_ROOT/BIN_ROOT is deliberately NOT in CFG_SIG (a
-# placement knob, not a build-content knob -- see the Makefile). We do NOT
-# compare whole-archive bytes: ar embeds each member's mtime in the archive
-# header, so two freshly-built archives (real vs scratch, built at different
-# wall-clock times) differ byte-for-byte even though every member is
-# content-identical.
-#
-# the old check globbed the REAL obj dir (`for o in
-# "$real_objdir"/*.o`) and demanded a scratch counterpart for every
-# object found -- but the real obj dir can legitimately carry EXTRA test
-# objects (test_wav_io.o, test_wav_writer_ubsan.o, ... from a prior `make
-# test_wav`/`make test-wav-ubsan` in that same keyed config) that the
-# scratch `make lib` here never builds, so an otherwise-clean tip that had
-# once run the WAV tests false-FAILed. Compared at the ARCHIVE-MEMBER level
-# instead: the archives are what `lib` DELIVERS, and their member sets are
-# identical by construction of the (a) name-list check below. Per-member
-# content is compared by iterating the real archive's own `ar -t` list with
-# `while IFS= read -r m` -- NEVER `for m in $(ar -t ...)`: macOS BSD ar has
-# a pseudo-member literally named `__.SYMDEF SORTED` whose embedded space
-# would word-split into two bogus tokens under a bare `for`. `__.SYMDEF*`
-# members are skipped (the symbol-table pseudo-member's presence is covered
-# by the name-list check; GNU ar doesn't even list it, so no fixed member
-# count is assumed).
+# Knob byte-neutrality: OBJ_ROOT/BIN_ROOT is deliberately not in CFG_SIG (a placement knob, not a
+# build-content knob). Whole-archive bytes are not compared: ar embeds each member's mtime in the
+# header, so archives built at different times differ byte for byte though every member is identical.
+# Compared at the archive-member level: the real obj dir can carry extra test objects (test_wav_io.o,
+# ... from a prior `make test_wav` in that keyed config) that the scratch `make lib` never builds, so
+# globbing the real obj dir would false-FAIL. Per-member content is compared by iterating the real
+# archive's own `ar -t` list with `while IFS= read -r m`, never `for m in $(ar -t ...)`: macOS BSD ar
+# has a pseudo-member literally named `__.SYMDEF SORTED` whose space would word-split. `__.SYMDEF*`
+# members are skipped (the name-list check (a) covers the symbol table; GNU ar does not list it, so no
+# fixed member count is assumed).
 neutral_ok=1
 while IFS= read -r m; do
   [ -n "$m" ] || continue
@@ -1141,12 +935,10 @@ S9_BIN_ROOT="$SCRATCH_ROOT/s9/bin"
 # effect of EXTRA_CFLAGS, not an incidental root-path difference.
 baseline_objdir="$(make -s OBJ_ROOT="$S9_OBJ_ROOT" BIN_ROOT="$S9_BIN_ROOT" print-obj-dir)"
 
-# CFLAGS=/CXXFLAGS=/LDFLAGS=/FP_POLICY= set on the command line must be
-# rejected at PARSE time (before any obj/bin dir is even created) with a
-# message mentioning "cannot be overridden" -- these variables are internal
-# (this Makefile's own +=/:= appends to them would be silently defeated by a
-# command-line origin, per GNU Make semantics); EXTRA_CFLAGS/EXTRA_LDFLAGS are
-# the supported hook instead.
+# CFLAGS=/CXXFLAGS=/LDFLAGS=/FP_POLICY= set on the command line must be rejected at parse time (before
+# any obj/bin dir is created) with a message mentioning "cannot be overridden": these variables are
+# internal, and the Makefile's own +=/:= appends would be silently defeated by a command-line origin.
+# EXTRA_CFLAGS/EXTRA_LDFLAGS are the supported hook.
 for pair in "CFLAGS=-O3" "CXXFLAGS=-O0" "LDFLAGS=-lfoo" "FP_POLICY=-ffp-contract=fast"; do
   ov_var="${pair%%=*}"
   ov_val="${pair#*=}"
@@ -1185,9 +977,8 @@ real_lib="$(make -s BACKEND=ne10 print-lib-path)"
 real_lib_sha_before="$(file_sha "$real_lib")"
 real_lib_mtime_before="$(mtime "$real_lib")"
 
-# Inject a foreign object directly into the SCRATCH delivered archive
-# (simulating what an old `ar rc` onto an EXISTING archive would leave
-# behind forever for a source file that's since been removed from SRCS).
+# Inject a foreign object directly into the SCRATCH delivered archive (what an `ar rc` onto an
+# existing archive would leave behind forever for a source file since removed from SRCS).
 cat > "$SCRATCH_ROOT/s10/s10_foreign.c" <<'EOF'
 int s10_foreign_symbol(void) { return 42; }
 EOF
@@ -1196,18 +987,12 @@ ar r "$s_lib" "$SCRATCH_ROOT/s10/s10_foreign.o"
 ar -t "$s_lib" | grep -q '^s10_foreign\.o$' && pass "S10: foreign object successfully injected into the SCRATCH archive (pre-condition)" \
   || fail "S10: failed to inject foreign object into scratch archive (pre-condition broken -- cannot test freshness)"
 
-# A normal rebuild (source touched, config unchanged) must produce a FRESH
-# archive (rm -f $@.tmp; ar rc $@.tmp $(BE_OBJS); ranlib; mv -f) -- never
-# `ar rc` onto the existing archive -- so the foreign member must be GONE
-# afterward, while hpf.o (a real, current source) must still be present.
-#
-# regression review: deterministic re-archive trigger replaces `sleep 1; touch
-# src/hpf.c`. Backdate the SCRATCH archive itself to a fixed date well in
-# the past -- older than every one of its member .o files (all built just
-# now, real "current" mtimes) -- so make's own dependency check ($(LIB):
-# $(BE_OBJS)) sees the archive as stale and re-archives from scratch on the
-# very next build. Touches NOTHING real: not a member .o, not any tracked
-# source.
+# A normal rebuild (source touched, config unchanged) must produce a FRESH archive (rm -f $@.tmp;
+# ar rc $@.tmp $(BE_OBJS); ranlib; mv -f), never `ar rc` onto the existing one, so the foreign member
+# must be gone afterward while hpf.o (a real, current source) is still present. The re-archive is
+# triggered deterministically by backdating the SCRATCH archive to a fixed date older than all its
+# member .o files, so make's dependency check ($(LIB): $(BE_OBJS)) sees it stale; nothing real is
+# touched.
 touch -t 202001010000 "$s_lib"
 make -s BACKEND=ne10 OBJ_ROOT="$S10_OBJ_ROOT" BIN_ROOT="$S10_BIN_ROOT" lib >/dev/null
 
@@ -1245,10 +1030,9 @@ echo "# S11: publish immutability / content-addressing"
 echo "############################################################"
 cd "$AC_DIR"
 
-# Captured BEFORE any of S11's sub-parts run, so S11c's "the REAL repo's
-# src/hpf.c is untouched" assertion works even if the user already had local
-# edits to it at scenario start -- never assume a clean tree, never
-# `git checkout --` to force one.
+# Captured before any of S11's sub-parts run, so S11c's "the real repo's src/hpf.c is untouched"
+# assertion holds even if the tree already had local edits to it (never assume a clean tree, never
+# `git checkout --`).
 HPF_SHA_BEFORE_S11="$(file_sha "$AC_DIR/src/hpf.c")"
 
 # dir mtime + every immediate FILE's mtime. `find -maxdepth 1 -type f`
@@ -1300,13 +1084,10 @@ echo "$commit1" | grep -Eq '^[0-9a-f]{40}$' && pass "S11a: git_commit= is a full
 
 snap_before="$(release_snapshot "$S11A_DIST/ne10/$id1")"
 
-# regression review: no sleep. The one-event-one-file ATTEST install
-# (--excl-install + retry-with-next-<NNN>) disambiguates a same-second
-# republish via the numeric suffix instead of requiring a distinct
-# <utcstamp> -- the regression version of this scenario needed `sleep 1` here
-# so the two publishes landed in different UTC seconds; that dependency is
-# gone (S16 stress-tests the same-second case directly, forcing 20 publishes
-# into ONE literal second via ATTEST_STAMP=).
+# No sleep: the one-event-one-file ATTEST install (--excl-install + retry-with-next-<NNN>)
+# disambiguates a same-second republish via the numeric suffix, so the two publishes need not land in
+# different UTC seconds (S16 stress-tests the same-second case, forcing 20 publishes into one literal
+# second via ATTEST_STAMP=).
 S11A_LOG="$SCRATCH_ROOT/s11a/republish.log"
 make -s BACKEND=ne10 publish DIST_ROOT="$S11A_DIST" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 >"$S11A_LOG" 2>&1
 grep -q "byte-verified" "$S11A_LOG" && pass "S11a: identical-content republish reports 'byte-verified'" \
@@ -1351,29 +1132,22 @@ else
 fi
 
 echo "--- S11c: content-change publish, exercised in a SANDBOX --------------"
-# Never in $AC_DIR: a real codegen change is needed here (a comment-only edit
-# produces a byte-identical object -- and the archiver runs in deterministic
-# mode, so it doesn't even pick up a new member timestamp -- so the content-
-# addressed release id CORRECTLY stays the same, which is the immutability
-# property under test elsewhere, not a bug). To exercise "same flags,
-# different content -> new release id" without ever touching the real repo,
-# this copies the tree into a throwaway sandbox and edits THAT copy.
+# Never in $AC_DIR: a real codegen change is needed (a comment-only edit yields a byte-identical
+# object, and the archiver runs in deterministic mode, so the content-addressed release id correctly
+# stays the same). To exercise "same flags, different content -> new release id" without touching the
+# real repo, this copies the tree into a throwaway sandbox and edits that copy.
 mkscratch s11c
 SANDBOX="$SCRATCH_ROOT/s11c/ac"
 mkdir -p "$SANDBOX"
 tar -c -C "$AC_DIR" --exclude obj --exclude bin --exclude dist --exclude .git . | tar -x -C "$SANDBOX"
 S11C_DIST="$SCRATCH_ROOT/s11c/dist"
 
-# regression: the tar copy has no .git (excluded above), and "no git identity"
-# is on its way to becoming an UNCONDITIONAL publish refusal (no escape
-# hatch admits it) -- so the sandbox gets its own REAL, disposable git
-# identity: `git init` + one commit, entirely inside $SCRATCH_ROOT (same
-# rationale as adopt_worktree_clone's throwaway history -- never touches the
-# real repo's .git in any way). The content edit below then makes it
-# ordinarily tracked-dirty, which ALLOW_DIRTY_PUBLISH=1 admits;
-# ALLOW_UNTRACKED_PUBLISH=1 rides along uniformly (build byproducts under
-# the sandbox's own obj/bin are gitignored via the copied .gitignore, but
-# uniformity keeps this scenario about content-addressing, not git policy).
+# The tar copy has no .git (excluded above), and a missing git identity is an unconditional publish
+# refusal, so the sandbox gets its own disposable git identity: `git init` + one commit, entirely
+# inside $SCRATCH_ROOT. The content edit below then makes it ordinarily tracked-dirty, which
+# ALLOW_DIRTY_PUBLISH=1 admits; ALLOW_UNTRACKED_PUBLISH=1 rides along uniformly (build byproducts under
+# the sandbox's obj/bin are gitignored via the copied .gitignore), so the scenario stays about content
+# addressing, not git policy.
 git -C "$SANDBOX" init -q
 git -C "$SANDBOX" add -A
 git -C "$SANDBOX" -c user.email=scratch@example.invalid -c user.name="scratch sandbox" \
@@ -1383,26 +1157,13 @@ sid1="$(readlink "$S11C_DIST/ne10/current" || true)"
 [ -n "$sid1" ] && pass "S11c: sandbox publish #1 -- current resolves ($sid1)" \
   || fail "S11c: sandbox publish #1 -- current symlink broken or missing"
 
-# regression review: resolve the sandbox's OWN hpf.o AND archive paths before
-# the edit. Force hpf.c's mtime to hpf.o's CURRENT mtime + 1s (BSD
-# touch -r/-A) right after appending the real content change below, exactly
-# as S5 does -- needed so make recompiles hpf.o at all (GNU Make 3.81
-# truncates its prerequisite-newer-than-target check to whole seconds, and
-# an append immediately after the sandbox's first publish can otherwise land
-# in the very SAME integer second as hpf.o's existing mtime).
-#
-# That alone is NOT sufficient, though (found empirically): the SAME
-# whole-second truncation applies one level up too, between the freshly
-# recompiled hpf.o and the ARCHIVE's own prior build -- a real, later hpf.o
-# compile whose timestamp nonetheless truncates to the SAME second as the
-# archive's last build leaves make believing the archive is still up to
-# date, so it never re-runs `ar rc`, and the archive (what publish actually
-# stages) stays byte-identical even though hpf.o now contains a genuinely
-# different symbol. So the archive itself (a sandbox artifact, not one of
-# common's real obj/bin under OBJ_ROOT/BIN_ROOT -- freely mutable here,
-# same rationale as S5's aec_wav backdate) is ALSO backdated by a safe
-# margin before the edit, guaranteeing make sees it as older than whatever
-# real "now" the subsequent `ar rc` lands on.
+# Resolve the sandbox's own hpf.o AND archive paths before the edit. Force hpf.c's mtime to hpf.o's
+# current mtime + 1s (BSD touch -r/-A) right after appending the content change, as S5 does: GNU Make
+# 3.81 truncates its prerequisite-newer-than-target check to whole seconds, and an append right after
+# the sandbox's first publish can land in the same integer second as hpf.o's mtime. The same
+# truncation applies between the recompiled hpf.o and the archive's prior build (make would believe
+# the archive up to date and skip `ar rc`, so the staged archive stays byte-identical), so the archive
+# (a sandbox artifact, freely mutable) is also backdated by a safe margin before the edit.
 sandbox_lib="$(make -C "$SANDBOX" -s BACKEND=ne10 print-lib-path)"
 sandbox_hpf_o="$(make -C "$SANDBOX" -s BACKEND=ne10 print-obj-dir)/hpf.o"
 touch -A -0500 "$sandbox_lib"
@@ -1438,13 +1199,10 @@ echo "# S12: toolchain coherence guard (CC/CXX target mismatch)"
 echo "############################################################"
 cd "$AC_DIR"
 mkscratch s12
-# the three shim builds below used to build into the
-# REAL obj/bin -- and the shim's scratch path lands in CFG_SIG (CXX= is in
-# the payload, and $SCRATCH_ROOT is fresh every run), so EVERY run of this
-# suite minted a brand-new orphan keyed directory pair in the real obj/+bin/
-# (200+ had accumulated). All three now build under a scratch
-# OBJ_ROOT/BIN_ROOT instead; the guard under test doesn't care where the
-# objects land.
+# The three shim builds below use a scratch OBJ_ROOT/BIN_ROOT: the shim's scratch path lands in CFG_SIG
+# (CXX= is in the payload and $SCRATCH_ROOT is fresh every run), so building in the real obj/bin would
+# mint a new orphan keyed directory pair per run. The guard under test does not care where objects
+# land.
 S12_OBJ_ROOT="$SCRATCH_ROOT/s12/obj"
 S12_BIN_ROOT="$SCRATCH_ROOT/s12/bin"
 
@@ -1487,18 +1245,12 @@ cc -O2 -o "$SCRATCH_ROOT/s13/swapln" "$AC_DIR/tools/atomic_symlink_swap.c"
 mkdir -p "$SCRATCH_ROOT/s13/d/relA" "$SCRATCH_ROOT/s13/d/relB"
 "$SCRATCH_ROOT/s13/swapln" relA "$SCRATCH_ROOT/s13/d/current"
 
-# Background sampler: reads `current` as fast as possible. The assertion is
-# on HARD misses -- a failed readlink whose IMMEDIATE re-read ALSO fails.
-# rename(2) leaves no window in the link's existence, so a correct swapln
-# produces zero hard misses; the old rm+mv fallback had a real unlinked
-# window (and dropped its temp INTO the target dir), which is exactly what a
-# hard miss would expose. A rare SINGLE-read transient failure is a
-# measured macOS path-lookup-vs-rename race in the READER, not a gap in the
-# link (calibrated on this host: 2000-swap hammer -> 2 single-read
-# transients, 0 double-read failures, while a never-swapped control link
-# sampled at the same rate showed 0 misses of any kind -- i.e. the transient
-# tracks concurrent rename activity in the kernel's name lookup, not the
-# helper). Soft misses are reported as INFO, never a failure.
+# Background sampler: reads `current` as fast as possible. The assertion is on HARD misses: a failed
+# readlink whose immediate re-read also fails. rename(2) leaves no window in the link's existence, so
+# a correct swapln produces zero hard misses (an rm+mv fallback has an unlinked window and drops its
+# temp into the target dir, which a hard miss would expose). A rare single-read transient failure is a
+# macOS path-lookup-vs-rename race in the reader, not a gap in the link (a never-swapped control link
+# sampled at the same rate shows none); soft misses are reported as INFO, never a failure.
 S13_SAMPLER_LOG="$SCRATCH_ROOT/s13/sampler.log"
 (
   while true; do
@@ -1571,19 +1323,16 @@ echo "############################################################"
 cd "$AC_DIR"
 mkscratch s14
 S14_DIST="$SCRATCH_ROOT/s14/dist"
-# one shared scratch OBJ_ROOT/BIN_ROOT pair for BOTH
-# racers -- the lock still serialises the winner's build (this is exactly
-# what the scenario tests), and the real obj/bin never see this throwaway
-# -DS14_LOCK_PROBE config either way.
+# One shared scratch OBJ_ROOT/BIN_ROOT pair for both racers: the lock still serialises the winner's
+# build (what the scenario tests), and the real obj/bin never see this throwaway -DS14_LOCK_PROBE
+# config.
 S14_OBJ_ROOT="$SCRATCH_ROOT/s14/obj"
 S14_BIN_ROOT="$SCRATCH_ROOT/s14/bin"
 
-# A fresh, never-before-built config (BACKEND=ne10 + a probe define unique to
-# this scenario) -- the winner's critical section (a real compile+link+stage,
-# not a no-op) takes long enough that two callers launched back-to-back
-# genuinely contend for the lock, making "exactly one winner" a reliable
-# assertion rather than a scheduling-dependent guess (contrast with S7p's
-# already-built-config concurrency check, which stays deliberately lenient).
+# A fresh, never-built config (BACKEND=ne10 plus a probe define unique to this scenario): the winner's
+# critical section (a real compile+link+stage) is long enough that two callers launched back to back
+# contend for the lock, making "exactly one winner" a reliable assertion (contrast S7p's
+# already-built-config check, which stays lenient).
 S14_LOG_A="$SCRATCH_ROOT/s14/log_a"; S14_LOG_B="$SCRATCH_ROOT/s14/log_b"
 S14_RC_A="$SCRATCH_ROOT/s14/rc_a"; S14_RC_B="$SCRATCH_ROOT/s14/rc_b"
 # `rc=0; cmd || rc=$?; ...` (not `cmd; echo $? >file`): under `set -e`, a
@@ -1635,14 +1384,11 @@ echo "# S15: make -n/-q/-t publish zero-write"
 echo "############################################################"
 cd "$AC_DIR"
 mkscratch s15
-# on top of the "no paths created" checks, each of
-# -n/-q/-t must also leave an ALREADY-EXISTING delivered artifact byte- and
-# mtime-untouched -- `-t` (touch mode) is exactly the flag whose standard
-# semantics WOULD bump artifact mtimes if the publish driver recursed under
-# it (the regression shape did; regression's driver makes -t a one-line no-op note
-# + exit 0 without recursion, asserted below). The reference artifact is the
-# REAL, default-rooted $be archive built by S1 -- the strongest thing this
-# suite owns to protect. All three modes are ZERO-WRITE.
+# On top of the "no paths created" checks, each of -n/-q/-t must leave an already-existing delivered
+# artifact byte- and mtime-untouched: `-t` (touch mode) would bump artifact mtimes if the publish
+# driver recursed under it, so the driver makes -t a one-line no-op note plus exit 0 without recursion
+# (asserted below). The reference artifact is the real, default-rooted $be archive built by S1. All
+# three modes are zero-write.
 for cfg in SIMD=1 SIMD=0; do
   be="${cfg/=/}"   # SIMD1 / SIMD0: label for scratch paths and messages
   S15_DIST="$SCRATCH_ROOT/s15/${be}_nx"
@@ -1681,8 +1427,8 @@ for cfg in SIMD=1 SIMD=0; do
     pass "S15[$be]: make -q publish is zero-write against the existing normal $be archive (size+mtime+sha unchanged)" \
     || fail "S15[$be]: make -q publish CHANGED the normal $be archive"
 
-  # regression: -t must exit 0 AND print the explicit no-op note (the driver
-  # no longer recurses under -t at all -- see the Makefile's dry-run guard).
+  # -t must exit 0 AND print the explicit no-op note (the driver does not recurse under -t; see the
+  # Makefile's dry-run guard).
   rc=0
   make -t $cfg DIST_ROOT="$S15_DIST" OBJ_ROOT="$S15_OBJ" BIN_ROOT="$S15_BIN" publish >"$S15_LOG.t" 2>&1 || rc=$?
   [ "$rc" -eq 0 ] && pass "S15[$be]: make -t publish exits rc=0" || fail "S15[$be]: make -t publish exits rc=$rc (expected 0)"
@@ -1699,13 +1445,11 @@ for cfg in SIMD=1 SIMD=0; do
 done
 
 echo "--- S15b: COMBINED dry-run flags stay zero-write against a STALE artifact --"
-# Round-7 follow-up: a combined `make -nt publish` used to take the -n branch
-# and recurse; the child make then saw BOTH flags and GNU make applies REAL
-# touch semantics down the _publish_impl prerequisite chain (reproduced) --
-# the driver now checks t FIRST. Exercised against a scratch-root build whose
-# archive is deliberately BACKDATED below its own objects: exactly the state
-# a leaked -t would "fix" by touching. Scratch-side only -- the real tree's
-# artifacts are covered by the S1 snapshot guard and must never be backdated.
+# Combined `make -nt publish`: the driver checks t first, because a child make that saw both flags
+# applies real touch semantics down the _publish_impl prerequisite chain. Exercised against a
+# scratch-root build whose archive is deliberately backdated below its own objects: exactly the state
+# a leaked -t would "fix" by touching. Scratch-side only; the real tree's artifacts are covered by the
+# S1 snapshot guard and must never be backdated.
 mkscratch s15b
 S15B_OBJ="$SCRATCH_ROOT/s15b/obj"; S15B_BIN="$SCRATCH_ROOT/s15b/bin"; S15B_DIST="$SCRATCH_ROOT/s15b/nx"
 make -s BACKEND=ne10 OBJ_ROOT="$S15B_OBJ" BIN_ROOT="$S15B_BIN" lib >/dev/null
@@ -1789,25 +1533,12 @@ echo "############################################################"
 echo "# S17: dirty-checkout publish policy"
 echo "############################################################"
 mkscratch s17
-# what used to be S17's own inline clone+overlay+
-# UNCONDITIONAL commit (which exited 1 on a clean tip -- nothing staged --
-# and killed the suite under `set -e`) is now the shared
-# adopt_worktree_clone() helper, whose commit is conditional. See the
-# helper's own comment for the full rationale (clean git identity that
-# still reflects today's possibly-uncommitted Makefile content; disposable
-# repo under $SCRATCH_ROOT only).
-#
-# Two-step clone (common is no longer its own git repo): audiolib is cloned
-# whole and S17_CLONE points at the clone's common/ subdir. This is also
-# what makes the dirty/untracked assertions below VALID rather than
-# accidentally vacuous: the adoption commit absorbs today's uncommitted
-# state across doa/, bf/, VAD/, tests/, gain/ AND common/ into one commit,
-# so the clone is clean at HEAD; only what S17 itself dirties under
-# common/ afterward shows up as a diff -- matching exactly what
-# `make -C "$S17_CLONE" publish` itself computes (its tracked-dirty gate is
-# whole-repo-scoped regardless of cwd; its untracked gate is cwd-scoped to
-# common/). See adopt_worktree_clone's doc comment for the full empirical
-# basis.
+# S17 runs in a clone made by the shared adopt_worktree_clone() helper (clean git identity reflecting
+# today's possibly-uncommitted Makefile; disposable repo under $SCRATCH_ROOT only). Two-step clone:
+# audiolib is cloned whole and S17_CLONE points at the clone's common/ subdir. The adoption commit
+# absorbs today's uncommitted state across all directories, so the clone is clean at HEAD and only
+# what S17 dirties under common/ shows up as a diff, matching what `make -C "$S17_CLONE" publish`
+# computes (its tracked-dirty gate is whole-repo-scoped, its untracked gate cwd-scoped to common/).
 S17_ROOT="$SCRATCH_ROOT/s17/audiolib_clone"
 adopt_worktree_clone "$AUDIOLIB_REPO_DIR" "$S17_ROOT"
 S17_CLONE="$S17_ROOT/common"
@@ -1816,16 +1547,11 @@ S17_OBJ_ROOT="$SCRATCH_ROOT/s17/obj"
 S17_BIN_ROOT="$SCRATCH_ROOT/s17/bin"
 S17_DIST="$SCRATCH_ROOT/s17/dist"
 
-# attest_from_log(): the publish recipe's own success line ends with
-# "(attested: <name>)" -- extracting the exact attest filename from THIS
-# invocation's own log is unambiguous regardless of which release dir it
-# landed in, unlike `find ATTEST -name 'attest-*.txt' | head -1` (regression
-# review, found while validating THIS script: a comment-only edit to hpf.c
-# -- see S17b below -- produces byte-identical object code, so a
-# deterministic archiver correctly reuses the SAME content-addressed release
-# id as the clean publish; `find | head -1` then has TWO candidate attest
-# files to choose from in that one release dir, in filesystem-listing order,
-# not necessarily the one THIS publish just wrote).
+# attest_from_log(): the publish recipe's success line ends with "(attested: <name>)"; extracting the
+# attest filename from this invocation's own log is unambiguous whichever release dir it landed in,
+# unlike `find ATTEST -name 'attest-*.txt' | head -1`: a comment-only edit to hpf.c (S17b below) yields
+# byte-identical object code, so the deterministic archiver reuses the same content-addressed release
+# id as the clean publish and that dir holds two attest files.
 attest_from_log() {
   local log="$1" name
   name="$(grep -o '(attested: [^)]*)' "$log" | sed -e 's/^(attested: //' -e 's/)$//' | head -1)"
@@ -1853,12 +1579,9 @@ else
 fi
 
 echo "--- S17b: dirty the clone's disposable hpf.c -> default publish FAILS --"
-# A disposable edit to the CLONE's own hpf.c (never the real repo's). This
-# is intentionally comment-only text -- see attest_from_log()'s comment
-# above for why that's fine: this scenario tests the DIRTY-PUBLISH POLICY
-# (attestation fields), not content-addressing (S11c already covers that
-# with a real code change), so whether the resulting object/archive bytes
-# happen to change is irrelevant here.
+# A disposable comment-only edit to the CLONE's own hpf.c (never the real repo's). This scenario tests
+# the dirty-publish policy (attestation fields), not content addressing (S11c covers that with a real
+# code change), so whether the object bytes change is irrelevant.
 echo "/* s17 disposable dirty probe */" >> "$S17_CLONE/src/hpf.c"
 S17_LOG_B="$SCRATCH_ROOT/s17/log_b"
 if make -C "$S17_CLONE" -s BACKEND=ne10 OBJ_ROOT="$S17_OBJ_ROOT" BIN_ROOT="$S17_BIN_ROOT" DIST_ROOT="$S17_DIST" publish >"$S17_LOG_B" 2>&1; then
@@ -1889,18 +1612,12 @@ else
 fi
 
 # --- untracked-file policy (S17d-S17h) -------------------
-# The untracked dimension is SEPARATE from the tracked-dirty one:
-# ALLOW_DIRTY_PUBLISH covers tracked changes only (`git status --porcelain
-# -uno`), ALLOW_UNTRACKED_PUBLISH covers untracked files, and the
-# attestation records untracked_tree_sha256 over the untracked files' exact
-# contents. These sub-cases assert the POLICY semantics (which knob admits
-# what; the hash field's presence and that it CHANGES whenever the untracked
-# bytes/symlink targets change) -- deliberately NOT the hash's internal
-# record encoding, which is an implementation detail the assertions here
-# must survive. Each sub-case runs in its own fresh clone (S17b/c left
-# $S17_CLONE tracked-dirty, and these cases need exact control of both
-# dimensions); builds use each clone's own default-rooted (clone-local,
-# gitignored) obj/ and bin/.
+# The untracked dimension is separate from the tracked-dirty one: ALLOW_DIRTY_PUBLISH covers tracked
+# changes only (`git status --porcelain -uno`), ALLOW_UNTRACKED_PUBLISH covers untracked files, and
+# the attestation records untracked_tree_sha256 over their exact contents. These sub-cases assert the
+# policy (which knob admits what; the hash field is present and changes whenever untracked bytes or
+# symlink targets change), deliberately not the hash's internal record encoding. Each runs in its own
+# fresh clone (S17b/c leave $S17_CLONE tracked-dirty) with clone-local gitignored obj/ and bin/.
 echo "--- S17d: untracked file -> default refused; ALLOW_DIRTY alone refused; both admit --"
 S17D_ROOT="$SCRATCH_ROOT/s17/audiolib_clone_d"
 adopt_worktree_clone "$AUDIOLIB_REPO_DIR" "$S17D_ROOT"
@@ -2000,13 +1717,10 @@ uhash_f2="$(grep '^untracked_tree_sha256=' "$attest_f2" 2>/dev/null | head -1 | 
   || fail "S17f: untracked_tree_sha256 did not change after repointing the symlink (f1=$uhash_f1 f2=$uhash_f2)"
 
 echo "--- S17g: BUILD-RELEVANT untracked source (tracked Makefile edit wires it in) --"
-# The exact attack the reviewer described: a TRACKED one-line Makefile edit
-# extends COMMON_SRCS with an UNTRACKED source file -- the artifact now
-# genuinely depends on untracked bytes the tracked diff alone cannot
-# account for. Requires BOTH knobs (each alone must refuse, each naming its
-# own dimension), and the resulting release must differ from the clean
-# clone's (S17a's) release id, with the probe object visibly a member of
-# the delivered archive.
+# A tracked one-line Makefile edit extends COMMON_SRCS with an untracked source file, so the artifact
+# depends on untracked bytes the tracked diff cannot account for. Requires BOTH knobs (each alone must
+# refuse, naming its own dimension), and the release must differ from the clean clone's (S17a) release
+# id, with the probe object a member of the delivered archive.
 S17G_ROOT="$SCRATCH_ROOT/s17/audiolib_clone_g"
 adopt_worktree_clone "$AUDIOLIB_REPO_DIR" "$S17G_ROOT"
 S17G_CLONE="$S17G_ROOT/common"  # two-step clone; see adopt_worktree_clone's doc comment and S17's clone above
@@ -2075,12 +1789,10 @@ else
 fi
 
 echo "--- S17i: fixed-field encoding -- the classic collision pair hashes DIFFER --"
-# Round-7 follow-up (reviewer-reproduced): raw space-joined "L <path> <target>"
-# records encoded symlink "a b"->"c" and "a"->"b c" IDENTICALLY, so two
-# different untracked trees shared one untracked_tree_sha256. The records are
-# now fixed-field (every variable-length value itself hashed) -- this pair
-# must therefore hash differently. Assertions stay format-agnostic beyond
-# "64-hex and different".
+# Raw space-joined "L <path> <target>" records would encode symlink "a b"->"c" and "a"->"b c"
+# identically, so two different untracked trees would share one untracked_tree_sha256. The records are
+# fixed-field (every variable-length value hashed), so this pair must hash differently. Assertions stay
+# format-agnostic beyond "64-hex and different".
 S17I_ROOT="$SCRATCH_ROOT/s17/audiolib_clone_i"
 adopt_worktree_clone "$AUDIOLIB_REPO_DIR" "$S17I_ROOT"
 S17I_CLONE="$S17I_ROOT/common"  # two-step clone; see adopt_worktree_clone's doc comment and S17's clone above
@@ -2104,10 +1816,9 @@ else
 fi
 
 echo "--- S17j: unreadable untracked file (chmod 000) -> fail-closed refusal ------"
-# Round-7 follow-up (reviewer-reproduced): shasum failing inside a command
-# substitution used to yield an EMPTY content hash with rc=0 -- publish
-# continued with a hole in the provenance. Any per-entry I/O failure now
-# downgrades the entry to an X record => named FATAL.
+# A shasum failing inside a command substitution must not yield an empty content hash with rc=0 (a
+# hole in the provenance): any per-entry I/O failure downgrades the entry to an X record => named
+# FATAL.
 echo "secret" > "$S17I_CLONE/unreadable.bin"; chmod 000 "$S17I_CLONE/unreadable.bin"
 S17_LOG_J="$SCRATCH_ROOT/s17/log_j"
 if make -C "$S17I_CLONE" -s BACKEND=ne10 OBJ_ROOT="$S17I_OBJ" BIN_ROOT="$S17I_BIN" DIST_ROOT="$S17I_DIST" \
@@ -2136,11 +1847,8 @@ else
 fi
 
 echo "--- S17l: identity-less checkout -> UNCONDITIONAL refusal -------------------"
-# Round-7 follow-up (reviewer + /simplify independently): commit=unknown set
-# dirty=untracked=unknown, ALLOW_DIRTY_PUBLISH=1 skipped the dirty gate and
-# the untracked gate only rejected "=1", so a no-git tree could publish with
-# no untracked enumeration at all. Unknown identity now refuses outright --
-# NEITHER escape hatch admits it.
+# An unknown commit identity sets dirty=untracked=unknown; neither ALLOW_DIRTY_PUBLISH=1 nor
+# ALLOW_UNTRACKED_PUBLISH=1 may admit it: publish refuses outright.
 S17L_DIR="$SCRATCH_ROOT/s17/nogit"
 mkdir -p "$S17L_DIR"
 tar -c -C "$AC_DIR" --exclude obj --exclude bin --exclude dist --exclude .git . | tar -x -C "$S17L_DIR"
@@ -2218,27 +1926,22 @@ echo "############################################################"
 echo "# S19: FFT_WRAPPER_ALIAS_CFLAGS is CFG_SIG-keyed (build-cache-"
 echo "# invalidation regression guard)"
 echo "############################################################"
-# Guards the build-cache gap behind the -fno-strict-aliasing flag: it used to be a bare
-# literal on the target-specific `CFLAGS +=` line of the fft_wrapper_ne10.o rule, and a
-# target-specific assignment does not change what $(CFLAGS) expanded to when
-# CFG_SIG_PAYLOAD (a parse-time `:=`) was computed, so the flag was invisible to CFG_SIG.
-# Editing it left CFG_SIG unchanged and `make lib` a silent no-op, and a keyed directory
-# built before the flag existed went on reusing an object compiled without it. The flag now
-# lives in the named variable $(FFT_WRAPPER_ALIAS_CFLAGS), folded into CFG_SIG_PAYLOAD and
-# referenced (never spelled as a literal) on the target-specific line.
+# Guards the build-cache gap behind -fno-strict-aliasing: a bare literal on the target-specific
+# `CFLAGS +=` line of the fft_wrapper_ne10.o rule is invisible to CFG_SIG (a target-specific
+# assignment does not change what $(CFLAGS) expanded to when the parse-time CFG_SIG_PAYLOAD was
+# computed), so editing it would leave CFG_SIG unchanged and a keyed directory built earlier would keep
+# an object compiled without it. The flag lives in the named variable $(FFT_WRAPPER_ALIAS_CFLAGS),
+# folded into CFG_SIG_PAYLOAD and referenced (never spelled as a literal) on the target-specific line.
 #
-# The property is proved without a command-line override (that is rejected, see S20): one
-# real `make lib` runs off the unmodified Makefile at $AC_DIR, the other off a scratch clone
-# (adopt_worktree_clone; VPATH, includes and sources need the whole tree) whose Makefile
-# copy has only the FFT_WRAPPER_ALIAS_CFLAGS definition line sed-patched to a different
-# literal. Both share one scratch OBJ_ROOT/BIN_ROOT so the comparison isolates the CFG_SIG
-# effect of the literal. Reverting the Makefile fix makes both builds land in the same keyed
-# directory.
+# The property is proved without a command-line override (rejected, see S20): one real `make lib`
+# runs off the unmodified Makefile at $AC_DIR, the other off a scratch clone (adopt_worktree_clone;
+# VPATH, includes and sources need the whole tree) whose Makefile copy has only the
+# FFT_WRAPPER_ALIAS_CFLAGS definition line sed-patched to a different literal. Both share one scratch
+# OBJ_ROOT/BIN_ROOT so the comparison isolates the CFG_SIG effect of the literal. Reverting the
+# Makefile fix makes both builds land in the same keyed directory.
 cd "$AC_DIR"
 mkscratch s19
-# Two-step clone (common is no longer its own git repo): audiolib is cloned
-# whole and S19_CLONE points at the clone's common/ subdir; see
-# adopt_worktree_clone's doc comment.
+# Two-step clone (see adopt_worktree_clone): S19_CLONE points at the audiolib clone's common/ subdir.
 S19_ROOT="$SCRATCH_ROOT/s19/audiolib_clone"
 adopt_worktree_clone "$AUDIOLIB_REPO_DIR" "$S19_ROOT"
 S19_CLONE="$S19_ROOT/common"
@@ -2291,17 +1994,11 @@ ar -t "$s19_changed_lib" 2>/dev/null | grep -q '^fft_wrapper_ne10\.o$' && \
 echo "############################################################"
 echo "# S20: FFT_WRAPPER_ALIAS_CFLAGS command-line override rejection"
 echo "############################################################"
-# Direct negative-test companion to the Makefile fix S19 above now relies on:
-# FFT_WRAPPER_ALIAS_CFLAGS was added as a 6th name to the SAME "Command-line
-# override rejection" foreach that already covers CFLAGS/CXXFLAGS/CPPFLAGS/
-# LDFLAGS/FP_POLICY (S9 above) -- reusing that exact established mechanism,
-# not a parallel/different rejection style. Mirrors S9's own assertion
-# shape/rigor exactly: each override must FAIL at parse time (before any
-# obj/bin dir is even created), with the same "cannot be overridden" message
-# S9 checks for. Two cases, both real command-line overrides, both with a
-# scratch OBJ_ROOT/BIN_ROOT: an EMPTY value (silently drops
-# -fno-strict-aliasing entirely -- the exact regression) and an explicitly
-# hostile `-fstrict-aliasing` value (re-enables strict aliasing outright).
+# Negative-test companion to S19: FFT_WRAPPER_ALIAS_CFLAGS is a name in the same "Command-line
+# override rejection" foreach as CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/FP_POLICY (S9), so each override must
+# FAIL at parse time (before any obj/bin dir is created) with the same "cannot be overridden" message
+# S9 checks. Two real command-line overrides under a scratch OBJ_ROOT/BIN_ROOT: an empty value (which
+# silently drops -fno-strict-aliasing) and an explicit `-fstrict-aliasing`.
 cd "$AC_DIR"
 mkscratch s20
 S20_OBJ_ROOT="$SCRATCH_ROOT/s20/obj"
@@ -2327,13 +2024,10 @@ echo "############################################################"
 echo "# S21: FFT_WRAPPER_ALIAS_CFLAGS \`make -e\` (environment-override mode)"
 echo "# bypass of S20's own guard"
 echo "############################################################"
-# S20 proved the command-line case. Under `make -e` GNU Make flips a variable's origin from
-# "environment" to "environment override" only when a makefile assignment to it is parsed, so
-# the override-rejection foreach saw plain "environment" for a variable assigned after it and
-# `env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing make -e lib` built a real archive with
-# strict aliasing on and no -fno-strict-aliasing. The Makefile now defines the bare literal
-# above the foreach. Two cases mirror S20's, each run through `env NAME=value make -e ...`
-# (an environment override, not a command-line assignment): the reported hostile value and
+# S20 covered the command line. Under `make -e` GNU Make flips a variable's origin from "environment"
+# to "environment override" only when a makefile assignment to it is parsed, so the foreach must see
+# the bare literal defined above it. Two cases mirror S20's, run through `env NAME=value make -e ...`
+# (an environment override, not a command-line assignment): the hostile value `-fstrict-aliasing` and
 # the empty value.
 cd "$AC_DIR"
 mkscratch s21
@@ -2356,9 +2050,8 @@ for pair in "FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing" "FFT_WRAPPER_ALIAS_CFLA
   fi
 done
 
-# Direct end-to-end confirmation of the exact reported repro, one level
-# closer to reality than print-obj-dir: a real \`lib\` build must ALSO be
-# rejected the same way (not just the print-* introspection targets).
+# End-to-end confirmation, one level closer to reality than print-obj-dir: a real \`lib\` build must
+# be rejected the same way (not just the print-* introspection targets).
 S21_LIB_LOG="$SCRATCH_ROOT/s21/log_lib_e2e"
 if env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing make -e BACKEND=ne10 OBJ_ROOT="$S21_OBJ_ROOT" BIN_ROOT="$S21_BIN_ROOT" lib >"$S21_LIB_LOG" 2>&1; then
   fail "S21: env FFT_WRAPPER_ALIAS_CFLAGS=-fstrict-aliasing make -e BACKEND=ne10 lib unexpectedly SUCCEEDED (the exact regression reproducer must now fail)"
@@ -2375,30 +2068,16 @@ echo "############################################################"
 echo "# S22: make -e environment-override rejection audit for the other"
 echo "# five names"
 echo "############################################################"
-# Auditing S21's fix prompted checking whether ANY of the other five names
-# in the same foreach (CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/FP_POLICY) had a
-# latent version of the identical \`make -e\` gap. CFLAGS/CXXFLAGS/LDFLAGS
-# did NOT (each has an unconditional \`+=\` before the foreach, so -e's
-# origin-flip had already happened by the time the foreach ran) -- confirmed
-# empirically, not re-tested here (S9 above already covers their
-# command-line rejection). FP_POLICY and CPPFLAGS DID:
-#   - FP_POLICY had the IDENTICAL shape as FFT_WRAPPER_ALIAS_CFLAGS: its own
-#     bare \`:=\` used to live only after the foreach (immediately ahead of
-#     its \`CFLAGS/CXXFLAGS +=\` appends), so \`env FP_POLICY=x make -e ...\`
-#     used to sail through -- a real build silently losing -ffp-contract=off
-#     entirely. Fixed the same way: bare \`:=\` relocated above the foreach.
-#   - CPPFLAGS had a DIFFERENT variant: its \`?=\` (well before the foreach)
-#     only ever assigns when the variable's origin is still "undefined" --
-#     given an environment-original value, that's already false, so the
-#     line is a complete no-op and the origin-flip trigger (an actual
-#     assignment ATTEMPT) never fires under -e, no matter how early the line
-#     sits. Fixed by changing \`?=\` to \`+=\` (an unconditional attempt, same
-#     shape as CFLAGS's own lines).
-# Both cases below run through \`env NAME=value make -e ...\`, mirroring
-# S21/S20's assertion style; CPPFLAGS/FP_POLICY are not consumed by any
-# compile recipe today, so print-obj-dir (not a real \`lib\` build) is the
-# right-sized check here, same as S9's own style for these
-# introspection-only probes.
+# The other names in the same foreach (CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/FP_POLICY) are audited for the
+# \`make -e\` gap. CFLAGS/CXXFLAGS/LDFLAGS are safe: each has an unconditional \`+=\` before the
+# foreach, so -e's origin flip has already happened (S9 covers their command-line rejection).
+#   - FP_POLICY: its bare \`:=\` is defined above the foreach, so \`env FP_POLICY=x make -e ...\` is
+#     rejected instead of silently losing -ffp-contract=off.
+#   - CPPFLAGS: it uses \`+=\` (an unconditional assignment attempt, like CFLAGS). A \`?=\` only
+#     assigns while the origin is still "undefined", so for an environment value it is a no-op, the
+#     origin flip never fires under -e, and the rejection would miss it.
+# Both cases run through \`env NAME=value make -e ...\`; CPPFLAGS/FP_POLICY are not consumed by any
+# compile recipe, so print-obj-dir (not a real \`lib\` build) is the right-sized check, as in S9.
 cd "$AC_DIR"
 mkscratch s22
 S22_OBJ_ROOT="$SCRATCH_ROOT/s22/obj"
@@ -2423,19 +2102,17 @@ done
 echo "############################################################"
 echo "# S23: FP policy conflict detection widened to CXXFLAGS/CPPFLAGS"
 echo "############################################################"
-# The FP-policy conflict check rejects -Ofast, -ffast-math and -ffp-contract=<anything>
-# (each would re-enable the FP contraction this repo pins off). It must look at CXXFLAGS and
-# CPPFLAGS as well as CFLAGS: a plain ENVIRONMENT CXXFLAGS or CPPFLAGS is deliberately
-# allowed to fold in (S9/S22) and never goes through EXTRA_CFLAGS, so
-#   env CXXFLAGS=-Ofast make lib
-# used to build a real archive whose one C++ TU (NE10_fft_generic_int32.cpp, see
-# NE10_CXXSRCS in the Makefile) carried -Ofast ahead of the trailing -ffp-contract=off, with
-# every other -Ofast relaxation live and unchecked.
+# The FP-policy conflict check rejects -Ofast, -ffast-math and -ffp-contract=<anything> (each would
+# re-enable the FP contraction this repo pins off). It must cover CXXFLAGS and CPPFLAGS as well as
+# CFLAGS: a plain environment CXXFLAGS or CPPFLAGS is allowed to fold in (S9/S22) and never passes
+# through EXTRA_CFLAGS, so `env CXXFLAGS=-Ofast make lib` would otherwise build the one C++ TU
+# (NE10_fft_generic_int32.cpp, see NE10_CXXSRCS in the Makefile) with -Ofast ahead of the trailing
+# -ffp-contract=off.
 #
-# Each case is a plain environment override (`env NAME=value make ...`, no `-e`, no
-# command-line assignment) against the real `lib` target, with a scratch OBJ_ROOT/BIN_ROOT so
-# a correctly rejected build never touches the real obj/bin. Three CXXFLAGS cases cover the
-# three conflict patterns and a fourth is the CPPFLAGS sibling of the -Ofast case.
+# Each case is a plain environment override (`env NAME=value make ...`, no `-e`, no command-line
+# assignment) against the real `lib` target, with a scratch OBJ_ROOT/BIN_ROOT so a correctly rejected
+# build never touches the real obj/bin. Three CXXFLAGS cases cover the three conflict patterns; a
+# fourth is the CPPFLAGS sibling of the -Ofast case.
 cd "$AC_DIR"
 mkscratch s23
 S23_OBJ_ROOT="$SCRATCH_ROOT/s23/obj"
@@ -2457,12 +2134,10 @@ for pair in "CXXFLAGS=-Ofast" "CXXFLAGS=-ffast-math" "CXXFLAGS=-ffp-contract=fas
   fi
 done
 
-# Positive control, mirroring S9's own EXTRA_CFLAGS positive-control shape:
-# a LEGITIMATE plain-environment CXXFLAGS value that does NOT match any of
-# the three conflict patterns must still fold in normally (the fix must
-# reject only the specific conflicting patterns, not CXXFLAGS overrides in
-# general) -- and, being folded into CFG_SIG, must land in a DIFFERENT
-# keyed dir than the plain baseline.
+# Positive control, mirroring S9's EXTRA_CFLAGS control: a legitimate plain-environment CXXFLAGS value
+# matching none of the three conflict patterns must still fold in normally (only the conflicting
+# patterns are rejected, not CXXFLAGS overrides in general) and, being folded into CFG_SIG, must land
+# in a different keyed dir than the plain baseline.
 baseline_ne10_objdir="$(make -s BACKEND=ne10 OBJ_ROOT="$S23_OBJ_ROOT" BIN_ROOT="$S23_BIN_ROOT" print-obj-dir)"
 wextra_ne10_objdir="$(env CXXFLAGS=-Wextra make -s BACKEND=ne10 OBJ_ROOT="$S23_OBJ_ROOT" BIN_ROOT="$S23_BIN_ROOT" print-obj-dir)"
 [ -n "$wextra_ne10_objdir" ] && [ "$wextra_ne10_objdir" != "$baseline_ne10_objdir" ] && \
@@ -2477,20 +2152,11 @@ else
   cat "$S23_WEXTRA_LIB_LOG" >&2
 fi
 
-# Round-9 regression coverage: the conflict-detection guard above used to be three
-# $(findstring PATTERN,TEXT) checks, and $(findstring) does a plain
-# SUBSTRING search over the whole concatenated text -- so it false-positived
-# on any token that merely CONTAINS one of these patterns as part of a
-# larger identifier, never mind that it isn't the compiler flag at all.
-# Direct repro (confirmed BEFORE this round's fix):
+# Whole-word matching: the conflict check uses $(filter), which splits its text into words and matches
+# each whole word, so a token that merely contains a pattern as a substring is not a conflict:
 #   env CXXFLAGS='-DROUND9_NOTE=-Ofastness' make -s BACKEND=ne10 print-obj-dir
-# used to fail with "FP policy conflict: ... contains -Ofast" even though
-# `-DROUND9_NOTE=-Ofastness` is a single, entirely harmless preprocessor
-# macro definition token that merely happens to contain the substring
-# "-Ofast" inside a larger identifier -- not the compiler flag -Ofast. The
-# fix replaced $(findstring) with $(filter), which splits its TEXT argument
-# on whitespace into WORDS and matches each whole word against the given
-# patterns, so a substring buried inside an unrelated token can never match.
+# `-DROUND9_NOTE=-Ofastness` is a single harmless preprocessor macro token, not the compiler flag
+# -Ofast, and must be accepted.
 S23_ROUND9_NOTE_LOG="$SCRATCH_ROOT/s23/log_round9_note"
 if env CXXFLAGS='-DROUND9_NOTE=-Ofastness' make -s BACKEND=ne10 OBJ_ROOT="$S23_OBJ_ROOT" BIN_ROOT="$S23_BIN_ROOT" print-obj-dir >"$S23_ROUND9_NOTE_LOG" 2>&1; then
   pass "S23: env CXXFLAGS='-DROUND9_NOTE=-Ofastness' make BACKEND=ne10 print-obj-dir (substring-only, non-conflicting) succeeds (regression false-positive fix)"
@@ -2503,22 +2169,15 @@ echo "############################################################"
 echo "# S23b: quote/escape/response-file bypass of the FP-policy"
 echo "# conflict gate itself"
 echo "############################################################"
-# See the header comment (search "S23b") for the full writeup. In short: the
-# exact-token $(filter) check above matches GNU Make's OWN text
-# representation of CFLAGS/CXXFLAGS/CPPFLAGS -- but Make has zero concept of
-# shell quoting, so a value the shell will unquote at compile-recipe time
-# (e.g. EXTRA_CFLAGS="'-Ofast'", stored by Make as the literal 9-character
-# text '-Ofast', quote characters included) never equals the bare word
-# -Ofast in Make's text and so could never be caught by $(filter) -- yet on
-# the actual compile recipe line the shell strips the quotes and the
-# compiler gets a real, live -Ofast. Each case below is a genuine PLAIN
-# ENVIRONMENT EXTRA_CFLAGS override (no `-e`, no command-line assignment)
-# against a cheap introspection target, with scratch OBJ_ROOT/BIN_ROOT so a
-# (correctly) rejected build never touches the real obj/bin trees -- same
-# discipline as S20/S21/S22 above. Each rejection must mention "FP policy
-# conflict" (the shared marker every FP-policy failure emits) AND the
-# specific forbidden construct named in the block's own $(error ...), so a
-# generic/unrelated failure can never be mistaken for the fix working.
+# S23b: the exact-token $(filter) check matches GNU Make's own text of CFLAGS/CXXFLAGS/CPPFLAGS, but
+# Make has no notion of shell quoting: a value the shell unquotes at compile-recipe time (e.g.
+# EXTRA_CFLAGS="'-Ofast'", stored by Make as the 9-character text '-Ofast', quotes included) never
+# equals the bare word -Ofast, yet the compiler gets a live -Ofast. Each case below is a plain
+# environment EXTRA_CFLAGS override (no `-e`, no command-line assignment) against a cheap
+# introspection target, under a scratch OBJ_ROOT/BIN_ROOT so a correctly rejected build never touches
+# the real obj/bin. Each rejection must mention "FP policy conflict" (the marker every FP-policy
+# failure emits) AND the specific forbidden construct named in the block's own $(error ...), so an
+# unrelated failure is not mistaken for the check working.
 cd "$AC_DIR"
 mkscratch s23b
 S23B_OBJ_ROOT="$SCRATCH_ROOT/s23b/obj"
@@ -2540,11 +2199,9 @@ S23B_LOG_2="$SCRATCH_ROOT/s23b/log_double_quoted"
 if env EXTRA_CFLAGS='"-ffast-math"' make BACKEND=ne10 OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_2" 2>&1; then
   fail "S23b: env EXTRA_CFLAGS='\"-ffast-math\"' (double-quoted) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
 else
-  # round-N allow-list redesign: the double-quote character is now caught by
-  # the character-class allow-list (S24 below), not a dedicated deny-list
-  # entry -- the message names the offending character generically
-  # ("outside the allowed set ... found: \"...\""), literally containing a
-  # double-quote inside the quoted report for this specific input.
+  # The double-quote character is caught by the character allow-list (S24), not a dedicated deny-list
+  # entry: the message names the offending character generically ("outside the allowed set ... found:
+  # \"...\"").
   if grep -q "FP policy conflict" "$S23B_LOG_2" && grep -q "outside the allowed set" "$S23B_LOG_2" && grep -qF 'found: """' "$S23B_LOG_2"; then
     pass "S23b: env EXTRA_CFLAGS='\"-ffast-math\"' (double-quoted) print-obj-dir correctly FAILS, identifying the double-quote character"
   else
@@ -2557,11 +2214,9 @@ S23B_LOG_3="$SCRATCH_ROOT/s23b/log_quote_split"
 if env EXTRA_CFLAGS="-O'f'ast" make BACKEND=ne10 OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_3" 2>&1; then
   fail "S23b: env EXTRA_CFLAGS=\"-O'f'ast\" (quote-split mid-token) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
 else
-  # The single quote here is still caught by the ONE surviving pure-Make
-  # $(findstring) check (see the Makefile's own comment on why that one
-  # check alone still needs to exist and run first) -- so this message still
-  # says "single-quote character" verbatim, unlike the double-quote/
-  # response-file cases above/below which now go through the allow-list.
+  # The single quote is caught by the one pure-Make $(findstring) check that runs before the allow-list
+  # (see the Makefile), so this message says "single-quote character" verbatim, unlike the
+  # double-quote and response-file cases.
   if grep -q "FP policy conflict" "$S23B_LOG_3" && grep -q "single-quote" "$S23B_LOG_3"; then
     pass "S23b: env EXTRA_CFLAGS=\"-O'f'ast\" (quote-split mid-token) print-obj-dir correctly FAILS, identifying the single-quote character"
   else
@@ -2574,8 +2229,8 @@ S23B_LOG_4="$SCRATCH_ROOT/s23b/log_response_file"
 if env EXTRA_CFLAGS='@flags.rsp' make BACKEND=ne10 OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_4" 2>&1; then
   fail "S23b: env EXTRA_CFLAGS='@flags.rsp' (response-file) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
 else
-  # '@' is now caught by the character-class allow-list (it is simply not in
-  # the allowed set), not a dedicated @-response-file deny-list entry.
+  # '@' is caught by the character allow-list (it is not in the allowed set), not a dedicated
+  # response-file deny-list entry.
   if grep -q "FP policy conflict" "$S23B_LOG_4" && grep -q "outside the allowed set" "$S23B_LOG_4" && grep -qF 'found: "@"' "$S23B_LOG_4"; then
     pass "S23b: env EXTRA_CFLAGS='@flags.rsp' (response-file) print-obj-dir correctly FAILS, identifying the @-prefixed response-file token"
   else
@@ -2584,14 +2239,10 @@ else
   fi
 fi
 
-# Positive controls: both are real, harmless, UNQUOTED tokens that contain
-# none of the newly-forbidden characters, so the new quote/escape/
-# response-file block must leave them alone entirely -- only the unchanged
-# exact-token $(filter) check further down governs whether a token IS
-# -Ofast/-ffast-math/-ffp-contract=<x>, and neither of these is. The first
-# is S23's own regression regression token (here via EXTRA_CFLAGS specifically,
-# the exact hook this bypass came in through); the second is its CFLAGS-
-# widening sibling from the same regression family.
+# Positive controls: harmless unquoted tokens (-DROUND9_NOTE=-Ofastness, -DTEXT=ffast-math) containing
+# no forbidden character must pass: only the exact-token $(filter) check decides whether a token IS
+# -Ofast/-ffast-math/-ffp-contract=<x>, and neither is. Both go through EXTRA_CFLAGS, the hook the
+# quoting bypass used.
 S23B_LOG_P1="$SCRATCH_ROOT/s23b/log_positive_round9_note"
 if env EXTRA_CFLAGS=-DROUND9_NOTE=-Ofastness make -s BACKEND=ne10 OBJ_ROOT="$S23B_OBJ_ROOT" BIN_ROOT="$S23B_BIN_ROOT" print-obj-dir >"$S23B_LOG_P1" 2>&1; then
   pass "S23b: env EXTRA_CFLAGS=-DROUND9_NOTE=-Ofastness print-obj-dir (positive control, no forbidden characters) succeeds"
@@ -2614,12 +2265,9 @@ echo "# deny-list never caught, plus the exact-token filter's own"
 echo "# distinct code path, plus the FP-policy check's OWN internal"
 echo "# variables"
 echo "############################################################"
-# See the header comment (search "S24") for the full writeup. Every negative
-# case below is a real, live bypass of the OLD deny-list (verified BEFORE
-# this round's allow-list fix: none of these characters/constructs were
-# checked for at all), each now REJECTED by the character-class allow-list.
-# Same discipline as S20/S21/S22/S23b: scratch OBJ_ROOT/BIN_ROOT so a
-# (correctly) rejected build never touches the real obj/bin trees.
+# Every negative case below is a glob, tilde, redirection or process-substitution shape that the
+# character-class allow-list must reject. Same discipline as S20-S23b: scratch OBJ_ROOT/BIN_ROOT so a
+# correctly rejected build never touches the real obj/bin trees.
 cd "$AC_DIR"
 mkscratch s24
 S24_OBJ_ROOT="$SCRATCH_ROOT/s24/obj"
@@ -2649,31 +2297,16 @@ s24_check_rejected "redirect-out"     '-I>/tmp/evil'  '>'
 s24_check_rejected "redirect-in"      '-I</etc/passwd' '<'
 s24_check_rejected "process-subst"    '<(echo hi)'    '()<'
 
-# Positive control (regression coverage, distinct code path): a Make-native
-# ${VAR}-style expansion still must be rejected via the EXACT-TOKEN
-# $(filter) check, not the character allow-list -- GNU Make treats ${...}
-# identically to $(...) and resolves it to R11_FLAG's value (-Ofast) before
-# either FP-policy check ever runs, so the resulting FP_INPUT_FLAGS text is
-# the plain, clean, ALL-ALLOWED-CHARACTERS token "-Ofast" -- the character
-# allow-list has nothing to catch here (every character in "-Ofast" is
-# individually permitted); only the unchanged FP_CONFLICT_FLAGS $(filter)
-# check can still reject it. This is the literal repro from the review
-# (`env R11_FLAG=-Ofast make -n EXTRA_CFLAGS=${R11_FLAG} lib`), adapted to
-# actually exercise MAKE's own ${...} resolution rather than the invoking
-# shell's: R11_FLAG must be `export`-ed as a real shell variable first (a
-# bare `env VAR=x cmd ${VAR}` does NOT make VAR visible to the CURRENT
-# shell's own expansion of ${VAR} in that same command line -- confirmed
-# directly; ${VAR} would either expand empty or (under `set -u`, as this
-# script runs with) abort the whole suite with "unbound variable") --
-# and 'EXTRA_CFLAGS=${R11_FLAG}' must be SINGLE-QUOTED on make's own
-# command line so the invoking shell does NOT resolve ${R11_FLAG} itself,
-# leaving the literal text for GNU MAKE to resolve (Make auto-imports every
-# environment variable, so R11_FLAG is visible to it once exported).
-# (Deliberately -n, a dry run -- the FP-policy checks run at Makefile parse
-# time, before any target executes, so a dry run alone still exercises this
-# path.) A future change to the exact-token filter logic that broke this
-# path would NOT be caught by any of the character-class tests above, so
-# this gets its own dedicated regression test.
+# Positive control on a distinct code path: a Make-native ${VAR} expansion must be rejected by the
+# exact-token $(filter) check, not the character allow-list. GNU Make treats ${...} like $(...) and
+# resolves it to R11_FLAG's value (-Ofast) before either FP-policy check runs, so FP_INPUT_FLAGS holds
+# the all-allowed-characters token "-Ofast": the allow-list has nothing to catch and only the
+# FP_CONFLICT_FLAGS $(filter) check can reject it. Literal repro:
+# `env R11_FLAG=-Ofast make -n EXTRA_CFLAGS=${R11_FLAG} lib`, adapted so Make, not the invoking shell,
+# resolves ${...}: R11_FLAG is `export`-ed first (under `set -u` an unset ${VAR} in the same command
+# line would abort the suite), and 'EXTRA_CFLAGS=${R11_FLAG}' is single-quoted so the shell leaves the
+# literal text for GNU Make, which auto-imports exported variables. -n suffices: the FP-policy checks
+# run at Makefile parse time, before any target executes.
 export R11_FLAG=-Ofast
 S24_LOG_R11="$SCRATCH_ROOT/s24/log_r11_dollar_brace"
 if make -n BACKEND=ne10 OBJ_ROOT="$S24_OBJ_ROOT" BIN_ROOT="$S24_BIN_ROOT" 'EXTRA_CFLAGS=${R11_FLAG}' lib >"$S24_LOG_R11" 2>&1; then
@@ -2688,31 +2321,17 @@ else
 fi
 unset R11_FLAG
 
-# Newly-discovered (this round, while implementing the allow-list): the
-# FP-policy check's own INTERNAL variables (FP_INPUT_FLAGS/
-# SHELL_SAFE_ALLOWLIST_RC/FP_CONFLICT_FLAGS/FP_ALLOWED_CHARS_RE --
-# SHELL_SAFE_ALLOWLIST_RC is this round's rename of what was FP_ALLOWLIST_RC
-# when this test was first written, broadened by the later S25 fix to also
-# gate LDFLAGS content) were themselves overridable from the command line /
-# under `-e`, silently defeating every check above while the REAL CFLAGS/
-# CXXFLAGS/CPPFLAGS used in actual compile recipes still carried the
-# dangerous content -- reproduced against BOTH this round's allow-list AND
-# the prior (unmodified) deny-list it replaces, so this is a pre-existing
-# gap, not a regression. Closed the same way S20/S21/S22 close it for
-# FP_POLICY/FFT_WRAPPER_ALIAS_CFLAGS -- each of the four names must now be
-# rejected, both as a plain command-line override and under `-e`. payload is
-# the EXTRA_CFLAGS value that would (absent the override) be caught by the
-# check the override under test defeats: FP_INPUT_FLAGS/
-# SHELL_SAFE_ALLOWLIST_RC/FP_ALLOWED_CHARS_RE gate the CHARACTER allow-list,
-# so a semicolon payload exercises that path; FP_CONFLICT_FLAGS gates the
-# SEPARATE -Ofast/-ffast-math/-ffp-contract= exact-token filter, so it needs
-# an all-allowed-characters payload that is still a real conflict ("-Ofast"
-# itself) -- a semicolon payload there would be caught by the (untouched)
-# allow-list first and never actually exercise the FP_CONFLICT_FLAGS-
-# specific override path at all. (S25 below repeats the SHELL_SAFE_INPUT_
-# FLAGS/SHELL_SAFE_ALLOWLIST_RC pair of this same matrix once more via an
-# EXTRA_LDFLAGS payload, since that is the specific vector S25 exists to
-# close.)
+# The FP-policy check's own internal variables (FP_INPUT_FLAGS, SHELL_SAFE_ALLOWLIST_RC,
+# FP_CONFLICT_FLAGS, FP_ALLOWED_CHARS_RE) must not be overridable from the command line or under `-e`:
+# an override would silently defeat every check above while the real CFLAGS/CXXFLAGS/CPPFLAGS still
+# carry the dangerous content. Each name must be rejected both as a plain command-line override and
+# under `-e`. `payload` is the EXTRA_CFLAGS value the overridden check would otherwise catch:
+# FP_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/FP_ALLOWED_CHARS_RE gate the character allow-list, so a
+# semicolon payload exercises that path; FP_CONFLICT_FLAGS gates the separate exact-token
+# -Ofast/-ffast-math/-ffp-contract= filter, so it needs an all-allowed-characters payload that is
+# still a real conflict ("-Ofast"), because a semicolon payload would be caught first by the untouched
+# allow-list and never exercise the FP_CONFLICT_FLAGS override. (S25 repeats the
+# SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC pair via an EXTRA_LDFLAGS payload.)
 s24_check_override_rejected() {
   local varname="$1" varvalue="$2" payload="$3" use_dash_e="$4" log
   log="$SCRATCH_ROOT/s24/log_override_$(printf '%s' "$varname" | tr -c 'A-Za-z0-9' '_')_$use_dash_e"
@@ -2748,23 +2367,17 @@ s24_check_override_rejected "FP_CONFLICT_FLAGS"      ""      '-Ofast' dashe
 echo "############################################################"
 echo "# S25: link-flags (LDFLAGS/EXTRA_LDFLAGS) character-safety coverage"
 echo "############################################################"
-# See the header comment (search "S25") for the full writeup. Before this
-# round's fix, LDFLAGS/EXTRA_LDFLAGS were not covered by the character-class
-# allow-list at all -- only FP_INPUT_FLAGS (CFLAGS/CXXFLAGS/CPPFLAGS) was
-# checked -- even though LDFLAGS is embedded in every real link recipe
-# ($(LINK) ... $(LDFLAGS)) the exact same way CFLAGS is embedded in every
-# compile recipe. Same discipline as S20-S24: scratch OBJ_ROOT/BIN_ROOT so a
-# (correctly) rejected build never touches the real obj/bin trees.
+# LDFLAGS/EXTRA_LDFLAGS get the same character-class allow-list as CFLAGS: LDFLAGS is embedded in every
+# link recipe ($(LINK) ... $(LDFLAGS)) just as CFLAGS is in every compile recipe. Same discipline as
+# S20-S24: scratch OBJ_ROOT/BIN_ROOT so a correctly rejected build never touches the real obj/bin.
 cd "$AC_DIR"
 mkscratch s25
 S25_OBJ_ROOT="$SCRATCH_ROOT/s25/obj"
 S25_BIN_ROOT="$SCRATCH_ROOT/s25/bin"
 
-# helper: run one EXTRA_LDFLAGS negative case against the allow-list and
-# assert both that it FAILS and that the specific character(s) named in
-# $2 appear in the reported disallowed-character set. Mirrors S24's
-# s24_check_rejected exactly, just aimed at EXTRA_LDFLAGS instead of
-# EXTRA_CFLAGS.
+# helper: run one EXTRA_LDFLAGS negative case against the allow-list and assert both that it FAILS and
+# that the specific character(s) named in $2 appear in the reported disallowed-character set. Mirrors
+# S24's s24_check_rejected, aimed at EXTRA_LDFLAGS.
 s25_check_rejected() {
   local label="$1" flag_value="$2" expect_chars="$3" log
   log="$SCRATCH_ROOT/s25/log_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_')"
@@ -2778,15 +2391,13 @@ s25_check_rejected() {
   fi
 }
 
-# The literal reported repro: a semicolon payload via
-# EXTRA_LDFLAGS, dry-run-confirmed BEFORE this round's fix to sail through
-# untouched and land live in a real link recipe (`make -n selftest
-# EXTRA_LDFLAGS=';echo LINK_FLAG_INJECTION'` showed the payload verbatim,
-# unfiltered, after `-lm`, on the actual `cc -o ... $(LDFLAGS)` line).
+# Semicolon payload via EXTRA_LDFLAGS: `make -n selftest EXTRA_LDFLAGS=';echo LINK_FLAG_INJECTION'`
+# must not carry the payload verbatim after `-lm` onto the `cc -o ... $(LDFLAGS)` link line; it is
+# rejected.
 s25_check_rejected "injection-semicolon" ';echo LINK_FLAG_INJECTION' ';'
 
-# Same glob/tilde/redirect/process-substitution matrix S24 runs for
-# EXTRA_CFLAGS, replicated verbatim for EXTRA_LDFLAGS.
+# Same glob/tilde/redirect/process-substitution matrix S24 runs for EXTRA_CFLAGS, repeated for
+# EXTRA_LDFLAGS.
 s25_check_rejected "glob-star"        '-L*t'          '*'
 s25_check_rejected "glob-question"    '-Lfas?'        '?'
 s25_check_rejected "glob-brackets"    '-Lfas[t]'      '[]'
@@ -2795,28 +2406,19 @@ s25_check_rejected "redirect-out"     '-lm>/tmp/evil'  '>'
 s25_check_rejected "redirect-in"      '-lm</etc/passwd' '<'
 s25_check_rejected "process-subst"    '<(echo hi)'    '()<'
 
-# Positive control: a real link flag this project's own Makefile comments
-# anticipate a consumer needing (the "-Wl,-rpath,dir / -Wa,--option
-# pass-through flags" example the allow-list's own char-set comment gives,
-# and the same rpath/library-path SHAPE this Makefile's own ZERO_HEAP_LDFLAGS
-# uses for its zero-heap test target -- see `-L$(BIN_DIR) ... -Wl,-rpath,...`
-# there) must still pass the character check AND actually link and run.
-# `@loader_path` itself (ZERO_HEAP_LDFLAGS's own literal rpath target on
-# macOS) is deliberately NOT reused here -- it is not something a caller
-# would ever pass through EXTRA_LDFLAGS (it's this Makefile's own
-# platform-conditional literal, appended directly in two target-specific
-# recipes, never folded through LDFLAGS/EXTRA_LDFLAGS at all) and its `@`
-# character sits outside the allowed set anyway; a plain filesystem rpath
-# path (no `@`) is the realistic EXTRA_LDFLAGS use case this control checks.
+# Positive control: a real link flag a consumer may need, in the shape the allow-list admits
+# (-Wl,-rpath,dir, as this Makefile's ZERO_HEAP_LDFLAGS uses), must pass the character check AND
+# actually link and run. `@loader_path` (ZERO_HEAP_LDFLAGS's macOS rpath literal) is not reused: it is
+# appended directly in two target-specific recipes, never folded through LDFLAGS/EXTRA_LDFLAGS, and its
+# `@` is outside the allowed set. A plain filesystem rpath path is the realistic use.
 #
-# "Runs selftest to completion" is judged against a reference taken in the same run, not
-# against a pinned number: the selftest is first run with no EXTRA_LDFLAGS, and the run with
-# the link flag must report the same TOTAL CHECKS lines (simd_selftest prints one per pass,
-# so the whole sorted set is compared, not just the first) and the same number of ALL PASS
-# lines. A link flag changes how the test binaries are linked, never which checks they run,
-# so the two must agree exactly; a pinned count goes stale whenever a selftest item is added
-# or removed. Both runs use the scratch roots (EXTRA_LDFLAGS is in CFG_SIG, so they get
-# separate keyed directories there) and the real obj/bin never see either.
+# "Runs selftest to completion" is judged against a reference from the same run: selftest is first run
+# with no EXTRA_LDFLAGS, and the run with the link flag must report the same TOTAL CHECKS lines
+# (simd_selftest prints one per pass, so the whole sorted set is compared) and the same number of ALL
+# PASS lines. A link flag changes how the binaries link, never which checks run, and a pinned count
+# goes stale whenever a selftest item is added or removed. Both runs use the scratch roots
+# (EXTRA_LDFLAGS is in CFG_SIG, so they get separate keyed directories) and the real obj/bin see
+# neither.
 S25_REF_LOG="$SCRATCH_ROOT/s25/log_reference_selftest"
 S25_POS_LOG="$SCRATCH_ROOT/s25/log_positive_rpath"
 # Sorted TOTAL CHECKS lines of one log, newline-folded; empty when there is none.
@@ -2863,13 +2465,9 @@ else
   cat "$S25_POS_LOG" >&2
 fi
 
-# Command-line/`-e` override-rejection for the two variables this round's
-# fix introduces/renames (SHELL_SAFE_INPUT_FLAGS is new; SHELL_SAFE_
-# ALLOWLIST_RC is FP_ALLOWLIST_RC's rename) -- S24 already covers both via
-# an EXTRA_CFLAGS payload; this repeats it via EXTRA_LDFLAGS specifically,
-# since that is the exact vector this round's fix exists to close (an
-# override here must not be able to let an EXTRA_LDFLAGS injection payload
-# back through).
+# Command-line/`-e` override rejection for SHELL_SAFE_INPUT_FLAGS and SHELL_SAFE_ALLOWLIST_RC: S24
+# covers both via an EXTRA_CFLAGS payload; this repeats it via EXTRA_LDFLAGS, the vector S25 exists to
+# close (an override must not let an EXTRA_LDFLAGS injection payload back through).
 s25_check_override_rejected() {
   local varname="$1" varvalue="$2" payload="$3" use_dash_e="$4" log
   log="$SCRATCH_ROOT/s25/log_override_$(printf '%s' "$varname" | tr -c 'A-Za-z0-9' '_')_$use_dash_e"
@@ -2940,11 +2538,9 @@ REAL_DIST_AFTER="$(real_dist_sentinel)"
 [ "$REAL_DIST_BEFORE" = "$REAL_DIST_AFTER" ] && pass "integrity: real \$AC_DIR/dist sentinel unchanged (absent stays absent, or byte+mtime identical)" \
   || fail "integrity: real \$AC_DIR/dist sentinel CHANGED during this run"
 
-# final-guard re-check against the snapshot taken in S1
-# (right after this suite's LAST intentional real-tree build). Every file
-# that existed then must still be sha+mtime identical now; a directory
-# created after the snapshot is allowed but reported (WARN/INFO -- after the
-# S12 fix there should be none), while a NEW file inside an
+# Final-guard re-check against the snapshot taken in S1 (right after this suite's last intentional
+# real-tree build). Every file that existed then must still be sha+mtime identical; a directory
+# created after the snapshot is allowed but reported (WARN/INFO), a new file inside an
 # already-snapshotted directory is a hard FAIL.
 FINAL_GUARD_DIRS_AFTER="$(real_tree_dirs)"
 FINAL_GUARD_SNAPSHOT_AFTER="$(real_tree_snapshot)"

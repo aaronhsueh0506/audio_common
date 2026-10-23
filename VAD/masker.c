@@ -7,17 +7,7 @@
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
 
-/* ---------- utility: 1D median filter (binary input) ----------
- *
- * The input is a 0/1 mask, so the median is a majority test and no window,
- * no sort and no comparator are needed: sorting k binary values puts the
- * (k - c) zeros first and the c ones last, so element k/2 is 1 exactly when
- * k/2 >= k - c, i.e. c >= k - k/2. (⚠ NOT `c > k/2` -- the two agree only
- * for odd k, and k is caller-supplied.)
- *
- * A qsort() with a function-pointer comparator per frequency bin per frame
- * (plus a scratch window) would give the same output at a much higher cost.
- */
+/* 1D median filter of a 0/1 mask: the median is 1 iff the count of ones c >= k - k/2 (valid for even k too). */
 static void median_filter_1d(const int* in, int* out, int F, int k)
 {
     int half = k / 2;
@@ -40,17 +30,7 @@ static void median_filter_1d(const int* in, int* out, int F, int k)
     }
 }
 
-/* ===================== pool-first memory layout =====================
- *
- * Bump allocator carving the masker's flat pool into typed sub-blocks.
- * File-private on purpose, exactly like BF's copy: masker_get_mem_size()
- * and masker_carve() below must stay in lockstep, and a shared helper would
- * make that relationship invisible.
- *
- * The heap constructor goes through the SAME carve, so the two entry points
- * cannot disagree about the layout -- the previous code allocated ten
- * separate blocks and had to unwind all ten by hand on any failure.
- */
+/* Pool layout: bump allocator over the flat pool; masker_get_mem_size() and masker_carve() must stay in lockstep. */
 typedef struct PoolCursor {
     uint8_t* ptr;
     size_t remaining;
@@ -80,24 +60,13 @@ size_t masker_get_mem_size(const MaskerConfig* cfg)
     F = (size_t)(cfg->NFFT / 2 + 1);
 
     total = ck_align16_size(sizeof(MaskEstimator));
-    /* float[F] x5: noise_floor, noise_psd, spp_time, power_frame,
-     * energy_frame */
-    total = ck_field_size(total, F, sizeof(float));
-    total = ck_field_size(total, F, sizeof(float));
-    total = ck_field_size(total, F, sizeof(float));
-    total = ck_field_size(total, F, sizeof(float));
-    total = ck_field_size(total, F, sizeof(float));
+    /* float[F] x5: noise_floor, noise_psd, spp_time, power_frame, energy_frame */
+    total = ck_field_size_reps(total, F, sizeof(float), 5);
     /* int[F] x6: band, energy, spp, spp_bin, spp_f, mask */
-    total = ck_field_size(total, F, sizeof(int));
-    total = ck_field_size(total, F, sizeof(int));
-    total = ck_field_size(total, F, sizeof(int));
-    total = ck_field_size(total, F, sizeof(int));
-    total = ck_field_size(total, F, sizeof(int));
-    total = ck_field_size(total, F, sizeof(int));
+    total = ck_field_size_reps(total, F, sizeof(int), 6);
     return MEM_SIZE_INVALID(total) ? 0 : total;
 }
 
-/* Carve order MUST stay in lockstep with masker_get_mem_size() above. */
 static MaskEstimator* masker_carve(void* mem, size_t need,
                                    const MaskerConfig* cfg)
 {
@@ -138,7 +107,6 @@ static MaskEstimator* masker_carve(void* mem, size_t need,
         return NULL;
     }
 
-    /* precompute band mask */
     for (f = 0; f < m->F; f++) {
         float freq = (float)f * m->sr / m->NFFT;
         m->band_mask[f] =
@@ -149,7 +117,6 @@ static MaskEstimator* masker_carve(void* mem, size_t need,
     return m;
 }
 
-/* ---------- constructors ---------- */
 MaskEstimator* masker_create(const MaskerConfig* cfg)
 {
     MaskEstimator* m;
@@ -157,8 +124,7 @@ MaskEstimator* masker_create(const MaskerConfig* cfg)
     size_t need = masker_get_mem_size(cfg);
 
     if (need == 0) return NULL;
-    /* One 16-byte-aligned block backs the struct and every array, so a
-     * failure unwinds with a single free() instead of ten. */
+    /* One 16-byte-aligned block backs the struct and every array. */
     if (posix_memalign(&block, 16, need) != 0 || !block) return NULL;
 
     m = masker_carve(block, need, cfg);
@@ -177,20 +143,18 @@ MaskEstimator* masker_init(void* mem, size_t mem_size, const MaskerConfig* cfg)
 
     m = masker_carve(mem, need, cfg);
     if (!m) return NULL;
-    m->owned_heap = NULL;   /* caller owns it */
+    m->owned_heap = NULL;
     return m;
 }
 
 void masker_destroy(MaskEstimator* m)
 {
     if (!m) return;
-    /* Pool path (owned_heap == NULL, masker_init()): the caller owns the
-     * memory -- struct and every array carved from it -- nothing to free. */
+    /* Pool path (owned_heap == NULL): the caller owns the memory; nothing to free. */
     if (m->owned_heap) free(m->owned_heap);
 }
 
-/* ---------- main step (per frame) ---------- */
-/* X_ref: single-channel spectrum, e.g. X[0] */
+/* X_ref: single-channel spectrum, e.g. X[0]. */
 void masker_step(MaskEstimator* m,
                  const Complex* X_ref
                 )
@@ -199,13 +163,10 @@ void masker_step(MaskEstimator* m,
 
     float frame_spp_sum = 0.0f;
 
-    /* ===== build power spectrum from reference channel ===== */
     sk_cmag_f32(m->power_frame, X_ref, m->F, 1e-8f);
     sk_linear_to_db_f32(m->energy_frame, m->power_frame, m->F);
 
-    /* ===== noise-floor tracking =====
-     * Whole-array, separate from the threshold compare below: noise_floor[f]
-     * depends only on bin f, so the two passes are independent. */
+    /* Noise-floor tracking (per-bin, independent of the threshold compare below). */
     if (!m->initialized) {
         memcpy(m->noise_floor, m->energy_frame,
                (size_t)m->F * sizeof(float));
@@ -214,7 +175,6 @@ void masker_step(MaskEstimator* m,
                         m->cfg.E_alpha_up, m->cfg.E_alpha_down);
     }
 
-    /* ===== per-frequency analysis ===== */
     for (int f = 0; f < m->F; f++) {
         float power = m->power_frame[f];
         float energy = m->energy_frame[f];
@@ -224,7 +184,6 @@ void masker_step(MaskEstimator* m,
             m->energy_mask[f] = (energy > thr) ? 1 : 0;
         }
 
-        /* ---------- MMSE-SPP ---------- */
         if (!m->initialized)
             m->noise_psd[f] = power;
 
@@ -239,7 +198,6 @@ void masker_step(MaskEstimator* m,
         }
     }
 
-    /* ===== frame-level noise update ===== */
     {
         float frame_spp = frame_spp_sum / (float)m->F;
 
@@ -253,7 +211,6 @@ void masker_step(MaskEstimator* m,
         }
     }
 
-    /* ===== frequency median filter ===== */
     if (m->cfg.enable_freq_smooth) {
         median_filter_1d(
             m->spp_mask_bin,
@@ -265,7 +222,6 @@ void masker_step(MaskEstimator* m,
         memcpy(m->spp_mask_f, m->spp_mask_bin, m->F * sizeof(int));
     }
 
-    /* ===== time smoothing ===== */
     for (int f = 0; f < m->F; f++) {
         if (m->cfg.enable_time_smooth) {
             m->spp_time[f] =
@@ -279,7 +235,6 @@ void masker_step(MaskEstimator* m,
         }
     }
 
-    /* ===== final TF mask ===== */
     for (int f = 0; f < m->F; f++) {
         int energy_ok = m->cfg.enable_energy ? m->energy_mask[f] : 1;
         int spp_ok    = m->cfg.enable_spp    ? m->spp_mask[f]    : 1;

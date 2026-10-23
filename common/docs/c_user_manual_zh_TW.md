@@ -40,7 +40,7 @@
 | `include/audio_pre_gain.h` | 以 dB 設定的輸入增益，逐樣本乘法，支援就地 | opaque handle + 函式 | 是 |
 | `utility/mem_align.h` | 自己算 static pool 尺寸時的 16-byte 對齊與溢位安全加乘 | 純巨集／`static inline` | 否 |
 | `utility/simd_kernels.h` | 想把 per-bin 迴圈換成向量化版本（NEON／純量兩套，行為一致） | 純標頭 | 否 |
-| `utility/simd_kernel_nn.h` | 神經網路模型前後處理（DFN2／ULCNet／GTCRN／DeepVQE）與重取樣器用的向量化核心，與 `simd_kernels.h` 分開管理 | 純標頭 | 否 |
+| `utility/simd_kernel_nn.h` | 神經網路模型前後處理（DFN2／ULCNet／GTCRN／DeepVQE）與 `audio_stft.h` 用的向量化核心，與 `simd_kernels.h` 分開管理 | 純標頭 | 否 |
 | `utility/fast_math.h` | 熱迴圈裡要 `exp`／`log`／`sqrt`／`E1` 的快速近似版 | 純標頭 | 否 |
 | `include/wav_io.h` | 離線工具讀寫 WAV 檔（強化過的解析器 + 兩種寫入風格） | 純標頭 | 否 |
 
@@ -61,7 +61,7 @@
 
 ## 2. 快速上手
 
-以下三段程式碼都已對現行標頭實際編譯並執行過。編譯方式見第 3 節。
+以下三段程式碼可直接編譯執行。編譯方式見第 3 節。
 
 ### 2.1 FFT 來回轉換
 
@@ -142,7 +142,7 @@ int main(void)
 }
 ```
 
-以上參數實測結果：`capacity` 為 161、`consumed` 為 480、`produced` 為 160。
+以上參數下：`capacity` 為 161、`consumed` 為 480、`produced` 為 160。
 **每個區塊都要檢查 `consumed`**：若 `consumed < input_frames`，代表輸出容量不足，剩下的輸入這次沒被吃掉，下次要重送。
 
 ### 2.3 對 mono 緩衝區做 HPF + 前級增益
@@ -197,7 +197,7 @@ make test_audio_utils   # pre-gain 與所有支援的取樣率配對測試
 
 ### 3.2 FFT 後端
 
-NE10 是唯一的 FFT 後端。`BACKEND=ne10` 是預設，也是唯一接受的值；給其他值（包含 `kiss`）建置會直接報錯停止。
+NE10 是唯一的 FFT 後端。`BACKEND=ne10` 是預設，也是唯一接受的值；給其他值建置會直接報錯停止。
 
 NE10 包裝層依 ARM32／ARM64 編譯器巨集自動選路；`SIMD=1` 且目標有 `__ARM_NEON` 時使用 NE10 NEON FFT，否則使用同一後端的 C FFT，`SIMD=0` 一律使用 C。共用 DSP／spatial 的 NEON 微核心需要 AArch64 指令，因此 ARM32 保留純量 fallback；ARM32 的 sqrt 使用正確捨入 `sqrtf`（VFP 為 VSQRT，soft-float 為 libm）。非 ARM 主機（例如 x86_64）仍不支援。交叉編譯時把 `CC`／`CXX`／`AR`／`RANLIB` 一起指定為目標工具鏈；ARM32 支援 NEON 時可加 `EXTRA_CFLAGS=-mfpu=neon-vfpv4`（AArch32 ARMv8 核心用 `-mfpu=neon-fp-armv8`）；不要用單純的 `-mfpu=neon`，它沒有硬體 FMA，所有明確的 `fmaf()`（`simd_aec.h` 的 PBFDKF 梯度與權重更新、`simd_kernels.h` 的複數乘加、`fft_wrapper_ne10.c` 的功率譜、`aec_post.c`）都會變成 libm 呼叫，位元結果不變但速度慢很多。ARMv7 Advanced SIMD 會把 subnormal 沖為零，並以預設 NaN 取代帶 payload 的 NaN，因此 ARM32 上 `SIMD=1` 與 `SIMD=0` 對 subnormal／NaN payload 的值可能不同；只有 NE10 NEON FFT，以及具硬體 FMA 的核心（`-mfpu=neon-vfpv4`）上 AEC 的 delay matched filter 受影響，其餘 kernel 在 ARM32 皆為 C。不同 ABI 要重新查詢 pool 尺寸／descriptor，不可沿用另一 ABI 的配置。
 
@@ -241,7 +241,8 @@ AUDIO_COMMON_LIB := $(shell $(MAKE) -s -C $(AUDIO_COMMON_DIR) print-lib-path)
 ### 3.5 消費端的編譯旗標
 
 ```
--I<common>/include        # 標頭搜尋路徑
+-I<common>/include        # 標頭搜尋路徑（頂層標頭）
+-I<common>                # 供 utility/... 標頭（#include "utility/fast_math.h"）使用
 -ffp-contract=off               # 強制要求，見下
 -fno-math-errno                 # AArch64 sqrtf 直接降成 FSQRT，不保留 errno fallback
 ```
@@ -261,7 +262,7 @@ AUDIO_COMMON_LIB := $(shell $(MAKE) -s -C $(AUDIO_COMMON_DIR) print-lib-path)
 
 ```
 cc -std=gnu99 -O2 -Wall -Wextra -ffp-contract=off -fno-math-errno \
-   -I<common>/include your_code.c "$(make -s -C <common> print-lib-path)" -lm -o your_app
+   -I<common>/include -I<common> your_code.c "$(make -s -C <common> print-lib-path)" -lm -o your_app
 ```
 
 ---
@@ -339,7 +340,7 @@ if (!fft) { /* 未對齊 / 空間不足 / 尺寸不合法 */ }
 fft_destroy(fft);            /* pool 路徑下是真正的 no-op，重複呼叫也安全 */
 ```
 
-`fft_get_mem_size()` 回報的位元組數**已包含**後端內部的 twiddle／設定資料，兩個後端在 `fft_init()` 之後都不會再向 heap 要任何記憶體。
+`fft_get_mem_size()` 回報的位元組數**已包含** NE10 內部的 twiddle／設定資料，`fft_init()` 之後不會再向 heap 要任何記憶體。
 
 #### 逐函式簽章與呼叫時機
 
@@ -381,7 +382,7 @@ void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);
 | `fft_from_mag_phase` | 由振幅與相位重建複數頻譜時 | 三個陣列長度都是 `n_freqs` |
 | `fft_apply_gain` | 對頻譜逐 bin 套用實數增益（就地） | `gain` 長度 `n_freqs` |
 
-**關於 `fft_phase()` 與 `fft_from_mag_phase()`**：這兩個函式是**受支援的公開 API**。它們在標頭中宣告、在兩個後端都有實作、語意明確（`atan2f(im, re)` 逐 bin；以及 `magnitude * (cos + i·sin)` 逐 bin）、且與其他頻譜輔助函式共用同一套 NULL 保護與長度慣例。目前 common 內部沒有呼叫者，但這不影響它們可被使用。
+**關於 `fft_phase()` 與 `fft_from_mag_phase()`**：這兩個函式是**受支援的公開 API**。它們在標頭中宣告、在 `fft_wrapper_ne10.c` 有實作、語意明確（`atan2f(im, re)` 逐 bin；以及 `magnitude * (cos + i·sin)` 逐 bin）、且與其他頻譜輔助函式共用同一套 NULL 保護與長度慣例。
 
 #### 緩衝區大小規則
 
@@ -784,7 +785,7 @@ static unsigned char g_pool[POOL_BYTES] __attribute__((aligned(16)));
 #### 生命週期
 
 純標頭，`static inline`，沒有 handle、沒有初始化、沒有釋放，不需要連結封存檔。
-只需要 `-I<common>/include` 加上 `-ffp-contract=off`。
+只需要 `-I<common>` 加上 `-ffp-contract=off`（`utility/` 標頭以 `utility/xxx.h` 引用）。
 
 #### 逐函式簽章與呼叫時機
 
@@ -1008,7 +1009,7 @@ void       wav_close_write(WavWriter* w);      /* 相容包裝，吞掉結果 */
 | `wav_open_write` | 開始寫檔時 | `sample_rate` 與 `channels` 都必須 `> 0` |
 | `wav_write_float` | 每個區塊 | `buf` 為 `n` 個 `float`；`n <= 0` 直接 return |
 | `wav_finalize_write` | 寫完，且**只呼叫一次** | 回 `0` 成功、`-1` 失敗；一定會消耗 `w` |
-| `wav_close_write` | 舊有程式碼相容用 | 等同 `wav_finalize_write()` 但丟棄回傳值 |
+| `wav_close_write` | 相容包裝 | 等同 `wav_finalize_write()` 但丟棄回傳值 |
 
 **接受的檔案格式（`wav_open_read`）**
 
@@ -1096,7 +1097,7 @@ float32 輸出路徑（`WAV_IO_WRITER_AEC` + `AEC_OUT_FLOAT=1`）是**原始位�
 2. 呼叫 `wav_finalize_write()` 之後又呼叫 `wav_close_write()`，造成 double free。
 3. 用 `wav_close_write()` 而不檢查任何錯誤，磁碟滿時得到一個標頭正確但資料被截斷的檔案。
 4. 在 include 之後才定義 `WAV_IO_WRITER_STYLE`，結果拿到預設風格。
-5. 餵 24-bit 或 44.1 kHz 以外沒問題但格式不合的檔案，`wav_open_read()` 回 `NULL` 卻沒檢查。
+5. 餵 24-bit 等不被接受的格式，`wav_open_read()` 回 `NULL` 卻沒檢查。
 6. 在即時路徑上使用這個模組。
 
 ---
@@ -1183,7 +1184,7 @@ int  ac_stft_latency_samples(const AcStftConfig*);                          /* �
 - [ ] 所有 include 了 `simd_kernels.h` 或 `fast_math.h` 的**消費端 TU** 都帶 `-ffp-contract=off -fno-math-errno`。
 - [ ] 這兩個旗標放在 `CFLAGS` 最後，沒有被後續附加項覆寫。
 - [ ] 專案中沒有任何地方出現 `-Ofast`、`-ffast-math` 或其他 `-ffp-contract=` 值。
-- [ ] 消費端有 `-I<common>/include`，連結時有 `-lm`。
+- [ ] 消費端有 `-I<common>/include` 與 `-I<common>`（`utility/...` 標頭用），連結時有 `-lm`。
 
 **SIMD 設定一致性**
 

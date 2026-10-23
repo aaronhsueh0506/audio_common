@@ -1,18 +1,12 @@
-/* Per-stage cost of masker_step(), plus the cost of the clock used to
- * measure it. Build and run ON THE TARGET -- the whole point is that the
- * development host and a Cortex-A53 disagree about which of these is
- * expensive, so a host number answers nothing.
+/* Per-stage cost of masker_step(), plus the cost of the clock read used to time it.
+ * Run it on the target: the host and a Cortex-A53 disagree about which stage is expensive.
  *
  *   make BACKEND=ne10 SIMD=1 bench-masker
- *   make BACKEND=ne10 SIMD=0 bench-masker      <- the decisive A/B
+ *   make BACKEND=ne10 SIMD=0 bench-masker      (A/B against SIMD=1)
  *
- * If SIMD=0 is FASTER, the shared NEON kernels are the regression: on an
- * A53 the NEON datapath is 64-bit internally, so a 128-bit op issues as two
- * micro-ops, and vld2q_f32 (which sk_cmag_f32 uses to de-interleave Complex)
- * is a multi-cycle structure load. Both erase the 4x a 128-bit ISA suggests.
- *
- * Stage totals are reported separately from masker_step() so a regression
- * can be attributed instead of guessed at.
+ * On an A53 the NEON datapath is 64-bit internally, so a 128-bit op issues as two micro-ops and
+ * vld2q_f32 (used by sk_cmag_f32 to de-interleave Complex) is a multi-cycle structure load.
+ * Stage totals are printed next to masker_step() so the cost can be attributed.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,8 +62,7 @@ int main(int argc, char** argv) {
         a[f] = 1e-3f + (float)f * 1e-4f; b[f] = a[f];
     }
 
-    /* What one clock read costs here -- the number that decides whether the
-     * AEC/pipeline stage timing is worth compiling out on this target. */
+    /* Cost of one clock read: decides whether stage timing is worth compiling in on this target. */
     t0 = now_s();
     for (i = 0; i < 200000; ++i) (void)now_s();
     clock_cost = (now_s() - t0) / 200000.0;
@@ -91,25 +84,13 @@ int main(int argc, char** argv) {
         sk_asym_ema_f32(a, b, F, cfg.E_alpha_up, cfg.E_alpha_down);
     s_ema = (now_s() - t0) / BENCH_FRAMES;
 
-    /* Consume every result so no loop below can be hoisted out of its
-     * repeat count. Measured behaviour without it was already correct here
-     * -- the per-kernel times scale ~linearly with F -- but that is a
-     * property of one compiler on one host, not something to rely on. */
+    /* Consume every result so the compiler cannot hoist a loop out of its repeat count. */
     for (f = 0; f < F; ++f) sink += a[f] + b[f];
 
-    /* Printed first because a wrong answer here dwarfs anything measured
-     * below: an -O0 build explains a large regression on its own, and it is
-     * not visible from a timing number alone.
-     *
-     * ⚠ The kernel label says which IMPLEMENTATION was compiled, NOT whether
-     * the code is vectorized. SIMD=0 defines SIMD_KERNELS_FORCE_SCALAR, which
-     * selects the plain-C fallback -- and the compiler is free to
-     * auto-vectorize that fallback, which on some hosts makes the "off" build
-     * the faster one. So SIMD=0 vs SIMD=1 answers "do the hand-written
-     * intrinsics beat what the compiler does on its own", which is the
-     * question worth asking, but it is NOT a SIMD-vs-scalar comparison. For a
-     * genuine scalar baseline build the fallback with vectorization disabled
-     * (-fno-tree-vectorize on GCC, -fno-vectorize on clang). */
+    /* Printed first: an -O0 build alone explains a large slowdown and is invisible in the timings.
+     * The kernel label names the implementation compiled, not whether the code is vectorized:
+     * SIMD=0 selects the plain-C fallback, which the compiler may auto-vectorize. For a true scalar
+     * baseline also pass -fno-tree-vectorize (GCC) or -fno-vectorize (clang). */
     printf("kernels=%s optimize=%s nfft=%d F=%d frames=%d sink=%.3g\n",
            SK_HAVE_NEON ? "neon-intrinsics"
                         : "scalar-fallback (compiler may vectorize it)",

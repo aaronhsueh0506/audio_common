@@ -1,18 +1,12 @@
 /*
  * test_ne10_c_parity.c - NEON-vs-C parity data generator.
  *
- * Built twice by the `test_ne10_force_c` target: against the normal NE10
- * backend (the `_neon` kernels) and with SIMD=0 (the `_c` scalar kernels).
- * Both runs use the same fixed vectors (impulse and a deterministic random
- * signal) at nfft in {256, 512, 1024} and dump the forward spectrum and the
- * inverse output as raw float32 to the file named by argv[1];
- * ne10_parity_compare.c then compares the two dumps.
- *
- * The program also checks its own round trip (forward then inverse recovers
- * the input), so a failure is not blamed on the other build.
- *
- * The random vector comes from a fixed LCG rather than libc rand() so that it
- * is bit-identical in both builds and on every platform.
+ * Built twice by the `test_ne10_force_c` target: against the normal NE10 backend (`_neon` kernels) and
+ * with SIMD=0 (`_c` scalar kernels). Both runs use the same fixed vectors (impulse and a deterministic
+ * random signal) at nfft in {256, 512, 1024} and dump the forward spectrum and inverse output as raw
+ * float32 to the file named by argv[1]; ne10_parity_compare.c compares the two dumps. The program also
+ * checks its own forward -> inverse round trip. The random vector comes from a fixed LCG, not libc
+ * rand(), so it is bit-identical in both builds and on every platform.
  */
 #include "fft_wrapper.h"
 

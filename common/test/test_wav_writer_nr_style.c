@@ -1,11 +1,8 @@
 /*
- * test_wav_writer_nr_style.c - runs the shared writer special-values test
- * (test_wav_writer_common.h) with WAV_IO_WRITER_NR; test_wav_io.c runs it
- * with the default WAV_IO_WRITER_AEC.
- *
- * WAV_IO_WRITER_STYLE is a compile-time setting, so this is a separate
- * translation unit built with -DWAV_IO_WRITER_STYLE=WAV_IO_WRITER_NR. The
- * reader tests are not repeated: the style does not affect the reader.
+ * test_wav_writer_nr_style.c - runs the shared writer special-values test (test_wav_writer_common.h)
+ * with WAV_IO_WRITER_NR; test_wav_io.c runs it with the default WAV_IO_WRITER_AEC. The style is a
+ * compile-time setting, so this is a separate translation unit built with
+ * -DWAV_IO_WRITER_STYLE=WAV_IO_WRITER_NR. Reader tests are not repeated: the style does not affect them.
  */
 #include "wav_io.h"
 #include "test_wav_writer_common.h"

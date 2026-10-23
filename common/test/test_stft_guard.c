@@ -1,22 +1,15 @@
 /*
  * test_stft_guard.c - memory-bounds test for audio_stft.h.
  *
- * Every AcStft and AcIstft is placed in a block of exactly
- * ac_stft_get_mem_size() / ac_istft_get_mem_size() bytes that ends flush
- * against a PROT_NONE page (and, in a second placement, starts flush behind
- * one), then driven through all of its entry points. A read or write outside
- * the reported size faults, and the fault is reported with the configuration
- * that caused it.
+ * Every AcStft and AcIstft sits in a block of exactly ac_stft_get_mem_size() / ac_istft_get_mem_size()
+ * bytes that ends flush against a PROT_NONE page (and, in a second placement, starts flush behind
+ * one), then is driven through all of its entry points. An access outside the reported size faults
+ * and is reported with the configuration that caused it.
  *
- * Matrix: fft_size 16..8192 (powers of two) x center 0/1 x synthesis mode x
- * own/borrowed FFT handle x own/borrowed window x guard after/before, for
- * both objects, with non-unit scales so the staging buffers are used.
- *
- * Two probes run first: a write one byte past the block must fault on both
- * sides, which shows that the guard is effective on this system.
- *
- * POSIX only (mmap, mprotect, sigsetjmp); elsewhere the test prints SKIP and
- * succeeds.
+ * Matrix: fft_size 16..8192 (powers of two) x center 0/1 x synthesis mode x own/borrowed FFT handle x
+ * own/borrowed window x guard after/before, both objects, with non-unit scales so the staging buffers
+ * are used. Two probes run first: a write one byte past the block must fault on both sides.
+ * POSIX only (mmap, mprotect, sigsetjmp); elsewhere the test prints SKIP and succeeds.
  */
 #include <stdio.h>
 

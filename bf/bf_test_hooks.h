@@ -3,9 +3,7 @@
 
 #include "bf.h"
 
-/* Internal oracle for scalar-vs-dispatch state-transition tests. It exists
- * only in the BF_TESTING object and is absent from deployable libbf.a;
- * production code must call bf_process_with_weights(). */
+/* Scalar-recurrence entry; compiled only with BF_TESTING and absent from the production library. */
 void bf_test_process_with_weights_scalar_rls(
     BF* g,
     const Complex* const* X,

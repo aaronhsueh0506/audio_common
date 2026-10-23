@@ -1,11 +1,4 @@
-/**
- * hpf.c - 2nd-order Butterworth IIR High-Pass Filter
- *
- * Bilinear transform from analog prototype.
- * Direct Form II transposed implementation.
- * Same formula as the AEC Python reference HighPassFilter, in float32 (not
- * bit-exact with it).
- */
+/** hpf.c - 2nd-order Butterworth high-pass, bilinear transform, direct form II transposed, float32. */
 
 #include "hpf.h"
 #include "utility/mem_align.h"
@@ -24,7 +17,6 @@ struct Hpf {
     int is_static;
 };
 
-/* Compute filter coefficients (shared by create and init) */
 static void hpf_compute_coeffs(Hpf* h, float cutoff_hz, int sample_rate) {
     float wc = 2.0f * (float)M_PI * cutoff_hz / (float)sample_rate;
     float wc_w = tanf(wc / 2.0f);
@@ -40,9 +32,8 @@ static void hpf_compute_coeffs(Hpf* h, float cutoff_hz, int sample_rate) {
     h->z2 = 0.0f;
 }
 
-/* Parameter domain shared by hpf_create and hpf_init: cutoff_hz finite and
- * > 0, sample_rate > 0, cutoff_hz below 0.45 * sample_rate so that wc / 2 in
- * hpf_compute_coeffs stays clear of the pi/2 pole of tanf. */
+/* Parameter domain shared by hpf_create and hpf_init: cutoff_hz finite and > 0, sample_rate > 0, cutoff_hz < 0.45 * sample_rate
+ * (keeps wc / 2 clear of the pi/2 pole of tanf). */
 static int hpf_params_valid(float cutoff_hz, int sample_rate) {
     if (!isfinite(cutoff_hz) || cutoff_hz <= 0.0f) return 0;
     if (sample_rate <= 0) return 0;
@@ -59,8 +50,6 @@ Hpf* hpf_create(float cutoff_hz, int sample_rate) {
     hpf_compute_coeffs(h, cutoff_hz, sample_rate);
     return h;
 }
-
-/* --- Static memory API --- */
 
 size_t hpf_get_mem_size(void) {
     size_t total = ck_field_size(0, 1, sizeof(Hpf));

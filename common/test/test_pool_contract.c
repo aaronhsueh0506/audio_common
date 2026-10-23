@@ -1,16 +1,10 @@
 /*
- * test_pool_contract.c - negative-input contract tests for the shared
- * static-memory pool APIs (fft_wrapper.h, hpf.h).
- *
- * Covers:
- *   - the pool inits (fft_init, hpf_init) reject a misaligned base pointer
- *     before writing anything, and a mem_size smaller than get_mem_size()
- *     reports (including the exact-size boundary);
- *   - hpf_create / hpf_init reject a cutoff_hz / sample_rate pair that is
- *     non-finite, non-positive, or at or above 0.45 * sample_rate.
- *
- * Every failure is printed and sets a global flag; main() reports ALL PASS or
- * FAIL at the end so one failure does not hide the rest.
+ * test_pool_contract.c - negative-input tests for the static-memory pool APIs (fft_wrapper.h, hpf.h):
+ *   - fft_init and hpf_init reject a misaligned base pointer before writing anything, and a mem_size
+ *     below get_mem_size() (including the exact-size boundary);
+ *   - hpf_create / hpf_init reject a cutoff_hz / sample_rate pair that is non-finite, non-positive,
+ *     or has cutoff_hz at or above 0.45 * sample_rate.
+ * Each failure is printed and sets a global flag; main() reports ALL PASS or FAIL at the end.
  */
 #include "fft_wrapper.h"
 #include "hpf.h"

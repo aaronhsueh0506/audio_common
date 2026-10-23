@@ -20,8 +20,7 @@ static int vad_median(MaskVAD* v, int raw)
     return (sum >= (k / 2 + 1));
 }
 
-/* One place that fills the struct, so the heap and pool constructors below
- * cannot drift in what a fresh instance looks like. */
+/* Fills a fresh instance; shared by the heap and pool constructors. */
 static void vad_reset_state(MaskVAD* v, const VadConfig* cfg)
 {
     v->cfg = *cfg;
@@ -44,15 +43,8 @@ size_t vad_get_mem_size(void)
 int vad_config_is_valid(const VadConfig* cfg)
 {
     if (!cfg || cfg->F <= 0) return 0;
-    /* vad_median() ignores any median_k that is not 5, 7 or 9, and med_buf
-     * holds exactly 9 entries -- that guard is what keeps a larger k from
-     * indexing past the array, not a policy. Refusing the config means a
-     * caller who asked for median smoothing either gets it or gets NULL,
-     * never a run with the filter silently switched off.
-     *
-     * Exported because vad_get_mem_size() takes no config: without it the
-     * sizing call would accept a config that vad_init() then refuses, which
-     * is exactly the split that makes a caller allocate and only then fail. */
+    /* vad_median() supports only median_k 5, 7 or 9 and med_buf holds 9 entries, so other values are refused.
+     * Exported because vad_get_mem_size() takes no config. */
     if (cfg->enable_median &&
         cfg->median_k != 5 && cfg->median_k != 7 && cfg->median_k != 9)
         return 0;
@@ -68,12 +60,11 @@ MaskVAD* vad_init(void* mem, size_t mem_size, const VadConfig* cfg)
     need = vad_get_mem_size();
     if (need == 0 || !MEM_IS_ALIGNED16(mem) || mem_size < need) return NULL;
 
-    /* Only the budgeted region is touched, so trailing bytes of a larger
-     * caller pool stay untouched (same contract as bf_init()). */
+    /* Only the budgeted region is touched; trailing bytes of a larger pool are left alone. */
     memset(mem, 0, need);
     v = (MaskVAD*)mem;
     vad_reset_state(v, cfg);
-    v->owned_heap = NULL;   /* caller owns it */
+    v->owned_heap = NULL;
     return v;
 }
 
@@ -83,10 +74,7 @@ MaskVAD* vad_create(const VadConfig* cfg)
     void* block;
     size_t need = vad_get_mem_size();
 
-    /* Delegates to vad_init() rather than malloc(sizeof(MaskVAD)) directly, so
-     * the heap path gets the SAME budget, the same 16-byte alignment vad_init()
-     * requires of everyone else, and the same zero-fill. A private malloc here
-     * would hand back memory vad_init() would have rejected. */
+    /* Delegates to vad_init() so the heap path gets the same budget, alignment and zero-fill. */
     if (!cfg || cfg->F <= 0) return NULL;
     if (posix_memalign(&block, 16, need) != 0 || !block) return NULL;
     v = vad_init(block, need, cfg);
@@ -98,8 +86,7 @@ MaskVAD* vad_create(const VadConfig* cfg)
 void vad_destroy(MaskVAD* v)
 {
     if (!v) return;
-    /* Pool path (owned_heap == NULL, vad_init()): the caller owns the memory,
-     * nothing to free here. */
+    /* Pool path (owned_heap == NULL): the caller owns the memory; nothing to free. */
     if (v->owned_heap) free(v->owned_heap);
 }
 

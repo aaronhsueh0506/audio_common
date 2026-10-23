@@ -1,18 +1,14 @@
 /*
  * test_stft.c - audio_stft.h contracts.
- *
- *   windows   ac_window_build against two independent spellings of the
- *      periodic sqrt-Hann formula at every power of two in [16, 8192].
- *   latency   the measured impulse delay of the analysis -> synthesis chain
- *      equals ac_stft_latency_samples, and the chain reconstructs its input.
- *   API contract   invalid sizes and configurations, block size and
- *      alignment checks, borrowed tables, dirty versus zeroed pools.
- *   scaled entry points   with non-unit spec_scale / ispec_scale the
- *      interleaved (Complex) and the split calls give the same bits, and both
- *      equal the unscaled transform times the scale.
- *
- * SIMD=0 / SIMD=1 comes from the build; results are only comparable within
- * one SIMD setting.
+ *   windows      ac_window_build against two independent spellings of the periodic sqrt-Hann formula
+ *                at every power of two in [16, 8192].
+ *   latency      the measured impulse delay of the analysis -> synthesis chain equals
+ *                ac_stft_latency_samples, and the chain reconstructs its input.
+ *   API          invalid sizes and configurations, block size and alignment checks, borrowed tables,
+ *                dirty versus zeroed pools.
+ *   scaled       with non-unit spec_scale / ispec_scale the Complex and split calls give the same
+ *                bits, and both equal the unscaled transform times the scale.
+ * SIMD=0 / SIMD=1 comes from the build; results are only comparable within one SIMD setting.
  */
 #include <float.h>
 #include <math.h>

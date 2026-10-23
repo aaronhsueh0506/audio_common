@@ -1,13 +1,11 @@
 /*
  * simd_nn_selftest.c - bitwise gate for utility/simd_kernel_nn.h.
  *
- * Every skn_<name>() (NEON when available, else the scalar twin) runs
- * against skn_<name>_scalar() on identical inputs over n = 0..17 and the
- * DSP sizes the NN pre/post code uses, with canaries on both sides of every
- * output. Arithmetic kernels draw finite values (plus +-0, denormals and
- * +-Inf where the kernel has no Inf-Inf/0*Inf hazard); the predicate kernel
- * draws every class, NaN included. ERB arithmetic counts both-NaN payload
- * differences; every other difference prints and exits 1.
+ * Every skn_<name>() (NEON when available, else the scalar twin) runs against skn_<name>_scalar() on
+ * identical inputs over n = 0..17 and the DSP sizes the NN pre/post code uses, with canaries on both
+ * sides of every output. Arithmetic kernels draw finite values (plus +-0, denormals and, where safe,
+ * +-Inf); the predicate kernel draws every class. ERB arithmetic counts both-NaN payload differences
+ * instead of failing on them; every other difference prints and exits 1.
  */
 #include "utility/simd_kernel_nn.h"
 
@@ -368,14 +366,10 @@ static void test_ctaps_mac(void) {
     printf("PASS ctaps_mac_f32\n");
 }
 
-/* skn_erb_forward_banded_f32: has no _scalar twin (see its own banner --
- * its original, DeepFilterNet2/3's erb_forward_banded, never had one
- * either), so there is nothing to differentially dispatch-test here. What
- * this checks instead is the kernel's own documented contract: a dense,
- * independently-structured double loop (no four-band batching, no shared
- * `common` prefix) that accumulates the same ascending-k, per-band fold
- * into a pre-seeded erb_work, over random sparse [k0,k1) ranges including
- * empty ones and ranges touching 0/n_bins. */
+/* skn_erb_forward_banded_f32 has no _scalar twin, so this checks its documented contract against a
+ * dense double loop (no four-band batching, no shared prefix) that accumulates the same ascending-k
+ * per-band fold into a pre-seeded erb_work, over random sparse [k0,k1) ranges including empty ones
+ * and ranges touching 0 and n_bins. */
 static void erb_forward_banded_ref(const float *power, const float *erb_fwd,
                                     const uint16_t *k0, const uint16_t *k1,
                                     int n_bands, float *erb_work) {
@@ -423,12 +417,9 @@ static void test_erb_forward_banded(void) {
     printf("PASS erb_forward_banded_f32\n");
 }
 
-/* skn_erb_expand_mask_f32{,_scalar,_neon}: dense reference is the sum over
- * EVERY band (never skipping by inv_lo/inv_hi), which is what a finite
- * gain's skip-the-zeros optimization must equal and what a non-finite
- * gain's whole-row fallback already is by definition -- the same
- * dense-contract style tests/test_nn_kernels.c uses for DFN2's copy of this
- * kernel. */
+/* skn_erb_expand_mask_f32{,_scalar,_neon}: the dense reference sums over EVERY band (never skipping by
+ * inv_lo/inv_hi), which is what a finite gain's skip-the-zeros path must equal and what a
+ * non-finite gain's whole-row fallback is by definition. */
 static void erb_expand_mask_ref(const float *band_gain, const float *erb_inv,
                                  int n_bins, int n_bands, float *bin_gain) {
     int k, b;
@@ -508,11 +499,9 @@ static void test_erb_expand_mask(void) {
     printf("PASS erb_expand_mask_f32\n");
 }
 
-/* skn_erb_band_accumulate_f32_scalar: reference uses the OPPOSITE loop
- * nest (outer bin, inner band -- GTCRN's own original structure) from the
- * kernel's (outer band, inner bin -- RNNoise-ERB's), so this is a genuine
- * independent-structure cross-check of the per-band ascending-k fold, not a
- * restatement of the kernel's own body. */
+/* skn_erb_band_accumulate_f32_scalar: the reference uses the opposite loop nest (outer bin, inner band)
+ * from the kernel's (outer band, inner bin), so it cross-checks the per-band ascending-k fold
+ * independently of the kernel body. */
 static void erb_band_accumulate_ref(const float *x, const float *table,
                                      int n_bins, int n_bands, float *banded) {
     int b, k;

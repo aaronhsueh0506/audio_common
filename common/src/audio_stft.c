@@ -57,8 +57,7 @@ static int config_valid(const AcStftConfig* cfg) {
     return 1;
 }
 
-/* Field walk shared by get_mem_size and init: `arrays` is the number of
- * float[n] regions; the staging bins follow them. */
+/* Field walk shared by get_mem_size and init: `arrays` float[n] regions, then the staging bins. */
 static int layout_walk(const AcStftConfig* cfg, size_t struct_bytes,
                        int arrays, Layout* lay) {
     size_t n = (size_t)cfg->fft_size;
@@ -91,8 +90,7 @@ static void* take(Cursor* c, size_t bytes) {
     return r;
 }
 
-/* Carve the borrowed-or-own FFT handle and window; both walks agree with
- * layout_walk by construction. Returns 0 if the own FFT cannot be built. */
+/* Carve the borrowed-or-own FFT handle and window; returns 0 if the own FFT cannot be built. */
 static int carve_tables(Cursor* c, const AcStftConfig* cfg, const Layout* lay,
                         FftHandle** fft, const float** window) {
     if (cfg->fft) {
@@ -124,8 +122,6 @@ void ac_stft_config_default(AcStftConfig* cfg, int fft_size) {
 int ac_stft_latency_samples(const AcStftConfig* cfg) {
     return config_valid(cfg) ? cfg->fft_size / 2 : -1;
 }
-
-/* ------------------------------ analysis ------------------------------ */
 
 size_t ac_stft_get_mem_size(const AcStftConfig* cfg) {
     Layout lay;
@@ -220,7 +216,7 @@ static void history_append(AcStft* s, const float* hop_in) {
     memcpy(s->history + s->n - s->hop, hop_in, (size_t)s->hop * sizeof(float));
 }
 
-/* Reflect prefix of the first centered frame: x[hop..1] followed by x[0..hop). */
+/* Reflect prefix of the first centered frame: x[hop..1] then x[0..hop). */
 static void build_head_segment(AcStft* s) {
     int i;
     for (i = 0; i < s->hop; ++i) s->seg[i] = s->history[s->hop - i];
@@ -285,8 +281,6 @@ int ac_stft_flush_planar(AcStft* s, float* re, float* im) {
     frame_planar(s, s->seg, re, im);
     return 1;
 }
-
-/* ----------------------------- synthesis ------------------------------ */
 
 static int istft_arrays(const AcStftConfig* cfg) {
     return cfg->ola == AC_OLA_ENV_NORM ? 3 : 2;

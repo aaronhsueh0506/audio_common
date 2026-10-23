@@ -1,21 +1,13 @@
 #!/bin/sh
 # run_selftest_ubsan.sh - UBSan probe for test/simd_selftest.c.
 #
-# Standalone script, not a Makefile target: simd_kernels.h is header-only, so no
-# common archive link is required (same as the simd_kernels.h half of
-# `make selftest`).
+# Standalone script, not a Makefile target: simd_kernels.h is header-only, so no common archive link
+# is required. It compiles and runs the same selftest source with
+# -fsanitize=undefined -fno-sanitize-recover=all and must exit 0 with no UBSan diagnostic; any
+# diagnostic is a real finding (signed overflow, UB misaligned access, ...), not noise. ASan is
+# intentionally not wired here.
 #
-# Compiles+runs the SAME selftest source with
-# -fsanitize=undefined -fno-sanitize-recover=all (host UBSan works fine for
-# a single small translation unit like this one) and must exit 0 with no
-# UBSan diagnostic printed -- any diagnostic here is a real finding (signed
-# overflow, misaligned access the compiler considers UB, etc.), not noise.
-#
-# ASan is intentionally NOT wired here: it stays a Linux-CI item (the ASan
-# runtime on the macOS development host is unusable). -fsanitize=undefined only.
-#
-# Usage: ./test/run_selftest_ubsan.sh   (from anywhere; cd's to this repo
-# root itself via the script's own location, no assumption about caller cwd)
+# Usage: ./test/run_selftest_ubsan.sh   (any cwd; it cd's to the repo root via its own location)
 
 set -e
 cd "$(dirname "$0")/.."

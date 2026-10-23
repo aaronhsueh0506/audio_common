@@ -1,11 +1,5 @@
-/**
- * Stateful rational polyphase audio resampler.
- *
- * Accepted rates are deliberately restricted to the product contract:
- * 8000, 16000, 24000, 32000, and 48000 Hz.  Input and output are interleaved
- * float32 frames.  State is preserved across process() calls, so arbitrary
- * block boundaries produce the same samples as one contiguous call.
- */
+/** Stateful rational polyphase resampler for 8000, 16000, 24000, 32000 and 48000 Hz.
+ * Input and output are interleaved float32 frames; state carries across process() calls, so block boundaries do not change the samples. */
 #ifndef AUDIO_RESAMPLER_H
 #define AUDIO_RESAMPLER_H
 
@@ -35,23 +29,12 @@ AudioResampler* audio_resampler_init(void* mem,
 void audio_resampler_destroy(AudioResampler* self);
 void audio_resampler_reset(AudioResampler* self);
 
-/**
- * Process as many complete input frames as output_capacity_frames permits.
- *
- * Input and output are interleaved: `output` needs room for
- * output_capacity_frames * channels floats. Returns 0 on success.
- * consumed_frames and produced_frames are always written on success.
- * consumed_frames < input_frames means the output capacity ran out: the
- * caller feeds the remainder again. The stream does not depend on how it is
- * split into calls or on the capacity given. For unequal rates input/output
- * buffers must not overlap. Equal-rate conversion is an exact memmove
- * passthrough.
- *
- * A non-finite input sample contaminates the outputs of the next
- * taps_per_phase + 3 input frames (the NEON build pads each phase to a
- * multiple of 4 taps; SIMD=0 reaches 3 frames less). The resampler does not
- * isolate it, so guard the input.
- */
+/** Process as many complete input frames as output_capacity_frames permits.
+ * `output` needs output_capacity_frames * channels floats. Returns 0 on success; consumed_frames and produced_frames are then always written.
+ * consumed_frames < input_frames means the output capacity ran out; feed the remainder again.
+ * For unequal rates the buffers must not overlap; equal rates are a memmove passthrough.
+ * A non-finite input sample contaminates every output whose filter window contains it (NEON also reads up to 3
+ * zero-padded taps, so SIMD=0 contaminates slightly fewer); guard the input. */
 int audio_resampler_process(AudioResampler* self,
                             const float* input,
                             int input_frames,
@@ -67,9 +50,7 @@ int audio_resampler_output_bound(const AudioResampler* self,
 int audio_resampler_input_rate(const AudioResampler* self);
 int audio_resampler_output_rate(const AudioResampler* self);
 int audio_resampler_channels(const AudioResampler* self);
-/** Group delay of the kernel in INPUT frames, rounded to the nearest frame.
- *  Exact for 8k/16k/48k pairs (the up factor divides the kernel half-length);
- *  fractional, hence rounded, for coprime pairs such as 32k -> 24k. */
+/** Group delay of the kernel in INPUT frames, rounded to the nearest frame (fractional for coprime pairs such as 32k -> 24k). */
 int audio_resampler_latency_input_frames(const AudioResampler* self);
 
 #ifdef __cplusplus

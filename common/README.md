@@ -7,8 +7,8 @@ One copy of the shared DSP code for every consumer repo (AEC, NR, Audio_ALG):
 | FFT wrapper | `include/fft_wrapper.h`, `src/fft_wrapper_ne10.c` | real-to-complex FFT over NE10; heap and static-memory paths. ARM32/ARM64 compiler-target dispatch; NEON or scalar C FFT |
 | NE10 | `lib/ne10/` | vendored DSP subset with documented local patches; see `lib/ne10/VENDORED.md` |
 | fast_math | `utility/fast_math.h` | header-only LUT/Taylor exp, minimax log, ARM hardware sqrt, and paper-pinned Martin-2004 E1 approximation |
-| simd_kernels | `utility/simd_kernels.h` | header-only **bit-exact** NEON/scalar per-bin kernels (complex magnitude, complex MAC / filter W-updates, EMA, gain apply, min/clip, pairwise sums, fast_sqrt, fast_exp/fast_exp_neg/fast_log/fast_log10/exp1_approx, noise-PSD update with a per-bin, speech-presence-dependent smoothing factor (`sk_noise_update_f32`), windowed overlap-add accumulate, float->int16 PCM clip/scale/convert). Every array-form kernel has an always-compiled scalar twin (the one exception is `sk_clip_scale_to_s16`'s single-quad form, whose `int16x4_t` return type does not exist without NEON -- callers guard it with `SK_HAVE_NEON` and fall back to the per-sample `sk__clip_scale_to_s16_elem`); the AArch64 NEON body replicates the scalar op sequence lane-for-lane (strict FMA discipline, no estimate instructions; the AArch64 sqrt kernel uses the correctly-rounded `vsqrtq_f32`). Use the Makefile's `SIMD=0` switch to select every scalar fallback; consumer TUs must build with `-ffp-contract=off` (see the header's doc comment). `make selftest` runs the bitwise NEON-vs-scalar check, gates the minimax log's accuracy against libm, and cross-checks the exp/log family bit-for-bit against fast_math.h's own implementation, which this header privately replicates rather than includes. |
-| simd_kernel_nn | `utility/simd_kernel_nn.h` | header-only **bit-exact** NEON/scalar kernels for the neural-network pre/post-processing (DFN2, Align-ULCNet, GTCRN, DeepVQE): branch-free all-finite scan, fill, elementwise multiply, feature power, Complex (de)interleave with optional scale, floored WOLA divide, magnitude with eps inside the root (`skn_mag_eps_f32`), and the per-bin complex tap filter (`skn_ctaps_mac_f32`, shared by DeepVQE's CCM and DeepFilterNet2's deep filter). Kept apart from `simd_kernels.h` so the traditional AEC/NR kernel set never changes with NN work; it includes `simd_kernels.h` only for the NEON switch and the Complex-quad helpers. Same contract (scalar twins, `SIMD=0`, `-ffp-contract=off`); `make selftest` also runs `test/simd_nn_selftest.c`. |
+| simd_kernels | `utility/simd_kernels.h` | header-only **bit-exact** NEON/scalar per-bin kernels (complex magnitude, complex MAC / filter W-updates, EMA, gain apply, min/clip, pairwise sums, `fast_sqrt`, `fast_exp`/`fast_exp_neg`/`fast_log`/`fast_log10`/`exp1_approx`, noise-PSD update with a per-bin smoothing factor (`sk_noise_update_f32`), windowed overlap-add accumulate, float->int16 PCM clip/scale/convert). Every array-form kernel has an always-compiled scalar twin; the one exception is the single-quad `sk_clip_scale_to_s16` (returns `int16x4_t`), which callers guard with `SK_HAVE_NEON`. The AArch64 NEON bodies replicate the scalar operation order lane for lane (strict FMA discipline, no estimate instructions, correctly rounded `vsqrtq_f32`). `SIMD=0` selects every scalar fallback; consumer TUs must build with `-ffp-contract=off`. `make selftest` runs the bitwise NEON-vs-scalar check, gates the minimax log's accuracy against libm, and cross-checks the exp/log family bit for bit against `fast_math.h`. |
+| simd_kernel_nn | `utility/simd_kernel_nn.h` | header-only **bit-exact** NEON/scalar kernels for the neural-network pre/post-processing (DFN2, Align-ULCNet, GTCRN, DeepVQE): branch-free all-finite scan, fill, elementwise multiply, feature power, Complex (de)interleave with optional scale, floored WOLA divide, magnitude with eps inside the root (`skn_mag_eps_f32`), and the per-bin complex tap filter (`skn_ctaps_mac_f32`, shared by DeepVQE's CCM and DeepFilterNet2's deep filter). Separate from `simd_kernels.h`; it includes that header only for the NEON switch and the Complex-quad helpers. Same contract (scalar twins, `SIMD=0`, `-ffp-contract=off`); `make selftest` also runs `test/simd_nn_selftest.c`. |
 | window | `include/audio_window.h`, `src/audio_window.c` | periodic sqrt-Hann in float32 via `ac_window_build`; no FFT or framing dependency. `audio_stft.h` includes this API for existing callers. |
 | STFT/ISTFT | `include/audio_stft.h`, `src/audio_stft.c` | one analysis object (`AcStft`) and one synthesis object (`AcIstft`) for 50%-overlap sqrt-Hann framing: accumulate-and-emit overlap-add or envelope-normalised overlap-add with reflect-padded centered analysis, optional spectrum scales for normalised NN spectra, shared or carved FFT handle and window, static memory only. `make selftest` runs `test/test_stft.c` (window formulas, latency and identity reconstruction, API contract, scaled entry points) |
 | HPF | `include/hpf.h`, `src/hpf.c` | biquad high-pass (f32, DF2-transposed), `hpf_create`/`hpf_get_mem_size`+`hpf_init` API — shared by platform code AND AEC's mic path |
@@ -61,7 +61,7 @@ pass-through. `audio_resampler_reset()` clears streaming history, so do not
 call it at ordinary chunk boundaries.
 
 FFT backend: NE10 is the only backend. `BACKEND=ne10` is the default and the only
-accepted value (any other value, `kiss` included, stops the build with an error).
+accepted value (any other value stops the build with an error).
 The compiler target selects ARM32 or ARM64 automatically. With `SIMD=1`,
 NE10 uses NEON when `__ARM_NEON` is available; otherwise it uses its scalar C
 FFT. `SIMD=0` always selects C. ARM32 uses the level-1 RFFT configuration,
@@ -92,39 +92,28 @@ VFP rules in both modes.
 
 ## FP-contraction policy
 
-`-ffp-contract=off -fno-math-errno` is a **unified policy spanning all four repos**
-(`common`, `NR/c_impl`, `AEC/c_impl`, `Audio_ALG/pipelines`): every
-translation unit any of their Makefiles compile — each repo's own sources
-*and* the vendored NE10 C and C++ TUs alike — builds with these flags,
-positioned so nothing can override it. In each Makefile the flag is the
-LAST token appended to `CFLAGS`/`CXXFLAGS` (after `EXTRA_CFLAGS`, after the
-NE10 defines, after `WERROR`/`NO_STDIO`), and each Makefile
-rejects, at parse time, an `EXTRA_CFLAGS` (or `CFLAGS=` override) containing
-`-Ofast`, `-ffast-math`, or `-ffp-contract=<anything>`:
+`-ffp-contract=off -fno-math-errno` is one policy across the four repos
+(`common`, `NR/c_impl`, `AEC/c_impl`, `Audio_ALG/pipelines`): every TU they
+compile, including the vendored NE10 C and C++ TUs, uses these flags, appended
+last to `CFLAGS`/`CXXFLAGS`. Each Makefile rejects, at parse time, a
+`CFLAGS`/`EXTRA_CFLAGS` containing `-Ofast`, `-ffast-math` or
+`-ffp-contract=<anything>`:
 
 ```
 $ make EXTRA_CFLAGS=-ffast-math
-Makefile:252: *** FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from EXTRA_CFLAGS.  Stop.
+*** FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains -ffast-math ...  Stop.
 ```
 
-`scripts/audit_fp_contract.sh` is the disassembly-level proof: it builds the
-`ne10` config, disassembles a fixed list of TUs expected to be
-genuinely scalar (this repo's `hpf.o`/the NE10 scalar-C
-objects, plus NR's three core objects), and fails if any fmadd/fmsub/
-fnmadd/fnmsub/fmla/fmls instruction shows up — the signature of the
-compiler choosing, on its own, to fuse a plain `a*b+c` expression, which is
-exactly what this flag forbids. It does NOT flag TUs that request fusion
-**explicitly** — `fft_wrapper_ne10.c`'s `fft_power()` scalar
-tail calls `fmaf()` directly (see that function's own comment) and the
-file carries an `__ARM_NEON`-guarded explicit `vfmaq_f32` block; it is
-EXEMPT (reported, never failed) with the exact source-level reason — see
-the script's own header comment for the full rationale, including a
-non-obvious finding (`NE10_rfft_float32.neonintrinsic.o`, despite its name,
-uses no fused intrinsic anywhere and is audited like any other scalar TU).
-Run it with `scripts/audit_fp_contract.sh`.
-The audit first compiles `fast_sqrt` for Cortex-A53 and Cortex-A73 Linux and
-requires an `FSQRT` instruction with no remaining `sqrtf` reference; this is
-why `-fno-math-errno` is part of the policy rather than a host-only tuning.
+`scripts/audit_fp_contract.sh [ne10]` is the disassembly-level check. It builds
+the `ne10` config, disassembles a fixed list of expected-scalar objects (this
+repo's `hpf.o`, `audio_pre_gain.o`, `audio_resampler.o`, `audio_window.o`,
+`audio_stft.o`, the NE10 objects, and NR's `anr.o`, `noise_estimator.o`,
+`spp_estimator.o`), and fails on any fmadd/fmsub/fnmadd/fnmsub/fmla/fmls, the
+signature of the compiler fusing a plain `a*b+c`. `fft_wrapper_ne10.o` requests
+fusion explicitly (`fmaf` in `fft_power()`, a `vfmaq_f32` block) and is
+reported, never failed. The audit first compiles `fast_sqrt` for Cortex-A53 and
+Cortex-A73 Linux and requires an `FSQRT` instruction with no remaining `sqrtf`
+reference, which is why `-fno-math-errno` is part of the policy.
 
 ## API conventions
 

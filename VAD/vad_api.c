@@ -16,8 +16,7 @@ struct VADApi {
     int vad_raw;
     int vad_out;
 
-    /* Non-NULL only on the vad_api_create() heap path. NULL on the
-     * vad_api_init() caller-pool path. */
+    /* Non-NULL only on the vad_api_create() path. */
     void* owned_heap;
 };
 
@@ -29,20 +28,10 @@ size_t vad_api_get_mem_size(const VADApiConfig* cfg)
 
     if (!cfg || cfg->backend != VAD_BACKEND_MASKER) return 0;
 
-    /* The two sub-configs are one contract, and nothing downstream compares
-     * them. masker_step() emits NFFT/2+1 mask entries; vad_step() then reads
-     * vad_cfg.F of them, so a larger F reads past the end of the mask -- a
-     * silent out-of-bounds read, not a wrong answer. Both fields are
-     * caller-supplied and independent, so this is the only place that can
-     * refuse the combination. */
+    /* vad_cfg.F must not exceed the NFFT/2+1 mask entries masker_step() emits (else vad_step() reads past the mask). */
     if (cfg->vad_cfg.F != cfg->masker_cfg.NFFT / 2 + 1) return 0;
     if (!vad_config_is_valid(&cfg->vad_cfg)) return 0;
-    /* Frequency smoothing has two ways to not do what was asked, and both
-     * are silent. An even smooth_size asks for a k-wide window and gets k+1,
-     * because the smoother centres on +-(k/2) -- only odd k spans exactly k
-     * bins. A smooth_size of zero or less makes median_filter_1d() copy its
-     * input straight through, so the pass runs and changes nothing. Refuse
-     * both rather than widen or skip silently. */
+    /* smooth_size must be odd (the smoother spans +-(k/2)) and positive (<= 0 would be a pass-through). */
     if (cfg->masker_cfg.enable_freq_smooth &&
         (cfg->masker_cfg.smooth_size <= 0 ||
          (cfg->masker_cfg.smooth_size & 1) == 0)) return 0;
@@ -51,19 +40,14 @@ size_t vad_api_get_mem_size(const VADApiConfig* cfg)
     vad_need    = vad_get_mem_size();
     if (masker_need == 0 || vad_need == 0) return 0;
 
-    /* One pool: [VADApi][masker sub-pool][VAD sub-pool]. Each sub-pool is
-     * handed to that module's own _init(), which carves it in turn -- the
-     * sizes below must stay in lockstep with vad_api_init()'s split. */
+    /* One pool: [VADApi][masker sub-pool][VAD sub-pool]; sizes must match the split in vad_api_init(). */
     total = ck_align16_size(sizeof(VADApi));
     total = ck_add_size(total, ck_align16_size(masker_need));
     total = ck_add_size(total, ck_align16_size(vad_need));
     return MEM_SIZE_INVALID(total) ? 0 : total;
 }
 
-/* Bump allocator over this instance's pool, bounds-checked. Hand-advancing a
- * uint8_t* would carve the sub-pools without ever comparing against what is
- * left, so a get_mem_size/init drift would run off the end silently instead of
- * returning NULL. Same shape as masker.c's copy and 4aec_nr_res.c's. */
+/* Bounds-checked bump allocator over this instance's pool; returns NULL when the pool is exhausted. */
 typedef struct PoolCursor {
     uint8_t* ptr;
     size_t remaining;
@@ -120,7 +104,7 @@ VADApi* vad_api_init(const VADApiConfig* cfg, void* mem, size_t mem_size)
     v->mask = NULL;
     v->vad_raw = 0;
     v->vad_out = 0;
-    v->owned_heap = NULL;   /* caller owns it */
+    v->owned_heap = NULL;
     return v;
 }
 
@@ -131,8 +115,7 @@ VADApi* vad_api_create(const VADApiConfig* cfg)
     size_t need = vad_api_get_mem_size(cfg);
 
     if (need == 0) return NULL;
-    /* Same single-block shape as the pool path, so the heap and pool
-     * constructors cannot disagree about the layout. */
+    /* Same single-block layout as the pool path. */
     if (posix_memalign(&block, 16, need) != 0 || !block) return NULL;
 
     v = vad_api_init(cfg, block, need);
@@ -187,9 +170,7 @@ void vad_api_destroy(VADApi* v)
 {
     if (!v) return;
 
-    /* Both sub-objects live inside this instance's pool, so their destroys
-     * are no-ops on that path; they are still called so the heap path and any
-     * future sub-object with real teardown stay correct. */
+    /* Sub-object destroys are no-ops on the pool path. */
     masker_destroy(v->masker);
     vad_destroy(v->mask_vad);
 

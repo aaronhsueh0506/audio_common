@@ -1,8 +1,4 @@
-/**
- * fft_wrapper.h - FFT wrapper interface
- *
- * Real-to-complex FFT for audio processing, implemented over NE10.
- */
+/** fft_wrapper.h - real-to-complex FFT over NE10. */
 
 #ifndef FFT_WRAPPER_H
 #define FFT_WRAPPER_H
@@ -20,171 +16,61 @@
 extern "C" {
 #endif
 
-/* ---------------------------------------------------------------------------
- * Static memory support (embedded targets — no heap).
- *
- * Each module exposes both a heap-based API (`_create / _destroy`) and a
- * static API (`_get_mem_size / _init / _destroy`). The static API takes a
- * caller-allocated buffer and places all internal state inline using
- * pointer arithmetic with 16-byte alignment.
- *
- * Pattern (apply to every module):
- *
- *     size_t   bytes = MODULE_get_mem_size(config);
- *     void*    buf   = ... obtained from caller's static pool ...
- *     Module*  m     = MODULE_init(buf, bytes, config);
- *     ...
- *     MODULE_destroy(m);   // no-op for static path; safe for both paths
- *
- * `MODULE_get_mem_size` and `MODULE_init` must walk fields in identical
- * order to keep alignment + bytes consistent.
- * --------------------------------------------------------------------------- */
-#include "ac_complex.h"   /* Complex { float r; float i; } */
+/* Static-memory pattern used by every module (heap: _create/_destroy; static: _get_mem_size/_init/_destroy):
+ *   bytes = MODULE_get_mem_size(config); m = MODULE_init(buf, bytes, config); MODULE_destroy(m);
+ * buf is caller-owned and 16-byte aligned; destroy is a no-op on the static path. */
+#include "ac_complex.h"
 
-/* Opaque FFT handle. Calls on one handle must not overlap in time: the
- * preserving forward and inverse calls share one staging block, and every call
- * uses the handle's NE10 work buffer. Distinct handles are independent. */
+/* Opaque FFT handle. Calls on one handle must not overlap in time (shared staging block and NE10 work buffer);
+ * distinct handles are independent. */
 typedef struct FftHandle FftHandle;
 
-/**
- * Create FFT handle for given size (heap path).
- *
- * @param fft_size FFT size: a power of 2 in [16, 8192]. Anything else is
- *                 rejected (NULL / 0).
- * @return FFT handle, or NULL on error
- */
+/** Create an FFT handle on the heap. fft_size: power of 2 in [16, 8192], anything else is rejected. Returns NULL on error. */
 FftHandle* fft_create(int fft_size);
 
-/**
- * Static-memory companions to fft_create.
- *
- *   bytes = fft_get_mem_size(fft_size);
- *   h     = fft_init(buffer, bytes, fft_size);
- *
- * The buffer must be at least `fft_get_mem_size(fft_size)` bytes and
- * 16-byte aligned. Returns NULL if `mem_size` is too small, or 0 from
- * `fft_get_mem_size` (and NULL from `fft_init`) if `fft_size` is outside the
- * [16, 8192] power-of-two range documented on `fft_create` above.
- *
- * `fft_get_mem_size` covers every byte fft_init() touches, including the
- * twiddle/config storage, so nothing is allocated outside the caller's block
- * (NE10 is initialised through the external-memory init described in
- * lib/ne10/VENDORED.md).
- */
+/** Static-memory companions to fft_create: bytes = fft_get_mem_size(fft_size); h = fft_init(buffer, bytes, fft_size).
+ * The buffer must be >= fft_get_mem_size(fft_size) bytes and 16-byte aligned. fft_get_mem_size returns 0 and fft_init NULL
+ * for an fft_size outside the range above or a too-small mem_size. Nothing is allocated outside the caller's block. */
 size_t     fft_get_mem_size(int fft_size);
 FftHandle* fft_init(void* mem, size_t mem_size, int fft_size);
 
-/**
- * Destroy FFT handle.
- *
- * A no-op for a handle created by fft_init(): nothing was allocated outside
- * the caller's block, so any number of calls is safe. An fft_create() handle
- * is freed, and like free() must be destroyed only once.
- */
+/** Destroy the handle. No-op for fft_init() handles; an fft_create() handle is freed and must be destroyed once. */
 void fft_destroy(FftHandle* handle);
 
-/**
- * Get number of frequency bins (fft_size/2 + 1)
- */
+/** Number of frequency bins (fft_size/2 + 1). */
 int fft_get_n_freqs(const FftHandle* handle);
 
-/**
- * Forward FFT: real input -> complex output
- *
- * @param handle FFT handle
- * @param time_in Real input [fft_size] -- must not alias freq_out
- * @param freq_out Complex output [n_freqs] -- must not alias time_in
- *
- * `restrict` lets the compiler vectorise the copy and scale loops. The two
- * buffers must not overlap (undefined behaviour otherwise); use
- * fft_forward_scratch() when the input buffer may be given up.
- */
+/** Forward FFT, real -> complex. time_in [fft_size] and freq_out [n_freqs] must not overlap (restrict).
+ * Use fft_forward_scratch() when the input may be given up. */
 void fft_forward(FftHandle* handle, const float* AC_FFT_RESTRICT time_in,
                  Complex* AC_FFT_RESTRICT freq_out);
 
-/**
- * Inverse FFT: complex input -> real output
- *
- * @param handle FFT handle
- * @param freq_in Complex input [n_freqs] -- must not alias time_out
- * @param time_out Real output [fft_size] -- must not alias freq_in
- *
- * `restrict`: as for fft_forward().
- */
+/** Inverse FFT, complex -> real. freq_in [n_freqs] and time_out [fft_size] must not overlap (restrict). */
 void fft_inverse(FftHandle* handle, const Complex* AC_FFT_RESTRICT freq_in,
                  float* AC_FFT_RESTRICT time_out);
 
-/**
- * Forward FFT: real input -> complex output, input clobber PERMITTED.
- *
- * Same transform as fft_forward(), but the input buffer's contents are
- * undefined after the call: the copy that protects the input from a kernel
- * that writes through its input pointer is skipped. Use it only when the input is not needed afterwards.
- *
- * @param handle FFT handle
- * @param time_in_clobbered Real input [fft_size]; contents undefined on return
- * @param complex_out Complex output [n_freqs]
- */
+/** Forward FFT as fft_forward(), but the input contents are undefined after the call (skips the protective copy).
+ * time_in_clobbered [fft_size], complex_out [n_freqs]. */
 void fft_forward_scratch(FftHandle* handle, float* time_in_clobbered, Complex* complex_out);
 
-/**
- * Inverse FFT: complex input -> real output, input clobber PERMITTED.
- *
- * Same transform as fft_inverse(), but the input buffer's contents are
- * undefined after the call (see fft_forward_scratch).
- *
- * @param handle FFT handle
- * @param freq_in_clobbered Complex input [n_freqs]; contents undefined on return
- * @param real_out Real output [fft_size]
- */
+/** Inverse FFT as fft_inverse(), but the input contents are undefined after the call.
+ * freq_in_clobbered [n_freqs], real_out [fft_size]. */
 void fft_inverse_scratch(FftHandle* handle, Complex* freq_in_clobbered, float* real_out);
 
-/**
- * Compute magnitude spectrum from complex spectrum
- *
- * @param freq Complex spectrum [n_freqs]
- * @param magnitude Output magnitude [n_freqs]
- * @param n_freqs Number of frequency bins
- */
+/** Magnitude spectrum: magnitude[k] from freq[k], k < n_freqs. */
 void fft_magnitude(const Complex* freq, float* magnitude, int n_freqs);
 
-/**
- * Compute power spectrum from complex spectrum
- *
- * @param freq Complex spectrum [n_freqs]
- * @param power Output power (magnitude^2) [n_freqs]
- * @param n_freqs Number of frequency bins
- */
+/** Power spectrum (magnitude^2): power[k] from freq[k], k < n_freqs. */
 void fft_power(const Complex* freq, float* power, int n_freqs);
 
-/**
- * Compute phase spectrum from complex spectrum (atan2f(im, re) per bin).
- *
- * @param freq Complex spectrum [n_freqs]
- * @param phase Output phase (radians) [n_freqs]
- * @param n_freqs Number of frequency bins
- */
+/** Phase spectrum in radians (atan2f(im, re) per bin): phase[k] from freq[k], k < n_freqs. */
 void fft_phase(const Complex* freq, float* phase, int n_freqs);
 
-/**
- * Reconstruct a complex spectrum from magnitude + phase
- * (spectrum[k] = magnitude[k] * (cosf(phase[k]) + i*sinf(phase[k]))).
- *
- * @param magnitude Input magnitude [n_freqs]
- * @param phase Input phase (radians) [n_freqs]
- * @param spectrum Output complex spectrum [n_freqs]
- * @param n_freqs Number of frequency bins
- */
+/** Rebuild a spectrum: spectrum[k] = magnitude[k] * (cosf(phase[k]) + i*sinf(phase[k])), phase in radians, k < n_freqs. */
 void fft_from_mag_phase(const float* magnitude, const float* phase,
                          Complex* spectrum, int n_freqs);
 
-/**
- * Apply gain to complex spectrum (in-place)
- *
- * @param freq Complex spectrum [n_freqs]
- * @param gain Gain array [n_freqs]
- * @param n_freqs Number of frequency bins
- */
+/** Apply gain[k] to freq[k] in place, k < n_freqs. */
 void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);
 
 #ifdef __cplusplus
@@ -193,4 +79,4 @@ void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);
 
 #undef AC_FFT_RESTRICT
 
-#endif // FFT_WRAPPER_H
+#endif

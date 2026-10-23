@@ -22,9 +22,7 @@
 
 #define AUDIO_RESAMPLER_HALF_TAPS_PER_RATIO 16
 
-/* Input frames staged per pass. Every channel keeps the previous
- * (window - 1) inputs in front of the staged ones, so the dot products read
- * one contiguous oldest-to-newest window and never wrap. */
+/* Input frames staged per pass; each channel keeps the previous (window - 1) inputs in front, so dot products read one contiguous window. */
 #define AUDIO_RESAMPLER_CHUNK 128
 
 struct AudioResampler {
@@ -36,13 +34,12 @@ struct AudioResampler {
     int filter_length;
     int taps_per_phase;
     int window;          /* taps_per_phase rounded up to a multiple of 4 */
-    int work_stride;     /* window - 1 + CHUNK, floats per channel       */
+    int work_stride;     /* window - 1 + CHUNK, floats per channel */
     int identity;
     int is_static;
     uint64_t input_index;
     uint64_t next_output_tick;
-    /* [up][window]: each phase row time-reversed (oldest tap first) and
-     * zero-padded in front, so row[j] pairs with the window sample j. */
+    /* [up][window]: each phase row time-reversed (oldest tap first) and zero-padded in front, so row[j] pairs with window sample j. */
     float* coefficients;
     float* work;         /* [channels][work_stride]: tail, then staged input */
     void* owned_heap;
@@ -134,7 +131,6 @@ static void* audio_resampler_carve(uint8_t** cursor,
     return result;
 }
 
-/* Tap `tap` of phase `phase`, tap 0 being the newest input's weight. */
 #define RS_COEF(self, phase, tap) \
     ((self)->coefficients[(size_t)(phase) * (self)->window + \
                           ((self)->window - 1 - (tap))])
@@ -170,7 +166,6 @@ static void audio_resampler_design(AudioResampler* self)
         RS_COEF(self, phase, tap) = (float)self->up * ideal * window;
     }
 
-    /* Pin unity DC independently for every fractional phase. */
     for (int phase = 0; phase < self->up; ++phase) {
         float sum = 0.0f;
         for (int tap = 0; tap < self->taps_per_phase; ++tap) {
@@ -268,17 +263,10 @@ void audio_resampler_reset(AudioResampler* self)
     self->next_output_tick = 0;
 }
 
-/* One output: the window's `window` samples (oldest first) against a phase
- * row of the same length. Every output of every phase, channel and block
- * position is formed by exactly this arithmetic, so a sample's value never
- * depends on how the input was split into calls or which outputs shared a
- * pass.
- *   NEON:  four lanes, each accumulating row[j] * win[j] with an unfused
- *          multiply then add in ascending j, then the lanes summed pairwise
- *          ((l0 + l1) + (l2 + l3)).
- *   SIMD=0: one sequential sum, newest tap first -- the order the Python
- *          rate adapter reproduces bit for bit. `first` is the oldest real
- *          tap; the zero padding in front is skipped. */
+/* One output: the `window` samples (oldest first) against a phase row of the same length. Every output is formed by exactly
+ * this arithmetic, so a sample never depends on how the input was split into calls.
+ * NEON: four lanes accumulating row[j] * win[j] (unfused multiply then add, ascending j), summed pairwise ((l0 + l1) + (l2 + l3)).
+ * SIMD=0: one sequential sum, newest tap first; `first` is the oldest real tap (the zero padding is skipped). */
 #if SK_HAVE_NEON
 static RS_ALWAYS_INLINE float rs_dot1(const float* row, const float* win,
                                       int window, int first)
@@ -292,8 +280,7 @@ static RS_ALWAYS_INLINE float rs_dot1(const float* row, const float* win,
     return vaddvq_f32(acc);
 }
 
-/* Four outputs that share one phase row, each against its own window: the
- * row loads are shared and the four accumulation chains are independent. */
+/* Four outputs sharing one phase row, each against its own window (independent accumulation chains). */
 static RS_ALWAYS_INLINE void rs_dot4(const float* row, const float* win0,
                                      const float* win1, const float* win2,
                                      const float* win3, int window,
@@ -308,7 +295,7 @@ static RS_ALWAYS_INLINE void rs_dot4(const float* row, const float* win0,
         a2 = vaddq_f32(a2, vmulq_f32(c, vld1q_f32(win2 + j)));
         a3 = vaddq_f32(a3, vmulq_f32(c, vld1q_f32(win3 + j)));
     }
-    /* Pairwise, the same (l0 + l1) + (l2 + l3) as vaddvq_f32 per output. */
+    /* Pairwise (l0 + l1) + (l2 + l3), as vaddvq_f32 per output. */
     vst1q_f32(out, vpaddq_f32(vpaddq_f32(a0, a1), vpaddq_f32(a2, a3)));
 }
 #else
@@ -332,8 +319,7 @@ static RS_ALWAYS_INLINE void rs_dot4(const float* row, const float* win0,
 }
 #endif
 
-/* Integer up-sampling (down == 1): every staged input emits all `up` phases
- * and `ahead` stays 0. Four consecutive inputs run together per phase. */
+/* Integer up-sampling (down == 1): every staged input emits all `up` phases and `ahead` stays 0. */
 static int rs_run_integer_up(const AudioResampler* self, int staged,
                              float* output, int room)
 {
@@ -369,9 +355,8 @@ static int rs_run_integer_up(const AudioResampler* self, int staged,
     return used;
 }
 
-/* Integer decimation (up == 1): an input emits one output when `*ahead` has
- * counted down to 0, then every `down` inputs. Outputs `down` inputs apart
- * share the single row. Returns the inputs consumed. */
+/* Integer decimation (up == 1): an input emits one output when `*ahead` has counted down to 0, then every `down` inputs.
+ * Returns the inputs consumed. */
 static int rs_run_decimation(const AudioResampler* self, int staged,
                              int* ahead, float* output, int room,
                              int* produced)
@@ -391,7 +376,6 @@ static int rs_run_decimation(const AudioResampler* self, int staged,
             used = first_out + room * down;
         }
     }
-    /* Inputs until the next output after the `used` consumed ones. */
     *ahead = first_out + n_out * down - used;
     for (int channel = 0; channel < channels; ++channel) {
         const float* base = self->work + (size_t)channel * self->work_stride;
@@ -415,8 +399,7 @@ static int rs_run_decimation(const AudioResampler* self, int staged,
     return used;
 }
 
-/* Any other rational pair: an input emits the outputs whose tick falls in its
- * own [0, up) window, one dot each. Returns the inputs consumed. */
+/* Any other rational pair: an input emits the outputs whose tick falls in its own [0, up) window, one dot each. Returns the inputs consumed. */
 static int rs_run_rational(const AudioResampler* self, int staged,
                            int* ahead, float* output, int room,
                            int* produced)
@@ -481,13 +464,8 @@ int audio_resampler_process(AudioResampler* self,
         const int down = self->down;
         const int channels = self->channels;
         const int tail = self->window - 1;
-        /* The next output's position on the up-sampled grid relative to the
-         * current input's first tick: next_output_tick - input_index * up.
-         * An input emits the outputs whose tick falls in its own [0, up)
-         * window, phase = that relative tick; each output moves it on by
-         * `down`, each consumed input takes `up` off, so it stays in
-         * [0, down) between inputs. The two 64-bit fields are written back
-         * once, below. */
+        /* Next output position on the up-sampled grid relative to the current input's first tick (next_output_tick - input_index * up);
+         * each output adds `down`, each consumed input subtracts `up`. The two 64-bit fields are written back once, below. */
         int ahead = (int)(self->next_output_tick -
                           self->input_index * (uint64_t)up);
 
@@ -521,7 +499,6 @@ int audio_resampler_process(AudioResampler* self,
                     output_capacity_frames - produced, &emitted);
             }
             if (used > 0) {
-                /* The newest window - 1 inputs become the next tail. */
                 for (int channel = 0; channel < channels; ++channel) {
                     float* work = self->work +
                                   (size_t)channel * self->work_stride;
@@ -531,7 +508,7 @@ int audio_resampler_process(AudioResampler* self,
             }
             consumed += used;
             produced += emitted;
-            if (used < staged) break;   /* output capacity ran out */
+            if (used < staged) break;
         }
         self->input_index += (uint64_t)consumed;
         self->next_output_tick =
@@ -574,12 +551,7 @@ int audio_resampler_latency_input_frames(const AudioResampler* self)
 {
     int up;
     if (!self) return -1;
-    /* The kernel is symmetric with (filter_length - 1) / 2 taps of group
-     * delay on the up-sampled grid, i.e. (filter_length - 1) / (2 * up) input
-     * frames. That is exact for every rate pair whose up factor divides
-     * ratio_max (8k/16k/48k in any combination); for a coprime pair such as
-     * 32k -> 24k (up 3, down 4) it is fractional and is rounded to the
-     * nearest frame. */
+    /* Group delay: (filter_length - 1) / (2 * up) input frames; fractional (rounded) for coprime pairs such as 32k -> 24k. */
     up = 2 * self->up;
     return (self->filter_length - 1 + up / 2) / up;
 }

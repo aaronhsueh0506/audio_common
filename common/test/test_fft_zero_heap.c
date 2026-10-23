@@ -1,18 +1,11 @@
 /*
  * test_fft_zero_heap.c - allocator-hook test for the static-memory paths.
- *
- *   - fft_get_mem_size / fft_init / fft_destroy make no malloc, calloc,
- *     realloc or free call, including inside the vendored NE10 code
- *     (lib/ne10/VENDORED.md).
- *   - fft_destroy on a pool-owned handle is a no-op however often it is
- *     called.
+ *   - fft_get_mem_size / fft_init / fft_destroy make no malloc, calloc, realloc or free call,
+ *     including inside the vendored NE10 code (lib/ne10/VENDORED.md).
+ *   - fft_destroy on a pool-owned handle is a no-op however often it is called.
  *   - the audio_stft.h objects never touch the allocator.
- *
- * The hook (zero_heap_hook.c) is described there; this file only uses its
- * zh_* counter API.
- *
- * test_hook_actually_counts() first shows that a deliberate allocator call is
- * observed, so the zero-call assertions rest on a working hook.
+ * The hook (zero_heap_hook.c) provides the zh_* counter API. test_hook_actually_counts() first shows
+ * that a deliberate allocator call is observed, so the zero-call assertions rest on a working hook.
  */
 #include "audio_stft.h"
 #include "fft_wrapper.h"
@@ -34,8 +27,7 @@ static int g_fail = 0;
     } \
 } while (0)
 
-/* Proves the hook mechanism actually intercepts calls (not a silent no-op)
- * before any of the zero-heap assertions below get to lean on it. */
+/* Proves the hook intercepts calls (is not a silent no-op) before the zero-heap assertions rely on it. */
 static void test_hook_actually_counts(void) {
     long mc, cc, rc, fc;
 
@@ -79,10 +71,9 @@ static void fill_synthetic(float* buf, int n, int phase_offset) {
     }
 }
 
-/* One init -> ZH_FRAMES frames (forward+inverse+scratch variants) -> destroy
- * pass over an already-allocated pool. Returns 1 on success, 0 otherwise.
- * Does not touch the allocator counters itself -- callers arm/read them
- * around this call. */
+/* One init -> ZH_FRAMES frames (forward+inverse+scratch variants) -> destroy pass over an
+ * already-allocated pool. Returns 1 on success, 0 otherwise. Callers arm and read the allocator
+ * counters around this call. */
 static int run_zero_heap_pass(void* pool, size_t pool_sz) {
     FftHandle* h = fft_init(pool, pool_sz, ZH_FFT_SIZE);
     if (!h) return 0;

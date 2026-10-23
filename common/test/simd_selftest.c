@@ -1,23 +1,12 @@
 /*
- * simd_selftest.c - bitwise correctness + microbenchmark harness for
- * utility/simd_kernels.h.
+ * simd_selftest.c - bitwise correctness and microbenchmark harness for utility/simd_kernels.h.
  *
- * For every sk_<name> kernel, runs sk_<name>() (NEON when available, else
- * scalar) and sk_<name>_scalar() on IDENTICAL copies of randomly-generated
- * input (mixed LCG bit patterns + a curated special-value pool, NaN
- * excluded) across a matrix of n values and trials, and memcmp's the full
- * output (plus accumulator/state buffers where relevant) bit-for-bit. Any
- * mismatch prints the kernel/n/trial/index and the two bit patterns, then
- * exit(1)s immediately -- there is no tolerance here, this is the
- * bit-exactness gate itself.
- *
- * After correctness, runs a small microbenchmark per kernel (n=257,
- * ~200k reps, CLOCK_MONOTONIC) and prints a one-line summary.
- *
- * test_fast_math_special_values() pins the special-value contract table of
- * fast_math.h: the exact return of fast_exp / fast_log / fast_sqrt for
- * NaN, +Inf, -Inf, 0 and negative inputs, and the NEON sk_fast_sqrt_f32 lane
- * equivalents.
+ * Every sk_<name> kernel (NEON when available, else scalar) and sk_<name>_scalar() run on identical
+ * copies of random input (LCG bit patterns plus a special-value pool, NaN excluded) over a matrix of
+ * n and trials, and the full outputs (plus accumulator/state buffers) are memcmp'd. A mismatch prints
+ * kernel/n/trial/index and both bit patterns and exits 1: there is no tolerance. A microbenchmark per
+ * kernel follows (n=257, ~200k reps, CLOCK_MONOTONIC). test_fast_math_special_values() pins
+ * fast_math.h's special-value table and the NEON sk_fast_sqrt_f32 lane equivalents.
  */
 #include "utility/simd_kernels.h"
 #include "utility/fast_math.h"
@@ -1021,29 +1010,15 @@ static void test_noise_update(void) {
 
 
 /* ═══════════ alignment + canary edge-case matrix ═══════════════════════════
- * Layered on the per-kernel tests above:
- *
- *   - n = 0 (run by every test above) means the kernel touches nothing; the
- *     canary buffers below check that. n = 1..17 covers every remainder of
- *     the 4-lane tail.
- *   - Offsets 1..15 floats: every buffer lives in its own 64-byte-aligned
- *     arena (posix_memalign) and each kernel is called at a +1..+15 float
- *     offset into it. Such pointers are always float-aligned but not 16-byte
- *     aligned, so vld1q_f32 / vst1q_f32 hit every sub-vector position. Three
- *     forms: input offset only, output offset only, and both offset to
- *     different values (edge_offsets_for_form). For kernels with several
- *     input arrays (cadd, min, capply_gain's g) only the primary array takes
- *     the offset; the others stay at offset 0. sk_clip_f32 works in place on
- *     one buffer, so test_clip_edge sweeps that one offset only.
- *   - Canary guard: every arena is filled with the pattern 0x7fc0dead before
- *     each call; the payload window then receives generated data (inputs) or
- *     stays canary (outputs). Afterwards every element outside the payload
- *     window of every arena the kernel could touch, read-only ones included,
- *     must still hold the canary. One check catches an out-of-bounds write on
- *     either side of the payload, and any write at all when n = 0.
- *
- * Scalar-versus-NEON agreement is checked by every check_bits_or_die call
- * (the NE10 side is covered by `make test_ne10_force_c`). */
+ *   - Offsets 1..15 floats into 64-byte-aligned arenas (posix_memalign) put vld1q_f32 / vst1q_f32 at
+ *     every sub-vector position. Three forms: input offset only, output offset only, both different
+ *     (edge_offsets_for_form). Only the primary input array takes the offset; the others stay at 0.
+ *     sk_clip_f32 works in place on one buffer, so test_clip_edge sweeps that one offset.
+ *   - Canary guard: every arena is filled with 0x7fc0dead before each call, and every element outside
+ *     the payload window of every arena the kernel could touch must still hold it afterwards. That
+ *     catches an out-of-bounds write on either side, and any write at all when n = 0.
+ * Scalar-versus-NEON agreement is checked by every check_bits_or_die call (the NE10 side is covered by
+ * `make test_ne10_force_c`). */
 
 #define EDGE_GUARD 32           /* guaranteed guard elements each side of the
                                  * payload window, regardless of offset/n */
@@ -1346,15 +1321,7 @@ static void test_clip_edge(void) {
     printf("PASS clip_f32_edge (n=0..17+existing x offset 1..15, single in-place buffer, canary-guarded)\n");
 }
 
-/* sk_wola_accumulate_f32 (acc[i] += x[i]*w[i]).
- *
- * It follows the edge convention of this file (canary-guarded arenas, the
- * three-form offset matrix, N_LIST x TRIALS), which gives it misaligned and
- * out-of-bounds coverage and feeds it the special-value pool of gen_float().
- *
- * The accumulate is in place on acc, so the two paths get independent copies
- * of the same starting accumulator. acc is both input and output, so its
- * canary is checked against the output offset. */
+
 /* int16 counterparts of the float canary helpers: sk_clip_scale_to_s16 is the
  * only kernel whose destination is not float. */
 #define EDGE_CANARY_S16 ((int16_t)0x5A5A)
@@ -1540,6 +1507,9 @@ static void test_clip_scale_to_s16_edge(void) {
            "canary-guarded)\n", clipped_hi, clipped_lo, in_range);
 }
 
+/* sk_wola_accumulate_f32 (acc[i] += x[i]*w[i]) follows the edge convention of this file (canary-guarded
+ * arenas, three-form offset matrix, N_LIST x TRIALS). acc is both input and output, so each path gets
+ * its own copy of the starting accumulator and its canary is checked against the output offset. */
 static void test_wola_accumulate_edge(void) {
     float *x_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
     float *w_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));

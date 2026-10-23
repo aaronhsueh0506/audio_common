@@ -1,16 +1,8 @@
 #include "spatial_simd.h"
 
 #include <math.h>
-/* simd_kernels.h supplies sk__cquad_load/sk__cquad_store -- the only
- * sanctioned way to move 4 lanes of a {float r; float i;} struct through
- * vld2q_f32/vst2q_f32 without a strict-aliasing-violating Complex-to-float
- * pointer cast. Included before the NEON-gate macro below so this file's
- * dispatch is derived from SK_HAVE_NEON directly, instead of
- * independently re-deriving `defined(__aarch64__) && defined(__ARM_NEON)` --
- * the previous independent derivation could disagree with simd_kernels.h's
- * own gate. It also transitively includes
- * <arm_neon.h> under the identical condition SK_HAVE_NEON already gates on,
- * so no separate NEON header include is needed here. */
+/* simd_kernels.h supplies sk__cquad_load/sk__cquad_store, the strict-aliasing-safe way to move 4 lanes of Complex through
+ * vld2q_f32/vst2q_f32. It is included before the NEON gate so dispatch follows SK_HAVE_NEON, which also pulls in <arm_neon.h>. */
 #include "simd_kernels.h"
 
 #if SK_HAVE_NEON
@@ -73,16 +65,16 @@ void spatial_phat_cross(const Complex* x_i,
 #endif
 }
 
-void spatial_conj_beamform_scalar(
+static void spatial_conj_beamform_scalar_range(
     const Complex* const* weights,
     const Complex* const* inputs,
     int channels,
     int bins,
+    int first,
     float scale,
     Complex* out)
 {
-    if (!weights || !inputs || !out || channels <= 0 || bins <= 0) return;
-    for (int f = 0; f < bins; ++f) {
+    for (int f = first; f < bins; ++f) {
         float real = 0.0f;
         float imag = 0.0f;
         for (int m = 0; m < channels; ++m) {
@@ -94,6 +86,19 @@ void spatial_conj_beamform_scalar(
         out[f].r = real * scale;
         out[f].i = imag * scale;
     }
+}
+
+void spatial_conj_beamform_scalar(
+    const Complex* const* weights,
+    const Complex* const* inputs,
+    int channels,
+    int bins,
+    float scale,
+    Complex* out)
+{
+    if (!weights || !inputs || !out || channels <= 0 || bins <= 0) return;
+    spatial_conj_beamform_scalar_range(
+        weights, inputs, channels, bins, 0, scale, out);
 }
 
 void spatial_conj_beamform(
@@ -130,22 +135,8 @@ void spatial_conj_beamform(
             sk__cquad_store(out + f, value);
         }
     }
-    if (f < bins) {
-        /* The scalar helper starts each channel at bin zero, so handle this
-         * short offset tail explicitly rather than manufacturing pointer
-         * arrays on the stack. */
-        for (int tail = f; tail < bins; ++tail) {
-            float real = 0.0f, imag = 0.0f;
-            for (int m = 0; m < channels; ++m) {
-                real += weights[m][tail].r * inputs[m][tail].r +
-                        weights[m][tail].i * inputs[m][tail].i;
-                imag += weights[m][tail].r * inputs[m][tail].i -
-                        weights[m][tail].i * inputs[m][tail].r;
-            }
-            out[tail].r = real * scale;
-            out[tail].i = imag * scale;
-        }
-    }
+    spatial_conj_beamform_scalar_range(
+        weights, inputs, channels, bins, f, scale, out);
 #else
     spatial_conj_beamform_scalar(
         weights, inputs, channels, bins, scale, out);
@@ -253,8 +244,7 @@ void spatial_bf_projection(
 #endif
 }
 
-/* Shared subtraction kernels use output-first arguments; keep this API
- * wrapper's NULL/count guard and input-first calling convention. */
+/* Wraps the shared output-first subtraction kernels with an input-first API and a NULL/count guard. */
 
 void spatial_complex_sub_array_scalar(
     const Complex* lhs,

@@ -1,14 +1,11 @@
 /*
  * test_wav_writer_ubsan.c - UBSan probe for the WAV writer bounds contract.
  *
- * Writes {1.0f, -1.0f, NAN} through wav_write_float in the default (AEC
- * style) PCM16 mode and must run clean under -fsanitize=undefined
- * -fno-sanitize-recover=all (the `test-wav-ubsan` target sets the flags).
- * Converting 1.0f * 32768 + 0.5 directly to int16_t would be an out-of-range
- * float-to-integer conversion (C99 6.3.1.4p1); the writer rounds into an
- * int32_t and saturates, and replaces NaN by 0.0f first.
- *
- * Standalone and header-only, like test_wav_io.c.
+ * Writes {1.0f, -1.0f, NAN} through wav_write_float in the default (AEC style) PCM16 mode and must run
+ * clean under -fsanitize=undefined -fno-sanitize-recover=all (set by the `test-wav-ubsan` target).
+ * Converting 1.0f * 32768 + 0.5 directly to int16_t would be an out-of-range float-to-integer
+ * conversion (C99 6.3.1.4p1); the writer rounds into an int32_t, saturates, and replaces NaN by 0.0f
+ * first. Standalone and header-only, like test_wav_io.c.
  */
 #include "wav_io.h"
 

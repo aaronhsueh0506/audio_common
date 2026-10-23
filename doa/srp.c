@@ -11,14 +11,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ============================================================================
- * Pool-first construction: SRP* struct itself first, then every internal
- * array carved out of the same caller-provided block via a 16-byte-aligned
- * bump allocator (mem_align.h). This mirrors AEC/c_impl's aec_get_mem_size/
- * aec_init pair and 4aec_nr_res.c's private PoolCursor/pool_carve() helper
- * -- kept file-private here too, not shared, matching that file's own
- * precedent.
- * ========================================================================== */
+/* Pool-first construction: the SRP struct, then every array carved from one caller-provided block with a 16-byte-aligned bump allocator (mem_align.h). */
 
 typedef struct PoolCursor {
     uint8_t* ptr;
@@ -41,11 +34,8 @@ static void* pool_carve(PoolCursor* cursor, size_t count,
     return out;
 }
 
-/* Config-only validation shared by srp_get_mem_size() and srp_init():
- * M>1, F>1 (note strictly greater than 1, not 0), num_angles>0,
- * finite/positive sr/NFFT, finite low_freq/high_freq, and a finite/positive
- * `c` (a plain cfg field, so it can be checked here without needing a live
- * ArrayGeometry). */
+/* Config-only validation shared by srp_get_mem_size() and srp_init(): M > 1, F > 1, num_angles > 0,
+ * finite positive sr/NFFT/c, finite low_freq/high_freq. */
 static int srp_validate_config(const SRP_Config* cfg) {
     if (!cfg) return 0;
     if (cfg->M <= 1 || cfg->F <= 1 || cfg->num_angles <= 0) return 0;
@@ -56,9 +46,7 @@ static int srp_validate_config(const SRP_Config* cfg) {
     return 1;
 }
 
-/* Geometry cross-check (geom->M must match cfg->M, x/y must be non-NULL). Only srp_init() can run this --
- * srp_get_mem_size() takes no ArrayGeometry, since the byte total never
- * depends on geometry values, only on cfg's M/F/num_angles. */
+/* Geometry check (geom->M == cfg->M, x/y non-NULL); only srp_init() can run it because srp_get_mem_size() takes no geometry. */
 static int srp_validate_geometry(const SRP_Config* cfg,
                                  const ArrayGeometry* geom) {
     if (!cfg || !geom) return 0;
@@ -76,10 +64,7 @@ size_t srp_get_mem_size(const SRP_Config* cfg) {
     a = (size_t)cfg->num_angles;
     m = (size_t)cfg->M;
     f = (size_t)cfg->F;
-    /* M is validated >1 above, so num_pairs = M*(M-1)/2 >= 1. Promote to
-     * size_t before multiplying purely to keep this arithmetic in the same
-     * checked-size domain as everything else below; M is a microphone count
-     * and never large enough in practice for an int product to overflow. */
+    /* num_pairs = M*(M-1)/2 >= 1 since M > 1; computed in size_t. */
     num_pairs = ((size_t)cfg->M * (size_t)(cfg->M - 1)) / 2;
 
     t = 0;
@@ -87,9 +72,7 @@ size_t srp_get_mem_size(const SRP_Config* cfg) {
 
     t = ck_field_size(t, a, sizeof(float));              /* angles */
 
-    /* a_array: Complex***, flattened to 3 carved blocks -- angle pointer
-     * table, mic pointer table (flat, sliced mid + a*M), data (flat,
-     * sliced data + (a*M+m)*F). */
+    /* a_array: angle pointer table, mic pointer table (mid + a*M), flat data (data + (a*M+m)*F). */
     t = ck_field_size(t, a, sizeof(Complex**));
     t = ck_field_size(t, ck_mul_size(a, m), sizeof(Complex*));
     t = ck_field_size(t, ck_mul_size(ck_mul_size(a, m), f), sizeof(Complex));
@@ -102,15 +85,13 @@ size_t srp_get_mem_size(const SRP_Config* cfg) {
     t = ck_field_size(t, num_pairs, sizeof(int));        /* pair_i */
     t = ck_field_size(t, num_pairs, sizeof(int));        /* pair_j */
 
-    /* pair_steer: same 3-level flattening technique as a_array, shape
-     * [num_angles][num_pairs][F]. */
+    /* pair_steer: same 3-level layout as a_array, [num_angles][num_pairs][F]. */
     t = ck_field_size(t, a, sizeof(Complex**));
     t = ck_field_size(t, ck_mul_size(a, num_pairs), sizeof(Complex*));
     t = ck_field_size(
         t, ck_mul_size(ck_mul_size(a, num_pairs), f), sizeof(Complex));
 
-    /* pair_phat: 2-level, [num_pairs][F]. Data block reserved but not
-     * required to be initialized by the carve step (see srp_init()). */
+    /* pair_phat: 2-level [num_pairs][F]; its data is written by srp() before it is read. */
     t = ck_field_size(t, num_pairs, sizeof(Complex*));
     t = ck_field_size(t, ck_mul_size(num_pairs, f), sizeof(Complex));
 
@@ -139,12 +120,7 @@ SRP* srp_init(void* mem, size_t mem_size,
     A = cfg->num_angles;
     num_pairs_sz = ((size_t)M * (size_t)(M - 1)) / 2;
 
-    /* Blanket zero-fill, same as aec_init()/four_aec_nr_res_init_ex(): every
-     * carved field starts at 0/NULL, including SRP::owned_heap (left NULL
-     * here -- only srp_create_from_geometry() sets it, after this returns).
-     * pair_phat's data block therefore starts zeroed rather than malloc's
-     * uninitialized garbage; harmless since srp()/spatial_phat_cross()
-     * always writes it before anything reads it (see srp.h). */
+    /* Zero-fill: every carved field starts at 0/NULL, including owned_heap (set later by srp_create_from_geometry()). */
     memset(mem, 0, need);
     s = (SRP*)mem;
 
@@ -155,10 +131,7 @@ SRP* srp_init(void* mem, size_t mem_size,
     s->F = F;
     s->num_angles = A;
 
-    /* angles: identical formula/type-promotion sequence to
-     * srp_create_uniform_angles() (int * float * double / int, rounded to
-     * float on assignment) so a_array below lands bit-identical to the
-     * heap path's srp_build_steering() output. */
+    /* Angle formula and type promotion match srp_create_uniform_angles(), so the steering matches the heap path. */
     s->angles = (float*)pool_carve(&cursor, (size_t)A, sizeof(float));
     if (!s->angles) return NULL;
     {
@@ -168,12 +141,7 @@ SRP* srp_init(void* mem, size_t mem_size,
         }
     }
 
-    /* a_array: angle pointer table -> mic pointer table (flat, mid + a*M)
-     * -> data (flat, data + (a*M+m)*F). Fill formula copied verbatim from
-     * srp_build_steering() (steering.c) -- same local-var shadowing of
-     * cfg->c/cfg->sr/cfg->NFFT is unnecessary since both are direct float
-     * member reads either way, but the expression itself is reproduced
-     * exactly to stay bit-identical. */
+    /* a_array fill formula matches srp_build_steering() in steering.c. */
     {
         Complex*** top;
         Complex** mid;
@@ -250,6 +218,7 @@ SRP* srp_init(void* mem, size_t mem_size,
         int f_start = (int)roundf(cfg->low_freq * cfg->NFFT / cfg->sr);
         int f_end = (int)roundf(cfg->high_freq * cfg->NFFT / cfg->sr);
         if (f_start < 1) f_start = 1;
+        if (f_start > F - 1) f_start = F - 1;
         if (f_end > F - 1) f_end = F - 1;
         if (f_end < f_start) f_end = f_start;
         s->f_start = f_start;
@@ -311,9 +280,7 @@ SRP* srp_init(void* mem, size_t mem_size,
                     pt_top[a][pp] = slot;
 
                     for (f = 0; f < F; f++) {
-                        /* pair_steer[a][p][f] = conj(w_i) * w_j: the pair's
-                         * inter-mic phase term, built once so the per-frame
-                         * score accumulation is a single product per bin. */
+                        /* pair_steer[a][p][f] = conj(w_i) * w_j, built once so scoring is one product per bin. */
                         slot[f] = spatial_complex_mul(
                             spatial_complex_conj(s->a_array[a][i][f]),
                             s->a_array[a][j][f]);
@@ -329,10 +296,7 @@ SRP* srp_init(void* mem, size_t mem_size,
         if (!phat_top || !phat_data) return NULL;
         for (p = 0; p < num_pairs; p++) {
             phat_top[p] = phat_data + (size_t)p * (size_t)F;
-            /* data intentionally not filled here -- one-frame scratch,
-             * only ever read within [f_start,f_end] after srp() writes it
-             * first (matches current malloc'd-but-uninitialized
-             * behavior). */
+            /* pair_phat data is one-frame scratch, read only within [f_start, f_end] after srp() writes it. */
         }
         s->pair_phat = phat_top;
     }
@@ -347,9 +311,12 @@ int srp_angle_to_index(SRP* s, float doa_rad)
     float deg, step;
     int idx;
 
-    if (!s || isnan(doa_rad)) return -1;
+    if (!s || !isfinite(doa_rad)) return -1;
 
     deg = doa_rad * 180.0f / (float)M_PI;
+    /* Keeps the wrap loops below short and finite for huge angles. */
+    if (!isfinite(deg)) return -1;
+    if (fabsf(deg) >= 1.0e6f) deg = fmodf(deg, 360.0f);
     while (deg < 0.0f) deg += 360.0f;
     while (deg >= 360.0f) deg -= 360.0f;
 
@@ -386,48 +353,28 @@ void srp(SRP* s, const Complex* const* X, const int* mask)
     int F = s->F;
     int A = s->num_angles;
 
-    /* init frame-level SRP score */
     for (int a = 0; a < A; a++) {
         s->S_theta[a] = 0.0f;
     }
 
-    /* init per-bin best angle */
     for (int f = 0; f < F; f++) {
         s->bin_best_idx[f] = -1;
         s->best_score[f] = -1e30f;
     }
 
-    /*
-     * The PHAT cross spectrum is independent of candidate angle.  The
-     * imported implementation recomputed it A times.  Materializing it once
-     * keeps the score accumulation order and steering math unchanged while
-     * removing that redundant work; spatial_phat_cross() supplies the
-     * AArch64 NEON hot path.
-     *
-     * Restricted to [f_start, f_end]: pair_phat[p] is one-frame scratch
-     * (srp.h) read ONLY within that same band by the scoring loop below
-     * (lines ~305-308) -- no other reader exists (grep-verified) -- so
-     * computing bins outside the searched band was pure waste. At 48kHz/
-     * 1024-pt (F=513) with a ~300-7000Hz search band this is ~144 bins
-     * instead of 513, roughly a 3.5x reduction in this per-frame,
-     * per-pair hot loop. Bins outside [f_start,f_end] are simply never
-     * touched (not zeroed) since nothing reads them.
-     */
+    /* The PHAT cross spectrum does not depend on the candidate angle, so it is computed once per frame,
+     * and only over [f_start, f_end], the only range the scoring loop reads. */
     for (int p = 0; p < s->num_pairs; ++p) {
         spatial_phat_cross(
             X[s->pair_i[p]] + s->f_start, X[s->pair_j[p]] + s->f_start,
             s->pair_phat[p] + s->f_start, s->f_end - s->f_start + 1);
     }
 
-    /* Candidate-major traversal exposes contiguous frequency bins to NEON.
-     * Per-angle accumulation still visits f in ascending order, and each
-     * bin still visits p/a in ascending order, preserving scalar results. */
+    /* Candidate-major traversal exposes contiguous bins to NEON; accumulation order is ascending in f, then p/a. */
     const int band = s->f_end - s->f_start + 1;
     for (int a = 0; a < A; ++a) {
-        /* score_scratch is public: the first angle zeroes all F bins so
-         * callers see zeros outside the searched band, and later angles
-         * rewrite only the band they accumulate into.  An empty band keeps
-         * the full clear on every angle. */
+        /* score_scratch is public: the first angle zeroes all F bins; later angles rewrite only the searched band.
+         * An empty band clears fully on every angle. */
         if (a == 0 || band <= 0)
             memset(s->score_scratch, 0, (size_t)F * sizeof(float));
         else
@@ -478,18 +425,7 @@ void doa_step(SRP* s,
 
     int run_srp = 0;
 
-    /*
-     * Only update SRP when:
-     *   1. raw VAD says speech exists
-     *   2. current frame matches update interval
-     *
-     * Example:
-     *   update_interval = 3
-     *   frame 0: run SRP
-     *   frame 1: reuse last DOA
-     *   frame 2: reuse last DOA
-     *   frame 3: run SRP
-     */
+    /* SRP runs only when raw VAD reports speech and the frame matches update_interval; other frames reuse the last DOA. */
     if (vad_raw) {
         if ((s->frame_counter % s->update_interval) == 0) {
             run_srp = 1;
@@ -500,18 +436,11 @@ void doa_step(SRP* s,
 
         srp(s, X, mask);
 
-        /*
-         * doa_raw: fresh SRP-PHAT result only.
-         * It is not smoothed and not held.
-         */
+        /* doa_raw: fresh SRP-PHAT result, neither smoothed nor held. */
         s->doa_raw = srp2doa(s);
         s->last_doa_raw = s->doa_raw;
 
-        /*
-         * doa_s: pending-smoothed DOA with hold.
-         * This is the stable DOA intended for downstream modules
-         * such as BF and post-gain.
-         */
+        /* doa_s: pending-smoothed DOA with hold; the stable DOA for downstream modules (BF, post-gain). */
         float doa_s_new;
 
         if (s->enable_smoothing) {
@@ -526,23 +455,13 @@ void doa_step(SRP* s,
             s->doa_s = doa_s_new;
             s->last_doa_s = doa_s_new;
         } else {
-            /*
-             * If smoother has no valid output this frame, keep the
-             * last valid smooth DOA. This prevents doa_s from being
-             * overwritten by NAN while preserving doa_raw as fresh-only.
-             */
+            /* If the smoother has no valid output, keep the last valid doa_s so it is never overwritten by NAN. */
             s->doa_s = s->last_doa_s;
         }
 
     } else {
 
-        /*
-         * No SRP update in this frame.
-         *
-         * Important:
-         * Do NOT call doa_smoother_update() with NAN here,
-         * otherwise the smoother pending state may be reset.
-         */
+        /* No SRP update this frame. Do not call doa_smoother_update() with NAN here: it can reset the smoother's pending state. */
         s->doa_raw = NAN;
         s->doa_s   = s->last_doa_s;
     }
@@ -591,8 +510,6 @@ void srp_destroy(SRP* s)
 {
     if (!s) return;
 
-    /* Pool path (owned_heap == NULL): the caller owns the pool, nothing to
-     * free. Heap path: one free() releases the whole posix_memalign'd
-     * block srp_create_from_geometry() carved everything out of. */
+    /* Pool path (owned_heap == NULL): nothing to free. Heap path: one free() releases the whole block. */
     if (s->owned_heap) free(s->owned_heap);
 }

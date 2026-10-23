@@ -1,12 +1,8 @@
 /**
- * tests/test_spatial_third_party.c — equivalence tests for the modules in
- * this directory.
- *
- * Keeps this arithmetic outside the 4AEC wrapper tests: dispatch must match
- * scalar PHAT, cached SRP must select the scalar golden angle, exported BF
- * weights must reconstruct the mono spectrum, the VAD's caller-pool path must
- * agree with its heap path bin for bin, and the gain modules must
- * produce the bytes of their reference formulations.
+ * tests/test_spatial_third_party.c - equivalence tests for the modules in this directory:
+ * dispatch must match scalar PHAT, cached SRP must select the scalar reference angle, exported BF
+ * weights must reconstruct the mono spectrum, and the caller-pool paths must agree with the heap
+ * paths bin for bin.
  */
 
 #include <math.h>
@@ -382,14 +378,9 @@ static int test_srp_score_scratch_band_contract(void) {
     return 1;
 }
 
-/* srp_get_mem_size()/srp_init() pool-first pair (Phase A.1): a caller-owned
- * pool larger than the queried size must have every byte beyond
- * srp_get_mem_size(cfg) left untouched, an undersized or misaligned pool
- * must be rejected outright, and the same pool must be reusable for a
- * second srp_init() after srp_destroy() releases the first instance (a
- * no-op on the pool path -- srp_destroy() only frees owned_heap). Also
- * exercises srp_get_mem_size()'s config validation directly (M<=1, F<=1,
- * num_angles<=0 -- the union of the config checks). */
+/* srp_get_mem_size()/srp_init() pool contract: bytes beyond srp_get_mem_size(cfg) stay untouched, an
+ * undersized or misaligned pool is rejected, and the pool is reusable after srp_destroy() (a no-op on
+ * the pool path). Also checks srp_get_mem_size()'s own config validation (M<=1, F<=1, num_angles<=0). */
 static int test_srp_init_pool_poison_and_bounds(void) {
     enum { EXTRA = 32 };
     SRP_Config cfg;
@@ -439,9 +430,8 @@ static int test_srp_init_pool_poison_and_bounds(void) {
           "pool bounds test: allocate aligned pool");
     memset(pool, 0xa5, pool_bytes);
 
-    /* srp_init() must also reject a geometry/cfg mismatch -- a check
-     * srp_get_mem_size() cannot make on its own since it never sees an
-     * ArrayGeometry -- and must not touch the pool while rejecting it. */
+    /* srp_init() rejects a geometry/cfg mismatch (srp_get_mem_size() never sees the geometry) without
+     * touching the pool. */
     {
         ArrayGeometry mismatched = *geometry;
         mismatched.M = cfg.M + 1;
@@ -503,18 +493,11 @@ static int test_srp_init_pool_poison_and_bounds(void) {
     return 1;
 }
 
-/* Heap-vs-pool byte-equal test: srp_create_from_geometry() (heap) and
- * srp_init() (caller pool) must produce byte-identical a_array steering
- * vectors and evolve identically across frames with varying VAD, including
- * doa_step()'s raw/smoothed DOA output and the per-bin S_theta/bin_best_idx
- * state srp() populates. Also spot-checks a handful of a_array[a][m]
- * entries directly against srp_build_steering()'s own output --
- * srp_build_steering() (steering.c) is a standalone heap utility that
- * neither constructor under test calls, so this is an independent
- * cross-check of the pool-carve inline fill formula in srp_init() against
- * the reference formula, not the carve step checking itself. This is the
- * single highest-risk place for a silent bug, since the steering formula
- * exists in two separately-maintained places. */
+/* srp_create_from_geometry() (heap) and srp_init() (pool) must produce byte-identical a_array
+ * steering vectors and evolve identically across frames with varying VAD, including doa_step()
+ * output and the per-bin S_theta/bin_best_idx state. Spot-checks a_array[a][m] against
+ * srp_build_steering() (steering.c), which neither constructor calls, so the steering formula that
+ * exists in two places is cross-checked independently. */
 static int test_srp_heap_vs_pool_byte_equal(void) {
     enum { M = 4, F = 65, NUM_ANGLES = 72, FRAMES = 40 };
     SRP_Config cfg;
@@ -712,9 +695,8 @@ static int test_bf_weight_export(void) {
     return 1;
 }
 
-/* bf_create() must reject an invalid forgetting factor on its own, not only
- * via the 4ch_aec_bf_nr_res wrapper's validate_config() -- a caller using
- * bf.h directly (bypassing the wrapper) must get the same protection. */
+/* bf_create() must reject an invalid forgetting factor itself, for callers using bf.h directly
+ * without a wrapper's config validation. */
 static int test_bf_create_rejects_invalid_lambda(void) {
     SRP_Config srp_cfg;
     BF_Config bf_cfg;
@@ -756,13 +738,91 @@ static int test_bf_create_rejects_invalid_lambda(void) {
     return 1;
 }
 
-/* Long-run integration check: over many hops of an active (allow_adapt=1),
- * unmasked RLS update, g->P must stay exactly Hermitian (each off-diagonal
- * pair equal to its own conjugate, each diagonal's imaginary part exactly
- * zero) and every P/wa/output value must stay finite. A fixed (not
- * re-randomized per hop) input is used deliberately so the RLS state
- * settles into a steady operating regime instead of just reacting to fresh
- * noise every hop. */
+/* Out-of-range inputs must stay defined: a search band above Nyquist is
+ * clamped to the last bin, non-finite or huge angles return without spinning
+ * in the wrap loops, and a non-finite fixed beam direction is refused. */
+static int test_degenerate_band_and_angle_inputs(void) {
+    SRP_Config srp_cfg;
+    BF_Config bf_cfg;
+    SRP* s;
+    BF* g;
+    Complex* storage;
+    Complex* ch[4];
+    Complex output[65];
+
+    s = make_test_srp(&srp_cfg);
+    CHECK(s != NULL, "degenerate inputs: create SRP");
+    CHECK(srp_angle_to_index(s, 1.0f) == 11 && srp_angle_to_index(s, -3.0f) == 38,
+          "srp_angle_to_index keeps ordinary angles");
+    CHECK(srp_angle_to_index(s, INFINITY) == -1 && srp_angle_to_index(s, -INFINITY) == -1 &&
+              srp_angle_to_index(s, NAN) == -1,
+          "srp_angle_to_index rejects non-finite angles");
+    CHECK(srp_angle_to_index(s, 1e30f) >= 0 && srp_angle_to_index(s, -1e30f) >= 0,
+          "srp_angle_to_index returns for huge angles");
+
+    storage = (Complex*)malloc(4u * 65u * sizeof(Complex));
+    CHECK(storage != NULL, "degenerate inputs: allocate channels");
+    for (int m = 0; m < 4; ++m) {
+        ch[m] = storage + m * 65;
+        for (int f = 0; f < 65; ++f) {
+            ch[m][f].r = random_signed();
+            ch[m][f].i = random_signed();
+        }
+    }
+
+    memset(&bf_cfg, 0, sizeof(bf_cfg));
+    bf_cfg.enable = 1;
+    bf_cfg.lambda = 0.995f;
+    bf_cfg.mu = 0.05f;
+    bf_cfg.adapt_interval = 1;
+    g = bf_create(4, 65, 72, s->a_array, &bf_cfg);
+    CHECK(g != NULL, "degenerate inputs: create BF");
+    bf_process_with_weights(g, (const Complex* const*)ch, INFINITY, 1, NULL, output, NULL);
+    bf_process_with_weights(g, (const Complex* const*)ch, 1e30f, 1, NULL, output, NULL);
+    bf_process_with_weights(g, (const Complex* const*)ch, -1e30f, 1, NULL, output, NULL);
+    bf_destroy(g);
+
+    bf_cfg.enable_fix_mode = 1;
+    bf_cfg.fixed_doa_rad = NAN;
+    CHECK(bf_create(4, 65, 72, s->a_array, &bf_cfg) == NULL,
+          "bf_create rejects a NaN fixed beam direction");
+    bf_cfg.fixed_doa_rad = INFINITY;
+    CHECK(bf_create(4, 65, 72, s->a_array, &bf_cfg) == NULL,
+          "bf_create rejects an infinite fixed beam direction");
+    bf_cfg.enable_fix_mode = 0;
+    g = bf_create(4, 65, 72, s->a_array, &bf_cfg);
+    CHECK(g != NULL, "bf_create ignores fixed_doa_rad outside fixed mode");
+    bf_destroy(g);
+    free(storage);
+    srp_destroy(s);
+
+    memset(&srp_cfg, 0, sizeof(srp_cfg));
+    srp_cfg.M = 4;
+    srp_cfg.F = 65;
+    srp_cfg.num_angles = 72;
+    srp_cfg.sr = 16000.0f;
+    srp_cfg.NFFT = 128.0f;
+    srp_cfg.c = 343.0f;
+    srp_cfg.low_freq = 9000.0f;
+    srp_cfg.high_freq = 12000.0f;
+    srp_cfg.switch_consec = 1;
+    srp_cfg.update_interval = 1;
+    {
+        ArrayGeometry* geometry = array_geometry_create_uca(4, 0.035f);
+        CHECK(geometry != NULL, "degenerate inputs: geometry");
+        s = srp_create_from_geometry(&srp_cfg, geometry);
+        array_geometry_destroy(geometry);
+    }
+    CHECK(s != NULL, "degenerate inputs: SRP with a band above Nyquist");
+    CHECK(s->f_start == 64 && s->f_end == 64,
+          "a band above Nyquist is clamped to the last bin");
+    srp_destroy(s);
+    return 1;
+}
+
+/* Over many hops of an active, unmasked RLS update, g->P must stay exactly Hermitian (off-diagonals
+ * conjugate pairs, diagonal imaginary parts zero) and every P/wa/output value finite. The input is
+ * fixed rather than re-randomized per hop so the RLS state settles into a steady regime. */
 static int test_bf_long_run_hermitian_and_finite(void) {
     enum { HOPS = 4000 };
     SRP_Config srp_cfg;
@@ -833,18 +893,11 @@ static int test_bf_long_run_hermitian_and_finite(void) {
     return 1;
 }
 
-/* Test: bf_create() forces the actual RLS update
- * cadence (g->adapt_interval) to 1 whenever enable_fix_mode &&
- * fixed_align_notebook, regardless of the caller's requested adapt_interval
- * -- kept for baseline-matching against the reference notebook. Any external
- * computation that assumes a particular cadence (e.g. audio_pipeline_4ch.c
- * retiming lambda for a slower wall-clock update period) MUST derive it via
- * the same bf_effective_adapt_interval() bf_create() uses internally
- * instead of re-deriving the forcing rule, so the two can never silently
- * diverge. This test creates real BF instances across representative
- * (enable_fix_mode, fixed_align_notebook, adapt_interval) combinations and
- * confirms bf_create()'s actual resulting cadence always matches what
- * bf_effective_adapt_interval() predicts for those same inputs. */
+/* bf_create() forces the RLS update cadence (g->adapt_interval) to 1 whenever enable_fix_mode &&
+ * fixed_align_notebook. Callers deriving timing from the cadence must use
+ * bf_effective_adapt_interval() rather than re-deriving the rule; this checks that its prediction
+ * matches the created instance for representative (enable_fix_mode, fixed_align_notebook,
+ * adapt_interval) combinations. */
 static int test_bf_effective_adapt_interval_matches_created_cadence(void) {
     static const struct {
         int enable_fix_mode;
@@ -896,25 +949,15 @@ static int test_bf_effective_adapt_interval_matches_created_cadence(void) {
     return 1;
 }
 
-/* BF_WA_LEAK (queried via bf_wa_leak_factor(), not duplicated as a
- * literal) must be a genuine forgetting factor in (0,1): a leaky
- * accumulator `wa = leak*wa + update` under constant forcing converges to
- * the closed-form steady state `update/(1-leak)`, whereas a plain
- * accumulator (leak == 1) would instead grow without bound. This proves the
- * constant actually has the bounding property the P/wa hardening relies on,
- * independent of how large a real deployment's own update count ever gets
- * (see bf.c's BF_WA_LEAK comment for why that count is hops-gated by VAD/
- * masking, not one-per-hop). */
+/* BF_WA_LEAK (read via bf_wa_leak_factor()) must be a genuine forgetting factor in (0,1): a leaky
+ * accumulator `wa = leak*wa + update` under constant forcing converges to update/(1-leak), whereas a
+ * plain accumulator (leak == 1) grows without bound. */
 static int test_bf_wa_leak_is_bounded(void) {
     float leak = bf_wa_leak_factor();
     double wa = 0.0;
     const double update = 0.37;
-    /* Run enough updates to be ~20 leak time constants (1/(1-leak)) deep,
-     * regardless of the actual leak value, so leak^n is astronomically
-     * small (tight convergence to steady state) and the naive/leaky ratio
-     * (== n*(1-leak)) is always ~20 -- this makes the test self-scaling if
-     * BF_WA_LEAK is ever retuned, instead of depending on today's specific
-     * 0.99999 to happen to produce a good ratio at a fixed n. */
+    /* Run ~20 leak time constants (1/(1-leak)) of updates so leak^n is negligible and the
+     * naive/leaky ratio (n*(1-leak)) is ~20 whatever the leak value. */
     const long n = (long)(20.0 / (1.0 - (double)leak)) + 1000L;
     long k;
     double expected_steady_state;
@@ -938,15 +981,10 @@ static int test_bf_wa_leak_is_bounded(void) {
     return 1;
 }
 
-/* BF's per-bin P-diagonal clamp (BF_P_DIAG_FLOOR/CEIL) must actually bound
- * a runaway diagonal, not just exist as dead code. An all-zero spectrum at
- * one bin makes the blocking-output u == 0 there (u = x - a*(a^H x/a^H a)
- * is linear in x), which makes upu_real == lambda (finite, positive)
- * regardless of steering vectors -- so the reactive isfinite/positivity
- * guard does NOT fire, and P_new[i][i] = P[i][i]/lambda (dividing by
- * lambda<1 grows the magnitude further), isolating the proactive clamp as
- * the only thing standing between a poked-in extreme value and an
- * unbounded diagonal. */
+/* BF's per-bin P-diagonal clamp (BF_P_DIAG_FLOOR/CEIL) must bound a runaway diagonal. An all-zero
+ * spectrum at one bin makes the blocking output u == 0, so upu_real == lambda (finite, positive) and
+ * the reactive isfinite/positivity guard does not fire; P_new[i][i] = P[i][i]/lambda keeps growing,
+ * leaving the clamp as the only bound. */
 static int test_bf_p_diag_clamp_bounds_runaway_values(void) {
     SRP_Config srp_cfg;
     BF_Config bf_cfg;
@@ -1015,23 +1053,9 @@ static int test_bf_p_diag_clamp_bounds_runaway_values(void) {
     return 1;
 }
 
-/* A NaN planted directly in P (as opposed to a runaway-but-finite diagonal,
- * which the proactive clamp handles) must not silently spread into gain/wa
- * and out through bf_out -- some reset guard must catch it and recover
- * just that one bin. NaN propagates through multiplication unconditionally
- * (NaN * x == NaN for any x, including 0), so poking a single NaN into P is
- * enough to corrupt this bin's pipeline regardless of the input spectrum's
- * content.
- *
- * Mutation-tested: with the reactive isfinite(upu_real) guard alone
- * disabled, this specific corruption (NaN in P feeding a zero input
- * spectrum) still gets caught -- NaN propagates on into gain and then wa,
- * and the separate "final per-bin finite check" on wa catches it instead.
- * Only disabling BOTH guards makes this test fail. That overlap is
- * consistent with the guards' own comments (the wa check is documented as
- * defense-in-depth for sources other than P), so this test is verifying
- * "the guard system recovers from a non-finite P entry" rather than
- * isolating one specific guard. */
+/* A NaN planted in P (as opposed to a finite runaway diagonal, which the clamp handles) must not
+ * spread into gain/wa and out through bf_out: a reset guard must recover just that one bin. Either
+ * the reactive isfinite(upu_real) guard or the final per-bin finite check on wa may catch it. */
 static int test_bf_bin_reset_on_nonfinite_p_propagation(void) {
     SRP_Config srp_cfg;
     BF_Config bf_cfg;
@@ -1091,12 +1115,9 @@ static int test_bf_bin_reset_on_nonfinite_p_propagation(void) {
     return 1;
 }
 
-/* bf_get_mem_size()/bf_init() pool-first pair (Phase A.2): a caller-owned
- * pool larger than the queried size must have every byte beyond
- * bf_get_mem_size(M, F) left untouched, an undersized or misaligned pool
- * must be rejected outright, and the same pool must be reusable for a
- * second bf_init() after bf_destroy() releases the first instance (a
- * no-op on the pool path -- bf_destroy() only frees owned_heap). */
+/* bf_get_mem_size()/bf_init() pool contract: bytes beyond bf_get_mem_size(M, F) stay untouched, an
+ * undersized or misaligned pool is rejected, and the pool is reusable after bf_destroy() (a no-op on
+ * the pool path). */
 static int test_bf_init_pool_poison_and_bounds(void) {
     enum { M = 4, F = 65, NUM_ANGLES = 72, EXTRA = 32 };
     SRP_Config srp_cfg;
@@ -1187,14 +1208,9 @@ static int test_bf_init_pool_poison_and_bounds(void) {
     return 1;
 }
 
-/* Heap-vs-pool byte-equal test: bf_create() (heap) and bf_init() (caller
- * pool) must evolve identically, hop for hop, across frames that both skip
- * AND trigger RLS adaptation -- not just matching bf_out/effective_weights,
- * but the internal P[i][j][f]/wa[m][f] RLS state too. This is the strongest
- * check available that flattening BF's nested Complex triple- and
- * double-pointer arrays into one carved pool block does not perturb the RLS
- * recursion's numeric evolution at all versus the original nested
- * calloc/malloc layout. */
+/* bf_create() (heap) and bf_init() (pool) must evolve identically, hop for hop, across frames that
+ * both skip and trigger RLS adaptation: bf_out/effective_weights and the internal P[i][j][f] and
+ * wa[m][f] state. */
 static int test_bf_heap_vs_pool_byte_equal(void) {
     enum { M = 4, F = 65, NUM_ANGLES = 72, HOPS = 40 };
     SRP_Config srp_cfg;
@@ -1492,23 +1508,14 @@ static VADApiConfig vad_test_config(int nfft) {
     return cfg;
 }
 
-/* ---------- the caller-pool contract, checked once ----------
- *
- * Every module in this directory implements the same one: an undersized or
- * misaligned block is refused without a single byte written, a legal block
- * puts the instance at mem[0] and is never written past `need`, and destroy()
- * leaves the block reusable. Four copies of this script had accumulated (VAD
- * plus the three gain stages); one copy means a new probe added here covers
- * all of them instead of three of four.
- *
- * The SRP and BF copies further up are deliberately left alone: they check a
- * strictly larger set (they re-poison and re-check between the rejected
- * calls), so folding them in would either weaken them or complicate this. */
+/* ---------- the caller-pool contract ----------
+ * An undersized or misaligned block is refused without a byte written, a legal block holds the
+ * instance at mem[0] and is never written past `need`, and destroy() leaves the block reusable.
+ * The SRP and BF pool tests above also re-poison between the rejected calls, so they stay separate. */
 typedef void* (*PoolInitFn)(void* mem, size_t bytes, void* ctx);
 typedef void (*PoolDestroyFn)(void* inst);
 
-/* CHECK_L rather than CHECK: one shared body serves four modules, so a bare
- * "init on a legal pool" would not say which one failed. */
+/* CHECK_L names the module under test in the failure message. */
 #define CHECK_L(condition, message)                                        \
     do {                                                                   \
         if (!(condition)) {                                                \
@@ -1701,6 +1708,8 @@ static int run_all_tests(void) {
     CHECK(test_bf_weight_export(), "BF effective-weight test");
     CHECK(test_bf_create_rejects_invalid_lambda(),
           "BF create lambda-bound test");
+    CHECK(test_degenerate_band_and_angle_inputs(),
+          "degenerate band/angle input test");
     CHECK(test_bf_long_run_hermitian_and_finite(),
           "BF long-run Hermitian/finite test");
     CHECK(test_bf_effective_adapt_interval_matches_created_cadence(),

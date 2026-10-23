@@ -1,4 +1,4 @@
-/* Periodic sqrt-Hann window construction, independent of FFT and framing. */
+/* Periodic sqrt-Hann window construction. */
 #ifndef AUDIO_WINDOW_H
 #define AUDIO_WINDOW_H
 

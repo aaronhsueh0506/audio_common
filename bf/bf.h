@@ -11,16 +11,14 @@ extern "C" {
 
 typedef struct {
     int enable;                  /* 0: bypass BF, 1: enable BF */
-    float lambda;
-    float mu;
+    float lambda;  /* RLS forgetting factor, (0, 1] */
+    float mu;  /* step scale applied to the weight update */
 
-    /* fix beam config */
-    int enable_fix_mode;          /* 0: AUTO DOA, 1: FIX BEAM */
-    float fixed_doa_rad;          /* only used when enable_fix_mode == 1 */
-    int fixed_align_notebook;     /* 1: fixed mode matches the original reference notebook's forced cadence */
+    int enable_fix_mode;          /* 0: auto DOA, 1: fixed beam */
+    float fixed_doa_rad;          /* Fixed beam direction (rad), must be finite; used when enable_fix_mode == 1. */
+    int fixed_align_notebook;     /* 1: fixed mode uses the notebook-style update with an every-hop cadence. */
 
-    /* adaptive update interval */
-    int adapt_interval;           /* update RLS every N frames, <=0 means 1 */
+    int adapt_interval;           /* Run the RLS update every N frames; <= 0 means 1. */
 } BF_Config;
 
 typedef struct {
@@ -33,113 +31,60 @@ typedef struct {
     float lambda;
     float mu;
 
-    /* fix beam config */
     int enable_fix_mode;
     float fixed_doa_rad;
     int fixed_align_notebook;
 
-    /* adaptive update interval */
     int adapt_interval;
 
-    /* steering */
     Complex*** a_array;
 
-    /* RLS. P is stored as P[M][M][F], so four adjacent frequency bins of
-     * one matrix element are contiguous for the AArch64 NEON update. This
-     * is internal state and must not be persisted or indexed by
-     * integrators. */
-    Complex*** P;   // (M,M,F)
-    Complex** wa;   // (M,F)
+    /* RLS state. P is P[M][M][F] (frequency contiguous for NEON). Internal; do not persist or index. */
+    Complex*** P;
+    Complex** wa;
 
-    /* Persistent per-hop work area. Keeping the F- and M*F-sized arrays
-     * here avoids a ~29 KiB stack spike at the 48 kHz / 1024-FFT grid. */
+    /* Persistent per-hop work area (keeps F- and M*F-sized arrays off the stack). */
     Complex* scratch;
     Complex* scratch_das;
     Complex* scratch_wu;
     Complex* scratch_spec;
     Complex* scratch_u;
 
-    /* state */
     int initialized;
     int first_doa_found;
-    int64_t first_doa_frame;  /* -1 sentinel ("not found yet"); int64_t
-                               * (not uint64_t) so that is a true negative
-                               * value; effectively unbounded for any real
-                               * frame_idx snapshot */
+    int64_t first_doa_frame;  /* -1 until the first DOA is found. */
     float current_doa;
-    uint64_t frame_idx;  /* per-frame monotonic counter; a 32-bit int would
-                          * overflow at INT_MAX (~199-265 days at typical
-                          * hop rates); uint64_t is effectively unbounded
-                          * for any real run and avoids signed-overflow UB */
+    uint64_t frame_idx;  /* Monotonic per-frame counter. */
 
-    /* log */
     float doa_used;
     int adaptive;
 
-    /* Lifetime count of per-bin RLS divergence recoveries (see
-     * BF_P_DIAG_FLOOR/CEIL in bf.c) -- NOT cleared by bf_reset(), so a
-     * caller/test can observe whether numerical instability occurred at all
-     * across this instance's whole run. Expected to stay at (or very near)
-     * 0 in normal operation; the diagonal clamp is meant to keep this
-     * reactive path rare. */
+    /* Lifetime count of per-bin RLS divergence recoveries; not cleared by bf_reset(). Stays at or near 0 in normal operation. */
     long bin_resets;
 
-    /* Non-NULL only on the bf_create() heap path: the single
-     * posix_memalign()'d block backing every array above, freed by
-     * bf_destroy(). NULL on the bf_init() caller-pool path, where the
-     * caller owns the memory and bf_destroy() must not free it. Appended
-     * at the end of the struct so every field above keeps its pre-existing
-     * offset (same precedent as AEC/c_impl's Aec.heap_arena). */
+    /* Non-NULL only on the bf_create() path: the block backing every array above, freed by bf_destroy(). NULL on the bf_init() pool path. */
     void* owned_heap;
 
 } BF;
 
-/*
- * Single source of truth for the adapt_interval BF will actually run at,
- * once fixed-notebook-mode forcing is taken into account.
- *
- * bf_create() forces the RLS update cadence to 1 (every hop) whenever
- * enable_fix_mode && fixed_align_notebook, regardless of the caller's
- * requested adapt_interval (kept for baseline-matching against the
- * reference notebook). Any quantity that is derived from "how often BF
- * actually adapts" -- e.g. a caller retiming lambda/mu for a slower
- * wall-clock update period -- MUST call this same function with the same
- * inputs instead of re-deriving the forcing rule, so the effective cadence
- * used for that derivation and the cadence bf_create() actually configures
- * can never silently diverge.
- */
+/* Adapt interval BF actually runs at: bf_create() forces 1 when enable_fix_mode && fixed_align_notebook.
+ * Callers deriving timing from the update cadence must use this function. */
 int bf_effective_adapt_interval(
     int enable_fix_mode, int fixed_align_notebook, int adapt_interval);
 
-/* create */
 BF* bf_create(int M, int F, int num_angles,
                 Complex*** a_array,
                 const BF_Config* cfg);
 
-/*
- * Static-memory companions: place a BF struct plus every backing array
- * (P/wa/scratch) in a single caller-owned pool. Mirrors AEC/c_impl's
- * aec_get_mem_size()/aec_init() pair (same simple, non-descriptor tier --
- * BF is a single library-level module, not a composite like
- * 4aec_nr_res.c).
- *
- * bf_get_mem_size(M, F) returns the total byte requirement; it does not
- * depend on num_angles or cfg (neither affects BF's own storage --
- * num_angles only indexes into the caller-owned a_array, and cfg's fields
- * are plain scalars copied into the struct). Returns 0 for an invalid
- * (M <= 0 or F <= 0) shape.
- *
- * bf_init() places the BF struct at mem[0], carves every backing array out
- * of the same block (no malloc called), and applies the exact same
- * validation bf_create() does. `a_array` remains a BORROWED pointer in both
- * bf_create() and bf_init() -- it is owned by the caller (typically SRP),
- * never carved from the pool or freed by BF.
- */
+/* Static-memory pair: bf_get_mem_size(M, F) returns the bytes needed for the struct and its arrays (0 for M <= 0 or F <= 0);
+ * it is independent of num_angles and cfg. bf_init() carves them from the caller's 16-byte-aligned pool with
+ * bf_create()'s validation. `a_array` is borrowed in both: owned by the caller, never carved or freed by BF. */
 size_t bf_get_mem_size(int M, int F);
 BF*   bf_init(void* mem, size_t mem_size, int M, int F,
                 int num_angles, Complex*** a_array,
                 const BF_Config* cfg);
 
+/* mask (optional): nonzero = freeze RLS adaptation on that bin; NULL = none. Opposite polarity to srp(). */
 void bf_process(BF* g,
                  const Complex* const* X,
                  float doa_s,
@@ -147,15 +92,8 @@ void bf_process(BF* g,
                  const int* mask,
                  Complex* bf_out);
 
-/*
- * Same BF processing and state update as bf_process(), plus the exact
- * pre-update effective coefficients under:
- *
- *   bf_out[f] = sum(effective_weights[m,f] * X[m,f])
- *
- * (no conjugation at the call site).  The output buffer may be NULL only
- * when the corresponding result is not needed; bf_out remains required.
- */
+/* bf_process() that also returns the pre-update effective weights: bf_out[f] = sum(effective_weights[m,f] * X[m,f])
+ * (no conjugation at the call site). effective_weights may be NULL when not needed; bf_out is required. */
 void bf_process_with_weights(BF* g,
                               const Complex* const* X,
                               float doa_s,
@@ -169,27 +107,13 @@ void bf_destroy(BF* g);
 float bf_get_doa_used(const BF* g);
 int bf_get_adaptive(const BF* g);
 
-/*
- * The per-hop leak factor applied to the adaptive weight state `wa` during
- * an active, unmasked RLS update (see bf.c's BF_WA_LEAK comment). Exposed
- * read-only so callers/tests can reference the authoritative constant
- * instead of duplicating its numeric value.
- */
+/* Per-hop leak factor applied to the adaptive weights during an unmasked RLS update. */
 float bf_wa_leak_factor(void);
 
-/*
- * Lifetime count of per-bin RLS divergence recoveries this instance has
- * performed (see BF struct's bin_resets field). Read-only diagnostic --
- * expected to stay at 0 in normal operation.
- */
+/* Lifetime count of per-bin RLS divergence recoveries (diagnostic). */
 long bf_get_bin_resets(const BF* g);
 
-/*
- * The P-diagonal clamp bounds applied every adapted frame (see bf.c's
- * BF_P_DIAG_FLOOR/CEIL comment). Exposed read-only so callers/tests can
- * reference the authoritative constants instead of duplicating their
- * numeric values (same rationale as bf_wa_leak_factor()).
- */
+/* P-diagonal clamp bounds applied after every adapted frame. */
 float bf_p_diag_floor(void);
 float bf_p_diag_ceil(void);
 

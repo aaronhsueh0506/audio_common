@@ -11,17 +11,14 @@
 extern "C" {
 #endif
 
-/* ===================== geometry ===================== */
 typedef struct {
     int M;
     float* x;
     float* y;
 } ArrayGeometry;
 
-/* ===================== forward declaration ===================== */
 typedef struct SRP SRP;
 
-/* ===================== config ===================== */
 typedef struct {
     int M;
     int F;
@@ -35,7 +32,7 @@ typedef struct {
     float low_freq;
     float high_freq;
 
-    /* smoothing config */
+    /* smoothing */
     int enable_smoothing;
     int switch_consec;
     float angle_tol;
@@ -44,7 +41,6 @@ typedef struct {
 
 } SRP_Config;
 
-/* ===================== SRP struct ===================== */
 struct SRP {
     int M;
     int F;
@@ -60,25 +56,19 @@ struct SRP {
     int enable_smoothing;
     DOA_Smoother smoother;
 
-    /* for post gain */
-    int* bin_best_idx;   /* length = F, each bin's best angle index */
+    /* post-gain support */
+    int* bin_best_idx;   /* length F: each bin's best angle index */
 
-    /* DOA output state */
     float doa_raw;
     float doa_s;
 
     int update_interval;
-    uint64_t frame_counter;  /* was int: a per-frame monotonic counter would
-                              * overflow INT_MAX (~199-265 days at typical
-                              * hop rates); uint64_t is effectively unbounded
-                              * for any real run and avoids signed-overflow UB */
+    uint64_t frame_counter;  /* Monotonic per-frame counter. */
 
     float last_doa_raw;
     float last_doa_s;
 
-    /* unique-pair SRP precompute
-     * pair_steer[a][p][f] = conj(a_array[a][i][f]) * a_array[a][j][f]
-     */
+    /* Unique-pair SRP precompute: pair_steer[a][p][f] = conj(a_array[a][i][f]) * a_array[a][j][f]. */
     int num_pairs;
     int* pair_i;
     int* pair_j;
@@ -87,15 +77,11 @@ struct SRP {
     float* score_scratch;         /* [F], one candidate angle */
     float* best_score;            /* [F], best candidate seen so far */
 
-    /* NULL on the pool-carved path (srp_init()) -- the caller owns the pool
-     * and srp_destroy() must not free it. Set to the posix_memalign'd block
-     * on the heap-convenience path (srp_create_from_geometry()), which
-     * carves an SRP out of it via srp_init() the same way the pool path
-     * does. */
+    /* NULL on the pool path (srp_init()); the caller owns the pool and srp_destroy() does not free it.
+     * Set on the heap path (srp_create_from_geometry()) to the posix_memalign'd block. */
     void* owned_heap;
 };
 
-/* ===================== angle / steering API ===================== */
 float* srp_create_uniform_angles(int num_angles);
 Complex*** srp_build_steering(
     const SRP_Config* cfg,
@@ -108,36 +94,28 @@ void srp_destroy_steering(
     int microphones
 );
 
-/*helper*/
 int srp_angle_to_index(SRP* s, float doa_rad);
 
-/* ===================== SRP pool-first create ===================== */
-/* srp_get_mem_size() returns the total byte requirement; caller allocates
- * once (16-byte aligned). srp_init() places the SRP struct at mem[0] and
- * carves every internal array out of the rest of the block; no malloc
- * called. Returns NULL if cfg/geom are invalid, mem is misaligned, or
- * mem_size is too small. */
+/* srp_get_mem_size() returns the total bytes; the caller allocates one 16-byte-aligned block.
+ * srp_init() places the SRP at mem[0] and carves every array from it (no malloc).
+ * Returns NULL if cfg/geom are invalid, mem is misaligned, or mem_size is too small. */
 size_t srp_get_mem_size(const SRP_Config* cfg);
 SRP*   srp_init(void* mem, size_t mem_size,
                 const SRP_Config* cfg, const ArrayGeometry* geom);
 
-/* Heap convenience wrapper over srp_init(): posix_memalign's a 16-byte
- * aligned pool sized by srp_get_mem_size(cfg), carves an SRP into it, and
- * records the allocation on SRP::owned_heap so srp_destroy() knows to free
- * it. Returns NULL on any allocation or validation failure (nothing leaks
- * on that path either). */
+/* Heap wrapper over srp_init(): allocates a 16-byte-aligned pool of srp_get_mem_size(cfg) bytes, records it in
+ * SRP::owned_heap for srp_destroy(), and returns NULL (nothing leaked) on any allocation or validation failure. */
 SRP* srp_create_from_geometry(
     const SRP_Config* cfg,
     const ArrayGeometry* geom
 );
 
-/* ===================== SRP ===================== */
+/* mask (optional): nonzero = use that bin in the score; NULL = all bins. Opposite polarity to bf_process(). */
 void srp(SRP* s, const Complex* const* X, const int* mask);
 
-/* ===================== SRP to DOA ===================== */
 float srp2doa(SRP* s);
 
-/* ===================== DOA ===================== */
+/* mask as in srp(). */
 void doa_step(SRP* srp,
               const Complex* const* X,
               const int* mask,
@@ -149,7 +127,6 @@ float doa_get_smooth(const SRP* srp);
 /* No new analysis frame: report raw=NAN while holding the smooth DOA. */
 void srp_hold(SRP* s);
 void srp_reset(SRP* s);
-/* ===================== destroy ===================== */
 void srp_destroy(SRP* s);
 
 #ifdef __cplusplus

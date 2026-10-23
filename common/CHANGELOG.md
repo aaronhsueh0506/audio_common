@@ -4,6 +4,32 @@ All notable changes to audio_common. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The README states the
 current behaviour only; how it got there is recorded here.
 
+## [Unreleased] — Source comments condensed
+
+Source and header comments in `common/` were cut to short contracts; design notes that lived only in those
+comments:
+
+- `fast_math.h` non-finite results (default mode; `USE_STANDARD_MATH` returns libm's): `fast_exp` NaN -> 0,
+  +Inf -> 8.8861105e+06f (bits 0x4b07975e), -Inf -> 0; `fast_log` NaN/0/negative -> -1e10f (0xd01502f9),
+  +Inf -> 88.72283935546875f (0x42b17218, an artefact of the range reduction); `fast_sqrt` NaN/negative/-0.0f ->
+  +0.0f, +Inf -> +Inf on ARM sqrtf or NaN on the Newton fallback. `fast_log` is accurate (< 1e-4 absolute) on positive
+  normal inputs; subnormals are not normalised.
+- `simd_kernels.h`: `sk_pairwise_sum_tailfold_f32` (variant A) enters the n <= 128 leaf directly and starts its
+  small-n sum at 0.0f; variant B (`..._tailfold_b_f32`) starts at `a[0]`, so a lone -0.0f gives +0.0f vs -0.0f.
+  Both fold the n % 8 tail one element at a time into the combined root. `sk_asym_ema_f32` selects `a_down` on
+  strict `x < s`; `sk_argmax*` use a two-pass max/first-match reduction with a scalar fallback for non-finite
+  peaks; `sk_linear_to_db_f32` has no NEON path (libm `log10f` is the only exact choice).
+- `sk_clip_scale_to_s16` clips to +-1, scales by 32767 and truncates; `wav_io.h`'s writer is deliberately not
+  built on it (NR style counts and zeroes non-finite input, AEC style scales by 32768 with round-half-away).
+- `simd_aec.h` fused kernels keep the scalar order: the coherence-gate loop 2 reads only values loop 1 wrote at
+  the same bin, the ERL update gates both stores with one combined mask (second condition against the original
+  `erl[k]`), and every min/max is compare plus select because `vminq/vmaxq` break signed-zero ties differently.
+- `fft_wrapper_ne10.c`: `n_freqs` complex values (4*fft_size + 8 bytes) cover `fft_size` floats, which is what
+  lets the forward and inverse staging share one block; the object is built with `-fno-strict-aliasing`
+  because `Complex` and `ne10_fft_cpx_float32_t` are cast to each other. The resampler's SIMD=0 path sums the
+  window newest tap first; the NEON path pairs lanes `(l0 + l1) + (l2 + l3)`. `hpf.c` uses the same
+  coefficient formula as the Python high-pass reference, in float32 (not bit-exact with it).
+
 ## [Unreleased] — 2026-10-23 — FFT handle shares its input staging
 
 - The preserving `fft_forward`/`fft_inverse` stage their input in one block per handle instead of
