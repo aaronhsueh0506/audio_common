@@ -20,7 +20,7 @@ One copy of the shared DSP code for every consumer repo (AEC, NR, Audio_ALG):
 
 ## Documentation
 
-- [`docs/c_user_manual_zh_TW.md`](docs/c_user_manual_zh_TW.md): per-function manual (signatures, error returns, buffer rules).
+- [`docs/c_user_manual_zh_TW.md`](docs/c_user_manual_zh_TW.md): per-function manual (signatures, error returns, buffer rules). It is the index and table of contents; chapters 5 and 6 live in the part files [`docs/c_user_manual_zh_TW_01_modules_core.md`](docs/c_user_manual_zh_TW_01_modules_core.md) (5.1-5.4), [`docs/c_user_manual_zh_TW_02_modules_util_io.md`](docs/c_user_manual_zh_TW_02_modules_util_io.md) (5.5-5.8) and [`docs/c_user_manual_zh_TW_03_checklist.md`](docs/c_user_manual_zh_TW_03_checklist.md) (integration checklist).
 - `docs/html/audio_common.html`: call order, minimal compile-checked examples and sequence diagrams.
 - `docs/html/audio_common_detail.html`: data flow, I/O and state tables, latency.
 - `docs/html/audio_common_c_api.html`: integrator-level API summary.

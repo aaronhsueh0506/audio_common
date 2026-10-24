@@ -29,7 +29,7 @@ is recorded in [`audiolib.pin`](../Audio_ALG/pipelines/audiolib.pin);
 | common: data flow, I/O and state tables, latency | `common/docs/html/audio_common_detail.html` |
 | common: integrator API summary | `common/docs/html/audio_common_c_api.html` |
 | common: external vs internal parameters, public vs internal functions | `common/docs/html/audio_common_params.html` |
-| common: per-function manual | [`common/docs/c_user_manual_zh_TW.md`](common/docs/c_user_manual_zh_TW.md) |
+| common: per-function manual | [`common/docs/c_user_manual_zh_TW.md`](common/docs/c_user_manual_zh_TW.md) (index; per-module chapters in the `c_user_manual_zh_TW_0*.md` part files next to it) |
 | VAD + SRP + BF chain: call order, sequence diagram, memory | `docs/html/spatial_chain.html` |
 | SRP-PHAT / DOA smoother | `docs/html/doa_srp.html` |
 | Beamformer | `docs/html/bf.html` |
