@@ -118,10 +118,8 @@ static void drive_stft(AcStft* s, int n) {
         for (k = 0; k < n; ++k) in[k] = rnd();
         (void)ac_stft_push(s, in, sp);
         (void)ac_stft_push_planar(s, in + hop, re, im);
-        ac_stft_frame(s, in, sp);
         ac_stft_frame_planar(s, in, re, im);
     }
-    (void)ac_stft_flush(s, sp);
     (void)ac_stft_flush_planar(s, re, im);
     (void)ac_stft_window(s);
     ac_stft_reset(s);
@@ -142,7 +140,6 @@ static void drive_istft(AcIstft* s, int n) {
         (void)ac_istft_push_planar(s, re, im, out);
     }
     (void)ac_istft_flush(s, out);
-    (void)ac_istft_window(s);
     ac_istft_reset(s);
     free(out); free(re); free(im); free(sp);
 }

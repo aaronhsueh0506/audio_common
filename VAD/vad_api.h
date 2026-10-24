@@ -34,9 +34,6 @@ int vad_api_get(const VADApi* v);
 int vad_api_get_raw(const VADApi* v);
 const int* vad_api_get_mask(const VADApi* v);
 
-MaskEstimator* vad_api_get_masker(VADApi* v);
-MaskVAD* vad_api_get_mask_vad(VADApi* v);
-
 void vad_api_destroy(VADApi* v);
 
 #endif

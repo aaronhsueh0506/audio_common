@@ -12,7 +12,6 @@ One copy of the shared DSP code for every consumer repo (AEC, NR, Audio_ALG):
 | window | `include/audio_window.h`, `src/audio_window.c` | periodic sqrt-Hann in float32 via `ac_window_build`; no FFT or framing dependency. `audio_stft.h` includes this API for existing callers. |
 | STFT/ISTFT | `include/audio_stft.h`, `src/audio_stft.c` | one analysis object (`AcStft`) and one synthesis object (`AcIstft`) for 50%-overlap sqrt-Hann framing: accumulate-and-emit overlap-add or envelope-normalised overlap-add with reflect-padded centered analysis, optional spectrum scales for normalised NN spectra, shared or carved FFT handle and window, static memory only. `make selftest` runs `test/test_stft.c` (window formulas, latency and identity reconstruction, API contract, scaled entry points) |
 | HPF | `include/hpf.h`, `src/hpf.c` | biquad high-pass (f32, DF2-transposed), `hpf_create`/`hpf_get_mem_size`+`hpf_init` API — shared by platform code AND AEC's mic path |
-| pre-gain | `include/audio_pre_gain.h`, `src/audio_pre_gain.c` | amplitude-dB (`10^(dB/20)`) input gain, heap/static lifecycle, in-place-safe, AArch64 NEON/scalar |
 | resampler | `include/audio_resampler.h`, `src/audio_resampler.c` | streaming rational polyphase float32 resampler; only 8/16/24/32/48 kHz, 1–8 interleaved channels, heap/static lifecycle, block-boundary-identical state (a sample never depends on how the input was split; NEON and `SIMD=0` sum each output in different orders, so they agree to float rounding, not bit for bit) |
 
 ## Build
@@ -21,7 +20,7 @@ One copy of the shared DSP code for every consumer repo (AEC, NR, Audio_ALG):
 make               # build the archive (NE10 FFT backend)
 make SIMD=0        # force every optional SIMD path to scalar (NE10 scalar C kernels)
 make selftest      # round-trip + static==heap byte-equality check
-make test_audio_utils  # pre-gain + all supported resample-rate pairs
+make test_audio_utils  # all supported resample-rate pairs
 make test          # default test tier (see Tests)
 make test-full     # default tier plus the publish checks and the standalone NEON-vs-C FFT parity
 ```
@@ -54,15 +53,7 @@ cutting a release or changing `publish`.
   `SK_SELFTEST_BENCH=1` to add their report-only microbenchmarks, e.g. `SK_SELFTEST_BENCH=1 make selftest`.
 - `test/run_selftest_ubsan.sh` runs `simd_selftest` under UBSan; it is not part of either tier.
 
-## Pre-gain and resampling
-
-`AudioPreGain` takes amplitude dB, converts it once, and applies no clipping:
-
-```c
-AudioPreGain *gain = audio_pre_gain_create(-6.0f);
-audio_pre_gain_process(gain, input, output, sample_count); /* in-place is OK */
-audio_pre_gain_destroy(gain);
-```
+## Resampling
 
 `AudioResampler` accepts only 8000, 16000, 24000, 32000, and 48000 Hz.
 Samples are interleaved float32 frames and the object must remain alive across
@@ -129,7 +120,7 @@ $ make EXTRA_CFLAGS=-ffast-math
 
 `scripts/audit_fp_contract.sh [ne10]` is the disassembly-level check. It builds
 the `ne10` config, disassembles a fixed list of expected-scalar objects (this
-repo's `hpf.o`, `audio_pre_gain.o`, `audio_resampler.o`, `audio_window.o`,
+repo's `hpf.o`, `audio_resampler.o`, `audio_window.o`,
 `audio_stft.o`, the NE10 objects, and NR's `anr.o`, `noise_estimator.o`,
 `spp_estimator.o`), and fails on any fmadd/fmsub/fnmadd/fnmsub/fmla/fmls, the
 signature of the compiler fusing a plain `a*b+c`. `fft_wrapper_ne10.o` requests
@@ -140,7 +131,7 @@ reference, which is why `-fno-math-errno` is part of the policy.
 
 ## API conventions
 
-- FFT, HPF, pre-gain and resampling expose a heap path (`X_create`/`X_destroy`) and a static-memory
+- FFT, HPF and resampling expose a heap path (`X_create`/`X_destroy`) and a static-memory
   path (`X_get_mem_size(...)` + `X_init(void* mem, size_t mem_size, ...)`), with a
   runtime `pool_owned`/`is_static` flag — no compile-time gate. `X_destroy` is
   safe on both paths (frees nothing pool-owned). Window generation needs no state;

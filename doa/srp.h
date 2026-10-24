@@ -82,20 +82,6 @@ struct SRP {
     void* owned_heap;
 };
 
-float* srp_create_uniform_angles(int num_angles);
-Complex*** srp_build_steering(
-    const SRP_Config* cfg,
-    const ArrayGeometry* geom,
-    const float* angles
-);
-void srp_destroy_steering(
-    Complex*** steering,
-    int num_angles,
-    int microphones
-);
-
-int srp_angle_to_index(SRP* s, float doa_rad);
-
 /* srp_get_mem_size() returns the total bytes; the caller allocates one 16-byte-aligned block.
  * srp_init() places the SRP at mem[0] and carves every array from it (no malloc).
  * Returns NULL if cfg/geom are invalid, mem is misaligned, or mem_size is too small. */
@@ -124,8 +110,6 @@ void doa_step(SRP* srp,
 
 float doa_get_raw(const SRP* srp);
 float doa_get_smooth(const SRP* srp);
-/* No new analysis frame: report raw=NAN while holding the smooth DOA. */
-void srp_hold(SRP* s);
 void srp_reset(SRP* s);
 void srp_destroy(SRP* s);
 

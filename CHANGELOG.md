@@ -10,6 +10,33 @@ smoother, beamformer and VAD sources that used to vendor under
 `Audio_ALG/pipelines/third_party/`. This file records changes to `audiolib`
 as a whole from this point on.
 
+## [Unreleased] — 2026-10-24 — Unused functions removed
+
+Everything below had no caller in `audiolib`, `AEC`, `NR`, `Audio_ALG` or the board samples other than tests of the
+removed function itself. Audio output of the remaining functions is unchanged.
+
+### Removed
+- `doa/steering.c` and `steering.h` whole: `array_geometry_create`, `_create_uca`, `_create_ula`, `_create_custom`,
+  `array_geometry_destroy`, `srp_create_uniform_angles`, `srp_build_steering`, `srp_destroy_steering`, and their
+  duplicate prototypes in `srp.h`. `ArrayGeometry` stays; callers fill `x`/`y` themselves. A board sample that still
+  has `#include "steering.h"` must drop that line.
+- `srp_angle_to_index`, `srp_hold` and the unused `DOA_Smoother_Config` typedef.
+- `audio_pre_gain` whole (`include/audio_pre_gain.h`, `src/audio_pre_gain.c`, `AudioPreGain`), including its
+  `audit_fp_contract.sh` row. `sk_scale_f32` stays.
+- `audio_resampler_input_rate`, `audio_resampler_output_rate`, `audio_resampler_channels`.
+- `fft_magnitude`, `fft_phase`, `fft_from_mag_phase`; `fft_power` stays.
+- `vad_api_get_masker`, `vad_api_get_mask_vad`.
+- `ac_stft_latency_samples` (the identity-chain delay is `fft_size / 2`), the interleaved `ac_stft_frame` and
+  `ac_stft_flush` (use `ac_stft_frame_planar` and `ac_stft_flush_planar`), and `ac_istft_window`.
+
+### Changed
+- `test_spatial_third_party` builds its UCA geometry on the stack. `test_srp_heap_vs_pool_byte_equal` compares both
+  constructors with a steering phase evaluated inside the test instead of `srp_build_steering`.
+- `test_stft` and `test_stft_guard` drive the planar frame and flush entries; the interleaved push path is still
+  compared against the planar one. `roundtrip` lost its `fft_magnitude` case.
+- `common/README.md`, `common/docs` (manual sections 5.5-5.9 are now 5.4-5.8) and the HTML pages no longer describe
+  the removed functions.
+
 ## [Unreleased] — 2026-10-23 — Input-validation fixes; sources and docs condensed
 
 ### Fixed

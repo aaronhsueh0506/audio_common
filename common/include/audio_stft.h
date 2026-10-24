@@ -10,8 +10,8 @@
  * Analysis framing (AcStftConfig.center):
  *   0  every push yields one frame over the last fft_size samples (zero history before the start).
  *   1  torch.stft(center=True, pad_mode='reflect') framing: the first push yields no frame, the second two,
- *      later pushes one each; ac_stft_flush adds the trailing reflect frame.
- * An identity chain delays the signal by hop = fft_size / 2 samples (ac_stft_latency_samples).
+ *      later pushes one each; ac_stft_flush_planar adds the trailing reflect frame.
+ * An identity chain delays the signal by hop = fft_size / 2 samples.
  * Memory: static only. size = get_mem_size(cfg); init(mem, size, cfg) takes a 16-byte-aligned block; no destroy.
  * The FFT handle and window table are carved from the block (cfg.fft / cfg.window NULL) or borrowed; a borrowed
  * handle may be shared by objects that run sequentially, and a borrowed table must outlive the object.
@@ -46,9 +46,6 @@ typedef struct AcStftConfig {
 /** Fill config with the defaults: center 0, AC_OLA_ACCUMULATE, scales 1.0f, own FFT and window. */
 void ac_stft_config_default(AcStftConfig* cfg, int fft_size);
 
-/** Samples of delay of an identity analysis -> synthesis chain; -1 for an invalid config. */
-int ac_stft_latency_samples(const AcStftConfig* cfg);
-
 typedef struct AcStft AcStft;
 
 /** Bytes for ac_stft_init; 0 for an invalid config. */
@@ -69,12 +66,10 @@ int ac_stft_push(AcStft* s, const float* hop_in, Complex* out);
 int ac_stft_push_planar(AcStft* s, const float* hop_in, float* re, float* im);
 
 /** Windowed rFFT of one caller-supplied fft_size-sample frame; touches no history. */
-void ac_stft_frame(AcStft* s, const float* frame, Complex* out);
 void ac_stft_frame_planar(AcStft* s, const float* frame, float* re, float* im);
 
-/** center = 1 only: the trailing reflect-padded frame, written to out. Returns 1, or 0 when fewer than two hops
+/** center = 1 only: the trailing reflect-padded frame, written to re/im. Returns 1, or 0 when fewer than two hops
  * were pushed or center = 0. Call ac_stft_reset afterwards. */
-int ac_stft_flush(AcStft* s, Complex* out);
 int ac_stft_flush_planar(AcStft* s, float* re, float* im);
 
 typedef struct AcIstft AcIstft;
@@ -83,7 +78,6 @@ size_t   ac_istft_get_mem_size(const AcStftConfig* cfg);
 AcIstft* ac_istft_init(void* mem, size_t mem_size, const AcStftConfig* cfg);
 /** Clears the overlap state and the frame counter. */
 void     ac_istft_reset(AcIstft* s);
-const float* ac_istft_window(const AcIstft* s);
 /** Snapshot of the live synthesis config (fields of the other object keep defaults). Returns 0, or -1 for NULL. */
 int ac_istft_get_config(const AcIstft* s, AcStftConfig* cfg);
 

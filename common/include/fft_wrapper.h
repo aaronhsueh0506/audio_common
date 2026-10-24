@@ -57,18 +57,8 @@ void fft_forward_scratch(FftHandle* handle, float* time_in_clobbered, Complex* c
  * freq_in_clobbered [n_freqs], real_out [fft_size]. */
 void fft_inverse_scratch(FftHandle* handle, Complex* freq_in_clobbered, float* real_out);
 
-/** Magnitude spectrum: magnitude[k] from freq[k], k < n_freqs. */
-void fft_magnitude(const Complex* freq, float* magnitude, int n_freqs);
-
 /** Power spectrum (magnitude^2): power[k] from freq[k], k < n_freqs. */
 void fft_power(const Complex* freq, float* power, int n_freqs);
-
-/** Phase spectrum in radians (atan2f(im, re) per bin): phase[k] from freq[k], k < n_freqs. */
-void fft_phase(const Complex* freq, float* phase, int n_freqs);
-
-/** Rebuild a spectrum: spectrum[k] = magnitude[k] * (cosf(phase[k]) + i*sinf(phase[k])), phase in radians, k < n_freqs. */
-void fft_from_mag_phase(const float* magnitude, const float* phase,
-                         Complex* spectrum, int n_freqs);
 
 /** Apply gain[k] to freq[k] in place, k < n_freqs. */
 void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);

@@ -2,8 +2,8 @@
  * test_stft.c - audio_stft.h contracts.
  *   windows      ac_window_build against two independent spellings of the periodic sqrt-Hann formula
  *                at every power of two in [16, 8192].
- *   latency      the measured impulse delay of the analysis -> synthesis chain equals
- *                ac_stft_latency_samples, and the chain reconstructs its input.
+ *   latency      the measured impulse delay of the analysis -> synthesis chain equals hop = fft_size / 2,
+ *                and the chain reconstructs its input.
  *   API          invalid sizes and configurations, block size and alignment checks, borrowed tables,
  *                dirty versus zeroed pools.
  *   scaled       with non-unit spec_scale / ispec_scale the Complex and split calls give the same
@@ -186,10 +186,10 @@ static int run_identity(int n, int center, AcOlaMode ola, float* x, float* y, in
         }
     }
     free(re); free(im); free(k1); free(k2);
-    return ac_stft_latency_samples(&cfg);
+    return n / 2;
 }
 
-/* Identity chain: the impulse delay equals ac_stft_latency_samples, and the
+/* Identity chain: the impulse delay equals hop = fft_size / 2, and the
  * reconstruction error of random input stays below IDENTITY_MAX_ERR. The
  * error depends on N; the input is seeded here so that it does not depend
  * on TEST_N. */
@@ -213,9 +213,9 @@ static void test_latency(void) {
             run_identity(n, center, center ? AC_OLA_ENV_NORM : AC_OLA_ACCUMULATE, x, y, hops);
             for (i = 0; i < hops * hop; ++i)
                 if (fabsf(y[i]) > best) { best = fabsf(y[i]); argmax = i; }
-            printf("LAT| N=%d center=%d impulse_at=%d peak_at=%d delay=%d peak=%.7f api=%d\n",
+            printf("LAT| N=%d center=%d impulse_at=%d peak_at=%d delay=%d peak=%.7f expected=%d\n",
                    n, center, t0, argmax, argmax - t0, best, lat);
-            expect(argmax - t0 == lat, "measured impulse delay equals ac_stft_latency_samples");
+            expect(argmax - t0 == lat, "measured impulse delay equals fft_size / 2");
             gen_block(x, hops * hop, KIND_UNIFORM);
             run_identity(n, center, center ? AC_OLA_ENV_NORM : AC_OLA_ACCUMULATE, x, y, hops);
             for (i = hop; i < hops * hop - hop; ++i) {
@@ -243,10 +243,8 @@ static void test_api_contract(void) {
         ac_stft_config_default(&cfg, bad_sizes[i]);
         expect(ac_stft_get_mem_size(&cfg) == 0, "invalid fft_size: stft size 0");
         expect(ac_istft_get_mem_size(&cfg) == 0, "invalid fft_size: istft size 0");
-        expect(ac_stft_latency_samples(&cfg) == -1, "invalid fft_size: latency -1");
     }
     ac_stft_config_default(&cfg, 512);
-    expect(ac_stft_latency_samples(&cfg) == 256, "latency 512 -> 256");
     cfg.center = 2;  expect(ac_stft_get_mem_size(&cfg) == 0, "invalid center");
     ac_stft_config_default(&cfg, 512);
     cfg.ola = (AcOlaMode)7; expect(ac_istft_get_mem_size(&cfg) == 0, "invalid ola mode");
@@ -360,6 +358,8 @@ static void test_scaled_entry_points(void) {
             Complex *orig = (Complex*)pool_alloc((size_t)nf * sizeof(Complex));
             float *re = (float*)pool_alloc((size_t)2 * nf * sizeof(float));
             float *im = (float*)pool_alloc((size_t)2 * nf * sizeof(float));
+            float *reu = (float*)pool_alloc((size_t)nf * sizeof(float));
+            float *imu = (float*)pool_alloc((size_t)nf * sizeof(float));
             float *in = (float*)pool_alloc((size_t)n * sizeof(float));
             float *oi = (float*)pool_alloc((size_t)hop * sizeof(float));
             float *op = (float*)pool_alloc((size_t)hop * sizeof(float));
@@ -399,20 +399,17 @@ static void test_scaled_entry_points(void) {
                 }
                 /* analysis: stateless frame of n samples */
                 gen_block(in, n, kind);
-                ac_stft_frame(ai, in, spi);
                 ac_stft_frame_planar(ap, in, re, im);
-                ac_stft_frame(au, in, spu);
-                snprintf(what, sizeof(what), "scaled N=%d frame interleaved vs planar t=%d", n, t);
-                same_complex_planar(spi, re, im, nf, what);
+                ac_stft_frame_planar(au, in, reu, imu);
                 {
                     int k;
                     for (k = 0; k < nf; ++k) {
-                        scaled[k].r = spu[k].r * cases[ci].spec_scale;
-                        scaled[k].i = spu[k].i * cases[ci].spec_scale;
+                        scaled[k].r = reu[k] * cases[ci].spec_scale;
+                        scaled[k].i = imu[k] * cases[ci].spec_scale;
                     }
                 }
                 snprintf(what, sizeof(what), "scaled N=%d frame vs unscaled * scale t=%d", n, t);
-                same_bytes(spi, scaled, (size_t)nf * 2, what);
+                same_complex_planar(scaled, re, im, nf, what);
                 checked++;
 
                 /* synthesis */
@@ -439,20 +436,17 @@ static void test_scaled_entry_points(void) {
                 checked++;
             }
             if (center) {
-                ni = ac_stft_flush(ai, spi);
                 np = ac_stft_flush_planar(ap, re, im);
-                nu = ac_stft_flush(au, spu);
-                expect(ni == 1 && np == 1 && nu == 1, "scaled flush returns one frame");
-                if (ni == 1 && np == 1 && nu == 1) {
+                nu = ac_stft_flush_planar(au, reu, imu);
+                expect(np == 1 && nu == 1, "scaled flush returns one frame");
+                if (np == 1 && nu == 1) {
                     int k;
-                    snprintf(what, sizeof(what), "scaled N=%d flush interleaved vs planar", n);
-                    same_complex_planar(spi, re, im, nf, what);
                     for (k = 0; k < nf; ++k) {
-                        scaled[k].r = spu[k].r * cases[ci].spec_scale;
-                        scaled[k].i = spu[k].i * cases[ci].spec_scale;
+                        scaled[k].r = reu[k] * cases[ci].spec_scale;
+                        scaled[k].i = imu[k] * cases[ci].spec_scale;
                     }
                     snprintf(what, sizeof(what), "scaled N=%d flush vs unscaled * scale", n);
-                    same_bytes(spi, scaled, (size_t)nf * 2, what);
+                    same_complex_planar(scaled, re, im, nf, what);
                     checked++;
                 }
             }
@@ -468,7 +462,7 @@ static void test_scaled_entry_points(void) {
                     checked++;
                 }
             }
-            free(spi); free(spu); free(scaled); free(orig); free(re); free(im); free(in);
+            free(spi); free(spu); free(scaled); free(orig); free(re); free(im); free(reu); free(imu); free(in);
             free(oi); free(op); free(ou);
             free(k1); free(k2); free(k3); free(k4); free(k5); free(k6);
         }

@@ -532,21 +532,6 @@ int audio_resampler_output_bound(const AudioResampler* self,
     return bound > (uint64_t)INT_MAX ? -1 : (int)bound;
 }
 
-int audio_resampler_input_rate(const AudioResampler* self)
-{
-    return self ? self->input_rate : -1;
-}
-
-int audio_resampler_output_rate(const AudioResampler* self)
-{
-    return self ? self->output_rate : -1;
-}
-
-int audio_resampler_channels(const AudioResampler* self)
-{
-    return self ? self->channels : -1;
-}
-
 int audio_resampler_latency_input_frames(const AudioResampler* self)
 {
     int up;

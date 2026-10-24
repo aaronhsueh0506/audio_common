@@ -15,7 +15,7 @@
 
 - 一組 FFT 介面，底層為 NE10（依 ARM32／ARM64 編譯目標自動選路）。
 - 一個串流式有理數重取樣器（rational polyphase resampler）。
-- 一個二階高通濾波器（HPF）與一個 dB 前級增益（pre-gain）。
+- 一個二階高通濾波器（HPF）。
 - 純標頭（header-only）的數學近似函式與 per-bin 微核心，供效能敏感的迴圈直接內嵌使用。
 - 一組靜態記憶體配置（static pool）用的對齊與尺寸計算巨集。
 - 一個經過強化的 WAV 讀寫器，給測試工具與離線批次程式使用。
@@ -23,10 +23,10 @@
 ### 不是什麼
 
 - **不是**完整的音訊處理管線。它不做回音消除、不做降噪、不做 VAD、不做 AGC，也不管框架（frame）排程。那些在上層專案。
-- **不是**通用音訊格式函式庫。WAV 模組只接受兩種取樣格式（見第 5.8 節），其他一律在開檔時就拒絕。
-- **不是**執行緒安全的物件庫。每一個 handle（`FftHandle`、`AudioResampler`、`Hpf`、`AudioPreGain`、`WavReader`、`WavWriter`）都帶有可變狀態，**同一個 handle 不可以同時被兩條執行緒使用**。不同 handle 之間彼此獨立，可以平行使用。
+- **不是**通用音訊格式函式庫。WAV 模組只接受兩種取樣格式（見第 5.7 節），其他一律在開檔時就拒絕。
+- **不是**執行緒安全的物件庫。每一個 handle（`FftHandle`、`AudioResampler`、`Hpf`、`WavReader`、`WavWriter`）都帶有可變狀態，**同一個 handle 不可以同時被兩條執行緒使用**。不同 handle 之間彼此獨立，可以平行使用。
 - **不是**會替你檢查取樣率一致性的框架。取樣率、通道數、緩衝區長度全部由呼叫端負責對齊。
-- **不做**自動裁切（clipping）與自動正規化。pre-gain 明確不做裁切；溢位政策是呼叫端的責任。
+- **不做**自動裁切（clipping）與自動正規化；溢位政策是呼叫端的責任。
 
 ### 標頭檔的功能地圖
 
@@ -37,7 +37,6 @@
 | `include/audio_stft.h` | sqrt-Hann STFT／ISTFT（50% overlap 組幀、加窗、overlap-add；centered reflect 分析與包絡正規化合成） | opaque handle + 函式 | 是 |
 | `include/audio_resampler.h` | 8/16/24/32/48 kHz 之間互轉，可跨區塊連續串流，最多 8 通道交錯 | opaque handle + 函式 | 是 |
 | `include/hpf.h` | 去直流、去低頻隆隆聲的二階高通濾波，逐樣本就地處理 | opaque handle + 函式 | 是 |
-| `include/audio_pre_gain.h` | 以 dB 設定的輸入增益，逐樣本乘法，支援就地 | opaque handle + 函式 | 是 |
 | `utility/mem_align.h` | 自己算 static pool 尺寸時的 16-byte 對齊與溢位安全加乘 | 純巨集／`static inline` | 否 |
 | `utility/simd_kernels.h` | 想把 per-bin 迴圈換成向量化版本（NEON／純量兩套，行為一致） | 純標頭 | 否 |
 | `utility/simd_kernel_nn.h` | 神經網路模型前後處理（DFN2／ULCNet／GTCRN／DeepVQE）與 `audio_stft.h` 用的向量化核心，與 `simd_kernels.h` 分開管理 | 純標頭 | 否 |
@@ -51,7 +50,6 @@
 - 要做 sqrt-Hann STFT／ISTFT 組幀 → `audio_stft.h`
 - 輸入取樣率跟處理取樣率不同 → `audio_resampler.h`
 - 麥克風訊號有直流偏移／低頻雜訊 → `hpf.h`
-- 輸入電平太小或太大 → `audio_pre_gain.h`
 - 沒有 heap，要從自備記憶池配置上面這些物件 → `mem_align.h`
 - 自己寫的 per-bin 迴圈想加速 → `simd_kernels.h`
 - 自己寫的純量迴圈裡有 `expf`／`logf`／`sqrtf` 想加速 → `fast_math.h`
@@ -145,32 +143,28 @@ int main(void)
 以上參數下：`capacity` 為 161、`consumed` 為 480、`produced` 為 160。
 **每個區塊都要檢查 `consumed`**：若 `consumed < input_frames`，代表輸出容量不足，剩下的輸入這次沒被吃掉，下次要重送。
 
-### 2.3 對 mono 緩衝區做 HPF + 前級增益
+### 2.3 對 mono 緩衝區做 HPF
 
 ```c
 #include <stdio.h>
 #include "hpf.h"
-#include "audio_pre_gain.h"
 
 int main(void)
 {
     const int sample_rate = 16000;
     const int n           = 160;               /* 10 ms @ 16 kHz */
 
-    Hpf*          hpf  = hpf_create(80.0f, sample_rate);   /* 截止 80 Hz */
-    AudioPreGain* gain = audio_pre_gain_create(-6.0f);     /* -6 dB */
-    if (!hpf || !gain) return 1;
+    Hpf* hpf = hpf_create(80.0f, sample_rate);   /* 截止 80 Hz */
+    if (!hpf) return 1;
 
     float buf[160];
     for (int i = 0; i < n; ++i) buf[i] = 0.5f;  /* 換成你的 mono float32 資料 */
 
-    /* 兩者都支援就地（in-place）：input 與 output 可以是同一個指標 */
-    if (audio_pre_gain_process(gain, buf, buf, n) != 0) return 1;
+    /* 支援就地（in-place）：input 與 output 可以是同一個指標 */
     hpf_process(hpf, buf, n);
 
     printf("buf[0] = %.6f\n", (double)buf[0]);
 
-    audio_pre_gain_destroy(gain);
     hpf_destroy(hpf);
     return 0;
 }
@@ -190,7 +184,7 @@ int main(void)
 make                    # 建置封存檔（NE10 FFT 後端）
 make SIMD=0             # 把所有可選的 SIMD 路徑改成純量（NE10 純量 C 核心）
 make selftest           # 往返轉換 + static/heap 位元一致性檢查
-make test_audio_utils   # pre-gain 與所有支援的取樣率配對測試
+make test_audio_utils   # 所有支援的取樣率配對測試
 ```
 
 `SIMD` 是公開的建置開關。其他旗標透過 `EXTRA_CFLAGS` 注入。
@@ -209,9 +203,8 @@ heap 路徑與 static pool 路徑輸出必須逐位元相同——配置方式�
 
 - `simd_kernels.h` 裡所有 `sk_*` 進入點（改為呼叫對應的 `_scalar` 版本，`SK_HAVE_NEON` 變成 0）
 - `simd_kernel_nn.h` 裡所有 `skn_*` 進入點（同上，改走 `_scalar` 版本）
-- `src/fft_wrapper_ne10.c` 裡 `fft_magnitude` / `fft_power` / `fft_apply_gain` 的向量化路徑
+- `src/fft_wrapper_ne10.c` 裡 `fft_power` / `fft_apply_gain` 的向量化路徑
 - `src/audio_resampler.c` 的向量化內積
-- `src/audio_pre_gain.c` 的向量化乘法
 
 **關鍵**：`simd_kernels.h` 與 `fast_math.h` 是純標頭。你自己的 `.c` 檔如果 include 了它們，那份程式碼是編在**你的** translation unit 裡，不是編在封存檔裡。因此封存檔用 `SIMD=0` 建置、而你的 TU 沒有加 `-DSIMD_KERNELS_FORCE_SCALAR`（或反過來），會得到兩種不同的核心行為並存。**兩邊必須一致。**
 
@@ -273,29 +266,26 @@ cc -std=gnu99 -O2 -Wall -Wextra -ffp-contract=off -fno-math-errno \
 
 | 慣例 | 意義 | 適用函式 |
 |---|---|---|
-| 回傳 `NULL` | 建構失敗（參數不合法、記憶體不足、pool 太小或未對齊、檔案不合法） | `fft_create`、`fft_init`、`hpf_create`、`hpf_init`、`audio_pre_gain_create`、`audio_pre_gain_init`、`audio_resampler_create`、`audio_resampler_init`、`wav_open_read`、`wav_open_write` |
-| 回傳 `0`（`size_t`） | 尺寸查詢失敗；**`0` 永遠代表失敗，不代表「不需要記憶體」** | `fft_get_mem_size`（`fft_size` 不合法）、`audio_resampler_get_mem_size`（取樣率／通道數不合法）、`hpf_get_mem_size`、`audio_pre_gain_get_mem_size`（僅在尺寸算術溢位時，實務上不會發生） |
-| 回傳 `0` / `-1`（`int`） | `0` 成功、`-1` 失敗（handle 為 NULL、指標為 NULL、數量為負） | `audio_resampler_process`、`audio_pre_gain_process`、`audio_pre_gain_set_db`、`wav_finalize_write` |
-| 回傳 `-1` 當哨兵值 | handle 為 NULL（或參數不合法）時回傳 `-1`，否則回傳真值 | `audio_resampler_input_rate`、`audio_resampler_output_rate`、`audio_resampler_channels`、`audio_resampler_latency_input_frames`、`audio_resampler_output_bound` |
-| 回傳 `NaN` | handle 為 NULL 時回傳 `NaN`（要用 `isnan()` 判斷，不能用 `== -1`） | `audio_pre_gain_get_db`、`audio_pre_gain_get_linear` |
+| 回傳 `NULL` | 建構失敗（參數不合法、記憶體不足、pool 太小或未對齊、檔案不合法） | `fft_create`、`fft_init`、`hpf_create`、`hpf_init`、`audio_resampler_create`、`audio_resampler_init`、`wav_open_read`、`wav_open_write` |
+| 回傳 `0`（`size_t`） | 尺寸查詢失敗；**`0` 永遠代表失敗，不代表「不需要記憶體」** | `fft_get_mem_size`（`fft_size` 不合法）、`audio_resampler_get_mem_size`（取樣率／通道數不合法）、`hpf_get_mem_size` |
+| 回傳 `0` / `-1`（`int`） | `0` 成功、`-1` 失敗（handle 為 NULL、指標為 NULL、數量為負） | `audio_resampler_process`、`wav_finalize_write` |
+| 回傳 `-1` 當哨兵值 | handle 為 NULL（或參數不合法）時回傳 `-1`，否則回傳真值 | `audio_resampler_latency_input_frames`、`audio_resampler_output_bound` |
 | 回傳 `0` 當哨兵值 | handle 為 NULL 時回傳 `0` | `fft_get_n_freqs` |
 | 回傳 `1` / `0` 當布林 | `1` = 支援、`0` = 不支援 | `audio_resampler_rate_supported` |
 | 回傳實際筆數 | 回傳真正讀到的樣本數；`0` 代表 NULL 參數或已到檔尾 | `wav_read_float` |
-| `void`，NULL 時安靜略過 | 傳入 NULL handle／NULL 緩衝區時直接 return，不當機、不回報 | `fft_forward`、`fft_inverse`、`fft_forward_scratch`、`fft_inverse_scratch`、`fft_magnitude`、`fft_power`、`fft_phase`、`fft_from_mag_phase`、`fft_apply_gain`、`hpf_process`、`hpf_reset`、`audio_resampler_reset`、`wav_write_float` |
-| `void`，釋放語意 | NULL 安全；static pool 建立的 handle 一律是 no-op | `fft_destroy`、`hpf_destroy`、`audio_pre_gain_destroy`、`audio_resampler_destroy` |
+| `void`，NULL 時安靜略過 | 傳入 NULL handle／NULL 緩衝區時直接 return，不當機、不回報 | `fft_forward`、`fft_inverse`、`fft_forward_scratch`、`fft_inverse_scratch`、`fft_power`、`fft_apply_gain`、`hpf_process`、`hpf_reset`、`audio_resampler_reset`、`wav_write_float` |
+| `void`，釋放語意 | NULL 安全；static pool 建立的 handle 一律是 no-op | `fft_destroy`、`hpf_destroy`、`audio_resampler_destroy` |
 | `void`，吞掉結果 | 內部呼叫 `wav_finalize_write()` 但丟棄其回傳值 | `wav_close_write` |
 | `void`，NULL 安全 | 關閉並釋放讀取器 | `wav_close_read` |
-| **無錯誤通道** | 不檢查 NULL、不檢查範圍；超出定義域的輸入回傳固定的邊界值（見第 5.7 節） | 所有 `sk_*` 核心、所有 `fast_*` / `clip_f` / `max_f` / `exp1_approx` |
+| **無錯誤通道** | 不檢查 NULL、不檢查範圍；超出定義域的輸入回傳固定的邊界值（見第 5.6 節） | 所有 `sk_*` 核心、所有 `fast_*` / `clip_f` / `max_f` / `exp1_approx` |
 
-三個最容易寫錯的判斷：
+兩個最容易寫錯的判斷：
 
 ```c
-/* 對 */ if (audio_pre_gain_process(g, in, out, n) != 0) { /* 失敗 */ }
-/* 對 */ if (isnan(audio_pre_gain_get_db(g)))            { /* handle 是 NULL */ }
+/* 對 */ if (audio_resampler_process(rs, in, n, out, cap, &used, &made) != 0) { /* 失敗 */ }
 /* 對 */ size_t need = fft_get_mem_size(sz); if (need == 0) { /* 尺寸不合法 */ }
 
-/* 錯 */ if (!audio_pre_gain_process(g, in, out, n)) { /* 這是「成功」！ */ }
-/* 錯 */ if (audio_pre_gain_get_db(g) == -1.0f)      { /* 永遠不會成立 */ }
+/* 錯 */ if (!audio_resampler_process(rs, in, n, out, cap, &used, &made)) { /* 這是「成功」！ */ }
 /* 錯 */ if (fft_get_mem_size(sz) >= 0)              { /* size_t 永遠 >= 0 */ }
 ```
 
@@ -360,11 +350,7 @@ void fft_forward_scratch(FftHandle* handle, float* time_in_clobbered,
 void fft_inverse_scratch(FftHandle* handle, Complex* freq_in_clobbered,
                          float* real_out);
 
-void fft_magnitude(const Complex* freq, float* magnitude, int n_freqs);
 void fft_power(const Complex* freq, float* power, int n_freqs);
-void fft_phase(const Complex* freq, float* phase, int n_freqs);
-void fft_from_mag_phase(const float* magnitude, const float* phase,
-                        Complex* spectrum, int n_freqs);
 void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);
 ```
 
@@ -376,13 +362,8 @@ void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);
 | `fft_inverse` | 每個 hop，頻域 → 時域 | `freq_in` 長度 `n_freqs`；已含 1/N 正規化，不要再自己除 |
 | `fft_forward_scratch` | 輸入緩衝區之後用不到、且想省一次複製時 | 呼叫後 `time_in_clobbered` 內容**未定義** |
 | `fft_inverse_scratch` | 同上，頻域側 | 呼叫後 `freq_in_clobbered` 內容**未定義** |
-| `fft_magnitude` | 需要 \|X[k]\| 時 | `n_freqs` 由 `fft_get_n_freqs()` 取得 |
-| `fft_power` | 需要 \|X[k]\|² 時（比 magnitude 便宜，不開根號） | 同上 |
-| `fft_phase` | 需要每個 bin 的相位（弧度）時 | 同上 |
-| `fft_from_mag_phase` | 由振幅與相位重建複數頻譜時 | 三個陣列長度都是 `n_freqs` |
+| `fft_power` | 需要 \|X[k]\|² 時 | `n_freqs` 由 `fft_get_n_freqs()` 取得 |
 | `fft_apply_gain` | 對頻譜逐 bin 套用實數增益（就地） | `gain` 長度 `n_freqs` |
-
-**關於 `fft_phase()` 與 `fft_from_mag_phase()`**：這兩個函式是**受支援的公開 API**。它們在標頭中宣告、在 `fft_wrapper_ne10.c` 有實作、語意明確（`atan2f(im, re)` 逐 bin；以及 `magnitude * (cos + i·sin)` 逐 bin）、且與其他頻譜輔助函式共用同一套 NULL 保護與長度慣例。
 
 #### 緩衝區大小規則
 
@@ -390,7 +371,7 @@ void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);
 |---|---|---|
 | 時域輸入／輸出 | `float` | `fft_size` |
 | 頻域頻譜 | `Complex` | `n_freqs = fft_size/2 + 1` |
-| magnitude / power / phase / gain | `float` | `n_freqs` |
+| power / gain | `float` | `n_freqs` |
 
 `Complex` 的定義就是 `{ float r; float i; }`，保證是兩個連續、無填補的 `float`（`simd_kernels.h` 有編譯期斷言保護這個佈局）。因此 `n_freqs` 個 `Complex` 佔 `n_freqs * 2 * sizeof(float)` 位元組。
 
@@ -401,7 +382,7 @@ static pool 的緩衝區只要 16-byte 對齊即可，不需要更大的對齊�
 - `fft_forward` / `fft_inverse` 的輸入與輸出**不可以重疊**（宣告上帶 `restrict`），重疊是未定義行為。
 - 需要「輸入緩衝區可被覆寫」的語意時用 `_scratch` 版本；它只是**允許**覆寫，不保證一定覆寫，所以呼叫後絕對不要再讀那個緩衝區。
 - `fft_apply_gain` 本來就是就地操作（直接改寫 `freq`）。
-- `fft_magnitude` / `fft_power` / `fft_phase` / `fft_from_mag_phase` 的輸入與輸出應視為不可重疊。
+- `fft_power` 的輸入與輸出應視為不可重疊。
 
 #### 錯誤回傳
 
@@ -471,9 +452,6 @@ int audio_resampler_process(AudioResampler* self,
                             int* consumed_frames, int* produced_frames);
 int audio_resampler_output_bound(const AudioResampler* self, int input_frames);
 
-int audio_resampler_input_rate(const AudioResampler* self);
-int audio_resampler_output_rate(const AudioResampler* self);
-int audio_resampler_channels(const AudioResampler* self);
 int audio_resampler_latency_input_frames(const AudioResampler* self);
 ```
 
@@ -484,7 +462,6 @@ int audio_resampler_latency_input_frames(const AudioResampler* self);
 | `output_bound` | 每個區塊，在 `process()` 之前 | 傳入這次要送的 `input_frames`，回傳輸出緩衝區至少要能裝多少 frame |
 | `process` | 每個區塊 | 見下方細節 |
 | `reset` | **只在**要丟棄整段串流歷史時（例如換檔案、串流重啟） | 不要在一般區塊邊界呼叫，那會破壞連續性 |
-| `input_rate` / `output_rate` / `channels` | 需要回查設定時 | — |
 | `latency_input_frames` | 需要做延遲補償對齊時 | 回傳以**輸入 frame** 為單位的群延遲 |
 
 `process()` 的語意：
@@ -519,7 +496,7 @@ if (capacity < 0) { /* handle 為 NULL 或 input_frames 為負，或結果過大
 - `get_mem_size`：參數不合法回 `0`。
 - `process`：回 `0` 成功、`-1` 失敗（`self`／`input`／`output`／兩個計數指標任一為 NULL，或 `input_frames`／`output_capacity_frames` 為負）。失敗時**不會**寫入兩個輸出計數。
 - `output_bound`：handle 為 NULL、`input_frames` 為負、或結果超出 `int` 範圍時回 `-1`。
-- `input_rate` / `output_rate` / `channels` / `latency_input_frames`：handle 為 NULL 時回 `-1`。
+- `latency_input_frames`：handle 為 NULL 時回 `-1`。
 - `reset` / `destroy`：`void`，NULL 安全。
 
 #### 常見錯誤
@@ -613,91 +590,7 @@ void   hpf_reset(Hpf* hpf);
 
 ---
 
-### 5.4 `audio_pre_gain.h` — dB 前級增益
-
-#### 何時使用
-
-輸入電平需要整體提升或衰減時，放在處理鏈最前面。dB 值只在 `create` / `init` / `set_db` 時換算一次，`process()` 每個樣本只做一次乘法。
-
-#### 生命週期
-
-**Heap 路徑**
-
-```c
-AudioPreGain* g = audio_pre_gain_create(-6.0f);
-if (!g) { /* gain_db 不是有限值，或換算結果不是有限值 */ }
-/* ... 每個區塊呼叫 audio_pre_gain_process ... */
-audio_pre_gain_destroy(g);
-```
-
-**Static pool 路徑**
-
-```c
-size_t need = audio_pre_gain_get_mem_size();
-AudioPreGain* g = audio_pre_gain_init(buf, need, -6.0f);   /* buf 需 16-byte 對齊 */
-if (!g) { /* 未對齊 / 空間不足 / gain_db 不合法 */ }
-/* ... 使用 ... */
-audio_pre_gain_destroy(g);     /* pool 路徑下為 no-op */
-```
-
-物件本身沒有跨呼叫的訊號狀態（只存增益值），但仍必須在 `process()` 期間存活。
-
-#### 逐函式簽章與呼叫時機
-
-```c
-AudioPreGain* audio_pre_gain_create(float gain_db);
-size_t        audio_pre_gain_get_mem_size(void);
-AudioPreGain* audio_pre_gain_init(void* mem, size_t mem_size, float gain_db);
-void          audio_pre_gain_destroy(AudioPreGain* self);
-
-int   audio_pre_gain_set_db(AudioPreGain* self, float gain_db);
-float audio_pre_gain_get_db(const AudioPreGain* self);
-float audio_pre_gain_get_linear(const AudioPreGain* self);
-
-int audio_pre_gain_process(const AudioPreGain* self,
-                           const float* input, float* output, int n_samples);
-```
-
-| 函式 | 什麼時候呼叫 | 參數怎麼填 |
-|---|---|---|
-| `create` / `init` | 初始化時一次 | `gain_db` 為振幅 dB（`0.0f` = 不變、負值衰減、正值放大），必須是有限值 |
-| `set_db` | 執行期要改增益時 | 換算失敗時**不會**動到既有增益 |
-| `get_db` | 回查目前設定 | handle 為 NULL 時回 `NaN` |
-| `get_linear` | 需要線性倍率（例如記錄 log）時 | handle 為 NULL 時回 `NaN`；例：`-6.0f` dB 對應約 `0.501187` |
-| `process` | 每個區塊 | `n_samples` 是樣本數；多通道交錯資料可以直接整段送（增益對所有通道相同） |
-| `destroy` | 結束時 | pool 路徑下為 no-op |
-
-**`process()` 不做裁切。** 正增益可能讓樣本超出 `[-1, 1]`。是否要裁切、在哪裡裁切，是呼叫端的決定。
-
-#### 緩衝區大小規則
-
-- `input` 與 `output` 各需 `n_samples` 個 `float`。
-- 交錯的多通道資料直接把 `n_samples` 填成 `frames * channels` 即可——這個模組不需要知道通道結構。
-
-#### 就地／別名限制
-
-**支援完全就地**：`input` 與 `output` 可以是**同一個指標**。
-不支援部分重疊（`output == input + k`，`k != 0`）。
-
-#### 錯誤回傳
-
-- `create` / `init`：失敗回 `NULL`（`gain_db` 為 NaN／Inf、換算結果非有限、pool 未對齊或太小）。
-- `get_mem_size`：僅在算術溢位時回 `0`（實務上不會發生）。
-- `set_db`：`0` 成功、`-1` 失敗。
-- `get_db` / `get_linear`：handle 為 NULL 時回 **`NaN`**。要用 `isnan()` 判斷。
-- `process`：`0` 成功、`-1` 失敗（`self`／`input`／`output` 任一為 NULL，或 `n_samples < 0`）。`n_samples == 0` 是合法的，回 `0`。
-- `destroy`：`void`，NULL 安全。
-
-#### 常見錯誤
-
-1. 把 `gain_db` 當成功率 dB。這裡是振幅 dB（`-6 dB` ≈ 0.5 倍振幅）。
-2. 用 `== -1.0f` 判斷 `get_db()` 失敗（實際是 `NaN`，必須用 `isnan()`）。
-3. 以為 `process()` 會裁切，結果下游收到超過 `[-1, 1]` 的樣本。
-4. 多通道時把 `n_samples` 填成 frame 數，只有前面 1/N 的資料被套用增益。
-
----
-
-### 5.5 `mem_align.h` — static pool 對齊與尺寸算術
+### 5.4 `mem_align.h` — static pool 對齊與尺寸算術
 
 #### 何時使用
 
@@ -773,7 +666,7 @@ static unsigned char g_pool[POOL_BYTES] __attribute__((aligned(16)));
 
 ---
 
-### 5.6 `simd_kernels.h` — per-bin 微核心（純標頭）
+### 5.5 `simd_kernels.h` — per-bin 微核心（純標頭）
 
 #### 何時使用
 
@@ -826,7 +719,7 @@ void sk_noise_update_f32(float *noise_psd, const float *spp,
 
 **選 `sk_*` 還是 `sk_*_scalar`？** 平常一律呼叫不帶後綴的版本，它會自動依建置設定選路。只有在要做「NEON vs 純量」對照驗證時才直接呼叫 `_scalar` 版本。
 
-**數值定義域**：`sk_fast_*` 與 `sk_exp1_approx_f32` 的每個元素行為與 `fast_math.h` 的同名函式完全一致（含定義域邊界值），見第 5.7 節。
+**數值定義域**：`sk_fast_*` 與 `sk_exp1_approx_f32` 的每個元素行為與 `fast_math.h` 的同名函式完全一致（含定義域邊界值），見第 5.6 節。
 
 #### 緩衝區大小規則
 
@@ -864,7 +757,7 @@ void sk_noise_update_f32(float *noise_psd, const float *spp,
 
 ---
 
-### 5.7 `fast_math.h` — 快速數學近似（純標頭）
+### 5.6 `fast_math.h` — 快速數學近似（純標頭）
 
 #### 何時使用
 
@@ -926,7 +819,7 @@ for (int k = 0; k < n_freqs; ++k) {
 
 #### 緩衝區大小規則
 
-不適用——全部都是純量對純量的函式。要對整個陣列做同樣運算時，請改用 `simd_kernels.h` 的 `sk_fast_*` 陣列版本（第 5.6 節），它們的每元素行為與這裡完全一致。
+不適用——全部都是純量對純量的函式。要對整個陣列做同樣運算時，請改用 `simd_kernels.h` 的 `sk_fast_*` 陣列版本（第 5.5 節），它們的每元素行為與這裡完全一致。
 
 #### 就地／別名限制
 
@@ -946,7 +839,7 @@ for (int k = 0; k < n_freqs; ++k) {
 
 ---
 
-### 5.8 `wav_io.h` — WAV 讀寫（純標頭）
+### 5.7 `wav_io.h` — WAV 讀寫（純標頭）
 
 #### 何時使用
 
@@ -1102,7 +995,7 @@ float32 輸出路徑（`WAV_IO_WRITER_AEC` + `AEC_OUT_FLOAT=1`）是**原始位�
 
 ---
 
-### 5.9 `audio_stft.h` — sqrt-Hann STFT／ISTFT
+### 5.8 `audio_stft.h` — sqrt-Hann STFT／ISTFT
 
 #### 何時使用
 
@@ -1130,13 +1023,12 @@ AcIstft *syn = ac_istft_init(pool_s, ss, &cfg);
 ```c
 int  ac_stft_push(AcStft*, const float* hop_in, Complex* out);              /* 回傳幀數 0..2 */
 int  ac_stft_push_planar(AcStft*, const float* hop_in, float* re, float* im);
-void ac_stft_frame(AcStft*, const float* frame, Complex* out);              /* 呼叫端自備 N 樣本，不碰歷史 */
-int  ac_stft_flush(AcStft*, Complex* out);                                  /* 僅 center=1：尾端 reflect 幀 */
+void ac_stft_frame_planar(AcStft*, const float* frame, float* re, float* im); /* 呼叫端自備 N 樣本，不碰歷史 */
+int  ac_stft_flush_planar(AcStft*, float* re, float* im);                   /* 僅 center=1：尾端 reflect 幀 */
 int  ac_istft_push(AcIstft*, const Complex* spec, float* out);              /* 回傳樣本數：hop 或 0 */
 int  ac_istft_push_planar(AcIstft*, const float* re, const float* im, float* out);
 int  ac_istft_flush(AcIstft*, float* out);                                  /* 僅 ENV_NORM：hop 個尚在 overlap 內的樣本 */
 void ac_window_build(float* w, int n);
-int  ac_stft_latency_samples(const AcStftConfig*);                          /* 恆等串接延遲 = fft_size/2；不合法 -1 */
 ```
 
 #### 緩衝區大小規則
@@ -1205,7 +1097,6 @@ int  ac_stft_latency_samples(const AcStftConfig*);                          /* �
 - [ ] 每個區塊都檢查 `consumed_frames`，未消耗的輸入有被重送。
 - [ ] 輸出緩衝區大小取自 `audio_resampler_output_bound()`，不是自己按比例算的。
 - [ ] `hpf` 是**單通道**模組：多通道時每個通道各有一個 `Hpf` 實例，且已先去交錯。
-- [ ] `audio_pre_gain` 用在交錯資料時，`n_samples` 填的是 `frames * channels`。
 - [ ] 清楚知道 `wav_read_float()` 只回第一個通道；多通道來源已在上游處理。
 - [ ] 不相等取樣率時，resampler 的輸入與輸出緩衝區不重疊。
 

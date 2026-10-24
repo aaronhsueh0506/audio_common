@@ -124,40 +124,6 @@ int main(void) {
     fft_destroy(hs);
     free(pool);
 
-    /* fft_magnitude against `sqrtf(re*re+im*im)` computed here under the same
-     * -ffp-contract=off build, bit for bit, at n_freqs values around the
-     * kernel's 4-lane boundary (0, 1, 3, 4, 5, 257). */
-    int mag_ok = 1;
-    {
-        Complex mspec[257];
-        float mag[257], mag_ref[257];
-        int nvals[] = { 0, 1, 3, 4, 5, 257 };
-        int vi;
-        for (int i = 0; i < 257; i++) {
-            mspec[i].r = sinf(0.7f * (float)i) * 3.0f - 1.0f;
-            mspec[i].i = cosf(1.3f * (float)i) * 2.0f + 0.5f;
-        }
-        for (vi = 0; vi < (int)(sizeof(nvals) / sizeof(nvals[0])); vi++) {
-            int m = nvals[vi];
-            memset(mag, 0, sizeof(mag));
-            memset(mag_ref, 0, sizeof(mag_ref));
-            fft_magnitude(mspec, mag, m);
-            for (int i = 0; i < m; i++) {
-                float re = mspec[i].r, im = mspec[i].i;
-                mag_ref[i] = sqrtf(re * re + im * im);
-            }
-            if (memcmp(mag, mag_ref, sizeof(mag)) != 0) {
-                mag_ok = 0;
-                printf("FAIL: fft_magnitude n_freqs=%d differs from scalar reference\n", m);
-            }
-        }
-        /* NULL inputs are a no-op. */
-        fft_magnitude(NULL, mag, 4);
-        fft_magnitude(mspec, NULL, 4);
-    }
-    printf("fft_magnitude vs scalar reference (n_freqs=0,1,3,4,5,257): %s\n",
-           mag_ok ? "byte-equal" : "DIFFER");
-
     int stage_ok = 1;
     {
         const int sizes[] = { 16, 64, 256, 512, 8192 };
@@ -171,7 +137,7 @@ int main(void) {
     printf("interleaved forward/inverse on one handle (n=16..8192, heap+pool): %s\n",
            stage_ok ? "independent of earlier calls" : "DIFFER");
 
-    int ok = (maxerr < 1e-3) && spec_eq && time_eq && mag_ok && stage_ok;
+    int ok = (maxerr < 1e-3) && spec_eq && time_eq && stage_ok;
     printf(ok ? ">>> PASS\n" : ">>> FAIL\n");
     return ok ? 0 : 1;
 }

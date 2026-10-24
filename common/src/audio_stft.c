@@ -119,10 +119,6 @@ void ac_stft_config_default(AcStftConfig* cfg, int fft_size) {
     cfg->ispec_scale = 1.0f;
 }
 
-int ac_stft_latency_samples(const AcStftConfig* cfg) {
-    return config_valid(cfg) ? cfg->fft_size / 2 : -1;
-}
-
 size_t ac_stft_get_mem_size(const AcStftConfig* cfg) {
     Layout lay;
     if (!config_valid(cfg) || !layout_walk(cfg, sizeof(AcStft), 2, &lay)) return 0;
@@ -200,11 +196,6 @@ static void frame_planar(AcStft* s, const float* segment, float* re, float* im) 
         skn_deinterleave_cf32(s->spec, re, im, (size_t)s->n_freqs);
 }
 
-void ac_stft_frame(AcStft* s, const float* frame, Complex* out) {
-    if (!s || !frame || !out) return;
-    frame_interleaved(s, frame, out);
-}
-
 void ac_stft_frame_planar(AcStft* s, const float* frame, float* re, float* im) {
     if (!s || !frame || !re || !im) return;
     frame_planar(s, frame, re, im);
@@ -268,13 +259,6 @@ int ac_stft_push_planar(AcStft* s, const float* hop_in, float* re, float* im) {
     return 1;
 }
 
-int ac_stft_flush(AcStft* s, Complex* out) {
-    if (!s || !out || !s->center || s->hops_seen < 2) return 0;
-    build_tail_segment(s);
-    frame_interleaved(s, s->seg, out);
-    return 1;
-}
-
 int ac_stft_flush_planar(AcStft* s, float* re, float* im) {
     if (!s || !re || !im || !s->center || s->hops_seen < 2) return 0;
     build_tail_segment(s);
@@ -329,8 +313,6 @@ void ac_istft_reset(AcIstft* s) {
     memset(s->time, 0, (size_t)s->n * sizeof(float));
     memset(s->spec, 0, (size_t)s->n_freqs * sizeof(Complex));
 }
-
-const float* ac_istft_window(const AcIstft* s) { return s ? s->window : NULL; }
 
 int ac_istft_get_config(const AcIstft* s, AcStftConfig* cfg) {
     if (!s || !cfg) return -1;

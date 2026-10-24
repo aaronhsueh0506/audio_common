@@ -2,7 +2,6 @@
 #include <string.h>
 #include <math.h>
 #include "srp.h"
-#include "steering.h"
 #include "utility/mem_align.h"
 #include "spatial_complex.h"
 #include "spatial_simd.h"
@@ -131,7 +130,7 @@ SRP* srp_init(void* mem, size_t mem_size,
     s->F = F;
     s->num_angles = A;
 
-    /* Angle formula and type promotion match srp_create_uniform_angles(), so the steering matches the heap path. */
+    /* Float angle grid a * 2*pi / A; the multiplication order fixes the rounding of every steering phase below. */
     s->angles = (float*)pool_carve(&cursor, (size_t)A, sizeof(float));
     if (!s->angles) return NULL;
     {
@@ -141,7 +140,7 @@ SRP* srp_init(void* mem, size_t mem_size,
         }
     }
 
-    /* a_array fill formula matches srp_build_steering() in steering.c. */
+    /* a_array[a][m][f] = exp(j*phase), phase = -2*pi*f_hz*tau, tau = -(x*cos(theta) + y*sin(theta)) / c: the plane-wave delay of mic m. */
     {
         Complex*** top;
         Complex** mid;
@@ -306,26 +305,6 @@ SRP* srp_init(void* mem, size_t mem_size,
     return s;
 }
 
-int srp_angle_to_index(SRP* s, float doa_rad)
-{
-    float deg, step;
-    int idx;
-
-    if (!s || !isfinite(doa_rad)) return -1;
-
-    deg = doa_rad * 180.0f / (float)M_PI;
-    /* Keeps the wrap loops below short and finite for huge angles. */
-    if (!isfinite(deg)) return -1;
-    if (fabsf(deg) >= 1.0e6f) deg = fmodf(deg, 360.0f);
-    while (deg < 0.0f) deg += 360.0f;
-    while (deg >= 360.0f) deg -= 360.0f;
-
-    step = 360.0f / (float)s->num_angles;
-    idx = (int)lroundf(deg / step) % s->num_angles;
-
-    return idx;
-}
-
 SRP* srp_create_from_geometry(
     const SRP_Config* cfg,
     const ArrayGeometry* geom
@@ -477,13 +456,6 @@ float doa_get_raw(const SRP* s)
 float doa_get_smooth(const SRP* s)
 {
     return s ? s->doa_s : NAN;
-}
-
-void srp_hold(SRP* s)
-{
-    if (!s) return;
-    s->doa_raw = NAN;
-    s->doa_s = s->last_doa_s;
 }
 
 void srp_reset(SRP* s)

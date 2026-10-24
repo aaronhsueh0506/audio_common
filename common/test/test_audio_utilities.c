@@ -1,4 +1,3 @@
-#include "audio_pre_gain.h"
 #include "audio_resampler.h"
 
 #include <math.h>
@@ -18,38 +17,6 @@
             return 1;                                                  \
         }                                                              \
     } while (0)
-
-static int test_pre_gain(void)
-{
-    const float input[7] = {-0.5f, -0.25f, 0.0f, 0.125f,
-                            0.25f, 0.5f, 1.0f};
-    float output[7];
-    float in_place[7];
-    float pool_storage[16] __attribute__((aligned(16)));
-    AudioPreGain* heap = audio_pre_gain_create(6.0f);
-    AudioPreGain* statik = audio_pre_gain_init(
-        pool_storage, sizeof(pool_storage), 6.0f);
-    CHECK(heap && statik, "pre-gain heap/static create");
-    CHECK(fabsf(audio_pre_gain_get_linear(heap) - 1.9952623f) < 1e-6f,
-          "6 dB uses amplitude /20 conversion");
-    CHECK(audio_pre_gain_process(heap, input, output, 7) == 0,
-          "out-of-place pre-gain");
-    memcpy(in_place, input, sizeof(input));
-    CHECK(audio_pre_gain_process(statik, in_place, in_place, 7) == 0,
-          "in-place pre-gain");
-    CHECK(memcmp(output, in_place, sizeof(output)) == 0,
-          "heap/static and in-place pre-gain parity");
-    CHECK(audio_pre_gain_set_db(heap, 0.0f) == 0,
-          "set pre-gain");
-    CHECK(audio_pre_gain_process(heap, input, output, 7) == 0 &&
-          memcmp(input, output, sizeof(input)) == 0,
-          "0 dB is exact identity");
-    CHECK(audio_pre_gain_set_db(heap, NAN) != 0,
-          "reject non-finite dB");
-    audio_pre_gain_destroy(statik);
-    audio_pre_gain_destroy(heap);
-    return 0;
-}
 
 static int run_resampler(AudioResampler* resampler,
                          const float* input,
@@ -397,7 +364,6 @@ static int test_tone_accuracy(void)
 
 int main(void)
 {
-    CHECK(test_pre_gain() == 0, "pre-gain tests");
     CHECK(test_supported_matrix() == 0, "resampler rate matrix");
     CHECK(test_identity_and_pool() == 0, "resampler identity/pool");
     CHECK(test_streaming_continuity() == 0, "resampler continuity");
@@ -406,6 +372,6 @@ int main(void)
           "resampler stream independent of block size and capacity");
     CHECK(test_reset_restores_the_initial_state() == 0, "resampler reset");
     CHECK(test_tone_accuracy() == 0, "resampler tone accuracy");
-    printf("All audio pre-gain/resampler tests passed\n");
+    printf("All audio resampler tests passed\n");
     return 0;
 }

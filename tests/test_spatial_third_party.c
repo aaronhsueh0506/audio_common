@@ -15,7 +15,6 @@
 #include "bf_test_hooks.h"
 #include "spatial_simd.h"
 #include "srp.h"
-#include "steering.h"
 #include "vad_api.h"
 
 #ifndef M_PI
@@ -42,9 +41,29 @@ static float complex_error(Complex a, Complex b) {
     return fmaxf(fabsf(a.r - b.r), fabsf(a.i - b.i));
 }
 
+/* Uniform circular array on caller-owned storage, so no test needs a heap geometry. */
+typedef struct {
+    ArrayGeometry g;
+    float x[8];
+    float y[8];
+} TestUca;
+
+static ArrayGeometry* uca_geometry(TestUca* u, int M, float radius) {
+    if (M <= 0 || M > 8) return NULL;
+    u->g.M = M;
+    u->g.x = u->x;
+    u->g.y = u->y;
+    for (int m = 0; m < M; m++) {
+        float phi = 2.0f * M_PI * m / M;
+        u->x[m] = radius * cosf(phi);
+        u->y[m] = radius * sinf(phi);
+    }
+    return &u->g;
+}
+
 /* Shared 4-mic/65-bin UCA SRP setup used by every BF-facing test below. */
 static SRP* make_test_srp(SRP_Config* srp_cfg) {
-    ArrayGeometry* geometry;
+    TestUca uca;
     SRP* srp_handle;
     memset(srp_cfg, 0, sizeof(*srp_cfg));
     srp_cfg->M = 4;
@@ -58,10 +77,7 @@ static SRP* make_test_srp(SRP_Config* srp_cfg) {
     srp_cfg->enable_smoothing = 0;
     srp_cfg->switch_consec = 1;
     srp_cfg->update_interval = 1;
-    geometry = array_geometry_create_uca(4, 0.035f);
-    if (!geometry) return NULL;
-    srp_handle = srp_create_from_geometry(srp_cfg, geometry);
-    array_geometry_destroy(geometry);
+    srp_handle = srp_create_from_geometry(srp_cfg, uca_geometry(&uca, 4, 0.035f));
     return srp_handle;
 }
 
@@ -198,6 +214,7 @@ static int test_bf_vector_kernels_scalar_vs_dispatch(void) {
 
 static int test_srp_precompute_equivalence(void) {
     SRP_Config cfg;
+    TestUca uca;
     ArrayGeometry* geometry;
     SRP* srp_handle;
     Complex* storage;
@@ -219,10 +236,9 @@ static int test_srp_precompute_equivalence(void) {
     cfg.angle_tol = 0.2f;
     cfg.update_interval = 1;
 
-    geometry = array_geometry_create_uca(4, 0.035f);
+    geometry = uca_geometry(&uca, 4, 0.035f);
     CHECK(geometry != NULL, "create UCA geometry");
     srp_handle = srp_create_from_geometry(&cfg, geometry);
-    array_geometry_destroy(geometry);
     CHECK(srp_handle != NULL, "create SRP");
     storage = (Complex*)malloc(
         (size_t)cfg.M * cfg.F * sizeof(Complex));
@@ -259,8 +275,7 @@ static int test_srp_precompute_equivalence(void) {
     for (int a = 1; a < cfg.num_angles; ++a) {
         if (golden[a] > golden[golden_best]) golden_best = a;
     }
-    CHECK(srp_angle_to_index(
-              srp_handle, srp2doa(srp_handle)) == golden_best,
+    CHECK(srp2doa(srp_handle) == srp_handle->angles[golden_best],
           "optimized SRP must choose scalar golden angle");
 
     free(golden);
@@ -384,6 +399,7 @@ static int test_srp_score_scratch_band_contract(void) {
 static int test_srp_init_pool_poison_and_bounds(void) {
     enum { EXTRA = 32 };
     SRP_Config cfg;
+    TestUca uca;
     ArrayGeometry* geometry;
     size_t need;
     unsigned char* pool;
@@ -404,7 +420,7 @@ static int test_srp_init_pool_poison_and_bounds(void) {
     cfg.switch_consec = 1;
     cfg.update_interval = 1;
 
-    geometry = array_geometry_create_uca(4, 0.035f);
+    geometry = uca_geometry(&uca, 4, 0.035f);
     CHECK(geometry != NULL, "pool bounds test: create UCA geometry");
 
     need = srp_get_mem_size(&cfg);
@@ -489,25 +505,23 @@ static int test_srp_init_pool_poison_and_bounds(void) {
     srp_destroy(s);
 
     free(pool);
-    array_geometry_destroy(geometry);
     return 1;
 }
 
 /* srp_create_from_geometry() (heap) and srp_init() (pool) must produce byte-identical a_array
  * steering vectors and evolve identically across frames with varying VAD, including doa_step()
- * output and the per-bin S_theta/bin_best_idx state. Spot-checks a_array[a][m] against
- * srp_build_steering() (steering.c), which neither constructor calls, so the steering formula that
- * exists in two places is cross-checked independently. */
+ * output and the per-bin S_theta/bin_best_idx state. Spot-checks a_array[a][m][f] against a
+ * plane-wave steering phase evaluated in this test from the geometry alone, so both constructors
+ * are held to one formula that neither of them calls. */
 static int test_srp_heap_vs_pool_byte_equal(void) {
     enum { M = 4, F = 65, NUM_ANGLES = 72, FRAMES = 40 };
     SRP_Config cfg;
+    TestUca uca;
     ArrayGeometry* geometry;
     SRP* heap_s;
     SRP* pool_s;
     size_t need;
     void* pool = NULL;
-    float* angles;
-    Complex*** golden_a_array;
     Complex* storage;
     Complex* channels[M];
     int frame;
@@ -527,7 +541,7 @@ static int test_srp_heap_vs_pool_byte_equal(void) {
     cfg.angle_tol = 0.2f;
     cfg.update_interval = 2;
 
-    geometry = array_geometry_create_uca(M, 0.035f);
+    geometry = uca_geometry(&uca, M, 0.035f);
     CHECK(geometry != NULL, "heap-vs-pool test: create UCA geometry");
 
     heap_s = srp_create_from_geometry(&cfg, geometry);
@@ -543,29 +557,23 @@ static int test_srp_heap_vs_pool_byte_equal(void) {
     CHECK(pool_s != NULL, "heap-vs-pool test: srp_init");
     CHECK(pool_s->owned_heap == NULL, "pool-path SRP has a NULL owned_heap");
 
-    angles = srp_create_uniform_angles(NUM_ANGLES);
-    CHECK(angles != NULL, "heap-vs-pool test: build golden angles");
-    golden_a_array = srp_build_steering(&cfg, geometry, angles);
-    CHECK(golden_a_array != NULL, "heap-vs-pool test: build golden steering");
-
     for (a = 0; a < NUM_ANGLES; a += 7) {
+        float theta = a * 2.0f * M_PI / NUM_ANGLES;
         for (m = 0; m < M; ++m) {
+            float tau = -(geometry->x[m] * cosf(theta) + geometry->y[m] * sinf(theta)) / cfg.c;
             for (f = 0; f < F; f += 5) {
-                CHECK(heap_s->a_array[a][m][f].r ==
-                              golden_a_array[a][m][f].r &&
-                          heap_s->a_array[a][m][f].i ==
-                              golden_a_array[a][m][f].i,
-                      "heap SRP a_array matches srp_build_steering golden");
-                CHECK(pool_s->a_array[a][m][f].r ==
-                              golden_a_array[a][m][f].r &&
-                          pool_s->a_array[a][m][f].i ==
-                              golden_a_array[a][m][f].i,
-                      "pool SRP a_array matches srp_build_steering golden");
+                float phase = -2.0f * M_PI * ((float)f * cfg.sr / cfg.NFFT) * tau;
+                float golden_r = cosf(phase);
+                float golden_i = sinf(phase);
+                CHECK(heap_s->a_array[a][m][f].r == golden_r &&
+                          heap_s->a_array[a][m][f].i == golden_i,
+                      "heap SRP a_array matches the plane-wave steering golden");
+                CHECK(pool_s->a_array[a][m][f].r == golden_r &&
+                          pool_s->a_array[a][m][f].i == golden_i,
+                      "pool SRP a_array matches the plane-wave steering golden");
             }
         }
     }
-    srp_destroy_steering(golden_a_array, NUM_ANGLES, M);
-    free(angles);
 
     storage = (Complex*)malloc((size_t)M * F * sizeof(Complex));
     CHECK(storage != NULL, "heap-vs-pool test: allocate shared inputs");
@@ -612,7 +620,6 @@ static int test_srp_heap_vs_pool_byte_equal(void) {
     srp_destroy(pool_s);
     free(pool);
     srp_destroy(heap_s);
-    array_geometry_destroy(geometry);
     return 1;
 }
 
@@ -739,7 +746,7 @@ static int test_bf_create_rejects_invalid_lambda(void) {
 }
 
 /* Out-of-range inputs must stay defined: a search band above Nyquist is
- * clamped to the last bin, non-finite or huge angles return without spinning
+ * clamped to the last bin, non-finite or huge beam angles return without spinning
  * in the wrap loops, and a non-finite fixed beam direction is refused. */
 static int test_degenerate_band_and_angle_inputs(void) {
     SRP_Config srp_cfg;
@@ -752,14 +759,6 @@ static int test_degenerate_band_and_angle_inputs(void) {
 
     s = make_test_srp(&srp_cfg);
     CHECK(s != NULL, "degenerate inputs: create SRP");
-    CHECK(srp_angle_to_index(s, 1.0f) == 11 && srp_angle_to_index(s, -3.0f) == 38,
-          "srp_angle_to_index keeps ordinary angles");
-    CHECK(srp_angle_to_index(s, INFINITY) == -1 && srp_angle_to_index(s, -INFINITY) == -1 &&
-              srp_angle_to_index(s, NAN) == -1,
-          "srp_angle_to_index rejects non-finite angles");
-    CHECK(srp_angle_to_index(s, 1e30f) >= 0 && srp_angle_to_index(s, -1e30f) >= 0,
-          "srp_angle_to_index returns for huge angles");
-
     storage = (Complex*)malloc(4u * 65u * sizeof(Complex));
     CHECK(storage != NULL, "degenerate inputs: allocate channels");
     for (int m = 0; m < 4; ++m) {
@@ -808,10 +807,10 @@ static int test_degenerate_band_and_angle_inputs(void) {
     srp_cfg.switch_consec = 1;
     srp_cfg.update_interval = 1;
     {
-        ArrayGeometry* geometry = array_geometry_create_uca(4, 0.035f);
+        TestUca uca;
+        ArrayGeometry* geometry = uca_geometry(&uca, 4, 0.035f);
         CHECK(geometry != NULL, "degenerate inputs: geometry");
         s = srp_create_from_geometry(&srp_cfg, geometry);
-        array_geometry_destroy(geometry);
     }
     CHECK(s != NULL, "degenerate inputs: SRP with a band above Nyquist");
     CHECK(s->f_start == 64 && s->f_end == 64,

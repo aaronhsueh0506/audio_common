@@ -466,7 +466,7 @@ for s2_obj in audio_stft.o fft_wrapper_ne10.o; do
     || fail "S2: $s2_obj member/object mismatch or identical across configs after same-second switch (SIMD=1: $m1 vs $o1; SIMD=0: $m2 vs $o2)"
 done
 # The two probes above are the members known to differ between SIMD=1 and SIMD=0; a stale
-# delivery of any OTHER config-sensitive member (audio_pre_gain.o, audio_resampler.o, ...)
+# delivery of any OTHER config-sensitive member (audio_resampler.o, ...)
 # is only seen by checking every member against its own keyed object.
 s2_bad_a="$(members_not_matching "$s2_lib_a" "$s2_objdir_a")"
 s2_bad_b="$(members_not_matching "$s2_lib_b" "$s2_objdir_b")"
@@ -2452,7 +2452,7 @@ if ! env -u EXTRA_LDFLAGS make BACKEND=ne10 OBJ_ROOT="$S25_OBJ_ROOT" BIN_ROOT="$
 elif env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=ne10 OBJ_ROOT="$S25_OBJ_ROOT" BIN_ROOT="$S25_BIN_ROOT" $S25_CARRIER >"$S25_POS_LOG" 2>&1; then
   pass "S25: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, real rpath/library-path link flag) builds AND runs the carrier tests ($S25_CARRIER) to completion"
   # Every test binary's own result lines, in order.
-  s25_results() { grep -E '^(--- .* ---$|PASS |>>> PASS|ALL PASS|TOTAL CHECKS: |test_stft(_guard)? PASS|GUARD\| |round-trip: |static vs heap: |fft_magnitude vs )' "$1" || true; }
+  s25_results() { grep -E '^(--- .* ---$|PASS |>>> PASS|ALL PASS|TOTAL CHECKS: |test_stft(_guard)? PASS|GUARD\| |round-trip: |static vs heap: )' "$1" || true; }
   if [ -n "$(s25_results "$S25_REF_LOG")" ] && [ "$(s25_results "$S25_REF_LOG")" = "$(s25_results "$S25_POS_LOG")" ]; then
     pass "S25: the link-flag carrier run prints exactly the reference run's per-test result lines (no test binary skipped)"
   else

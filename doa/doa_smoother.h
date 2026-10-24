@@ -8,11 +8,6 @@ extern "C" {
 typedef struct {
     int switch_consec;
     float angle_tol;
-} DOA_Smoother_Config;
-
-typedef struct {
-    int switch_consec;
-    float angle_tol;
     float null_value;
 
     float last;

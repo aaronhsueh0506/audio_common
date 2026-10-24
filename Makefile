@@ -73,7 +73,7 @@ override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
                    $(WERROR_CFLAGS) -ffp-contract=off -fno-math-errno
 
 SRCS = common/utility/spatial_complex.c common/utility/spatial_simd.c \
-       doa/doa_smoother.c doa/steering.c doa/srp.c bf/bf.c \
+       doa/doa_smoother.c doa/srp.c bf/bf.c \
        VAD/masker.c VAD/vad.c VAD/vad_api.c
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
@@ -120,7 +120,7 @@ $(COMMON_LIB): FORCE
 	@test -f '$@' || { echo "FATAL: common did not produce $@" >&2; exit 1; }
 
 SPATIAL_COMMON_OBJS = $(OBJ_DIR)/spatial_complex.o $(OBJ_DIR)/spatial_simd.o
-DOA_OBJS = $(OBJ_DIR)/doa_smoother.o $(OBJ_DIR)/steering.o $(OBJ_DIR)/srp.o
+DOA_OBJS = $(OBJ_DIR)/doa_smoother.o $(OBJ_DIR)/srp.o
 BF_OBJS = $(OBJ_DIR)/bf.o
 VAD_OBJS = $(OBJ_DIR)/masker.o $(OBJ_DIR)/vad.o $(OBJ_DIR)/vad_api.o
 
@@ -168,9 +168,6 @@ $(OBJ_DIR)/spatial_simd.o: common/utility/spatial_simd.c common/utility/spatial_
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/doa_smoother.o: doa/doa_smoother.c doa/doa_smoother.h | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/steering.o: doa/steering.c doa/steering.h doa/srp.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/srp.o: doa/srp.c doa/srp.h common/utility/spatial_complex.h common/utility/spatial_simd.h | _cfg_guard

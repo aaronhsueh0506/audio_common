@@ -83,7 +83,6 @@ count_fma() {
 # consumer objects; compiling an unused wrapper would not prove the linked code.
 AUDIT_ENTRIES='
 AC|both|hpf.o|SCALAR|shared HPF core (src/hpf.c) -- no NEON intrinsics, no explicit fmaf/fma anywhere
-AC|both|audio_pre_gain.o|SCALAR|input gain stage (src/audio_pre_gain.c) -- its broadcast multiply inlines sk_scale_f32, a lone vmulq_f32 with no add to fuse; this row is what makes "the kernels inline into their call sites, and those objects ARE disassembled" true for this one
 AC|both|audio_resampler.o|SCALAR|streaming polyphase resampler (src/audio_resampler.c) -- its own NEON dot products (separate vmulq_f32/vaddq_f32 lane chains, never vfmaq_f32) and, under SIMD=0, a plain sequential multiply-add loop: any fmla/fmadd here is compiler contraction
 AC|both|audio_window.o|SCALAR|periodic sqrt-Hann table (src/audio_window.c); separate scalar multiply/subtract operations, no explicit fmaf/fma
 AC|both|audio_stft.o|SCALAR|STFT/ISTFT objects (src/audio_stft.c) -- inline simd_kernels.h / simd_kernel_nn.h kernels (separate vmulq_f32/vaddq_f32, no vfmaq_f32) and plain scalar loops for the spectrum scale; no explicit fmaf/fma, so any fmla/fmadd here is compiler contraction

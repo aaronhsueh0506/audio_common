@@ -133,7 +133,7 @@ OBJ_DIR = $(OBJ_ROOT)/$(BACKEND)-$(CFG_SIG)
 BIN_DIR = $(BIN_ROOT)/$(BACKEND)-$(CFG_SIG)
 
 # Shared DSP sources (always in the archive).
-COMMON_SRCS = src/hpf.c src/audio_pre_gain.c src/audio_resampler.c src/audio_window.c src/audio_stft.c
+COMMON_SRCS = src/hpf.c src/audio_resampler.c src/audio_window.c src/audio_stft.c
 
 # NE10 source footprint: fft_wrapper_ne10.c only calls the float32 R2C/C2R entry points
 # (ne10_fft_alloc_r2c_float32, ne10_fft_r2c_mem_size_float32, ne10_fft_init_r2c_float32_ext,
@@ -435,7 +435,7 @@ selftest: $(LIB) test_stft test_stft_guard test_heap_alignment | _cfg_guard
 	@$(BIN_DIR)/simd_nn_selftest
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_audio_utilities.o test/test_audio_utilities.c
 	$(LINK) -o $(BIN_DIR)/test_audio_utilities $(OBJ_DIR)/test_audio_utilities.o $(LIB) $(LDFLAGS)
-	@echo "--- common pre-gain/resampler test [$(BACKEND)] ---"
+	@echo "--- common resampler test [$(BACKEND)] ---"
 	@$(BIN_DIR)/test_audio_utilities
 
 # test_stft: audio_stft.h window, latency, API-contract and scaled-entry-point checks.
@@ -456,7 +456,7 @@ test_stft_guard: $(LIB) | _cfg_guard
 test_audio_utils: $(LIB) | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_audio_utilities.o test/test_audio_utilities.c
 	$(LINK) -o $(BIN_DIR)/test_audio_utilities $(OBJ_DIR)/test_audio_utilities.o $(LIB) $(LDFLAGS)
-	@echo "--- common pre-gain/resampler test [$(BACKEND)] ---"
+	@echo "--- common resampler test [$(BACKEND)] ---"
 	@$(BIN_DIR)/test_audio_utilities
 
 test_heap_alignment: | _cfg_guard

@@ -179,27 +179,6 @@ void fft_inverse_scratch(FftHandle* h, Complex* freq_in_clobbered, float* real_o
     NE10_C2R_1D_FLOAT32(real_out, (ne10_fft_cpx_float32_t*)freq_in_clobbered, h->r2c_cfg);
 }
 
-void fft_magnitude(const Complex* spectrum, float* magnitude, int n_freqs) {
-    if (!spectrum || !magnitude) return;
-
-    int k = 0;
-#if SK_HAVE_NEON
-    /* re*re + im*im is two separately rounded multiplies and an add (built with -ffp-contract=off); the NEON path uses vmulq/vmulq/vaddq,
-     * never vfmaq, to match the scalar loop. vsqrtq_f32 is correctly rounded like sqrtf. */
-    for (; k + 4 <= n_freqs; k += 4) {
-        float32x4x2_t v = sk__cquad_load(spectrum + k);
-        float32x4_t re = v.val[0], im = v.val[1];
-        float32x4_t sumsq = vaddq_f32(vmulq_f32(re, re), vmulq_f32(im, im));
-        vst1q_f32(magnitude + k, vsqrtq_f32(sumsq));
-    }
-#endif
-    for (; k < n_freqs; k++) {
-        float re = spectrum[k].r;
-        float im = spectrum[k].i;
-        magnitude[k] = sqrtf(re * re + im * im);
-    }
-}
-
 void fft_power(const Complex* spectrum, float* power, int n_freqs) {
     if (!spectrum || !power) return;
 
@@ -217,24 +196,6 @@ void fft_power(const Complex* spectrum, float* power, int n_freqs) {
         float re = spectrum[k].r;
         float im = spectrum[k].i;
         power[k] = fmaf(re, re, im * im);
-    }
-}
-
-void fft_phase(const Complex* spectrum, float* phase, int n_freqs) {
-    if (!spectrum || !phase) return;
-
-    for (int k = 0; k < n_freqs; k++) {
-        phase[k] = atan2f(spectrum[k].i, spectrum[k].r);
-    }
-}
-
-void fft_from_mag_phase(const float* magnitude, const float* phase,
-                        Complex* spectrum, int n_freqs) {
-    if (!magnitude || !phase || !spectrum) return;
-
-    for (int k = 0; k < n_freqs; k++) {
-        spectrum[k].r = magnitude[k] * cosf(phase[k]);
-        spectrum[k].i = magnitude[k] * sinf(phase[k]);
     }
 }
 

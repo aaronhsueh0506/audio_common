@@ -156,16 +156,6 @@ const int* vad_api_get_mask(const VADApi* v)
     return v ? v->mask : NULL;
 }
 
-MaskEstimator* vad_api_get_masker(VADApi* v)
-{
-    return v ? v->masker : NULL;
-}
-
-MaskVAD* vad_api_get_mask_vad(VADApi* v)
-{
-    return v ? v->mask_vad : NULL;
-}
-
 void vad_api_destroy(VADApi* v)
 {
     if (!v) return;

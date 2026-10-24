@@ -47,9 +47,6 @@ int audio_resampler_process(AudioResampler* self,
 int audio_resampler_output_bound(const AudioResampler* self,
                                  int input_frames);
 
-int audio_resampler_input_rate(const AudioResampler* self);
-int audio_resampler_output_rate(const AudioResampler* self);
-int audio_resampler_channels(const AudioResampler* self);
 /** Group delay of the kernel in INPUT frames, rounded to the nearest frame (fractional for coprime pairs such as 32k -> 24k). */
 int audio_resampler_latency_input_frames(const AudioResampler* self);
 
