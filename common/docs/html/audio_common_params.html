@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>common 參數表</title>
+<style>
+body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;margin:0 auto;padding:0 1rem 3rem;line-height:1.55;color:#1a1a1a;max-width:70rem}
+nav{padding:.6rem 0;border-bottom:2px solid #2a6;margin-bottom:1rem;font-size:.95rem}
+nav a{margin-right:1rem;color:#164;text-decoration:none;font-weight:600}
+nav a:hover{text-decoration:underline}
+nav .sep{color:#999;margin-right:1rem}
+h1{font-size:1.5rem;border-bottom:1px solid #ccc;padding-bottom:.3rem}
+h2{font-size:1.15rem;margin-top:1.6rem;border-left:4px solid #2a6;padding-left:.5rem}
+h3{font-size:1rem;margin-top:1.1rem;color:#164}
+table{border-collapse:collapse;margin:.6rem 0;font-size:.86rem}
+th,td{border:1px solid #bbb;padding:.25rem .5rem;text-align:left;vertical-align:top}
+th{background:#eef5f0}
+pre{background:#f4f6f5;border:1px solid #dde;padding:.6rem;overflow-x:auto;font-size:.8rem;line-height:1.35}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.86em;background:#f2f2f2;padding:0 .15em}
+pre code{background:none;padding:0}
+.note{background:#fff8e6;border:1px solid #e0c878;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
+.warn{background:#fdeeee;border:1px solid #e0a0a0;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
+.small{font-size:.82rem;color:#555}
+.tblwrap{overflow-x:auto}
+.ext{background:#eaf6ee}
+.int{background:#f6f0e4}
+</style>
+</head>
+<body>
+<nav><a href="../../../../Audio_ALG/docs/html/index.html">index</a><a href="../../../../AEC/docs/html/aec.html">aec</a><a href="../../../../NR/docs/html/nr.html">nr</a><a href="audio_common.html">common</a><span class="sep">|</span><a href="audio_common_detail.html">common 細節</a><a href="audio_common_c_api.html">common API</a><a href="audio_common_params.html">common 參數</a><span class="sep">|</span><a href="../../../docs/html/spatial_chain.html">空間鏈</a><a href="../../../docs/html/doa_srp.html">DOA/SRP</a><a href="../../../docs/html/bf.html">BF</a><a href="../../../docs/html/vad.html">VAD</a><span class="sep">|</span><a href="../../../../AEC/docs/html/aec_c_api.html">AEC API</a><a href="../../../../AEC/docs/html/aec_params.html">AEC 參數</a><a href="../../../../NR/docs/html/nr_c_api.html">NR API</a><a href="../../../../NR/docs/html/nr_c_api_params.html">NR 參數</a><a href="../../../../Audio_ALG/docs/html/integration_example.html">串接範例</a></nav>
+<h1>common 參數表 — 外部 / 內部,以及該呼叫的函式</h1>
+<p class="small">本頁回答兩件事:(1) 第三方可以調的參數有哪些、哪些存在但不建議開放;(2) 整合者實際會呼叫的函式與純內部函式的分界。逐函式簽章見 <a href="audio_common_c_api.html">common API</a>,呼叫順序與時序圖見 <a href="audio_common.html">common</a>。每列都標出處(<code>audiolib/common/</code> 底下的檔案)。</p>
+
+<h2>分類準則</h2>
+<div class="tblwrap"><table>
+<tr><th>類別</th><th>定義</th></tr>
+<tr class="ext"><td><b>外部</b></td><td>描述部署環境(取樣率、FFT 點數、聲道數)或呼叫契約,有界、有驗證,錯值會被拒絕(回 NULL/0)而不是悄悄失效</td></tr>
+<tr class="int"><td><b>內部</b></td><td>濾波器設計常數、數值護欄、編譯期常數、狀態欄位。存在於程式內、技術上可改,但改動會改變數值結果或破壞與其他 repo 的對位,不建議開放</td></tr>
+</table></div>
+<p class="small">common 的函式庫物件<b>都沒有執行期 setter</b>:設定在 <code>create</code>/<code>init</code> 時固定,要改就重建物件(並在換串流時才重建,不要逐 block 重建)。</p>
+
+<h2>FFT(<code>fft_wrapper.h</code>)</h2>
+<div class="tblwrap"><table>
+<tr><th>參數</th><th>類別</th><th>範圍 / 預設</th><th>說明與出處</th></tr>
+<tr class="ext"><td><code>fft_size</code></td><td>外部</td><td>2 的冪、<code>[16, 8192]</code>;無預設</td><td>唯一的 FFT 參數。範圍外 <code>fft_get_mem_size</code> 回 0、<code>fft_create</code>/<code>fft_init</code> 回 NULL(<code>src/fft_wrapper_ne10.c:39</code>)。建立時固定</td></tr>
+<tr class="ext"><td>heap 或 pool 路徑</td><td>外部</td><td><code>fft_create</code> / <code>fft_get_mem_size</code>+<code>fft_init</code></td><td>pool 必須 16-byte 對齊;<code>fft_get_mem_size</code> 已含 NE10 內部 cfg 與 twiddle</td></tr>
+<tr class="int"><td>後端與縮放:NE10、<code>NE10_DSP_RFFT_SCALING</code>、<code>NE10_UNROLL_LEVEL=1</code>、<code>NE10_ENABLE_DSP</code></td><td>內部</td><td>Makefile 固定</td><td><code>fft_inverse</code> 的 1/N 完全靠 <code>NE10_DSP_RFFT_SCALING</code>;vendored 後端的 cfg 版面與 <code>UNROLL_LEVEL=1</code> 綁定(<code>Makefile:169</code>、<code>lib/ne10/VENDORED.md</code>)</td></tr>
+<tr class="int"><td>共用 input staging、scratch、twiddle</td><td>內部</td><td>由 <code>fft_get_mem_size</code> 決定</td><td>同一支 handle 的呼叫不可在時間上重疊;不同 handle 互相獨立(<code>fft_wrapper.h</code>)</td></tr>
+<tr class="int"><td><code>fft_power</code> 的 <code>fmaf(re, re, im·im)</code> 運算順序</td><td>內部</td><td>—</td><td>與 NEON 路徑逐 lane 同序,決定位元結果(<code>src/fft_wrapper_ne10.c:198</code>)</td></tr>
+</table></div>
+
+<h2>STFT / ISTFT / 窗(<code>audio_stft.h</code>、<code>audio_window.h</code>)</h2>
+<div class="tblwrap"><table>
+<tr><th>參數</th><th>類別</th><th>範圍 / 預設</th><th>說明與出處</th></tr>
+<tr class="ext"><td><code>fft_size</code></td><td>外部</td><td>2 的冪、<code>[16, 8192]</code>;<code>ac_stft_config_default</code> 帶入你給的值</td><td>hop 固定為 <code>fft_size/2</code>(只支援 50% overlap)(<code>src/audio_stft.c:49</code>)</td></tr>
+<tr class="ext"><td><code>center</code></td><td>外部(<code>AcStft</code>)</td><td>0 或 1;預設 0</td><td>0 = 每次 push 恆 1 幀;1 = <code>torch.stft(center=True, reflect)</code> 框架(第 1 次 push 0 幀、第 2 次 2 幀)。建立時固定,其他值使 init 回 NULL</td></tr>
+<tr class="ext"><td><code>ola</code></td><td>外部(<code>AcIstft</code>)</td><td><code>AC_OLA_ACCUMULATE</code>(預設)/ <code>AC_OLA_ENV_NORM</code></td><td>ACCUMULATE 每幀吐 hop 個樣本;ENV_NORM 另累加窗平方包絡,第 1 幀不吐樣本,多一張 <code>env[N]</code></td></tr>
+<tr class="ext"><td><code>spec_scale</code> / <code>ispec_scale</code></td><td>外部</td><td>float;預設 1.0f;未驗證有限性</td><td>前向 FFT 後 / 反向 FFT 前對每個 bin 乘的倍率;恰為 1.0f 時略過乘法(bin 為精確搬移)。給 NN 正規化頻譜用</td></tr>
+<tr class="ext"><td><code>fft</code> / <code>window</code>(借用)</td><td>外部(進階)</td><td>NULL = 自帶(預設)</td><td>借用的 handle 的 <code>n_freqs</code> 必須等於 <code>fft_size/2+1</code>,否則 init 回 NULL;窗表須 <code>fft_size</code> 個 float、不變、活得比物件久;一支 handle 可被多個物件共用,呼叫須循序。省 pool(N=512:21,840 → 6,240 B)</td></tr>
+<tr class="int"><td>窗公式 <code>sqrtf(0.5f·(1−cosf(2π·k/N)))</code>(週期 sqrt-Hann,float32)</td><td>內部</td><td>固定</td><td>四個 repo 的 WOLA 約定;<code>ac_window_build</code> 的 float 運算順序決定每個係數的捨入(<code>src/audio_window.c</code>)</td></tr>
+<tr class="int"><td>包絡下限 <code>AC_ENV_FLOOR = 1e-11f</code></td><td>內部</td><td>固定</td><td>ENV_NORM 的除數下限,對齊 <code>torch.istft</code> 行為(<code>src/audio_stft.c:12</code>)</td></tr>
+<tr class="int"><td>幀計數飽和(<code>AcStft</code> 3、<code>AcIstft</code> 2)、歷史/暫存陣列</td><td>內部</td><td>—</td><td>決定啟動期的幀數規則,不是調參(<code>src/audio_stft.c:22,36</code>)</td></tr>
+</table></div>
+
+<h2>HPF(<code>hpf.h</code>)</h2>
+<div class="tblwrap"><table>
+<tr><th>參數</th><th>類別</th><th>範圍 / 預設</th><th>說明與出處</th></tr>
+<tr class="ext"><td><code>cutoff_hz</code></td><td>外部</td><td>有限、<code>&gt; 0</code>、嚴格 <code>&lt; 0.45 × sample_rate</code>;無預設</td><td>16 kHz 上限 7200 Hz。不合法回 NULL(不產生退化係數)(<code>src/hpf.c:37</code>)。AEC 內建的 mic-path HPF 預設 80 Hz(<code>AEC/c_impl/include/aec.h</code> 的 <code>highpass_cutoff_hz</code>),在 AEC 外再串一層前先確認沒有重複</td></tr>
+<tr class="ext"><td><code>sample_rate</code></td><td>外部</td><td>int,<code>&gt; 0</code></td><td>只用來算係數,與 resampler 的 5 個取樣率白名單無關</td></tr>
+<tr class="int"><td>形式與 Q:二階 Butterworth(係數用 <code>√2</code>)、雙線性轉換、Direct Form II transposed</td><td>內部</td><td>固定</td><td>沒有 Q 或階數參數;改形式等於換濾波器(<code>src/hpf.c:hpf_compute_coeffs</code>)</td></tr>
+<tr class="int"><td>0.45 的邊界餘裕</td><td>內部</td><td>固定</td><td>讓 <code>tanf(wc/2)</code> 遠離 π/2 的極點(<code>src/hpf.c:35</code>)</td></tr>
+<tr class="int"><td>狀態 <code>z1, z2</code></td><td>內部</td><td>初值 0</td><td><code>hpf_reset</code> 只清這兩個,係數不變。<code>hpf_get_mem_size() = 32 B</code>(本機實測,與 cutoff 無關)</td></tr>
+</table></div>
+
+<h2>重取樣(<code>audio_resampler.h</code>)</h2>
+<div class="tblwrap"><table>
+<tr><th>參數</th><th>類別</th><th>範圍 / 預設</th><th>說明與出處</th></tr>
+<tr class="ext"><td><code>input_rate</code> / <code>output_rate</code></td><td>外部</td><td>8000、16000、24000、32000、48000(可相同)</td><td>其他值一律被拒;相同 = 精確 memmove 直通(<code>src/audio_resampler.c:rate_supported</code>)</td></tr>
+<tr class="ext"><td><code>channels</code></td><td>外部</td><td><code>[1, 8]</code>(<code>AUDIO_RESAMPLER_MAX_CHANNELS</code>)</td><td>介面是交錯 float32</td></tr>
+<tr class="int"><td>濾波器長度:每側 <code>16 × max(up, down)</code> 個 tap(<code>AUDIO_RESAMPLER_HALF_TAPS_PER_RATIO</code>)</td><td>內部</td><td>固定</td><td>決定延遲與記憶體;延遲 = <code>(filter_length−1)/(2·up)</code> 輸入 frame(<code>src/audio_resampler.c:23,93</code>)</td></tr>
+<tr class="int"><td>截止 <code>0.47 / max(up, down)</code>(以升頻後取樣率正規化)、Blackman 窗、每個相位列的直流增益正規化到 1</td><td>內部</td><td>固定</td><td>等價於低取樣率奈奎斯特頻率的 0.94 倍。改動會改變通帶/阻帶與所有輸出(<code>src/audio_resampler.c:142-180</code>)</td></tr>
+<tr class="int"><td>每趟暫存 <code>AUDIO_RESAMPLER_CHUNK = 128</code> frame</td><td>內部</td><td>固定</td><td>只影響工作區大小;輸出與輸入如何切塊無關(<code>src/audio_resampler.c:26</code>)</td></tr>
+</table></div>
+
+<h2>pool 與對齊(<code>utility/mem_align.h</code>)</h2>
+<div class="tblwrap"><table>
+<tr><th>項目</th><th>類別</th><th>說明</th></tr>
+<tr class="ext"><td>pool 基底 16-byte 對齊</td><td>外部(契約)</td><td>所有 <code>X_init</code> 都檢查,未對齊回 NULL</td></tr>
+<tr class="ext"><td><code>ALIGN16</code>、<code>MEM_IS_ALIGNED16</code>、<code>MEM_SIZE_INVALID</code>、<code>ck_add_size</code>、<code>ck_mul_size</code>、<code>ck_align16_size</code>、<code>ck_field_size</code>、<code>ck_field_size_reps</code></td><td>外部(自己切 pool 時才用)</td><td>飽和算術;溢位飽和到 <code>SIZE_MAX</code>,走訪結束檢查一次,溢位時 <code>get_mem_size</code> 必須回 0</td></tr>
+<tr class="int"><td><code>ac_memreq_abi_hash</code></td><td>內部</td><td>各 repo 的版面雜湊在 ILP32 目標加上 ABI 標記;整合者不呼叫</td></tr>
+</table></div>
+
+<h2>標頭型核心與編譯期開關</h2>
+<div class="tblwrap"><table>
+<tr><th>項目</th><th>類別</th><th>說明</th></tr>
+<tr class="ext"><td><code>SIMD_KERNELS_FORCE_SCALAR</code>(消費端 TU 的定義)</td><td>外部</td><td>必須與 archive 的 <code>SIMD=0|1</code> 一致:<code>SIMD=0</code> 對應有定義。<code>SK_HAVE_NEON</code> 可在執行期印出確認</td></tr>
+<tr class="ext"><td><code>-ffp-contract=off -fno-math-errno</code>(消費端 TU)</td><td>外部</td><td>include 了 <code>simd_kernels.h</code>/<code>fast_math.h</code> 的 TU 必須帶,放在 CFLAGS 最後</td></tr>
+<tr class="ext"><td><code>WAV_IO_WRITER_STYLE</code>(<code>wav_io.h</code>)</td><td>外部(離線工具)</td><td><code>WAV_IO_WRITER_AEC</code>(預設)/ <code>WAV_IO_WRITER_NR</code>,須在 include 前定義;AEC 風格另受環境變數 <code>AEC_OUT_FLOAT=1</code> 影響</td></tr>
+<tr class="int"><td><code>USE_STANDARD_MATH</code>(<code>fast_math.h</code>)</td><td>內部(對照用)</td><td>改用 libm,非有限輸入的結果與近似版不同;selftest 兩種都測</td></tr>
+<tr class="int"><td><code>USE_OPTIMIZED_E1</code>(<code>fast_math.h</code>)</td><td>內部</td><td>只改 <code>exp1_approx</code> 的分支順序,兩種順序必須逐位元相同(<code>make selftest</code> 兩種都跑)</td></tr>
+<tr class="int"><td><code>FM_LOG_C1…C4</code>、<code>exp_int_table</code>、<code>exp1_approx</code> 三段係數(Martin 等 2004 式 (17))</td><td>內部</td><td>標頭註明係數不得改動</td></tr>
+<tr class="int"><td><code>simd_aec.h</code>、<code>simd_nr.h</code></td><td>內部</td><td><code>simd_aec.h</code> 是 AEC 專用核心(濾波權重更新 <code>sk_wupdate_*</code>、成對加總、ERLE/ERL 與噪聲追蹤…),<code>simd_nr.h</code> 是 NR 專用核心(環形最小值、增益準備…);由各自 repo 引用與測試</td></tr>
+</table></div>
+
+<h2>make 變數(建置面)</h2>
+<div class="tblwrap"><table>
+<tr><th>變數</th><th>類別</th><th>說明</th></tr>
+<tr class="ext"><td><code>SIMD=0|1</code></td><td>外部</td><td>預設 1。0 = 所有可選 SIMD 路徑改走純量(NE10 純量 C 核心)。0 與 1 的 FFT/resampler 輸出只在浮點捨入內一致</td></tr>
+<tr class="ext"><td><code>EXTRA_CFLAGS</code>、<code>CC/CXX/AR/RANLIB</code>、<code>TOOLCHAIN_CHECK</code>、<code>WERROR</code></td><td>外部</td><td>含 <code>-Ofast</code>、<code>-ffast-math</code>、<code>-ffp-contract=…</code> 的 <code>EXTRA_CFLAGS</code> 在 parse 期被拒;旗標變數只接受由 <code>[A-Za-z0-9_./=,+-]</code> 與空白組成的單純 token(引號等字元也被拒)。交叉編譯時 CC 與 CXX 的 target 必須一致(<code>TOOLCHAIN_CHECK=1</code>)</td></tr>
+<tr class="ext"><td><code>OBJ_ROOT</code>、<code>BIN_ROOT</code>、<code>DIST_ROOT</code>、<code>make print-lib-path</code></td><td>外部</td><td>archive 路徑由旗標雜湊決定,用 <code>print-lib-path</code> 取得,不要自己拼</td></tr>
+<tr class="int"><td><code>BACKEND</code></td><td>內部</td><td>只接受 <code>ne10</code>,其他值建置直接報錯</td></tr>
+<tr class="int"><td><code>DEBUG</code>、<code>NO_STDIO</code></td><td>內部</td><td>common 的 Makefile 宣告並納入雜湊,但不消費</td></tr>
+<tr class="int"><td><code>ALLOW_DIRTY_PUBLISH</code>、<code>ALLOW_UNTRACKED_PUBLISH</code>、<code>ATTEST_STAMP</code>、<code>HOSTCC</code></td><td>內部</td><td><code>make publish</code> 的釋出與測試旋鈕</td></tr>
+</table></div>
+
+<h2>函式:整合者呼叫 vs 內部</h2>
+<div class="tblwrap"><table>
+<tr><th>模組</th><th>整合者呼叫</th><th>內部 / 不要直接呼叫</th></tr>
+<tr><td>FFT</td><td><code>fft_create</code>、<code>fft_get_mem_size</code>、<code>fft_init</code>、<code>fft_destroy</code>、<code>fft_get_n_freqs</code>、<code>fft_forward</code>、<code>fft_inverse</code>、<code>fft_forward_scratch</code>、<code>fft_inverse_scratch</code>、<code>fft_power</code>、<code>fft_apply_gain</code></td><td>NE10 的 <code>ne10_*</code>(vendored,<code>lib/ne10/</code>)</td></tr>
+<tr><td>STFT/ISTFT</td><td><code>ac_stft_config_default</code>、<code>ac_stft_get_mem_size</code>、<code>ac_stft_init</code>、<code>ac_stft_push</code>、<code>ac_stft_push_planar</code>、<code>ac_stft_reset</code>、<code>ac_istft_get_mem_size</code>、<code>ac_istft_init</code>、<code>ac_istft_push</code>、<code>ac_istft_push_planar</code>、<code>ac_istft_reset</code></td><td>—</td></tr>
+<tr><td>STFT/ISTFT 進階</td><td><code>ac_stft_frame_planar</code>(自備一幀、不碰歷史)、<code>ac_stft_flush_planar</code>、<code>ac_istft_flush</code>(center=1/ENV_NORM 收尾)、<code>ac_stft_window</code>(取窗表共用)、<code>ac_stft_get_config</code>、<code>ac_istft_get_config</code>(取目前設定快照,NULL 回 −1)</td><td>—</td></tr>
+<tr><td>窗</td><td><code>ac_window_build</code></td><td>—</td></tr>
+<tr><td>HPF</td><td><code>hpf_create</code>、<code>hpf_get_mem_size</code>、<code>hpf_init</code>、<code>hpf_process</code>、<code>hpf_reset</code>、<code>hpf_destroy</code></td><td>—</td></tr>
+<tr><td>重取樣</td><td><code>audio_resampler_rate_supported</code>、<code>_create</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_process</code>、<code>_output_bound</code>、<code>_latency_input_frames</code>、<code>_reset</code>、<code>_destroy</code></td><td>—</td></tr>
+<tr><td>離線工具</td><td><code>wav_open_read</code>、<code>wav_read_float</code>、<code>wav_close_read</code>、<code>wav_open_write</code>、<code>wav_write_float</code>、<code>wav_finalize_write</code>(<code>wav_close_write</code> 是丟棄結果的相容包裝)</td><td>—</td></tr>
+<tr><td>標頭核心</td><td>—</td><td>所有 <code>sk_*</code>(<code>simd_kernels.h</code>)、<code>skn_*</code>(<code>simd_kernel_nn.h</code>)、<code>fast_exp</code>/<code>fast_exp_neg</code>/<code>fast_log</code>/<code>fast_log10</code>/<code>fast_sqrt</code>/<code>exp1_approx</code>/<code>clip_f</code>/<code>max_f</code>(<code>fast_math.h</code>)、<code>spatial_*</code>(<code>utility/spatial_*.h</code>,SRP/BF 用)。只有自己的熱迴圈形狀與某核心完全一致時才考慮直接用</td></tr>
+</table></div>
+
+<h2>相關檔案</h2>
+<ul class="small">
+<li><code>audiolib/common/include/*.h</code>(公開標頭)、<code>audiolib/common/utility/*.h</code>(標頭核心)、<code>audiolib/common/Makefile</code></li>
+<li>頁面:<a href="audio_common.html">common</a>、<a href="audio_common_detail.html">common 細節</a>、<a href="audio_common_c_api.html">common API</a>、<a href="../../../docs/html/spatial_chain.html">空間鏈</a>、<a href="../../../../Audio_ALG/docs/html/index.html">Audio_ALG 總覽</a></li>
+</ul>
+
+</body>
+</html>

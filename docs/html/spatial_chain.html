@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>空間鏈 (VAD / DOA / BF)</title>
+<style>
+body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;margin:0 auto;padding:0 1rem 3rem;line-height:1.55;color:#1a1a1a;max-width:70rem}
+nav{padding:.6rem 0;border-bottom:2px solid #2a6;margin-bottom:1rem;font-size:.95rem}
+nav a{margin-right:1rem;color:#164;text-decoration:none;font-weight:600}
+nav a:hover{text-decoration:underline}
+nav .sep{color:#999;margin-right:1rem}
+h1{font-size:1.5rem;border-bottom:1px solid #ccc;padding-bottom:.3rem}
+h2{font-size:1.15rem;margin-top:1.6rem;border-left:4px solid #2a6;padding-left:.5rem}
+h3{font-size:1rem;margin-top:1.1rem;color:#164}
+table{border-collapse:collapse;margin:.6rem 0;font-size:.86rem}
+th,td{border:1px solid #bbb;padding:.25rem .5rem;text-align:left;vertical-align:top}
+th{background:#eef5f0}
+pre{background:#f4f6f5;border:1px solid #dde;padding:.6rem;overflow-x:auto;font-size:.8rem;line-height:1.35}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.86em;background:#f2f2f2;padding:0 .15em}
+pre code{background:none;padding:0}
+.note{background:#fff8e6;border:1px solid #e0c878;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
+.warn{background:#fdeeee;border:1px solid #e0a0a0;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
+.small{font-size:.82rem;color:#555}
+.tblwrap{overflow-x:auto}
+.ext{background:#eaf6ee}
+.int{background:#f6f0e4}
+</style>
+</head>
+<body>
+<nav><a href="../../../Audio_ALG/docs/html/index.html">index</a><a href="../../../AEC/docs/html/aec.html">aec</a><a href="../../../NR/docs/html/nr.html">nr</a><a href="../../common/docs/html/audio_common.html">common</a><span class="sep">|</span><a href="spatial_chain.html">空間鏈</a><a href="doa_srp.html">DOA/SRP</a><a href="bf.html">BF</a><a href="vad.html">VAD</a><span class="sep">|</span><a href="../../common/docs/html/audio_common_params.html">common 參數</a><a href="../../common/docs/html/audio_common_c_api.html">common API</a><a href="../../common/docs/html/audio_common_detail.html">common 細節</a><span class="sep">|</span><a href="../../../AEC/docs/html/aec_params.html">AEC 參數</a><a href="../../../NR/docs/html/nr_c_api_params.html">NR 參數</a><a href="../../../Audio_ALG/docs/html/pipeline_4ch.html">4ch pipeline</a></nav>
+<h1>空間鏈 — VAD、SRP-PHAT、波束器的串接</h1>
+<p class="small">audiolib 的 <code>VAD/</code>、<code>doa/</code>、<code>bf/</code> 三個模組。逐元件的參數與函式表見 <a href="vad.html">VAD</a>、<a href="doa_srp.html">DOA/SRP</a>、<a href="bf.html">BF</a>。</p>
+
+<h2>概要</h2>
+<p>三個模組都在頻域工作:輸入是已經做過 FFT 的多路頻譜(<code>const Complex *const *X</code>,<code>X[m]</code> 為第 m 路的 F = NFFT/2+1 個 bin),輸出是方位角、頻域遮罩或波束後頻譜。它們自己不做 FFT,只用 common 的標頭(<code>Complex</code> 型別與 <code>utility/</code> 核心);本機以 <code>libdoa.a libbf.a libvad.a libspatial_common.a -lm</code> 連結通過,不需要 <code>libaudio_common.a</code>。</p>
+<pre>
+ 麥克風 x M → (每路 AEC / 前處理) → X[0..M-1]  (每路 F 個 bin)
+                                     |
+          +--------------------------+-------------------------------+
+          v                          v                               v
+  vad_api_process(X[0])      doa_step(X, mask, raw, out)     bf_process_with_weights(X, doa_s, ..., mask)
+   -> raw / out / mask  --->   -> doa_s (弧度,NaN=尚無)  --->    -> 波束後頻譜 beam[F] + 等效權重 w[M*F]
+</pre>
+<ul>
+<li>專案內唯一用到 SRP 與 BF 的整合者是 Audio_ALG 的 4ch 單元(<code>Audio_ALG/pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c</code>):它建立 <code>SRP</code> 與 <code>BF</code>、讓 BF 借用 <code>srp-&gt;a_array</code>。該單元的 <code>process_beam</code> / <code>process_with_activity</code> 由呼叫端帶入 VAD 旗標與頻率遮罩;<code>audio_pipeline_4ch_process</code> 則改用單元內建的 energy-VAD fallback(<code>auto_vad_threshold_dbfs</code>、<code>auto_vad_snr_ratio</code>、<code>auto_vad_hangover_frames</code>)。專案內沒有任何 pipeline 實例化 <code>VADApi</code>(只有 <code>tests/</code> 與 <code>bench-masker</code> 在用)。本頁的 VAD 步驟是這三個模組的設計用法,不是已量產的接線。</li>
+<li>遮罩極性在兩個標頭都有寫:<code>mask[f]</code> 非 0 表示「SRP 用這個 bin」,同一個遮罩傳給 <code>bf_process</code> 時表示「凍結這個 bin 的 RLS 更新」,兩邊極性相反;4ch 單元的標頭也是這樣定義:同一份遮罩一方面選出 SRP 要用的 bin,一方面凍結這些 bin 上的 BF 更新。</li>
+</ul>
+
+<h2>如何呼叫使用</h2>
+<p><b>順序</b>:(1) 各模組 <code>*_get_mem_size</code>,任一回 0 代表設定被拒;(2) 配置 16-byte 對齊的 pool;(3) <code>vad_api_init</code>、<code>srp_init</code>、<code>bf_init</code>(<code>bf_init</code> 要 SRP 的 steering 表,所以在 <code>srp_init</code> 之後);(4) 每個 hop 依序 <code>vad_api_process</code> → <code>doa_step</code> → <code>bf_process_with_weights</code>;(5) 結束時 BF 先於 SRP 銷毀。以下範例(4 麥克風、16 kHz、NFFT 256)已用 <code>-Wall -Wextra -Werror</code> 編譯,並以合成的平面波輸入執行過(DOA 收斂到植入的 60°)。VAD 設定值是示意,不是產品預設。</p>
+<pre><code>#include &lt;math.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include "srp.h"
+#include "bf.h"
+#include "vad_api.h"
+
+enum { MICS = 4, FFT_N = 256, BINS = FFT_N / 2 + 1, ANGLES = 72, SAMPLE_RATE = 16000 };
+
+typedef struct {
+    SRP *srp; BF *bf; VADApi *vad;
+    void *srp_pool, *bf_pool, *vad_pool;
+} Spatial;
+
+static void *pool_alloc(size_t bytes)                 /* 16-byte 對齊;嵌入式可換成 static 陣列 */
+{
+    void *p = NULL;
+    return (bytes &amp;&amp; posix_memalign(&amp;p, 16, bytes) == 0) ? p : NULL;
+}
+
+void spatial_close(Spatial *s)
+{
+    vad_api_destroy(s-&gt;vad);
+    bf_destroy(s-&gt;bf);                                /* BF 借用 SRP 的 steering,先銷毀 BF */
+    srp_destroy(s-&gt;srp);
+    free(s-&gt;vad_pool); free(s-&gt;bf_pool); free(s-&gt;srp_pool);
+    memset(s, 0, sizeof *s);
+}
+
+/* mic_x/mic_y:各 mic 在陣列平面上的位置(公尺);DOA 角 θ 的平面波延遲 τ = -(x·cosθ + y·sinθ)/c */
+int spatial_open(Spatial *s, float *mic_x, float *mic_y)
+{
+    ArrayGeometry geom = { MICS, mic_x, mic_y };       /* 只在 srp_init 內被讀取 */
+    SRP_Config sc;  BF_Config bc;  VADApiConfig vc;
+    memset(s, 0, sizeof *s); memset(&amp;sc, 0, sizeof sc); memset(&amp;bc, 0, sizeof bc); memset(&amp;vc, 0, sizeof vc);
+
+    sc.M = MICS; sc.F = BINS; sc.num_angles = ANGLES;                /* 衍生量:由陣列與 FFT 格點決定 */
+    sc.sr = (float)SAMPLE_RATE; sc.NFFT = (float)FFT_N; sc.c = 343.0f;
+    sc.low_freq = 300.0f; sc.high_freq = 7000.0f;                    /* 搜尋頻帶 */
+    sc.enable_smoothing = 1; sc.switch_consec = 3;
+    sc.angle_tol = 10.0f * 3.14159265f / 180.0f; sc.update_interval = 2;
+
+    bc.enable = 1; bc.lambda = 0.995f; bc.mu = 0.1f; bc.adapt_interval = 1;   /* 自動 DOA、不固定波束 */
+
+    vc.backend = VAD_BACKEND_MASKER;                                 /* 以下數值是示意,不是產品預設 */
+    vc.masker_cfg.NFFT = FFT_N; vc.masker_cfg.sr = SAMPLE_RATE;
+    vc.masker_cfg.E_alpha_up = 0.999f; vc.masker_cfg.E_alpha_down = 0.97f; vc.masker_cfg.margin_dB = 6.0f;
+    vc.masker_cfg.low_freq = 200.0f; vc.masker_cfg.high_freq = 8000.0f;
+    vc.masker_cfg.M_alpha = 0.995f; vc.masker_cfg.spp_thr = 0.9f; vc.masker_cfg.spp_upd_thr = 0.3f;
+    vc.masker_cfg.enable_freq_smooth = 1; vc.masker_cfg.smooth_size = 5;      /* 必須為正奇數 */
+    vc.masker_cfg.enable_time_smooth = 1; vc.masker_cfg.T_alpha = 0.6f;
+    vc.masker_cfg.enable_energy = vc.masker_cfg.enable_spp = vc.masker_cfg.enable_band = 1;
+    vc.vad_cfg.F = BINS;                                             /* 必須等於 NFFT/2+1 */
+    vc.vad_cfg.mode = 1; vc.vad_cfg.mask_thr = 0.2f; vc.vad_cfg.min_bins = 3;
+    vc.vad_cfg.enable_median = 1; vc.vad_cfg.median_k = 5;           /* 只接受 5/7/9 */
+    vc.vad_cfg.enable_smooth = 1; vc.vad_cfg.hangover = 8;
+
+    size_t srp_bytes = srp_get_mem_size(&amp;sc), bf_bytes = bf_get_mem_size(MICS, BINS),
+           vad_bytes = vad_api_get_mem_size(&amp;vc);                    /* 任一為 0 = 設定被拒絕 */
+    if (!srp_bytes || !bf_bytes || !vad_bytes) return -1;
+    s-&gt;srp_pool = pool_alloc(srp_bytes); s-&gt;bf_pool = pool_alloc(bf_bytes); s-&gt;vad_pool = pool_alloc(vad_bytes);
+    if (!s-&gt;srp_pool || !s-&gt;bf_pool || !s-&gt;vad_pool) goto fail;
+
+    s-&gt;srp = srp_init(s-&gt;srp_pool, srp_bytes, &amp;sc, &amp;geom);           /* NULL = cfg/geom 不合法、未對齊或太小 */
+    if (!s-&gt;srp) goto fail;
+    s-&gt;bf = bf_init(s-&gt;bf_pool, bf_bytes, MICS, BINS, ANGLES, s-&gt;srp-&gt;a_array, &amp;bc);   /* a_array 是借用 */
+    s-&gt;vad = vad_api_init(&amp;vc, s-&gt;vad_pool, vad_bytes);
+    if (!s-&gt;bf || !s-&gt;vad) goto fail;
+    return 0;
+fail:
+    spatial_close(s);
+    return -1;
+}
+
+/* 每個 hop 一次。X[m] = 第 m 路的 BINS 個頻譜 bin(例如 AEC lane 的線性輸出頻譜)。
+ * beam[BINS] 得到 BF 輸出頻譜;eff_w[MICS*BINS] 得到本 hop 更新前的等效權重(不需要時傳 NULL)。 */
+void spatial_hop(Spatial *s, const Complex *const *X, Complex *beam, Complex *eff_w)
+{
+    vad_api_process(s-&gt;vad, X[0]);                                   /* 1. 用一路頻譜做 VAD */
+    int vad_raw = vad_api_get_raw(s-&gt;vad);                           /*    未經中值與 hangover */
+    int vad_out = vad_api_get(s-&gt;vad);                               /*    經中值與 hangover */
+    const int *mask = vad_api_get_mask(s-&gt;vad);                      /*    非 0 = SRP 用該 bin、BF 凍結該 bin */
+    doa_step(s-&gt;srp, X, mask, vad_raw, vad_out);                     /* 2. DOA(vad_raw 為 1 才跑 SRP) */
+    bf_process_with_weights(s-&gt;bf, X, doa_get_smooth(s-&gt;srp),        /* 3. 波束:DOA 為 NaN 時直通第 0 路 */
+                            vad_out ? 0 : 1, mask, beam, eff_w);     /*    只在 vad_out == 0 時允許 RLS 更新 */
+}</code></pre>
+<div class="tblwrap"><table>
+<tr><th>情況</th><th>行為</th></tr>
+<tr><td>任一 <code>*_get_mem_size</code> 回 0</td><td>設定被拒;不要 init。SRP 看 <code>M&gt;1、F&gt;1、num_angles&gt;0</code> 與 <code>sr、NFFT、c</code> 有限且 &gt;0、<code>low_freq/high_freq</code> 有限</td></tr>
+<tr><td><code>srp_init</code>/<code>bf_init</code>/<code>vad_api_init</code> 回 NULL</td><td>設定不合法、pool 未對齊或太小(<code>srp_init</code> 另檢查 <code>geom-&gt;M == cfg-&gt;M</code> 且 <code>x</code>、<code>y</code> 非 NULL)</td></tr>
+<tr><td><code>doa_step</code>、<code>vad_api_process</code> 收到 NULL</td><td>靜默返回</td></tr>
+<tr><td><code>bf_process*</code>、<code>srp()</code>、<code>srp2doa()</code></td><td><b>不檢查 NULL</b>;<code>bf_init</code> 也不檢查 <code>a_array</code> 的實際形狀(必須是 <code>[num_angles][M][F]</code>,<code>num_angles</code> 與 SRP 相同),呼叫端負責</td></tr>
+<tr><td>非有限的頻譜值</td><td>BF 會重置受影響 bin 的 RLS 狀態(<code>bf_get_bin_resets</code> 計數);SRP 與 VAD 沒有此防護,請在進 FFT 前攔截</td></tr>
+<tr><td>重置</td><td><code>srp_reset</code>、<code>bf_reset</code>;VAD 三層(<code>masker</code>、<code>vad</code>、<code>vad_api</code>)都沒有 reset 函式,要重置就對同一塊 pool 再呼叫 <code>vad_api_init</code>(init 會先把該塊清零)</td></tr>
+<tr><td>執行緒</td><td>每個物件有可變狀態,同一物件不可同時被兩條執行緒使用</td></tr>
+</table></div>
+
+<h2>流程時序圖</h2>
+<pre>
+ Application            VADApi             SRP              BF
+     |                    |                 |                |
+ ─── 初始化(一次)───────────────────────────────────────────────────────────────
+     |-- vad_api_get_mem_size(&amp;vc) ---->|                 |     0 = F != NFFT/2+1、median_k 非 5/7/9、smooth_size 非正奇數…
+     |-- srp_get_mem_size(&amp;sc) ---------------------->|     |     0 = 設定被拒
+     |-- bf_get_mem_size(M, F) ------------------------------->|     0 = M &lt;= 0 或 F &lt;= 0(與 num_angles、cfg 無關)
+     |   (配置三塊 16-byte 對齊 pool)
+     |-- vad_api_init(&amp;vc, mem, n) -->|                 |                |
+     |-- srp_init(mem, n, &amp;sc, &amp;geom) ------------->|  建 steering 與 pair 表(geom 只在此被讀)
+     |-- bf_init(mem, n, M, F, A, srp-&gt;a_array, &amp;bc) -------------->|  borrow a_array
+ ─── 穩態 hop(每 hop 一次)──────────────────────────────────────────────────────
+     |-- vad_api_process(v, X[0]) ->|  masker_step → vad_step
+     |&lt;- vad_api_get_raw / vad_api_get / vad_api_get_mask -|
+     |-- doa_step(srp, X, mask, vad_raw, vad_out) ----->|  vad_raw 且 counter % update_interval == 0:
+     |                    |                 |             srp() → srp2doa() → doa_smoother_update(…, vad_out)
+     |                    |                 |             否則 doa_raw = NaN、doa_s 維持上一個值
+     |-- doa_get_smooth(srp) -------------->|  → doa_s
+     |-- bf_process_with_weights(bf, X, doa_s, allow_adapt, mask, beam, w) ->|
+     |                    |                 |    enable=0 或 doa_s=NaN: beam = X[0],不更新;
+     |                    |                 |    否則 DAS − wa 分支;allow_adapt 且 frame_idx % adapt_interval == 0 才更新 RLS
+     |&lt;- beam[F]、w[M*F]、(bf_get_adaptive / bf_get_doa_used / bf_get_bin_resets) ----|
+ ─── 重置 / 結束 ────────────────────────────────────────────────────────────────
+     |-- srp_reset ; bf_reset ;(VAD:對同一塊 pool 重新 vad_api_init)
+     |-- vad_api_destroy ; bf_destroy ; srp_destroy      (BF 在 SRP 之前;pool 路徑的 destroy 不釋放記憶體)
+</pre>
+
+<h2>訊號泳道圖(以 hop 為欄)</h2>
+<p class="small">假設 <code>update_interval = 2</code>、<code>switch_consec = 3</code>、聲源已被追蹤、之後移到新方向;<code>vad_raw</code> 在 hop 1–6 為 1,<code>hangover</code> 讓 <code>vad_out</code> 在 hop 7 仍為 1。</p>
+<pre>
+hop →                   0      1      2      3      4      5      6      7
+vad_raw                 0      1      1      1      1      1      1      0
+vad_out(含 hangover)    0      1      1      1      1      1      1      1
+SRP 是否執行            -      -      run    -      run    -      run    -    ← vad_raw 且 frame_counter 為偶數
+doa_s(smoother)        舊     舊     舊     舊     舊     舊     新     新   ← 新方向連續 3 次 SRP 結果(互差 ≤ angle_tol)才採用
+RLS 更新(allow_adapt)  可     -      -      -      -      -      -      -    ← 只在 vad_out = 0 且 frame_idx % adapt_interval == 0
+</pre>
+<div class="tblwrap"><table>
+<tr><th>環節</th><th>延遲</th><th>依據</th></tr>
+<tr><td>VAD 輸出</td><td>0 hop;<code>median_k</code> 讓起點與終點各延後 floor(k/2) hop;<code>hangover</code> 讓終點再延後 hangover hop</td><td><code>VAD/vad.c</code>;本機以 hangover=3、median 關/開(k=5)餵遮罩量測:起點 0/+2 hop、終點 +3/+5 hop</td></tr>
+<tr><td>SRP / BF 演算</td><td>0 hop(同 hop 輸入、同 hop 輸出)</td><td>逐 hop 呼叫,無跨 hop 緩衝</td></tr>
+<tr><td>換向</td><td>從第一次 SRP 觀測到新方向起,需 <code>switch_consec</code> 次連續觀測(互差 ≤ <code>angle_tol</code>),即再經 <code>(switch_consec−1) × update_interval</code> hop;從聲源移動算起最多再加 <code>update_interval−1</code> hop 等 SRP 輪到(<code>vad_raw</code> 持續為 1 時;上例 3/2 為 4~5 hop);第一次取得 DOA 不需等待</td><td><code>doa/doa_smoother.c</code>、<code>doa/srp.c:doa_step</code></td></tr>
+</table></div>
+
+<h2>狀態與記憶體</h2>
+<p class="small">以下為本機(ARM64、LP64)呼叫 <code>*_get_mem_size</code> 的實測值。結構內含指標,ARM32 須重新查詢。SRP 以 <code>num_angles = 72</code>、<code>M = 4</code>、<code>sr/NFFT = 16000/256</code> 等計算。</p>
+<div class="tblwrap"><table>
+<tr><th>物件</th><th>誰存放</th><th>F = 129 (16 kHz / 256)</th><th>F = 257 (16 kHz / 512)</th><th>F = 513 (48 kHz / 1024)</th></tr>
+<tr><td><code>SRP</code>(A=72, M=4)</td><td>caller pool</td><td>758,608 B</td><td>1,503,568 B</td><td>2,993,488 B</td></tr>
+<tr><td><code>BF</code>(M=4)</td><td>caller pool</td><td>28,224 B</td><td>55,872 B</td><td>111,168 B</td></tr>
+<tr><td><code>VADApi</code></td><td>caller pool</td><td>6,240 B(其中 masker 6,000 B、VAD 96 B)</td><td>11,872 B</td><td>23,136 B</td></tr>
+</table></div>
+<p>SRP 的大宗是兩張預先計算的表:<code>a_array</code> ≈ A·M·F·8 B 與 <code>pair_steer</code> ≈ A·M(M−1)/2·F·8 B(出處 <code>doa/srp.c:srp_get_mem_size</code>)。因此記憶體隨 <code>num_angles</code> 線性成長,這是 <code>num_angles</code> 不宜隨意調大的主因。BF 的大宗是 <code>P[M][M][F]</code> 的 RLS 協方差,與 <code>num_angles</code> 無關。</p>
+
+<h2>相關檔案與測試</h2>
+<ul class="small">
+<li><code>audiolib/doa/srp.h</code>、<code>srp.c</code>、<code>doa_smoother.{h,c}</code>;<code>audiolib/bf/bf.h</code>、<code>bf.c</code>、<code>bf_test_hooks.h</code>(僅測試);<code>audiolib/VAD/{masker,vad,vad_api}.{h,c}</code></li>
+<li><code>audiolib/common/utility/spatial_simd.{h,c}</code>、<code>spatial_complex.{h,c}</code>:SRP/BF 共用的 PHAT、波束、投影等 scalar/NEON 核心(整合者不直接呼叫)</li>
+<li><code>audiolib/tests/test_spatial_third_party.c</code>:核心 scalar-vs-dispatch 比對、SRP 預計算等價、各物件的 pool 毒化與邊界、heap 與 pool 位元組相同、BF 權重匯出、無效 lambda、退化頻帶與非有限角度、BF 長跑 Hermitian 與有限性、adapt_interval、leak 上界、P 對角夾限、非有限傳播的單 bin 重置、32 位元邊界計數、VAD 設定拒絕;<code>make test</code> 執行(並先跑 <code>audit-no-bf-test-symbols</code>)</li>
+<li><code>audiolib/tests/bench_masker.c</code>:<code>make bench-masker</code>,只報時間、不判定</li>
+<li>相關頁面:<a href="vad.html">VAD</a>、<a href="doa_srp.html">DOA/SRP</a>、<a href="bf.html">BF</a>、<a href="../../common/docs/html/audio_common_params.html">common 參數</a>、<a href="../../../Audio_ALG/docs/html/pipeline_4ch.html">4ch pipeline</a>、<a href="../../../Audio_ALG/docs/html/index.html">Audio_ALG 總覽</a></li>
+</ul>
+
+</body>
+</html>

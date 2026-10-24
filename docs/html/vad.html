@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VAD 與頻率遮罩</title>
+<style>
+body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;margin:0 auto;padding:0 1rem 3rem;line-height:1.55;color:#1a1a1a;max-width:70rem}
+nav{padding:.6rem 0;border-bottom:2px solid #2a6;margin-bottom:1rem;font-size:.95rem}
+nav a{margin-right:1rem;color:#164;text-decoration:none;font-weight:600}
+nav a:hover{text-decoration:underline}
+nav .sep{color:#999;margin-right:1rem}
+h1{font-size:1.5rem;border-bottom:1px solid #ccc;padding-bottom:.3rem}
+h2{font-size:1.15rem;margin-top:1.6rem;border-left:4px solid #2a6;padding-left:.5rem}
+h3{font-size:1rem;margin-top:1.1rem;color:#164}
+table{border-collapse:collapse;margin:.6rem 0;font-size:.86rem}
+th,td{border:1px solid #bbb;padding:.25rem .5rem;text-align:left;vertical-align:top}
+th{background:#eef5f0}
+pre{background:#f4f6f5;border:1px solid #dde;padding:.6rem;overflow-x:auto;font-size:.8rem;line-height:1.35}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.86em;background:#f2f2f2;padding:0 .15em}
+pre code{background:none;padding:0}
+.note{background:#fff8e6;border:1px solid #e0c878;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
+.warn{background:#fdeeee;border:1px solid #e0a0a0;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
+.small{font-size:.82rem;color:#555}
+.tblwrap{overflow-x:auto}
+.ext{background:#eaf6ee}
+.int{background:#f6f0e4}
+</style>
+</head>
+<body>
+<nav><a href="../../../Audio_ALG/docs/html/index.html">index</a><a href="../../../AEC/docs/html/aec.html">aec</a><a href="../../../NR/docs/html/nr.html">nr</a><a href="../../common/docs/html/audio_common.html">common</a><span class="sep">|</span><a href="spatial_chain.html">空間鏈</a><a href="doa_srp.html">DOA/SRP</a><a href="bf.html">BF</a><a href="vad.html">VAD</a><span class="sep">|</span><a href="../../common/docs/html/audio_common_params.html">common 參數</a><a href="../../common/docs/html/audio_common_c_api.html">common API</a><a href="../../common/docs/html/audio_common_detail.html">common 細節</a><span class="sep">|</span><a href="../../../AEC/docs/html/aec_params.html">AEC 參數</a><a href="../../../NR/docs/html/nr_c_api_params.html">NR 參數</a><a href="../../../Audio_ALG/docs/html/pipeline_4ch.html">4ch pipeline</a></nav>
+<h1>VAD 與頻率遮罩(<code>VAD/</code>)</h1>
+<p class="small">對應 <code>audiolib/VAD/vad_api.h</code>(整合者入口)、<code>masker.h</code>(遮罩估計)、<code>vad.h</code>(遮罩轉有聲/無聲)。與 SRP、BF 的串接見 <a href="spatial_chain.html">空間鏈</a>。</p>
+
+<h2>概要</h2>
+<p>單聲道的頻域 VAD,分兩層。<b>masker</b> 對一路頻譜(<code>X_ref</code>,F = NFFT/2+1 個 bin)逐 bin 判斷「這個 bin 現在有沒有語音」,輸出一張 0/1 的頻率遮罩;<b>MaskVAD</b> 把遮罩算成一個有聲/無聲旗標。<code>VADApi</code> 把兩層包成一次呼叫,並同時給出三個東西:<code>raw</code>(遮罩判定,未平滑)、<code>out</code>(經中值與 hangover)、<code>mask</code>(給 SRP 選 bin、給 BF 凍結 bin)。目前 backend 只有 <code>VAD_BACKEND_MASKER</code>。</p>
+<div class="warn">專案內沒有任何 pipeline 實例化 <code>VADApi</code>(只有 <code>tests/</code> 與 <code>make bench-masker</code>),所以<b>沒有產品預設值</b>,也沒有 <code>config_default</code> 函式;本頁範例的數值是示意,未針對實際音訊調校,偵測品質待量測。測試檔(<code>tests/test_spatial_third_party.c:vad_test_config</code>)的 <code>spp_thr = 0.5</code> 只用來驗證 pool 與設定拒絕,不適合直接拿去偵測(原因見下方「<code>spp_thr</code> 的意義」)。</div>
+
+<h2>如何呼叫使用</h2>
+<p><b>順序</b>:填 <code>VADApiConfig</code>(兩個子設定必須互相一致)→ <code>vad_api_get_mem_size</code>(0 = 被拒)→ 16-byte 對齊 pool → <code>vad_api_init(cfg, mem, n)</code>(注意參數順序:設定在前)→ 每 hop <code>vad_api_process</code> 後讀 <code>get_raw</code>/<code>get</code>/<code>get_mask</code> → <code>vad_api_destroy</code>。heap 路徑 <code>vad_api_create(cfg)</code>。<b>沒有 reset</b>:要重新開始就對同一塊 pool 再呼叫 <code>vad_api_init</code>(init 會先清零)。以下範例已用 <code>-Wall -Wextra -Werror</code> 編譯,並以合成輸入(低振幅噪聲後接一段強頻譜)執行:噪聲段不觸發;語音段開始後 <code>raw</code> 晚 1 hop 變 1、<code>out</code> 再晚 2 hop(中值 k = 5);語音段結束後 <code>out</code> 比 <code>raw</code> 多維持約 hangover + 2 = 10 hop。</p>
+<pre><code>#include "vad_api.h"
+
+enum { FFT_N = 256, BINS = FFT_N / 2 + 1 };
+static unsigned char g_vad_pool[8 * 1024] __attribute__((aligned(16)));    /* &gt;= vad_api_get_mem_size */
+
+/* 沒有 config_default,也沒有產品預設值:以下是示意值,請用你的資料調整 */
+VADApi *vad_open(int sample_rate)
+{
+    VADApiConfig cfg = {0};
+    cfg.backend = VAD_BACKEND_MASKER;
+    cfg.masker_cfg.NFFT = FFT_N;  cfg.masker_cfg.sr = sample_rate;
+    cfg.masker_cfg.E_alpha_up = 0.999f;  cfg.masker_cfg.E_alpha_down = 0.97f;   /* 每 hop 的噪聲底追蹤係數 */
+    cfg.masker_cfg.margin_dB = 6.0f;                                           /* 高出噪聲底多少 dB 才算有能量 */
+    cfg.masker_cfg.low_freq = 200.0f;  cfg.masker_cfg.high_freq = 8000.0f;     /* 只看這個頻帶(嚴格大於/小於) */
+    cfg.masker_cfg.M_alpha = 0.995f;  cfg.masker_cfg.spp_thr = 0.9f;  cfg.masker_cfg.spp_upd_thr = 0.3f;
+    cfg.masker_cfg.enable_freq_smooth = 1;  cfg.masker_cfg.smooth_size = 5;    /* 必須為正奇數 */
+    cfg.masker_cfg.enable_time_smooth = 1;  cfg.masker_cfg.T_alpha = 0.6f;
+    cfg.masker_cfg.enable_energy = 1;  cfg.masker_cfg.enable_spp = 1;  cfg.masker_cfg.enable_band = 1;
+    cfg.vad_cfg.F = BINS;                                                      /* 必須等於 NFFT/2+1 */
+    cfg.vad_cfg.mode = 1;  cfg.vad_cfg.mask_thr = 0.2f;                        /* 遮罩中 &gt;= 20% 的 bin 為 1 就算有聲 */
+    cfg.vad_cfg.enable_median = 1;  cfg.vad_cfg.median_k = 5;                  /* 只接受 5、7、9 */
+    cfg.vad_cfg.enable_smooth = 1;  cfg.vad_cfg.hangover = 8;                  /* 語音結束後再多維持 8 hop */
+
+    size_t bytes = vad_api_get_mem_size(&amp;cfg);        /* 0 = 設定被拒(F、median_k、smooth_size 不符等) */
+    if (bytes == 0 || bytes &gt; sizeof g_vad_pool) return NULL;
+    return vad_api_init(&amp;cfg, g_vad_pool, bytes);     /* NULL = pool 未對齊或太小 */
+}
+
+/* 每 hop:X0 是一路的 BINS 個頻譜 bin。回傳 vad_out;mask 與 raw 交給 SRP/BF */
+int vad_hop(VADApi *v, const Complex *X0, int *vad_raw, const int **mask)
+{
+    vad_api_process(v, X0);
+    *vad_raw  = vad_api_get_raw(v);       /* 遮罩判定的結果,未經中值與 hangover */
+    *mask     = vad_api_get_mask(v);      /* BINS 個 0/1;下一次 process 前有效;第一次 process 之前為 NULL */
+    return vad_api_get(v);                /* 經中值與 hangover 的輸出 */
+}
+/* 沒有 reset 函式:重新開始就對同一塊 pool 再呼叫 vad_api_init;結束 vad_api_destroy(pool 路徑不釋放) */</code></pre>
+<div class="tblwrap"><table>
+<tr><th>函式</th><th>失敗/邊界</th></tr>
+<tr><td><code>vad_api_get_mem_size(cfg)</code></td><td>0 = <code>backend</code> 不是 MASKER、<code>vad_cfg.F != masker_cfg.NFFT/2+1</code>、<code>vad_config_is_valid</code> 失敗(<code>F &lt;= 0</code>,或開了中值而 <code>median_k</code> 不是 5/7/9)、開了 <code>enable_freq_smooth</code> 而 <code>smooth_size</code> 非正奇數、<code>masker_cfg.NFFT &lt;= 0</code>(<code>VAD/vad_api.c:23-46</code>)</td></tr>
+<tr><td><code>vad_api_init(cfg, mem, n)</code></td><td>NULL = 上述任一、<code>mem</code> 為 NULL 或未對齊、<code>n</code> 不足</td></tr>
+<tr><td><code>vad_api_process(v, X_ref)</code></td><td>NULL 靜默返回。<code>X_ref</code> 必須有 F 個 bin;不檢查非有限值</td></tr>
+<tr><td><code>vad_api_get_raw / get / get_mask</code></td><td>NULL 回 0 / 0 / NULL。<code>get_mask</code> 在第一次 <code>process</code> 之前為 NULL;回傳的指標指向內部陣列,下一次 <code>process</code> 會被覆寫</td></tr>
+</table></div>
+<p class="small">直接使用下層(<code>masker_*</code>、<code>vad_*</code>)時,<code>masker_get_mem_size</code> 只檢查 <code>NFFT &gt; 0</code>,<code>masker_init</code> 不驗證 <code>smooth_size</code>、各 alpha 與 <code>F</code> 的對應;這些檢查只在 <code>vad_api_get_mem_size</code> 做,下層呼叫端要自己保證。<code>vad_config_is_valid</code> 是為了在 <code>vad_get_mem_size()</code>(不帶設定)之外先驗證設定而匯出。</p>
+
+<h2>流程時序圖</h2>
+<pre>
+ Application             VADApi              MaskEstimator             MaskVAD
+     |                     |                      |                       |
+ ─── 初始化 ─────────────────────────────────────────────────────────────────────
+     |-- vad_api_get_mem_size(&amp;cfg) ->|  檢查 F == NFFT/2+1、median_k、smooth_size
+     |-- vad_api_init(&amp;cfg,mem,n) ->|-- masker_init ------>|  噪聲底/噪聲 PSD 尚未初始化
+     |                     |-- vad_init -------------------------------->|  med_buf 全 0、state=0
+ ─── 每 hop ───────────────────────────────────────────────────────────────────
+     |-- vad_api_process(v, X_ref) ->|-- masker_step(X_ref) -->|
+     |                     |        |  power = |X|²+1e-8;energy = 10·log10(power)
+     |                     |        |  噪聲底(dB):第 1 個 frame 設為 energy,之後 sk_asym_ema(E_alpha_up/down)
+     |                     |        |  energy_mask = energy &gt; 噪聲底 + margin_dB
+     |                     |        |  spp = σ(xi − ln(1+xi)),xi = max(power/noise_psd − 1, 0)
+     |                     |        |  frame 平均 spp &lt; spp_upd_thr → noise_psd 以 M_alpha 更新
+     |                     |        |  spp_mask_bin = spp &gt; spp_thr;(開啟時)頻率中值 → 時間平滑(&gt; 0.5)
+     |                     |        |  band_mask = low_freq &lt; f &lt; high_freq(嚴格不等號)
+     |                     |        |  mask[f] = energy_ok &amp;&amp; spp_ok &amp;&amp; band_ok(關掉的條件視為 1)
+     |                     |-- vad_step(mask) ---------------------------->|
+     |                     |                      |  raw = mode 0/1/2 對遮罩計數的判定
+     |                     |                      |  (開啟時)中值 k 取多數 → hangover
+     |&lt;- vad_api_get_raw / vad_api_get / vad_api_get_mask --|
+ ─── 重置 / 結束 ──────────────────────────────────────────────────────────────
+     |-- vad_api_init(同一塊 pool)  (沒有 reset 函式)
+     |-- vad_api_destroy            (pool 路徑不釋放;heap 路徑釋放整塊)
+</pre>
+<p><b>泳道(以 hop 為欄)</b>:<code>hangover = 3</code>、遮罩非空的 hop 為 2–7。數字由本機以 <code>vad_step</code> 餵遮罩量測(<code>mode = 0</code>)。</p>
+<pre>
+hop →                 0 1 2 3 4 5 6 7 8 9 10 11 12 13
+raw(遮罩判定)         0 0 1 1 1 1 1 1 0 0  0  0  0  0
+out(中值關)           0 0 1 1 1 1 1 1 1 1  1  0  0  0     ← 終點延後 hangover = 3 hop
+out(中值 k=5 開)      0 0 0 0 1 1 1 1 1 1  1  1  1  0     ← 起點延後 2 hop、終點再延後 2 hop
+</pre>
+<p class="small">起點延後 floor(k/2) hop 是因為中值取最近 k 個 raw 的多數(<code>sum &gt;= k/2+1</code>),緩衝初始為 0;<code>out</code> 的終點 = 中值終點 + hangover。</p>
+
+<h2>參數表</h2>
+<p class="small">分類準則同 <a href="doa_srp.html">DOA/SRP</a>。沒有產品先例可循,下列分類依「單位是否固定、是否與 hop 大小耦合」判斷。所有設定在建立時固定,沒有執行期 setter。</p>
+<h3>外部</h3>
+<div class="tblwrap"><table>
+<tr class="ext"><th>欄位</th><th>範圍(程式碼驗證)</th><th>作用</th></tr>
+<tr><td><code>VadConfig.mode</code> / <code>mask_thr</code> / <code>min_bins</code></td><td>mode 0 = 遮罩有任一 bin;1 = <code>count/F &gt;= mask_thr</code>;2 = <code>count &gt;= min_bins</code>。其他 mode 值不報錯,行為等同 0</td><td>決定遮罩怎麼變成有聲/無聲。比例規則(mode 1)與 F 無關,換 FFT 大小時不用重調</td></tr>
+<tr><td><code>enable_median</code> / <code>median_k</code></td><td>開啟時 <code>median_k</code> 必須是 5、7 或 9(<code>vad_config_is_valid</code>)</td><td>抑制孤立的 1 或 0;延遲 floor(k/2) hop</td></tr>
+<tr><td><code>enable_smooth</code> / <code>hangover</code></td><td>hangover 為 hop 數,未驗證</td><td>有聲後保持 hangover 個 hop;單位是 hop,換 hop 長度時要自己換算</td></tr>
+<tr><td><code>MaskerConfig.low_freq</code> / <code>high_freq</code> / <code>enable_band</code></td><td>Hz;band mask 為嚴格 <code>low &lt; f &lt; high</code></td><td>只看語音頻帶</td></tr>
+<tr><td><code>margin_dB</code> / <code>enable_energy</code></td><td>dB,未驗證</td><td>能量需高出噪聲底多少 dB。越大越不敏感</td></tr>
+<tr><td><code>spp_thr</code> / <code>enable_spp</code></td><td>機率門檻,未驗證</td><td>見下表。<b>0.5 等於「bin 功率高於噪聲 PSD 就通過」</b></td></tr>
+<tr><td><code>enable_freq_smooth</code> / <code>smooth_size</code></td><td>開啟時 <code>smooth_size</code> 必須是正奇數(只有 <code>vad_api_get_mem_size</code> 檢查)</td><td>頻率軸中值,去除孤立的 bin</td></tr>
+<tr><td><code>enable_time_smooth</code></td><td>int</td><td>時間軸平滑開關(係數見內部表)</td></tr>
+</table></div>
+<h3>衍生(要填,但不是調參)</h3>
+<p><code>masker_cfg.NFFT</code>(&gt; 0,F = NFFT/2+1)、<code>masker_cfg.sr</code>、<code>vad_cfg.F</code>(必須等於 NFFT/2+1)、<code>backend</code>(只有 <code>VAD_BACKEND_MASKER</code>)。</p>
+<h3>內部(不建議開放)</h3>
+<div class="tblwrap"><table>
+<tr class="int"><th>項目</th><th>位置</th><th>為什麼不開放</th></tr>
+<tr><td><code>E_alpha_up</code> / <code>E_alpha_down</code>(噪聲底的 dB 域 EMA)、<code>M_alpha</code>(噪聲 PSD)、<code>T_alpha</code>(遮罩時間平滑)</td><td><code>masker.h</code>、<code>masker.c:masker_step</code></td><td>都是<b>每 hop</b> 的遞迴係數,masker 內部不做時間換算,hop 長度或取樣率一改,時間常數就跟著變;錯值讓追蹤失效而不報錯</td></tr>
+<tr><td><code>spp_upd_thr</code></td><td><code>masker.c</code></td><td>決定何時允許更新噪聲 PSD(frame 平均 spp 低於它才更新);設太低會讓噪聲 PSD 永遠停在初值,設太高會把語音學進噪聲</td></tr>
+<tr><td>常數:功率下限 <code>1e-8f</code>(<code>sk_cmag_f32</code> 的 eps)、<code>1e-12f</code>(<code>gamma</code> 分母、噪聲 PSD 更新)、時間平滑後的門檻 <code>0.5f</code></td><td><code>masker.c</code></td><td>編譯期常數,演算法定義的一部分</td></tr>
+<tr><td>第 1 個 frame 用自己的 energy 與功率初始化噪聲底與噪聲 PSD</td><td><code>masker.c</code></td><td>啟動行為;含語音的第 1 個 frame 會讓噪聲估計偏高</td></tr>
+<tr><td><code>MaskEstimator</code>/<code>MaskVAD</code> 結構欄位、<code>med_buf[9]</code></td><td><code>masker.h</code>、<code>vad.h</code></td><td>工作區與狀態,不是 API</td></tr>
+</table></div>
+<h3><code>spp_thr</code> 的意義(由 <code>masker.c</code> 的公式推得,非量測)</h3>
+<p><code>Q = xi − ln(1+xi)</code> 對所有 <code>xi &gt; 0</code> 都大於 0,所以 <code>spp = 1/(1+e<sup>−Q</sup>) &gt; 0.5</code> 等價於 <code>xi &gt; 0</code>,也就是 <code>γ = power/noise_psd &gt; 1</code>。穩態雜訊下仍有相當比例的 bin 功率會高於噪聲 PSD,因此 <code>spp_thr = 0.5</code> 會讓遮罩對雜訊也有一大片 1(本機以低振幅白噪聲餵過,遮罩持續有數十個 bin 為 1,<code>raw</code> 在多數 hop 為 1)。下表是各門檻要求的 <code>γ</code>(數值解 <code>γ−1−ln γ = ln(thr/(1−thr))</code>):</p>
+<div class="tblwrap"><table>
+<tr><th><code>spp_thr</code></th><th>0.6</th><th>0.7</th><th>0.8</th><th>0.9</th><th>0.95</th><th>0.99</th></tr>
+<tr><td>需要 <code>γ ≥</code></td><td>2.19(3.4 dB)</td><td>2.92(4.7 dB)</td><td>3.69(5.7 dB)</td><td>4.76(6.8 dB)</td><td>5.68(7.5 dB)</td><td>7.63(8.8 dB)</td></tr>
+</table></div>
+
+<h3>函式:整合者呼叫 vs 內部</h3>
+<div class="tblwrap"><table>
+<tr><th>類別</th><th>函式</th></tr>
+<tr><td>整合者呼叫</td><td><code>vad_api_get_mem_size</code>、<code>vad_api_init</code>、<code>vad_api_create</code>、<code>vad_api_process</code>、<code>vad_api_get</code>、<code>vad_api_get_raw</code>、<code>vad_api_get_mask</code>、<code>vad_api_destroy</code></td></tr>
+<tr><td>下層(可單獨用,檢查較少)</td><td><code>masker_get_mem_size</code>、<code>masker_init</code>、<code>masker_create</code>、<code>masker_step</code>、<code>masker_get_mask</code>、<code>masker_destroy</code>;<code>vad_get_mem_size</code>、<code>vad_config_is_valid</code>、<code>vad_init</code>、<code>vad_create</code>、<code>vad_step</code>、<code>vad_get_raw</code>、<code>vad_get_out</code>、<code>vad_destroy</code></td></tr>
+<tr><td>內部</td><td><code>median_filter_1d</code>、<code>vad_median</code>、<code>vad_smooth</code>、<code>vad_mask2raw</code>(皆 static);<code>sk_cmag_f32</code>、<code>sk_linear_to_db_f32</code>、<code>sk_asym_ema_f32</code>(<code>common/utility/simd_kernels.h</code>)</td></tr>
+</table></div>
+
+<h2>狀態與記憶體</h2>
+<div class="tblwrap"><table>
+<tr><th>狀態</th><th>大小</th><th>誰存放</th></tr>
+<tr><td>masker:<code>noise_floor</code>、<code>noise_psd</code>、<code>spp_time</code>、<code>power_frame</code>、<code>energy_frame</code>(各 F 個 float)與 6 張 F 個 int 的遮罩</td><td><code>masker_get_mem_size</code>:NFFT=256 為 6,000 B;NFFT=512 為 11,632 B</td><td>caller pool</td></tr>
+<tr><td>MaskVAD:<code>med_buf[9]</code>、<code>state</code>、<code>hang_cnt</code>、<code>vad_raw/out</code></td><td><code>vad_get_mem_size() = 96 B</code></td><td>caller pool</td></tr>
+<tr><td><code>VADApi</code>(上兩者加外殼)</td><td><code>vad_api_get_mem_size</code>:NFFT=256 為 6,240 B;NFFT=512 為 11,872 B;NFFT=1024 為 23,136 B</td><td>caller pool(單一區塊)</td></tr>
+</table></div>
+<p class="small">ARM64/LP64 本機實測;結構含指標,ARM32 須重新查詢。</p>
+
+<h2>相關檔案與測試</h2>
+<ul class="small">
+<li><code>audiolib/VAD/vad_api.{h,c}</code>、<code>masker.{h,c}</code>、<code>vad.{h,c}</code></li>
+<li><code>audiolib/tests/test_spatial_third_party.c</code>:<code>test_vad_api_refuses_configs_its_modules_cannot_serve</code>、<code>test_vad_api_init_pool_poison_and_bounds</code>、<code>test_vad_api_heap_vs_pool_identical</code>;<code>audiolib/tests/bench_masker.c</code>(<code>make bench-masker</code>,各階段耗時,只報時間)</li>
+<li>頁面:<a href="spatial_chain.html">空間鏈</a>、<a href="doa_srp.html">DOA/SRP</a>、<a href="bf.html">BF</a>、<a href="../../common/docs/html/audio_common.html">common</a>、<a href="../../../Audio_ALG/docs/html/index.html">Audio_ALG 總覽</a></li>
+</ul>
+
+</body>
+</html>

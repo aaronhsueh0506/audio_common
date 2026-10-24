@@ -5,6 +5,8 @@
 
 所有內容以 `include/` 底下的現行標頭檔與 `src/` 現行實作為準；本手冊是這個函式庫使用方式的唯一權威來源。
 
+HTML 文件站（`audiolib/common/docs/html/`）補上本手冊沒有的視角：呼叫順序與流程時序圖（`audio_common.html`）、資料流／I/O／狀態大小／延遲矩陣（`audio_common_detail.html`）、整合者視角的 API 摘要（`audio_common_c_api.html`），以及哪些參數可以對外開放、哪些只該留在內部、哪些函式該呼叫（`audio_common_params.html`）。同一個 repo 的 `VAD/`、`doa/`、`bf/` 不屬於 common，文件在 `audiolib/docs/html/`。
+
 ---
 
 ## 1. 這個函式庫是什麼／不是什麼
@@ -14,6 +16,7 @@
 `common` 是給 AEC、NR、pipelines 等上層專案共用的**低階 DSP 基礎元件**，一份程式碼、一份封存檔（`.a`），所有消費端共用。它提供：
 
 - 一組 FFT 介面，底層為 NE10（依 ARM32／ARM64 編譯目標自動選路）。
+- 一對 sqrt-Hann STFT／ISTFT 物件（50% overlap 組幀、加窗、overlap-add）與週期 sqrt-Hann 窗表。
 - 一個串流式有理數重取樣器（rational polyphase resampler）。
 - 一個二階高通濾波器（HPF）。
 - 純標頭（header-only）的數學近似函式與 per-bin 微核心，供效能敏感的迴圈直接內嵌使用。
@@ -22,9 +25,9 @@
 
 ### 不是什麼
 
-- **不是**完整的音訊處理管線。它不做回音消除、不做降噪、不做 VAD、不做 AGC，也不管框架（frame）排程。那些在上層專案。
+- **不是**完整的音訊處理管線。它不做回音消除、不做降噪、不做 AGC，也不管框架（frame）排程；回音消除與降噪在 AEC、NR 兩個 repo。同一個 audiolib repo 的 `VAD/`、`doa/`、`bf/` 也不屬於 common（見 `audiolib/docs/html/spatial_chain.html`）。
 - **不是**通用音訊格式函式庫。WAV 模組只接受兩種取樣格式（見第 5.7 節），其他一律在開檔時就拒絕。
-- **不是**執行緒安全的物件庫。每一個 handle（`FftHandle`、`AudioResampler`、`Hpf`、`WavReader`、`WavWriter`）都帶有可變狀態，**同一個 handle 不可以同時被兩條執行緒使用**。不同 handle 之間彼此獨立，可以平行使用。
+- **不是**執行緒安全的物件庫。每一個 handle（`FftHandle`、`AcStft`、`AcIstft`、`AudioResampler`、`Hpf`、`WavReader`、`WavWriter`）都帶有可變狀態，**同一個 handle 不可以同時被兩條執行緒使用**。不同 handle 之間彼此獨立，可以平行使用。
 - **不是**會替你檢查取樣率一致性的框架。取樣率、通道數、緩衝區長度全部由呼叫端負責對齊。
 - **不做**自動裁切（clipping）與自動正規化；溢位政策是呼叫端的責任。
 
@@ -32,7 +35,8 @@
 
 | 標頭檔 | 解決什麼問題 | 型態 | 需要連結 `.a` 嗎 |
 |---|---|---|---|
-| `include/fft_wrapper.h` | 實數訊號 ↔ 頻譜（rfft / irfft）、頻譜的振幅／功率／增益套用 | opaque handle + 函式 | 是 |
+| `include/fft_wrapper.h` | 實數訊號 ↔ 頻譜（rfft / irfft）、頻譜的功率／增益套用 | opaque handle + 函式 | 是 |
+| `include/ac_complex.h` | `Complex`（`{ float r; float i; }`）型別，`fft_wrapper.h` 與 `simd_kernels.h` 都 include 它 | 型別 | 否 |
 | `include/audio_window.h` | 建立 periodic sqrt-Hann float32 窗表，不依賴 FFT 或組幀物件 | 函式 | 是 |
 | `include/audio_stft.h` | sqrt-Hann STFT／ISTFT（50% overlap 組幀、加窗、overlap-add；centered reflect 分析與包絡正規化合成） | opaque handle + 函式 | 是 |
 | `include/audio_resampler.h` | 8/16/24/32/48 kHz 之間互轉，可跨區塊連續串流，最多 8 通道交錯 | opaque handle + 函式 | 是 |
@@ -41,6 +45,7 @@
 | `utility/simd_kernels.h` | 想把 per-bin 迴圈換成向量化版本（NEON／純量兩套，行為一致） | 純標頭 | 否 |
 | `utility/simd_kernel_nn.h` | 神經網路模型前後處理（DFN2／ULCNet／GTCRN／DeepVQE）與 `audio_stft.h` 用的向量化核心，與 `simd_kernels.h` 分開管理 | 純標頭 | 否 |
 | `utility/fast_math.h` | 熱迴圈裡要 `exp`／`log`／`sqrt`／`E1` 的快速近似版 | 純標頭 | 否 |
+| `utility/simd_aec.h`、`utility/simd_nr.h` | AEC、NR 各自專用的向量化核心本體（整合者不呼叫，由各自 repo 測試） | 純標頭 | 否 |
 | `include/wav_io.h` | 離線工具讀寫 WAV 檔（強化過的解析器 + 兩種寫入風格） | 純標頭 | 否 |
 
 **選用指引（一句話版）**
@@ -185,6 +190,8 @@ make                    # 建置封存檔（NE10 FFT 後端）
 make SIMD=0             # 把所有可選的 SIMD 路徑改成純量（NE10 純量 C 核心）
 make selftest           # 往返轉換 + static/heap 位元一致性檢查
 make test_audio_utils   # 所有支援的取樣率配對測試
+make test               # 預設測試層（selftest、test_pool、test_wav、test_wav_nr_style、test_zero_heap、test-fast-sqrt-codegen，加建置隔離套件的 core 情境）
+make test-full          # 預設層另加 NEON-vs-C FFT 容差比對與完整建置隔離套件
 ```
 
 `SIMD` 是公開的建置開關。其他旗標透過 `EXTRA_CFLAGS` 注入。
@@ -193,7 +200,7 @@ make test_audio_utils   # 所有支援的取樣率配對測試
 
 NE10 是唯一的 FFT 後端。`BACKEND=ne10` 是預設，也是唯一接受的值；給其他值建置會直接報錯停止。
 
-NE10 包裝層依 ARM32／ARM64 編譯器巨集自動選路；`SIMD=1` 且目標有 `__ARM_NEON` 時使用 NE10 NEON FFT，否則使用同一後端的 C FFT，`SIMD=0` 一律使用 C。共用 DSP／spatial 的 NEON 微核心需要 AArch64 指令，因此 ARM32 保留純量 fallback；ARM32 的 sqrt 使用正確捨入 `sqrtf`（VFP 為 VSQRT，soft-float 為 libm）。非 ARM 主機（例如 x86_64）仍不支援。交叉編譯時把 `CC`／`CXX`／`AR`／`RANLIB` 一起指定為目標工具鏈；ARM32 支援 NEON 時可加 `EXTRA_CFLAGS=-mfpu=neon-vfpv4`（AArch32 ARMv8 核心用 `-mfpu=neon-fp-armv8`）；不要用單純的 `-mfpu=neon`，它沒有硬體 FMA，所有明確的 `fmaf()`（`simd_aec.h` 的 PBFDKF 梯度與權重更新、`simd_kernels.h` 的複數乘加、`fft_wrapper_ne10.c` 的功率譜、`aec_post.c`）都會變成 libm 呼叫，位元結果不變但速度慢很多。ARMv7 Advanced SIMD 會把 subnormal 沖為零，並以預設 NaN 取代帶 payload 的 NaN，因此 ARM32 上 `SIMD=1` 與 `SIMD=0` 對 subnormal／NaN payload 的值可能不同；只有 NE10 NEON FFT，以及具硬體 FMA 的核心（`-mfpu=neon-vfpv4`）上 AEC 的 delay matched filter 受影響，其餘 kernel 在 ARM32 皆為 C。不同 ABI 要重新查詢 pool 尺寸／descriptor，不可沿用另一 ABI 的配置。
+NE10 包裝層依 ARM32／ARM64 編譯器巨集自動選路；`SIMD=1` 且目標有 `__ARM_NEON` 時使用 NE10 NEON FFT，否則使用同一後端的 C FFT，`SIMD=0` 一律使用 C。共用 DSP／spatial 的 NEON 微核心需要 AArch64 指令，因此 ARM32 保留純量 fallback；ARM32 的 sqrt 使用正確捨入 `sqrtf`（VFP 為 VSQRT，soft-float 為 libm）。非 ARM 主機（例如 x86_64）仍不支援。交叉編譯時把 `CC`／`CXX`／`AR`／`RANLIB` 一起指定為目標工具鏈；ARM32 支援 NEON 時可加 `EXTRA_CFLAGS=-mfpu=neon-vfpv4`（AArch32 ARMv8 核心用 `-mfpu=neon-fp-armv8`）；不要用單純的 `-mfpu=neon`，它沒有硬體 FMA，所有明確的 `fmaf()`（`simd_aec.h` 的 PBFDKF 梯度與權重更新、`simd_kernels.h` 的融合複數乘加 `sk_cmac_fma_ring_f32`、`fft_wrapper_ne10.c` 的功率譜）都會變成 libm 呼叫，位元結果不變但速度慢很多。ARMv7 Advanced SIMD 會把 subnormal 沖為零，並以預設 NaN 取代帶 payload 的 NaN，因此 ARM32 上 `SIMD=1` 與 `SIMD=0` 對 subnormal／NaN payload 的值可能不同；只有 NE10 NEON FFT，以及具硬體 FMA 的核心（`-mfpu=neon-vfpv4`）上 AEC 的 delay matched filter 受影響，其餘 kernel 在 ARM32 皆為 C。不同 ABI 要重新查詢 pool 尺寸／descriptor，不可沿用另一 ABI 的配置。
 
 heap 路徑與 static pool 路徑輸出必須逐位元相同——配置方式不影響數值。NEON 與 `SIMD=0`（NE10 純量 C 核心）兩條路徑只在浮點捨入內一致，不保證逐位元相同（`make test_ne10_force_c` 以容差比對），所以位元級回歸比對的兩邊必須是同一個 `SIMD` 設定。
 
@@ -266,14 +273,16 @@ cc -std=gnu99 -O2 -Wall -Wextra -ffp-contract=off -fno-math-errno \
 
 | 慣例 | 意義 | 適用函式 |
 |---|---|---|
-| 回傳 `NULL` | 建構失敗（參數不合法、記憶體不足、pool 太小或未對齊、檔案不合法） | `fft_create`、`fft_init`、`hpf_create`、`hpf_init`、`audio_resampler_create`、`audio_resampler_init`、`wav_open_read`、`wav_open_write` |
-| 回傳 `0`（`size_t`） | 尺寸查詢失敗；**`0` 永遠代表失敗，不代表「不需要記憶體」** | `fft_get_mem_size`（`fft_size` 不合法）、`audio_resampler_get_mem_size`（取樣率／通道數不合法）、`hpf_get_mem_size` |
+| 回傳 `NULL` | 建構失敗（參數不合法、記憶體不足、pool 太小或未對齊、檔案不合法） | `fft_create`、`fft_init`、`ac_stft_init`、`ac_istft_init`、`hpf_create`、`hpf_init`、`audio_resampler_create`、`audio_resampler_init`、`wav_open_read`、`wav_open_write` |
+| 回傳 `0`（`size_t`） | 尺寸查詢失敗；**`0` 永遠代表失敗，不代表「不需要記憶體」** | `fft_get_mem_size`（`fft_size` 不合法）、`ac_stft_get_mem_size`／`ac_istft_get_mem_size`（設定不合法）、`audio_resampler_get_mem_size`（取樣率／通道數不合法）、`hpf_get_mem_size` |
 | 回傳 `0` / `-1`（`int`） | `0` 成功、`-1` 失敗（handle 為 NULL、指標為 NULL、數量為負） | `audio_resampler_process`、`wav_finalize_write` |
 | 回傳 `-1` 當哨兵值 | handle 為 NULL（或參數不合法）時回傳 `-1`，否則回傳真值 | `audio_resampler_latency_input_frames`、`audio_resampler_output_bound` |
 | 回傳 `0` 當哨兵值 | handle 為 NULL 時回傳 `0` | `fft_get_n_freqs` |
 | 回傳 `1` / `0` 當布林 | `1` = 支援、`0` = 不支援 | `audio_resampler_rate_supported` |
 | 回傳實際筆數 | 回傳真正讀到的樣本數；`0` 代表 NULL 參數或已到檔尾 | `wav_read_float` |
-| `void`，NULL 時安靜略過 | 傳入 NULL handle／NULL 緩衝區時直接 return，不當機、不回報 | `fft_forward`、`fft_inverse`、`fft_forward_scratch`、`fft_inverse_scratch`、`fft_power`、`fft_apply_gain`、`hpf_process`、`hpf_reset`、`audio_resampler_reset`、`wav_write_float` |
+| 回傳幀數／樣本數，`0` 兼作 NULL 引數 | `ac_stft_push`／`_planar` 回傳寫出的幀數；`ac_istft_push`／`_planar` 回傳寫出的樣本數（`hop`，`AC_OLA_ENV_NORM` 第 1 幀為 `0`）；`ac_stft_flush_planar`、`ac_istft_flush` 在條件不符時回 `0` | `ac_stft_push`、`ac_stft_push_planar`、`ac_stft_flush_planar`、`ac_istft_push`、`ac_istft_push_planar`、`ac_istft_flush` |
+| 回傳 `0` / `-1`（取回設定） | `0` 成功、`-1` 為 NULL 引數 | `ac_stft_get_config`、`ac_istft_get_config` |
+| `void`，NULL 時安靜略過 | 傳入 NULL handle／NULL 緩衝區時直接 return，不當機、不回報 | `fft_forward`、`fft_inverse`、`fft_forward_scratch`、`fft_inverse_scratch`、`fft_power`、`fft_apply_gain`、`ac_stft_frame_planar`、`ac_stft_reset`、`ac_istft_reset`、`hpf_process`、`hpf_reset`、`audio_resampler_reset`、`wav_write_float` |
 | `void`，釋放語意 | NULL 安全；static pool 建立的 handle 一律是 no-op | `fft_destroy`、`hpf_destroy`、`audio_resampler_destroy` |
 | `void`，吞掉結果 | 內部呼叫 `wav_finalize_write()` 但丟棄其回傳值 | `wav_close_write` |
 | `void`，NULL 安全 | 關閉並釋放讀取器 | `wav_close_read` |
@@ -462,7 +471,7 @@ int audio_resampler_latency_input_frames(const AudioResampler* self);
 | `output_bound` | 每個區塊，在 `process()` 之前 | 傳入這次要送的 `input_frames`，回傳輸出緩衝區至少要能裝多少 frame |
 | `process` | 每個區塊 | 見下方細節 |
 | `reset` | **只在**要丟棄整段串流歷史時（例如換檔案、串流重啟） | 不要在一般區塊邊界呼叫，那會破壞連續性 |
-| `latency_input_frames` | 需要做延遲補償對齊時 | 回傳以**輸入 frame** 為單位的群延遲 |
+| `latency_input_frames` | 需要做延遲補償對齊時 | 回傳以**輸入 frame** 為單位的群延遲（四捨五入；降取樣比 r 為 `16·r`，升取樣為 16，等取樣率為 0；例：48 kHz → 16 kHz 為 48） |
 
 `process()` 的語意：
 
@@ -507,6 +516,7 @@ if (capacity < 0) { /* handle 為 NULL 或 input_frames 為負，或結果過大
 4. 每個區塊重建 resampler，或在區塊邊界呼叫 `reset()`。
 5. 送進非交錯（planar）資料。這個 API 只吃交錯格式。
 6. 用了 44100 Hz。它不在白名單內，`create()` 會回 `NULL`。
+7. 輸入含 NaN／Inf。一個非有限樣本會污染所有濾波視窗涵蓋它的輸出（NEON 另多讀最多 3 個補零 tap，所以 `SIMD=0` 受污染的輸出略少）；resampler 不檢查，請在送進來前攔截。
 
 ---
 
@@ -673,7 +683,7 @@ static unsigned char g_pool[POOL_BYTES] __attribute__((aligned(16)));
 當你自己的 per-bin／per-sample 迴圈是熱點、而下表剛好有形狀一致的核心時。
 每個核心都有兩個進入點：`sk_<name>()`（在支援的平台上走 NEON）與 `sk_<name>_scalar()`（永遠是純量）。**兩者對任何有限輸入產生逐位元相同的結果**，所以可以在效能與可攜性之間切換而不改變數值輸出。
 
-如果你的迴圈形狀跟下表都不一樣，就不要硬套——直接寫你自己的純量迴圈。
+如果你的迴圈形狀跟下表都不一樣，就不要硬套——直接寫你自己的純量迴圈。神經網路前後處理另有 `simd_kernel_nn.h` 的 `skn_*` 核心（同樣的 scalar 雙胞胎與 `SIMD=0` 規則），不在本手冊逐一列出。
 
 #### 生命週期
 
@@ -700,7 +710,20 @@ void sk_exp1_approx_f32(const float *x, float *out, int n);
 void sk_noise_update_f32(float *noise_psd, const float *spp,
                          const float *power,
                          float alpha_d, float bb_scale, int n);
-/* 以上每一個都有對應的 sk_<name>_scalar(...)，參數完全相同 */
+void sk_csub_f32(Complex *out, const Complex *a, const Complex *b, int n);
+void sk_wola_accumulate_f32(float *acc, const float *x, const float *w, int n);
+void sk_cmag_f32(float *out, const Complex *x, int n, float eps);
+void sk_asym_ema_f32(float *s, const float *x, int n, float a_up, float a_down);
+void sk_scale_f32(float *out, const float *x, float g, int n);
+void sk_linear_to_db_f32(float *out, const float *x, int n);          /* 只有純量實作 */
+void sk_clip_scale_to_s16_arr(int16_t *out, const float *in, int n);
+int  sk_argmax_f32(const float *x, int n);
+int  sk_argmax_sq_f32(const float *h, int n);
+int  sk_argmax_i32(const int *a, int n);                                /* 只有純量實作，n >= 1 */
+void sk_cmac_f32(Complex *acc, const Complex *w, const Complex *x, int n);
+void sk_cmac_fma_ring_f32(Complex *acc, const Complex *W, const Complex *X_buf,
+                          int curr_p, int n_part, int K);
+/* 除了上面標註「只有純量」的兩個，其餘都有對應的 sk_<name>_scalar(...)，參數完全相同 */
 ```
 
 | 核心 | 做什麼 | 什麼時候用 |
@@ -716,6 +739,15 @@ void sk_noise_update_f32(float *noise_psd, const float *spp,
 | `sk_fast_log_f32` | `fast_log` 陣列版 | 大量對數 |
 | `sk_exp1_approx_f32` | `exp1_approx` 陣列版 | 大量 E1 近似 |
 | `sk_noise_update_f32` | `noise_psd[i] = a*noise_psd[i] + (1-a)*power[i]`，其中 `a = alpha_d + (1-alpha_d)*spp[i]*bb_scale`（語音存在機率越高 `a` 越接近 1，估計值越不動） | 追蹤噪聲功率譜（噪聲 PSD），平滑係數隨每個 bin 的語音存在機率變動 |
+| `sk_csub_f32` | `out[i] = a[i] - b[i]`（複數逐項相減） | 頻譜相減 |
+| `sk_wola_accumulate_f32` | `acc[i] += x[i]*w[i]` | overlap-add 累加（三個陣列不可別名） |
+| `sk_cmag_f32` | `out[i] = x[i].r² + x[i].i² + eps`（**平方幅度加下限，沒有開根號**，名字容易誤導） | 功率譜加 floor |
+| `sk_asym_ema_f32` | `s[i]` 就地更新：`x[i] < s[i]` 用 `a_down`，否則用 `a_up`（嚴格小於） | 上升與下降係數不同的 EMA |
+| `sk_scale_f32` | `out[i] = x[i]*g`（單一 broadcast 增益） | 整段乘常數 |
+| `sk_linear_to_db_f32` | `out[i] = 10*log10f(x[i])`，**只有純量**（libm `log10f`） | 功率轉 dB |
+| `sk_clip_scale_to_s16_arr` | float 夾到 ±1、乘 32767、向零截斷成 int16；**不處理 NaN**（呼叫端須先排除）；單 quad 版 `sk_clip_scale_to_s16` 只在 NEON、回傳 `int16x4_t` | 輸出到 PCM16 |
+| `sk_argmax_f32`／`sk_argmax_sq_f32`／`sk_argmax_i32` | 回傳最大值（平方值／int32）的**第一個**索引 | 找峰值 |
+| `sk_cmac_f32`／`sk_cmac_fma_ring_f32` | 複數乘加 `acc[i] += w[i]*x[i]`；後者用 FMA 形式沿 `n_part` 個分割累加，`x` 取環形緩衝；**兩者不可互換**（捨入不同） | 濾波器乘加 |
 
 **選 `sk_*` 還是 `sk_*_scalar`？** 平常一律呼叫不帶後綴的版本，它會自動依建置設定選路。只有在要做「NEON vs 純量」對照驗證時才直接呼叫 `_scalar` 版本。
 
@@ -736,10 +768,10 @@ void sk_noise_update_f32(float *noise_psd, const float *spp,
 |---|---|
 | `sk_clip_f32` | 本來就是就地（只有一個 `x` 參數） |
 | `sk_ema_f32` | `state` 是就地讀寫；`x` 必須與 `state` 不重疊 |
-| `sk_capply_gain_f32` | 支援 `out == z`（完全相同指標） |
+| `sk_capply_gain_f32`、`sk_scale_f32`、`sk_csub_f32` | `sk_capply_gain_f32` 支援 `out == z`、`sk_scale_f32` 支援 `out == x`、`sk_csub_f32` 支援 `out == a`（完全相同指標） |
 | `sk_fast_exp_f32`、`sk_fast_exp_neg_f32`、`sk_fast_log_f32`、`sk_exp1_approx_f32` | 支援 `out == x`（完全相同指標） |
-| `sk_noise_update_f32` | `noise_psd` 是就地讀寫；`spp`／`power` 必須與它不重疊 |
-| 其他所有核心（含 `sk_fast_sqrt_f32`、`sk_min_f32`、`sk_cadd_f32`、`sk_sq_scale_f32`） | **不支援任何別名** |
+| `sk_noise_update_f32`、`sk_asym_ema_f32`、`sk_cmac_f32`、`sk_cmac_fma_ring_f32` | `noise_psd`／`s`／`acc` 是就地讀寫；其餘輸入必須與它不重疊 |
+| 其他所有核心（含 `sk_fast_sqrt_f32`、`sk_min_f32`、`sk_cadd_f32`、`sk_sq_scale_f32`、`sk_wola_accumulate_f32`、`sk_cmag_f32`） | **不支援任何別名** |
 
 **部分重疊（`out == x + k`，`k != 0`）在所有核心一律不支援**，即使某次執行看起來正常。
 
@@ -801,7 +833,9 @@ static inline float max_f(float a, float b);
 **重點：這些函式對非有限輸入回傳的是「定義域邊界常數」，不是 IEEE 語意的結果。**
 例如 `fast_sqrt(NaN)` 回 `0.0f`（不是 NaN）、`fast_log(-1.0f)` 回 `-1e10f`（不是 NaN）、`fast_exp(+Inf)` 回一個有限的飽和值（不是 `+Inf`）。這些值是確定且穩定的，但**不具數學意義**。正確做法是在資料進入 DSP 之前就把非有限樣本清掉（`wav_read_float()` 在讀檔端已經做了這件事），而不是依賴這些邊界值。
 
-production `fast_log` 以 IEEE-754 range reduction 加 degree-4 minimax 多項式實作（Horner，各目標同樣的分離乘加順序，不用 FMA）；selftest 對全部 `2^23` 個 normalized mantissa 逐一檢查，並對每個 binade 抽樣掃描，最大絕對誤差契約為 `< 1e-4`。`fast_sqrt` 在 AArch64 使用 `FSQRT`，ARM32 VFP 使用 `VSQRT`（正確捨入，與 `sqrtf` 逐位元相同）；ARM32 soft-float 則呼叫 libm。A53/A73 硬體 sqrt codegen audit 要求沒有 `sqrtf` errno fallback；非 ARM 目標保留兩次 Newton iteration 的 portable fallback。
+production `fast_log` 以 IEEE-754 range reduction 加 degree-4 minimax 多項式實作（Horner，各目標同樣的分離乘加順序，不用 FMA）；selftest 對全部 `2^23` 個 normalized mantissa 逐一檢查，並以固定步距掃過所有正規化的正數 float，最大絕對誤差契約為 `< 1e-4`。`fast_sqrt` 在 AArch64 使用 `FSQRT`，ARM32 VFP 使用 `VSQRT`（正確捨入，與 `sqrtf` 逐位元相同）；ARM32 soft-float 則呼叫 libm。A53/A73 硬體 sqrt codegen audit 要求沒有 `sqrtf` errno fallback；非 ARM 目標保留兩次 Newton iteration 的 portable fallback。
+
+編譯期巨集 `USE_STANDARD_MATH` 會把 `fast_*` 全部換成 libm（非有限輸入的結果隨之改為 IEEE 語意，只用於對照）；`USE_OPTIMIZED_E1` 只改 `exp1_approx` 的分支順序，結果必須與預設順序逐位元相同（`make selftest` 兩種都跑）。
 
 `exp1_approx` 的數學目標是 Ephraim–Malah MMSE-LSA 增益裡的精確指數積分；production 三段係數則固定採用 Martin、Malah、Cox、Accardi 2004 論文式 (17) 的低複雜度近似，不把它當成可自由 retune 的 NR 參數。
 
@@ -1021,6 +1055,15 @@ AcIstft *syn = ac_istft_init(pool_s, ss, &cfg);
 #### 逐函式簽章與呼叫時機
 
 ```c
+void ac_stft_config_default(AcStftConfig* cfg, int fft_size);
+size_t   ac_stft_get_mem_size(const AcStftConfig* cfg);                     /* 0 = 設定不合法 */
+AcStft*  ac_stft_init(void* mem, size_t mem_size, const AcStftConfig* cfg);
+size_t   ac_istft_get_mem_size(const AcStftConfig* cfg);
+AcIstft* ac_istft_init(void* mem, size_t mem_size, const AcStftConfig* cfg);
+void ac_stft_reset(AcStft*);   void ac_istft_reset(AcIstft*);               /* 清歷史與幀計數，設定與窗不變 */
+const float* ac_stft_window(const AcStft*);                                 /* 使用中的窗表，可借給 AcIstft */
+int  ac_stft_get_config(const AcStft*, AcStftConfig*);                      /* 0；NULL 引數回 -1 */
+int  ac_istft_get_config(const AcIstft*, AcStftConfig*);
 int  ac_stft_push(AcStft*, const float* hop_in, Complex* out);              /* 回傳幀數 0..2 */
 int  ac_stft_push_planar(AcStft*, const float* hop_in, float* re, float* im);
 void ac_stft_frame_planar(AcStft*, const float* frame, float* re, float* im); /* 呼叫端自備 N 樣本，不碰歷史 */
@@ -1102,7 +1145,8 @@ void ac_window_build(float* w, int n);
 
 **生命週期**
 
-- [ ] 所有有狀態的物件（`Hpf`、`AudioResampler`、`FftHandle`）在整段串流期間存活，不是每個區塊重建。
+- [ ] 所有有狀態的物件（`Hpf`、`AudioResampler`、`FftHandle`、`AcStft`、`AcIstft`）在整段串流期間存活，不是每個區塊重建。
+- [ ] `AcStft`／`AcIstft` 的 `center`、`ola`、`spec_scale`／`ispec_scale` 在建立時決定；`center = 1` 時 `ac_stft_push` 的輸出緩衝區容納 2 幀。
 - [ ] `audio_resampler_reset()` 只在真的要丟棄串流歷史時呼叫。
 - [ ] 每個 handle 不會被兩條執行緒同時使用。
 - [ ] `wav_finalize_write()` 對每個 writer 只呼叫一次，之後不再碰該指標。

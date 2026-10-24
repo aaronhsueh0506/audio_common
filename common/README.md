@@ -7,12 +7,25 @@ One copy of the shared DSP code for every consumer repo (AEC, NR, Audio_ALG):
 | FFT wrapper | `include/fft_wrapper.h`, `src/fft_wrapper_ne10.c` | real-to-complex FFT over NE10; heap and static-memory paths. ARM32/ARM64 compiler-target dispatch; NEON or scalar C FFT |
 | NE10 | `lib/ne10/` | vendored DSP subset with documented local patches; see `lib/ne10/VENDORED.md` |
 | fast_math | `utility/fast_math.h` | header-only LUT/Taylor exp, minimax log, ARM hardware sqrt, and paper-pinned Martin-2004 E1 approximation |
-| simd_kernels | `utility/simd_kernels.h` | header-only **bit-exact** NEON/scalar per-bin kernels (complex magnitude, complex MAC / filter W-updates, EMA, gain apply, min/clip, pairwise sums, `fast_sqrt`, `fast_exp`/`fast_exp_neg`/`fast_log`/`fast_log10`/`exp1_approx`, noise-PSD update with a per-bin smoothing factor (`sk_noise_update_f32`), windowed overlap-add accumulate, float->int16 PCM clip/scale/convert). Every array-form kernel has an always-compiled scalar twin; the one exception is the single-quad `sk_clip_scale_to_s16` (returns `int16x4_t`), which callers guard with `SK_HAVE_NEON`. The AArch64 NEON bodies replicate the scalar operation order lane for lane (strict FMA discipline, no estimate instructions, correctly rounded `vsqrtq_f32`). `SIMD=0` selects every scalar fallback; consumer TUs must build with `-ffp-contract=off`. `make selftest` runs the bitwise NEON-vs-scalar check, gates the minimax log's accuracy against libm, and cross-checks the exp/log family bit for bit against `fast_math.h`. |
-| simd_kernel_nn | `utility/simd_kernel_nn.h` | header-only **bit-exact** NEON/scalar kernels for the neural-network pre/post-processing (DFN2, Align-ULCNet, GTCRN, DeepVQE): branch-free all-finite scan, fill, elementwise multiply, feature power, Complex (de)interleave with optional scale, floored WOLA divide, magnitude with eps inside the root (`skn_mag_eps_f32`), and the per-bin complex tap filter (`skn_ctaps_mac_f32`, shared by DeepVQE's CCM and DeepFilterNet2's deep filter). Separate from `simd_kernels.h`; it includes that header only for the NEON switch and the Complex-quad helpers. Same contract (scalar twins, `SIMD=0`, `-ffp-contract=off`); `make selftest` also runs `test/simd_nn_selftest.c`. |
+| simd_kernels | `utility/simd_kernels.h` | header-only **bit-exact** NEON/scalar kernels: complex add/subtract/gain-apply and multiply-accumulate (unfused `sk_cmac_f32`, fused `sk_cmac_fma_ring_f32`), squared magnitude plus floor (`sk_cmag_f32`, no square root), EMA and asymmetric EMA, scale, min/clip, argmax, `fast_sqrt`/`fast_exp`/`fast_exp_neg`/`fast_log`/`exp1_approx` array forms, noise-PSD update with a per-bin smoothing factor (`sk_noise_update_f32`), windowed overlap-add accumulate, float->int16 PCM clip/scale/convert. Every kernel with a NEON body has an always-compiled `_scalar` twin; the exceptions are scalar-only (`sk_linear_to_db_f32`, `sk_argmax_i32`) and the single-quad `sk_clip_scale_to_s16` (returns `int16x4_t`), which callers guard with `SK_HAVE_NEON`. The AArch64 NEON bodies replicate the scalar operation order lane for lane (strict FMA discipline, no estimate instructions, correctly rounded `vsqrtq_f32`). `SIMD=0` selects every scalar fallback; consumer TUs must build with `-ffp-contract=off`. `make selftest` runs the bitwise NEON-vs-scalar check, gates the minimax log's accuracy against libm, and cross-checks the array-form exp/log/E1 kernels against the `fast_math.h` scalar functions. |
+| simd_kernel_nn | `utility/simd_kernel_nn.h` | header-only **bit-exact** NEON/scalar kernels for the neural-network pre/post-processing (DFN2, Align-ULCNet, GTCRN, DeepVQE): branch-free all-finite scan, fill, elementwise multiply, feature power, Complex (de)interleave with optional scale, floored WOLA divide, magnitude with eps inside the root (`skn_mag_eps_f32`), the per-bin complex tap filter (`skn_ctaps_mac_f32`, shared by DeepVQE's CCM and DeepFilterNet2's deep filter), and the ERB band forward / expand / accumulate kernels (`skn_erb_*`). Separate from `simd_kernels.h`; it includes that header only for the NEON switch and the Complex-quad helpers. Same contract (scalar twins, `SIMD=0`, `-ffp-contract=off`); `make selftest` also runs `test/simd_nn_selftest.c`. |
+| simd_aec / simd_nr | `utility/simd_aec.h`, `utility/simd_nr.h` | header-only NEON/scalar kernel bodies that belong to AEC (filter weight updates, pairwise sums, ERLE/ERL and noise tracking) and NR (ring minimum, gain preparation); they are included and tested by those repos, not part of the integrator-facing surface. |
 | window | `include/audio_window.h`, `src/audio_window.c` | periodic sqrt-Hann in float32 via `ac_window_build`; no FFT or framing dependency. `audio_stft.h` includes this API for existing callers. |
 | STFT/ISTFT | `include/audio_stft.h`, `src/audio_stft.c` | one analysis object (`AcStft`) and one synthesis object (`AcIstft`) for 50%-overlap sqrt-Hann framing: accumulate-and-emit overlap-add or envelope-normalised overlap-add with reflect-padded centered analysis, optional spectrum scales for normalised NN spectra, shared or carved FFT handle and window, static memory only. `make selftest` runs `test/test_stft.c` (window formulas, latency and identity reconstruction, API contract, scaled entry points) |
-| HPF | `include/hpf.h`, `src/hpf.c` | biquad high-pass (f32, DF2-transposed), `hpf_create`/`hpf_get_mem_size`+`hpf_init` API — shared by platform code AND AEC's mic path |
+| HPF | `include/hpf.h`, `src/hpf.c` | 2nd-order Butterworth high-pass (f32, DF2-transposed), `hpf_create`/`hpf_get_mem_size`+`hpf_init` API; `cutoff_hz` must be finite, positive and below 0.45 x sample rate. Shared by platform code AND AEC's mic path |
 | resampler | `include/audio_resampler.h`, `src/audio_resampler.c` | streaming rational polyphase float32 resampler; only 8/16/24/32/48 kHz, 1–8 interleaved channels, heap/static lifecycle, block-boundary-identical state (a sample never depends on how the input was split; NEON and `SIMD=0` sum each output in different orders, so they agree to float rounding, not bit for bit) |
+| Complex, pool helpers | `include/ac_complex.h`, `utility/mem_align.h` | `Complex {float r; float i;}` and the 16-byte alignment / saturating size arithmetic every `X_get_mem_size` + `X_init` pair is built on |
+| WAV I/O | `include/wav_io.h` | header-only hardened reader/writer for tools and tests (PCM16 and float32, up to 8 channels); not for real-time paths |
+| spatial kernels | `utility/spatial_complex.{h,c}`, `utility/spatial_simd.{h,c}` | PHAT cross-spectrum, conjugate beamforming, BF projection and pair-score kernels used by `doa/` and `bf/`; built into `libspatial_common.a` by the top-level `audiolib/Makefile`, not into `libaudio_common.a` |
+
+## Documentation
+
+- [`docs/c_user_manual_zh_TW.md`](docs/c_user_manual_zh_TW.md): per-function manual (signatures, error returns, buffer rules).
+- `docs/html/audio_common.html`: call order, minimal compile-checked examples and sequence diagrams.
+- `docs/html/audio_common_detail.html`: data flow, I/O and state tables, latency.
+- `docs/html/audio_common_c_api.html`: integrator-level API summary.
+- `docs/html/audio_common_params.html`: which parameters are external (a third party may set them) and which are internal, and which functions an integrator calls.
+- `../docs/html/spatial_chain.html` and its component pages: SRP/DOA, beamformer and VAD, which live in the same repo outside `common/`.
 
 ## Build
 
@@ -92,8 +105,8 @@ For example, set the full ARM32 toolchain with
 Add `EXTRA_CFLAGS=-mfpu=neon-vfpv4` when that target supports NEON (use
 `-mfpu=neon-fp-armv8` for AArch32 ARMv8 cores). Do not use plain `-mfpu=neon`:
 it has no hardware fused multiply-add, so every explicit `fmaf()` (the PBFDKF
-gradient and weight update in `simd_aec.h`, the complex multiply-accumulate in
-`simd_kernels.h`, the FFT power spectrum in `fft_wrapper_ne10.c`, `aec_post.c`)
+gradient and weight update in `simd_aec.h`, the fused complex multiply-accumulate
+`sk_cmac_fma_ring_f32` in `simd_kernels.h`, the FFT power spectrum in `fft_wrapper_ne10.c`)
 becomes a libm call. The bits are unchanged, the cost is not. No source edit is
 needed when switching compiler targets. Query static-pool sizes/descriptors
 again for each ABI; pointers change native layouts.
@@ -117,6 +130,8 @@ last to `CFLAGS`/`CXXFLAGS`. Each Makefile rejects, at parse time, a
 $ make EXTRA_CFLAGS=-ffast-math
 *** FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains -ffast-math ...  Stop.
 ```
+
+The flag variables must also be plain whitespace-separated tokens built from `[A-Za-z0-9_./=,+-]`; a quote or any other character is rejected at parse time for the same reason.
 
 `scripts/audit_fp_contract.sh [ne10]` is the disassembly-level check. It builds
 the `ne10` config, disassembles a fixed list of expected-scalar objects (this
@@ -151,8 +166,11 @@ Audio buffers, spectra and shared SIMD kernels use float32. AEC/NR retain
 selected double bookkeeping and validation expressions to preserve their
 Python reference behavior; do not narrow those mechanically.
 
-Python/C validation has two layers: standard-math C against Python, then
-shipping C against standard-math C within its approved approximation budget.
-C goldens separately protect output within each build configuration. SIMD
-kernel twins preserve their documented operation order and NaN contract;
-FFT and resampler SIMD modes may have floating-point rounding differences.
+What this repo asserts: each NEON kernel equals its scalar twin bit for bit
+(`simd_selftest`, `simd_nn_selftest`, run by `make selftest`); heap and
+static-memory paths are byte-equal; FFT, STFT/ISTFT and the resampler differ
+between NEON and `SIMD=0` by float rounding only, so compare results within one
+`SIMD` setting. The Python-versus-C validation of AEC and NR has two layers
+(a standard-math C build, built with `-DUSE_STANDARD_MATH`, against Python; then
+the shipping build against the standard-math build) and is run from those repos,
+e.g. `AEC/c_impl/test/pyc_parity_aec.sh`; see their READMEs.

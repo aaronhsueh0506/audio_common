@@ -33,26 +33,39 @@ pre code{background:none;padding:0}
 <a href="../../../../NR/docs/html/nr.html">nr</a>
 <a href="audio_common.html">common</a>
 <span class="sep">|</span>
-<a href="../../../../AEC/docs/html/aec_c_api.html">AEC API</a>
-<a href="../../../../NR/docs/html/nr_c_api.html">NR API</a>
+<a href="audio_common_detail.html">common 細節</a>
 <a href="audio_common_c_api.html"><b>common API</b></a>
+<a href="audio_common_params.html">common 參數</a>
+<span class="sep">|</span>
+<a href="../../../docs/html/spatial_chain.html">空間鏈</a>
+<a href="../../../docs/html/doa_srp.html">DOA/SRP</a>
+<a href="../../../docs/html/bf.html">BF</a>
+<a href="../../../docs/html/vad.html">VAD</a>
+<span class="sep">|</span>
+<a href="../../../../AEC/docs/html/aec_c_api.html">AEC API</a>
+<a href="../../../../AEC/docs/html/aec_params.html">AEC 參數</a>
+<a href="../../../../NR/docs/html/nr_c_api.html">NR API</a>
+<a href="../../../../NR/docs/html/nr_c_api_params.html">NR 參數</a>
 <a href="../../../../Audio_ALG/docs/html/integration_example.html">串接範例</a>
 </nav>
 
 <h1>common C API 使用說明</h1>
-<p class="small">本頁是<b>整合者視角</b>的 API 說明。common 是 AEC／NR／pipelines 共用的底層 DSP 層,公開 API 位於 <code>include/</code>,共用實作細節位於 <code>utility/</code>。canonical 出處是 <code>common/docs/c_user_manual_zh_TW.md</code>。</p>
+<p class="small">本頁是<b>整合者視角</b>的 API 說明。common 是 AEC／NR／pipelines 共用的底層 DSP 層,公開 API 位於 <code>include/</code>,共用實作細節位於 <code>utility/</code>。canonical 出處是 <code>common/docs/c_user_manual_zh_TW.md</code>。呼叫順序與時序圖見 <a href="audio_common.html">common</a>,外部／內部參數分類見 <a href="audio_common_params.html">common 參數</a>。</p>
 
 <h2>1. 公開 API 與內部 utility</h2>
 <div class="tblwrap"><table>
 <tr><th>Header</th><th>分類</th><th>什麼時候需要</th></tr>
-<tr><td><code>fft_wrapper.h</code></td><td><b>整合者面向</b></td><td>只要 FFT 本身時(組幀與 overlap-add 請用 <code>audio_stft.h</code>)。<b>也是 NR 的 <code>Complex</code> 型別來源</b></td></tr>
+<tr><td><code>fft_wrapper.h</code></td><td><b>整合者面向</b></td><td>只要 FFT 本身時(組幀與 overlap-add 請用 <code>audio_stft.h</code>)。它 include <code>ac_complex.h</code>,<code>Complex</code>(<code>{float r; float i;}</code>)由該標頭定義,<code>simd_kernels.h</code> 也用同一個型別</td></tr>
 <tr><td><code>audio_stft.h</code></td><td><b>整合者面向</b></td><td>自己要做 sqrt-Hann STFT／ISTFT(50% overlap 的組幀、加窗、overlap-add)時</td></tr>
 <tr><td><code>audio_window.h</code></td><td><b>整合者面向</b></td><td><code>ac_window_build()</code>：獨立產生 periodic sqrt-Hann,無 FFT／組幀狀態</td></tr>
 <tr><td><code>audio_resampler.h</code></td><td><b>整合者面向</b></td><td>擷取取樣率 ≠ 處理取樣率時</td></tr>
 <tr><td><code>hpf.h</code></td><td><b>整合者面向</b></td><td>要在 AEC <b>之外</b>做高通時(AEC 內建 mic-path HPF,見下)</td></tr>
+<tr><td><code>ac_complex.h</code></td><td>型別</td><td><code>Complex</code> 的定義;include <code>fft_wrapper.h</code> 或 <code>simd_kernels.h</code> 即可取得</td></tr>
 <tr><td><code>mem_align.h</code></td><td>半公開</td><td>只有「自己也要從同一塊 pool 切物件」或自算 pool 總需求時。單純呼叫別人的 <code>_get_mem_size</code>+<code>_init</code> <b>不需要</b></td></tr>
 <tr><td><code>simd_kernels.h</code></td><td class="dead">內部/共用核心</td><td>一般整合者<b>不呼叫</b>。只有自己寫的熱迴圈剛好與某個核心形狀完全一致時才考慮</td></tr>
 <tr><td><code>simd_kernel_nn.h</code></td><td class="dead">內部/共用核心</td><td>神經網路模型前後處理與 <code>audio_stft.h</code> 專用的 <code>skn_*</code> 核心(與 <code>simd_kernels.h</code> 分開管理,傳統 AEC/NR 不引用)。一般整合者<b>不呼叫</b></td></tr>
+<tr><td><code>simd_aec.h</code>、<code>simd_nr.h</code></td><td class="dead">內部(AEC／NR 專用)</td><td>AEC、NR 各自引用的專用核心本體,由各自 repo 測試;整合者不呼叫</td></tr>
+<tr><td><code>spatial_complex.h</code>、<code>spatial_simd.h</code></td><td class="dead">內部(SRP／BF 用)</td><td>編進 <code>libspatial_common.a</code>,見 <a href="../../../docs/html/spatial_chain.html">空間鏈</a></td></tr>
 <tr><td><code>fast_math.h</code></td><td class="dead">內部/共用</td><td>同上。<b>超出定義域回固定邊界常數而非 IEEE 語意</b>(例:<code>fast_sqrt(NaN)</code> 回 <code>0.0f</code>)</td></tr>
 <tr><td><code>wav_io.h</code></td><td class="dead">離線工具專用</td><td><b>不適合即時/嵌入式路徑</b>(用 stdio + malloc,每樣本一次 fread/fwrite)</td></tr>
 </table></div>
@@ -68,7 +81,7 @@ pre code{background:none;padding:0}
 <tr><td>對齊</td><td><b>16 bytes</b>,由 <code>MEM_IS_ALIGNED16</code> 在每個 <code>_init()</code> 進入點檢查,未對齊一律回 <code>NULL</code></td></tr>
 <tr><td>heap vs pool</td><td><code>AcStft</code>／<code>AcIstft</code> 只有 pool 路徑。其他提供 heap API 的模組以 handle 內部 flag 決定 <code>destroy()</code> 要不要 <code>free()</code>。pool 路徑的 destroy 是 no-op、可重複呼叫;heap 路徑<b>只能呼叫一次</b></td></tr>
 <tr><td>有狀態物件必須存活整段串流</td><td><code>AudioResampler</code>／<code>Hpf</code>／<code>FftHandle</code>／<code>AcStft</code>／<code>AcIstft</code> <b>不要逐 block 重建</b></td></tr>
-<tr><td>溢位</td><td><code>mem_align.h</code> 的 <code>ck_add_size</code>／<code>ck_mul_size</code>／<code>ck_align16_size</code>／<code>ck_field_size</code> 是<b>飽和</b>算術,任一步溢位就飽和到 <code>SIZE_MAX</code> 並一路傳遞,走訪結尾用 <code>MEM_SIZE_INVALID()</code> 檢查一次</td></tr>
+<tr><td>溢位</td><td><code>mem_align.h</code> 的 <code>ck_add_size</code>／<code>ck_mul_size</code>／<code>ck_align16_size</code>／<code>ck_field_size</code>／<code>ck_field_size_reps</code> 是<b>飽和</b>算術,任一步溢位就飽和到 <code>SIZE_MAX</code> 並一路傳遞,走訪結尾用 <code>MEM_SIZE_INVALID()</code> 檢查一次</td></tr>
 </table></div>
 
 <h2>3. <code>fft_wrapper.h</code> — FFT 包裝層</h2>
@@ -124,6 +137,7 @@ for (int f = 0; f &lt; n; ++f)
 <tr><td><code>AcIstft</code> 輸出</td><td><code>AC_OLA_ACCUMULATE</code>:每幀吐 hop 個樣本。<code>AC_OLA_ENV_NORM</code>:acc／max(env, <code>1e-11f</code>);第 1 幀吐 0 個;<code>ac_istft_flush()</code> 吐 hop 個尚在 overlap 內的樣本(不推進狀態)。輸入頻譜不會被修改</td></tr>
 <tr><td>別名</td><td>輸出緩衝區不得與輸入重疊;<code>ac_stft_frame_planar()</code> 的 <code>frame</code> 是呼叫端自備的 N 樣本,不改變歷史</td></tr>
 <tr><td>延遲</td><td>恆等串接 = hop = <code>fft_size/2</code> 個樣本</td></tr>
+<tr><td>取回設定</td><td><code>ac_stft_get_config(s, &amp;cfg)</code>／<code>ac_istft_get_config(s, &amp;cfg)</code> 取得使用中設定的快照(另一個物件負責的欄位保持預設值);回 0,任一引數為 NULL 回 −1</td></tr>
 <tr><td>記憶體</td><td>只有 static 路徑,無 heap、無 destroy;pool 16-byte 對齊。<code>init</code> 對髒 pool 與全零 pool 給出相同輸出(<code>test_stft</code> 檢查)</td></tr>
 </table></div>
 <div class="note"><code>test_stft</code> 驗證本物件的窗公式(與兩種寫法的獨立公式逐位元相同)、分析→合成的延遲與恆等重建、API 契約,以及非單位 <code>spec_scale</code>／<code>ispec_scale</code> 下 interleaved 與 split 入口逐位元相同、且等於未縮放結果乘以縮放值。</div>
@@ -144,7 +158,7 @@ hpf_destroy(hpf);</pre>
 </table></div>
 <div class="note"><b>AEC 已經內建 mic-path HPF</b>(<code>AecConfig.enable_highpass</code> 預設 1、<code>highpass_cutoff_hz</code> 預設 80),而且 <b>far/ref 路徑刻意沒有 HPF</b>。要在 AEC 之外再做一層之前,先確認你不是在重複同一件事——見 <a href="../../../../AEC/docs/html/aec_c_api_params.html#hpf">AEC 參數 §8.2</a>。</div>
 
-<h2>5. 輸入 gain — <code>FixGain</code>(在 Audio_ALG,不在這裡)</h2>
+<h2>5. 輸入 gain — <code>FixGain</code>(在 Audio_ALG,不在這裡;以下列的是 <code>fix_gain.h</code> 的契約)</h2>
 <p><code>common</code> 沒有 gain 模組。輸入電平調整用 <code>Audio_ALG/pipelines/third_party/gain/fix_gain.h</code> 的 <code>FixGain</code>;單聲道只要 <code>channels = 1</code>。</p>
 <div class="tblwrap"><table>
 <tr><th>項目</th><th>契約 / 效果</th></tr>
@@ -171,7 +185,8 @@ if (audio_resampler_process(r, in, in_frames, out, cap,
 <tr><td>輸出容量</td><td>用 <code>audio_resampler_output_bound()</code>。<b>自己按比例算會偶發少一個 frame</b>(例:48k→16k、480 frames:bound 161、實際 160)</td></tr>
 <tr><td>重疊</td><td>不同 rate 時 in/out <b>不可重疊</b>;<b>相同 rate 是精確 memmove 直通,此時重疊安全</b></td></tr>
 <tr><td><code>reset()</code></td><td>只在真的要丟棄整段串流歷史時呼叫(換檔/重啟),<b>不要在一般 block 邊界呼叫</b></td></tr>
-<tr><td>延遲</td><td><code>audio_resampler_latency_input_frames()</code>,以<b>輸入 frame</b> 為單位</td></tr>
+<tr><td>延遲</td><td><code>audio_resampler_latency_input_frames()</code>,以<b>輸入 frame</b> 為單位(降取樣比 r 為 16·r,升取樣 16,四捨五入;整張矩陣見 <a href="audio_common_detail.html">common 細節</a>)</td></tr>
+<tr><td>非有限輸入</td><td>一個 NaN/Inf 輸入樣本會污染所有濾波視窗涵蓋它的輸出(NEON 另多讀最多 3 個補零 tap,<code>SIMD=0</code> 受污染的輸出略少);請在送進來前攔截</td></tr>
 </table></div>
 
 <h2>7. <code>wav_io.h</code> — 只給離線工具</h2>
@@ -192,26 +207,30 @@ if (audio_resampler_process(r, in, in_frames, out, cap,
 <tr><td><code>sk_ema_f32</code></td><td><code>state[i]=α·state[i]+β·x[i]</code></td><td><code>state</code> 就地;<code>x</code> 須不重疊</td></tr>
 <tr><td><code>sk_capply_gain_f32</code></td><td><code>out[i]=z[i]*g[i]</code>(複數×實數增益)</td><td><code>out==z</code> 可</td></tr>
 <tr><td><code>sk_cadd_f32</code></td><td>複數逐項加</td><td>不可</td></tr>
+<tr><td><code>sk_csub_f32</code></td><td>複數逐項減</td><td><code>out==a</code> 可</td></tr>
+<tr><td><code>sk_cmac_f32</code></td><td><code>acc[i] += w[i]*x[i]</code>(複數,未融合)</td><td><code>acc</code> 就地累加</td></tr>
+<tr><td><code>sk_cmac_fma_ring_f32</code></td><td>以 FMA 形式沿 <code>n_part</code> 個分割累加 <code>acc[k] += w_part[k]*x_part[k]</code>(<code>x_part</code> 取環形緩衝);與 <code>sk_cmac_f32</code> 不可互換</td><td><code>acc</code> 就地累加</td></tr>
 <tr><td><code>sk_sq_scale_f32</code></td><td><code>out[i]=x[i]²·scale</code></td><td>不可</td></tr>
 <tr><td><code>sk_min_f32</code> / <code>sk_clip_f32</code></td><td>逐項取小 / 就地夾限</td><td><code>clip</code> 本就就地;<code>min</code> 不可</td></tr>
 <tr><td><code>sk_fast_sqrt_f32</code></td><td><code>fast_sqrt</code> 陣列版</td><td>不可</td></tr>
 <tr><td><code>sk_fast_exp_f32</code> / <code>_exp_neg</code> / <code>_log</code> / <code>sk_exp1_approx_f32</code></td><td><code>fast_math</code> 對應陣列版</td><td>皆 <code>out==x</code> 可</td></tr>
 <tr><td><code>sk_noise_update_f32</code></td><td>噪聲 PSD 追蹤更新:<code>a=alpha_d+(1-alpha_d)·spp[i]·bb_scale</code>,<code>noise[i]=a·noise[i]+(1-a)·power[i]</code>(平滑係數隨每 bin 語音存在機率變動)</td><td><code>noise_psd</code> 就地</td></tr>
 <tr><td><code>sk_wola_accumulate_f32</code></td><td><code>acc[i]+=x[i]*w[i]</code>(OLA 累加)</td><td>不可</td></tr>
-<tr><td><code>sk_clip_scale_to_s16</code> / <code>_arr</code></td><td>float<code>[-1,1]</code>→int16 PCM</td><td>—</td></tr>
+<tr><td><code>sk_clip_scale_to_s16</code> / <code>_arr</code></td><td>float<code>[-1,1]</code>→int16 PCM(夾到 ±1、乘 32767、向零截斷;<b>不處理 NaN</b>,呼叫端須先排除)。單 quad 版回傳 <code>int16x4_t</code>、只在 NEON,呼叫端用 <code>SK_HAVE_NEON</code> 保護</td><td>—</td></tr>
+<tr><td><code>sk_argmax_f32</code> / <code>sk_argmax_sq_f32</code> / <code>sk_argmax_i32</code></td><td>回傳最大值(平方值 / int32)的第一個索引;<code>sk_argmax_i32</code> 只有純量且要求 <code>n&gt;=1</code></td><td>唯讀</td></tr>
 <tr><td><code>sk_cmag_f32</code></td><td>⚠ 名為 mag 但實際是 <code>x.r²+x.i²+eps</code>(<b>功率+floor,沒開根號</b>)</td><td>不可</td></tr>
 <tr><td><code>sk_linear_to_db_f32</code></td><td><code>10·log10f(x)</code>,<b>刻意沒有 NEON 路徑</b>(避免混用近似 log10)</td><td>不可</td></tr>
 <tr><td><code>sk_asym_ema_f32</code></td><td>上升/下降不同係數的非對稱 EMA</td><td><code>s</code> 就地</td></tr>
 <tr><td><code>sk_scale_f32</code></td><td><code>out[i]=x[i]*g</code>(單一 broadcast 增益)</td><td><code>out==x</code> 可</td></tr>
 </table></div>
-<p class="small">若你的迴圈形狀跟上表都不一樣,<b>就不要硬套</b>。</p>
+<p class="small">若你的迴圈形狀跟上表都不一樣,<b>就不要硬套</b>。神經網路前後處理另有 <code>simd_kernel_nn.h</code> 的 <code>skn_*</code>(finite 掃描、fill、乘法、功率、Complex 交錯/去交錯、WOLA 除法、<code>skn_ctaps_mac_f32</code>、ERB 相關核心),與 <code>simd_kernels.h</code> 分開管理,同樣不是整合者面向的 API。</p>
 
 <h2>9. 建置與連結</h2>
 <pre>make -C common lib BACKEND=ne10 SIMD=1     # 產品
 make -C common lib BACKEND=ne10 SIMD=0     # 純量建置</pre>
 <p>消費端至少要帶:</p>
-<pre>-std=gnu99 -ffp-contract=off
--I&lt;common&gt;/include
+<pre>-std=gnu99 -ffp-contract=off -fno-math-errno
+-I&lt;common&gt;/include -I&lt;common&gt;        (後者給 utility/... 標頭)
 &lt;libaudio_common.a&gt; -lm</pre>
 <div class="tblwrap"><table>
 <tr><th>要點</th><th>說明</th></tr>
@@ -219,6 +238,7 @@ make -C common lib BACKEND=ne10 SIMD=0     # 純量建置</pre>
 <tr><td>ARM32 旗標</td><td>支援 NEON 時用 <code>EXTRA_CFLAGS=-mfpu=neon-vfpv4</code>(AArch32 ARMv8 用 <code>-mfpu=neon-fp-armv8</code>);單純 <code>-mfpu=neon</code> 沒有硬體 FMA,每個 <code>fmaf()</code> 都變成 libm 呼叫(位元不變,速度慢很多)。ARMv7 Advanced SIMD 會把 subnormal 沖為零並以預設 NaN 取代 NaN payload,所以 ARM32 的 <code>SIMD=1</code> 與 <code>SIMD=0</code> 對這類值可能不同(NE10 NEON FFT，以及具硬體 FMA 核心上的 AEC delay matched filter)</td></tr>
 <tr><td><code>SIMD_KERNELS_FORCE_SCALAR</code></td><td>archive 與<b>你的</b> TU 的定義狀態必須一致</td></tr>
 <tr><td>禁用</td><td><code>-Ofast</code>／<code>-ffast-math</code> 會改變遞迴 DSP 數值與 parity</td></tr>
+<tr><td>連結驅動器</td><td>archive 內有一個 C++ 目的檔(<code>NE10_fft_generic_int32.cpp</code>),本 repo 的 Makefile 以 <code>$(CXX)</code> 連結;本機用 C 驅動器連結本頁的範例通過,其他工具鏈是否需要額外的 C++ 執行期庫待量測</td></tr>
 <tr><td>archive 路徑</td><td>由 build flags hash 決定,用 <code>make -s ... print-lib-path</code> 取得,<b>不要自行拼 <code>bin/</code></b></td></tr>
 </table></div>
 <div class="note"><code>common/Makefile</code> 宣告了 <code>NO_STDIO</code>／<code>DEBUG</code> 但<b>不消費它們</b>;本 library 也<b>沒有任何 stage-timing／log／status API</b>。可觀測性請往上層(AEC／pipeline)取——見 <a href="../../../../Audio_ALG/docs/html/integration_example.html">串接範例</a> 的 DEBUG 章節。</div>

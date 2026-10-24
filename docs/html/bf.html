@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>波束器 BF</title>
+<style>
+body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;margin:0 auto;padding:0 1rem 3rem;line-height:1.55;color:#1a1a1a;max-width:70rem}
+nav{padding:.6rem 0;border-bottom:2px solid #2a6;margin-bottom:1rem;font-size:.95rem}
+nav a{margin-right:1rem;color:#164;text-decoration:none;font-weight:600}
+nav a:hover{text-decoration:underline}
+nav .sep{color:#999;margin-right:1rem}
+h1{font-size:1.5rem;border-bottom:1px solid #ccc;padding-bottom:.3rem}
+h2{font-size:1.15rem;margin-top:1.6rem;border-left:4px solid #2a6;padding-left:.5rem}
+h3{font-size:1rem;margin-top:1.1rem;color:#164}
+table{border-collapse:collapse;margin:.6rem 0;font-size:.86rem}
+th,td{border:1px solid #bbb;padding:.25rem .5rem;text-align:left;vertical-align:top}
+th{background:#eef5f0}
+pre{background:#f4f6f5;border:1px solid #dde;padding:.6rem;overflow-x:auto;font-size:.8rem;line-height:1.35}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.86em;background:#f2f2f2;padding:0 .15em}
+pre code{background:none;padding:0}
+.note{background:#fff8e6;border:1px solid #e0c878;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
+.warn{background:#fdeeee;border:1px solid #e0a0a0;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
+.small{font-size:.82rem;color:#555}
+.tblwrap{overflow-x:auto}
+.ext{background:#eaf6ee}
+.int{background:#f6f0e4}
+</style>
+</head>
+<body>
+<nav><a href="../../../Audio_ALG/docs/html/index.html">index</a><a href="../../../AEC/docs/html/aec.html">aec</a><a href="../../../NR/docs/html/nr.html">nr</a><a href="../../common/docs/html/audio_common.html">common</a><span class="sep">|</span><a href="spatial_chain.html">空間鏈</a><a href="doa_srp.html">DOA/SRP</a><a href="bf.html">BF</a><a href="vad.html">VAD</a><span class="sep">|</span><a href="../../common/docs/html/audio_common_params.html">common 參數</a><a href="../../common/docs/html/audio_common_c_api.html">common API</a><a href="../../common/docs/html/audio_common_detail.html">common 細節</a><span class="sep">|</span><a href="../../../AEC/docs/html/aec_params.html">AEC 參數</a><a href="../../../NR/docs/html/nr_c_api_params.html">NR 參數</a><a href="../../../Audio_ALG/docs/html/pipeline_4ch.html">4ch pipeline</a></nav>
+<h1>波束器 BF(<code>bf/</code>)</h1>
+<p class="small">對應 <code>audiolib/bf/bf.h</code>、<code>bf.c</code>(測試專用的 <code>bf_test_hooks.h</code> 不在產品封存檔內)。與 SRP、VAD 的串接見 <a href="spatial_chain.html">空間鏈</a>。</p>
+
+<h2>概要</h2>
+<p>頻域自適應波束器,結構是 GSC 形式:固定波束 <code>das</code>(以目前方向的 steering 做共軛加權平均,係數 1/M)減去自適應分支 <code>wa<sup>H</sup>·u</code>,其中 <code>u = x − a·(a<sup>H</sup>x)/(a<sup>H</sup>a)</code> 是把目標方向投影掉的 blocking 輸出。<code>wa</code> 以逐 bin 的 RLS 更新。方向來自呼叫端傳入的 <code>doa_s</code>(通常是 SRP 的 <code>doa_get_smooth</code>),BF 自己不做 DOA、也不做任何保持(hold);也可以設定固定波束。</p>
+<ul>
+<li>輸入 <code>X[m][f]</code> 是 M 路、F 個 bin 的頻譜;輸出 <code>bf_out[F]</code> 是波束後頻譜(<code>Complex</code>)。BF 不做 FFT/OLA,時域重建由整合者負責。</li>
+<li><b>steering 表是借用的</b>:<code>a_array[angle][mic][bin]</code> 由呼叫端擁有(通常是 <code>srp-&gt;a_array</code>),<code>bf_init</code> 不複製、<code>bf_destroy</code> 不釋放。BF 用 <code>doa2index</code> 把方向四捨五入到 <code>360/num_angles</code> 度的格點,所以 <code>num_angles</code> 必須與產生這張表的格點一致;非有限的方向取 0 號格點(<code>bf.c:579</code>)。</li>
+<li>遮罩極性與 SRP <b>相反</b>:BF 的 <code>mask</code> 非 0 表示「凍結該 bin 的 RLS 更新」(<code>fixed_align_notebook</code> 模式例外,該模式忽略遮罩)。</li>
+</ul>
+
+<h2>如何呼叫使用</h2>
+<p><b>順序</b>:取得 steering 表 → <code>bf_get_mem_size(M, F)</code>(0 = M 或 F 不合法;大小與 <code>num_angles</code>、<code>cfg</code> 無關)→ 16-byte 對齊 pool → <code>bf_init</code>(NULL = 失敗)→ 每 hop <code>bf_process</code> 或 <code>bf_process_with_weights</code> → <code>bf_reset</code>(換串流)→ <code>bf_destroy</code>(要在擁有 steering 表的 SRP 之前)。heap 路徑 <code>bf_create(M, F, num_angles, a_array, cfg)</code> 內部用 <code>posix_memalign</code>。以下範例已用 <code>-Wall -Wextra -Werror</code> 編譯,並以合成平面波(steering 表取自 <code>srp_create_from_geometry</code>)執行:前 50 hop <code>vad_out = 1</code> 不更新、後 50 hop 更新,<code>doa_s</code> 為 NaN 時輸出等於 <code>X[0]</code>。</p>
+<pre><code>#include "bf.h"
+
+enum { MICS = 4, BINS = 129, ANGLES = 72 };
+static unsigned char g_bf_pool[32 * 1024] __attribute__((aligned(16)));   /* &gt;= bf_get_mem_size(MICS, BINS) */
+
+/* a_array[angle][mic][bin]:steering 表,由呼叫端擁有(例如 srp-&gt;a_array),BF 只借用、不複製也不釋放。
+ * num_angles 必須與產生這張表的格點相同。fixed_doa_rad 只在 fixed_mode = 1 時使用。 */
+BF *beam_open(Complex ***a_array, int fixed_mode, float fixed_doa_rad)
+{
+    BF_Config cfg = {0};
+    cfg.enable = 1;                    /* 0 = 直通第 0 路 */
+    cfg.lambda = 0.995f;               /* RLS 遺忘因子,(0, 1],單位是「每次更新」 */
+    cfg.mu = 0.1f;                     /* 權重更新步長倍率 */
+    cfg.adapt_interval = 1;            /* 每 N 個 frame 才做一次 RLS 更新;輸出每個 frame 都算 */
+    cfg.enable_fix_mode = fixed_mode;  /* 1 = 波束固定指向 fixed_doa_rad,忽略傳入的 doa_s */
+    cfg.fixed_doa_rad = fixed_doa_rad;
+    size_t bytes = bf_get_mem_size(MICS, BINS);          /* 與 num_angles、cfg 無關;0 = M 或 F 不合法 */
+    if (bytes == 0 || bytes &gt; sizeof g_bf_pool) return NULL;
+    return bf_init(g_bf_pool, bytes, MICS, BINS, ANGLES, a_array, &amp;cfg);   /* NULL = lambda/mu/doa 不合法等 */
+}
+
+/* 每 hop:X[m] 為第 m 路的 BINS 個 bin;doa_s 為 NaN(尚無方向)時輸出 = X[0],且不更新 */
+void beam_hop(BF *bf, const Complex *const *X, float doa_s, int vad_out, const int *mask, Complex *beam)
+{
+    /* allow_adapt:通常只在「沒有目標語音」(vad_out == 0)時讓 RLS 學;mask 非 0 的 bin 不更新 */
+    bf_process(bf, X, doa_s, vad_out ? 0 : 1, mask, beam);
+    /* bf_get_adaptive(bf):本 hop 是否真的做了 RLS 更新;bf_get_doa_used(bf):實際使用的方向 */
+}
+/* 換串流:bf_reset(bf)(清 RLS 與計數,bin_resets 不清);結束:bf_destroy(bf) */</code></pre>
+<div class="tblwrap"><table>
+<tr><th>函式</th><th>失敗/邊界</th></tr>
+<tr><td><code>bf_init(mem, n, M, F, num_angles, a_array, cfg)</code></td><td>NULL = <code>mem</code>/<code>cfg</code>/<code>a_array</code> 為 NULL、<code>M/F/num_angles &lt;= 0</code>、<code>lambda</code> 非有限或不在 <code>(0, 1]</code>、<code>mu</code> 非有限、固定模式下 <code>fixed_doa_rad</code> 非有限、<code>mem</code> 未對齊或 <code>n</code> 不足(<code>bf.c:bf_init</code> 開頭的檢查)。init 只清 <code>bf_get_mem_size</code> 的範圍</td></tr>
+<tr><td><code>bf_process(g, X, doa_s, allow_adapt, mask, bf_out)</code></td><td><b>不檢查 NULL</b>;<code>X</code> 必須是 M 個各含 F 個 bin 的指標;<code>bf_out</code> 要 F 個 <code>Complex</code></td></tr>
+<tr><td><code>bf_process_with_weights(…, bf_out, w)</code></td><td>同上,另外把本 hop <b>更新前</b>的等效權重寫進 <code>w[M*F]</code>(通道主序,<code>w[m*F+f]</code>);<code>bf_out[f] = Σ_m w[m,f]·X[m,f]</code>(呼叫端不必再取共軛)。<code>w</code> 可為 NULL,<code>bf_out</code> 必須有</td></tr>
+<tr><td><code>bf_get_doa_used(g)</code> / <code>bf_get_adaptive(g)</code></td><td>NULL 回 NaN / 0。bypass 的 hop 兩者為 NaN / 0</td></tr>
+<tr><td><code>bf_effective_adapt_interval(fix, notebook, interval)</code></td><td>BF 實際使用的更新間隔(<code>interval &lt;= 0</code> 為 1;固定+notebook 強制 1)。要依更新節奏推算時間常數的整合者必須用它,而不是自己的設定值</td></tr>
+</table></div>
+
+<h2>流程時序圖</h2>
+<pre>
+ Application              BF                    SRP 的 a_array(借用)       spatial_* 核心
+     |                     |                           |                         |
+ ─── 初始化 ────────────────────────────────────────────────────────────────────
+     |-- bf_get_mem_size(M,F) ->|
+     |-- bf_init(mem,n,M,F,A,a_array,&amp;cfg) ->|  驗證 cfg;P = 單位陣、wa = 0、frame_idx = 0
+ ─── 每 hop ───────────────────────────────────────────────────────────────────
+     |-- bf_process_with_weights(X, doa_s, allow_adapt, mask, out, w) ->|
+     |                     |  enable == 0                   → out = X[0],adaptive = 0,結束
+     |                     |  自動模式且 doa_s == NaN        → out = X[0],adaptive = 0,結束
+     |                     |  固定模式 → doa = fixed_doa_rad;否則 doa = doa_s
+     |                     |  idx = doa2index(doa, num_angles);a = a_array[idx] ---&gt;|
+     |                     |  das  = conj-beamform(a, X, 1/M) ----------------------------&gt; spatial_conj_beamform
+     |                     |  u    = projection(a, X, das) -------------------------------&gt; spatial_bf_projection
+     |                     |  wu   = conj-beamform(wa, u, 1)  ----------------------------&gt; spatial_conj_beamform
+     |                     |  out  = das − wu                ----------------------------&gt; spatial_complex_sub_array
+     |                     |  (w 非 NULL) 匯出更新前的等效權重 ---------------------------&gt; spatial_bf_effective_weights
+     |                     |  allow_adapt 且 frame_idx % adapt_interval == 0 時:
+     |                     |     對 mask 為 0 的每個 bin:RLS 更新 P、wa(wa 先乘 leak)
+     |                     |     upu 非有限或 &lt;= 0 → 該 bin P=I、wa=0、bin_resets++,跳過
+     |                     |     P 對角夾在 [1e-6, 1e6];wa 非有限 → 同樣重置該 bin
+     |                     |  frame_idx++
+     |&lt;- out[F]、w[M*F]、bf_get_adaptive / bf_get_doa_used / bf_get_bin_resets -|
+ ─── 重置 ───────────────────────────────────────────────────────────────────────
+     |-- bf_reset -------->|  P=I、wa=0、frame_idx=0、first_doa 狀態與 doa_used 歸初值(bin_resets 不清)
+</pre>
+<p class="small">BF 沒有取樣延遲(同 hop 輸入、同 hop 輸出)。RLS 的收斂速度由 <code>lambda</code> 與更新次數決定,更新次數 = 滿足 <code>allow_adapt</code>、<code>adapt_interval</code>、遮罩三道門的 hop 數;swimlane 見 <a href="spatial_chain.html">空間鏈</a>。</p>
+
+<h2>參數表</h2>
+<p class="small">分類準則同 <a href="doa_srp.html">DOA/SRP</a>。BF <b>沒有任何執行期 setter</b>,所有設定在 <code>bf_init</code> 時固定。「4ch 單元」欄是專案內整合者在 <code>audio_pipeline_4ch_default_config</code> 使用的值,僅供參考。</p>
+<h3>外部(<code>BF_Config</code>)</h3>
+<div class="tblwrap"><table>
+<tr class="ext"><th>欄位</th><th>範圍(程式碼驗證)</th><th>作用與取捨</th><th>4ch 單元</th></tr>
+<tr><td><code>enable</code></td><td>int,非 0 為開</td><td>0 時整個 BF 旁路,輸出 = <code>X[0]</code>(每 hop 只剩一次複製)。記憶體不變(pool 仍照 M、F 配置)</td><td>1</td></tr>
+<tr><td><code>lambda</code></td><td>有限,<code>(0, 1]</code></td><td>RLS 遺忘因子,<b>單位是「每次 RLS 更新」</b>。BF 內部不做任何時間換算;4ch 單元的 0.995 是以 10 ms 一次更新為基準調出來的,傳入前依 <code>hop × 更新間隔</code> 換算(0.995 是單元層的約定,不是 BF 的預設)</td><td>0.995(單元層,再換算)</td></tr>
+<tr><td><code>mu</code></td><td>有限(BF 只要求有限;4ch 單元另外要求 <code>&gt;= 0</code>)</td><td>權重更新步長倍率,乘在 RLS 增益上。0 = 不學(只剩 leak)。notebook 模式下被忽略</td><td>0.1</td></tr>
+<tr><td><code>enable_fix_mode</code> / <code>fixed_doa_rad</code></td><td>int;<code>fixed_doa_rad</code> 在固定模式下必須有限</td><td>1 = 波束固定指向 <code>fixed_doa_rad</code>,<code>doa_s</code> 被忽略(包含 NaN)。適合方向已知的裝置</td><td>0 / 0</td></tr>
+<tr><td><code>adapt_interval</code></td><td>int,<code>&lt;= 0</code> 改為 1</td><td>每 N 個 frame 做一次 RLS 更新,輸出仍每個 frame 都算;省算量,收斂變慢</td><td>1</td></tr>
+</table></div>
+<h3>內部(不建議開放)</h3>
+<div class="tblwrap"><table>
+<tr class="int"><th>項目</th><th>位置</th><th>為什麼不開放</th></tr>
+<tr><td><code>fixed_align_notebook</code>(<code>BF_Config</code> 欄位,但屬內部)</td><td><code>bf.c:648-653</code></td><td>為了對齊參考實作而存在:強制每 frame 更新、停用遮罩凍結與 <code>mu</code>、<code>upu</code> 多加一個 <code>lambda</code>。只在固定模式下有意義,不是產品選項</td></tr>
+<tr><td><code>BF_WA_LEAK = 0.99999f</code></td><td><code>bf.c:18</code>;唯讀 <code>bf_wa_leak_factor()</code></td><td>只在實際更新時套用的權重漏洩,時間常數 1/(1−leak) 次更新,遠慢於遺忘時間,用來限制長時間連續執行的 <code>wa</code> 成長;與 <code>lambda</code> 耦合</td></tr>
+<tr><td><code>BF_P_DIAG_FLOOR = 1e-6f</code>、<code>BF_P_DIAG_CEIL = 1e6f</code></td><td><code>bf.c:25-26</code>;唯讀 <code>bf_p_diag_floor/ceil()</code></td><td>RLS 發散護欄,每次更新後夾 P 的對角。改動會悄悄改變 <code>bin_resets</code> 的觸發行為</td></tr>
+<tr><td><code>upu</code> 守衛:非有限或 <code>&lt;= 0</code> 重置該 bin;<code>|upu| &lt; 1e-12f</code> 墊到 <code>1e-12f</code></td><td><code>bf.c:277-283</code></td><td>單 bin 重置而非整個 BF 重置,避免丟掉其他 bin 的適應;屬數值護欄</td></tr>
+<tr><td>投影分母下限 <code>1e-12f</code>、<code>das</code> 係數 <code>1/M</code>、P 的 Hermitian 對稱化</td><td><code>common/utility/spatial_simd.c:162</code>、<code>bf.c</code></td><td>演算法定義的一部分;scalar/NEON 共用</td></tr>
+<tr><td>P 初值單位陣、<code>wa</code> 初值 0、<code>bin_resets</code> 不被 <code>bf_reset</code> 清除</td><td><code>bf.c:bf_init</code>、<code>bf_reset</code></td><td><code>bin_resets</code> 是診斷計數(正常運作應為 0 或接近 0),不是狀態</td></tr>
+<tr><td><code>BF</code> 結構欄位(<code>P</code>、<code>wa</code>、<code>scratch*</code>、<code>frame_idx</code>…)</td><td><code>bf.h</code></td><td>標頭註明 <code>P</code> 為「內部,不要保存或索引」;其餘同理</td></tr>
+</table></div>
+
+<h3>函式:整合者呼叫 vs 內部</h3>
+<div class="tblwrap"><table>
+<tr><th>類別</th><th>函式</th></tr>
+<tr><td>整合者呼叫</td><td><code>bf_get_mem_size</code>、<code>bf_init</code>、<code>bf_create</code>、<code>bf_process</code>、<code>bf_process_with_weights</code>、<code>bf_reset</code>、<code>bf_destroy</code>、<code>bf_get_doa_used</code>、<code>bf_get_adaptive</code>、<code>bf_effective_adapt_interval</code></td></tr>
+<tr><td>診斷(唯讀)</td><td><code>bf_get_bin_resets</code>、<code>bf_wa_leak_factor</code>、<code>bf_p_diag_floor</code>、<code>bf_p_diag_ceil</code></td></tr>
+<tr><td>僅測試</td><td><code>bf_test_process_with_weights_scalar_rls</code>(要 <code>-DBF_TESTING</code> 才編譯;<code>make audit-no-bf-test-symbols</code> 確認產品封存檔 <code>libbf.a</code> 不含 <code>bf_test_</code> 符號)</td></tr>
+<tr><td>內部</td><td><code>spatial_conj_beamform</code>、<code>spatial_bf_projection</code>、<code>spatial_complex_sub_array</code>、<code>spatial_bf_effective_weights</code>、<code>spatial_complex_*</code>(<code>common/utility/spatial_*.h</code>)</td></tr>
+</table></div>
+
+<h2>狀態與記憶體</h2>
+<div class="tblwrap"><table>
+<tr><th>狀態</th><th>大小</th><th>誰存放</th></tr>
+<tr><td>RLS 協方差 <code>P[M][M][F]</code></td><td>M·M·F·8 B(頻率軸連續,NEON 一次 4 個 bin)</td><td>caller pool</td></tr>
+<tr><td>自適應權重 <code>wa[M][F]</code></td><td>M·F·8 B</td><td>caller pool</td></tr>
+<tr><td>每 hop 工作區 <code>scratch</code></td><td>(M+3)·F·8 B</td><td>caller pool</td></tr>
+<tr><td>steering 表</td><td>不在 BF 內(借用)</td><td>呼叫端</td></tr>
+</table></div>
+<p>總量 <code>bf_get_mem_size(4, 129) = 28,224 B</code>、<code>(4, 257) = 55,872 B</code>、<code>(4, 513) = 111,168 B</code>(ARM64/LP64 本機實測,含指標表與對齊)。</p>
+
+<h2>相關檔案與測試</h2>
+<ul class="small">
+<li><code>audiolib/bf/bf.h</code>、<code>bf.c</code>、<code>bf_test_hooks.h</code>;<code>audiolib/common/utility/spatial_simd.{h,c}</code></li>
+<li><code>audiolib/tests/test_spatial_third_party.c</code>:<code>test_bf_vector_kernels_scalar_vs_dispatch</code>、<code>test_bf_weight_export</code>、<code>test_bf_create_rejects_invalid_lambda</code>、<code>test_bf_long_run_hermitian_and_finite</code>、<code>test_bf_effective_adapt_interval_matches_created_cadence</code>、<code>test_bf_wa_leak_is_bounded</code>、<code>test_bf_p_diag_clamp_bounds_runaway_values</code>、<code>test_bf_bin_reset_on_nonfinite_p_propagation</code>、<code>test_bf_init_pool_poison_and_bounds</code>、<code>test_bf_heap_vs_pool_byte_equal</code>、<code>test_bf_rls_dispatch_matches_scalar_state</code>、<code>test_bf_frame_idx_survives_32bit_boundary</code></li>
+<li>頁面:<a href="spatial_chain.html">空間鏈</a>、<a href="doa_srp.html">DOA/SRP</a>、<a href="vad.html">VAD</a>、<a href="../../common/docs/html/audio_common.html">common</a>、<a href="../../../Audio_ALG/docs/html/pipeline_4ch.html">4ch pipeline</a>、<a href="../../../Audio_ALG/docs/html/index.html">Audio_ALG 總覽</a></li>
+</ul>
+
+</body>
+</html>
