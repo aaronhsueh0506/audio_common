@@ -158,14 +158,14 @@ hpf_destroy(hpf);</pre>
 </table></div>
 <div class="note"><b>AEC 已經內建 mic-path HPF</b>(<code>AecConfig.enable_highpass</code> 預設 1、<code>highpass_cutoff_hz</code> 預設 80),而且 <b>far/ref 路徑刻意沒有 HPF</b>。要在 AEC 之外再做一層之前,先確認你不是在重複同一件事——見 <a href="../../../../AEC/docs/html/aec_c_api_params.html#hpf">AEC 參數 §8.2</a>。</div>
 
-<h2>5. 輸入 gain — <code>FixGain</code>(在 Audio_ALG,不在這裡;以下列的是 <code>fix_gain.h</code> 的契約)</h2>
-<p><code>common</code> 沒有 gain 模組。輸入電平調整用 <code>Audio_ALG/pipelines/third_party/gain/fix_gain.h</code> 的 <code>FixGain</code>;單聲道只要 <code>channels = 1</code>。</p>
+<h2>5. 輸入 gain — <code>sk_scale_f32</code> / <code>sk_clip_f32</code>(<code>simd_kernels.h</code>)</h2>
+<p><code>common</code> 沒有獨立的 gain 模組;輸入電平調整用 <code>utility/simd_kernels.h</code> 的兩個核心自己組(這是 §8 所述「一般不要直接呼叫」的例外:形狀剛好吻合時才用)。<code>sk_scale_f32(out, x, g, n)</code> 做 <code>out[i] = x[i] * g</code>(單一 broadcast 增益,<code>out == x</code> 可);<code>sk_clip_f32(x, lo, hi, n)</code> 就地夾限。多聲道由呼叫端對每個聲道各呼叫一次;單聲道就是一次呼叫。</p>
 <div class="tblwrap"><table>
 <tr><th>項目</th><th>契約 / 效果</th></tr>
-<tr><td>聲道</td><td>多聲道,per-channel gain 表</td></tr>
-<tr><td>Clipping</td><td>選配 <code>enable_clip</code> + <code>clip_value</code></td></tr>
-<tr><td>執行期改值</td><td><b>不行</b>——沒有 retune 路徑,改值要重建 instance</td></tr>
-<tr><td>怪癖</td><td><code>global_gain</code> 剛好為 <code>0</code> 會被<b>改寫成 1.0</b> 而非靜音。要靜音請用 <code>enable</code> 旗標</td></tr>
+<tr><td>聲道</td><td>核心只處理連續的 <code>n</code> 個 float,沒有聲道概念;per-channel 增益由呼叫端的迴圈決定</td></tr>
+<tr><td>Clipping</td><td>另呼叫 <code>sk_clip_f32</code>(先比下界、再比上界);要不要夾、夾在哪由呼叫端決定</td></tr>
+<tr><td>執行期改值</td><td>核心無狀態,每次呼叫可傳不同的 <code>g</code>、<code>lo</code>、<code>hi</code></td></tr>
+<tr><td>增益為 0</td><td>就是乘以 0(輸出全 0),沒有被改寫成 1.0 的特例</td></tr>
 </table></div>
 <div class="warn"><b>Gain 設定會直接改變 AEC 行為。</b>把輸入 gain 調到讓 ref 常態接近滿刻度,會觸發 AEC 的飽和偵測(<code>saturation_threshold</code> 預設 0.95)並讓線性模型失準 → ERLE 下降。調 gain 之後請重新確認回音消除量。</div>
 

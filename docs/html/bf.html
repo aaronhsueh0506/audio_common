@@ -110,13 +110,13 @@ void beam_hop(BF *bf, const Complex *const *X, float doa_s, int vad_out, const i
 <p class="small">BF 沒有取樣延遲(同 hop 輸入、同 hop 輸出)。RLS 的收斂速度由 <code>lambda</code> 與更新次數決定,更新次數 = 滿足 <code>allow_adapt</code>、<code>adapt_interval</code>、遮罩三道門的 hop 數;swimlane 見 <a href="spatial_chain.html">空間鏈</a>。</p>
 
 <h2>參數表</h2>
-<p class="small">分類準則同 <a href="doa_srp.html">DOA/SRP</a>。BF <b>沒有任何執行期 setter</b>,所有設定在 <code>bf_init</code> 時固定。「4ch 單元」欄是專案內整合者在 <code>audio_pipeline_4ch_default_config</code> 使用的值,僅供參考。</p>
+<p class="small">分類準則同 <a href="doa_srp.html">DOA/SRP</a>。BF <b>沒有任何執行期 setter</b>,所有設定在 <code>bf_init</code> 時固定。「sample beam」欄是專案內 sample helper 的 <code>mcab_sample_beam_default_params()</code>(<code>Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab_sample_beam.c</code>)使用的值,僅供參考。</p>
 <h3>外部(<code>BF_Config</code>)</h3>
 <div class="tblwrap"><table>
-<tr class="ext"><th>欄位</th><th>範圍(程式碼驗證)</th><th>作用與取捨</th><th>4ch 單元</th></tr>
+<tr class="ext"><th>欄位</th><th>範圍(程式碼驗證)</th><th>作用與取捨</th><th>sample beam</th></tr>
 <tr><td><code>enable</code></td><td>int,非 0 為開</td><td>0 時整個 BF 旁路,輸出 = <code>X[0]</code>(每 hop 只剩一次複製)。記憶體不變(pool 仍照 M、F 配置)</td><td>1</td></tr>
-<tr><td><code>lambda</code></td><td>有限,<code>(0, 1]</code></td><td>RLS 遺忘因子,<b>單位是「每次 RLS 更新」</b>。BF 內部不做任何時間換算;4ch 單元的 0.995 是以 10 ms 一次更新為基準調出來的,傳入前依 <code>hop × 更新間隔</code> 換算(0.995 是單元層的約定,不是 BF 的預設)</td><td>0.995(單元層,再換算)</td></tr>
-<tr><td><code>mu</code></td><td>有限(BF 只要求有限;4ch 單元另外要求 <code>&gt;= 0</code>)</td><td>權重更新步長倍率,乘在 RLS 增益上。0 = 不學(只剩 leak)。notebook 模式下被忽略</td><td>0.1</td></tr>
+<tr><td><code>lambda</code></td><td>有限,<code>(0, 1]</code></td><td>RLS 遺忘因子,<b>單位是「每次 RLS 更新」</b>。BF 內部不做任何時間換算;helper 的 <code>bf_lambda</code> 預設 0.995 是以 10 ms 一次更新為基準,傳入前由 helper 依 <code>hop × 有效更新間隔</code> 換算(0.995 是 helper 層的約定,不是 BF 的預設)</td><td>0.995(helper 層,再換算)</td></tr>
+<tr><td><code>mu</code></td><td>有限(BF 只要求有限;sample helper 另外要求 <code>&gt;= 0</code>)</td><td>權重更新步長倍率,乘在 RLS 增益上。0 = 不學(只剩 leak)。notebook 模式下被忽略</td><td>0.1</td></tr>
 <tr><td><code>enable_fix_mode</code> / <code>fixed_doa_rad</code></td><td>int;<code>fixed_doa_rad</code> 在固定模式下必須有限</td><td>1 = 波束固定指向 <code>fixed_doa_rad</code>,<code>doa_s</code> 被忽略(包含 NaN)。適合方向已知的裝置</td><td>0 / 0</td></tr>
 <tr><td><code>adapt_interval</code></td><td>int,<code>&lt;= 0</code> 改為 1</td><td>每 N 個 frame 做一次 RLS 更新,輸出仍每個 frame 都算;省算量,收斂變慢</td><td>1</td></tr>
 </table></div>
