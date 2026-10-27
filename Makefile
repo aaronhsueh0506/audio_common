@@ -127,7 +127,7 @@ VAD_OBJS = $(OBJ_DIR)/masker.o $(OBJ_DIR)/vad.o $(OBJ_DIR)/vad_api.o
 .DEFAULT_GOAL := all
 .PHONY: all libs lib libspatial_common.a libdoa.a libbf.a libvad.a \
         clean bench-masker \
-        test test_spatial_third_party audit-no-bf-test-symbols \
+        test test-ubsan test_spatial_third_party audit-no-bf-test-symbols \
         print-bin-dir print-obj-dir print-spatial-common-lib-path \
         print-doa-lib-path print-bf-lib-path print-vad-lib-path \
         audit-no-stdio _cfg_guard
@@ -225,6 +225,11 @@ audit-no-bf-test-symbols: $(BF_LIB)
 
 test: audit-no-bf-test-symbols $(BIN_DIR)/test_spatial_third_party
 	"$(abspath $(BIN_DIR))/test_spatial_third_party"
+
+# The same gate rebuilt (this archive set and common's) under -fsanitize=undefined; EXTRA_CFLAGS is part of the
+# build signature, so the instrumented objects get their own directories next to the plain ones.
+test-ubsan:
+	+$(MAKE) test EXTRA_CFLAGS='$(EXTRA_CFLAGS) -fsanitize=undefined -fno-sanitize-recover=all'
 
 test_spatial_third_party: $(BIN_DIR)/test_spatial_third_party
 

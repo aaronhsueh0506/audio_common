@@ -10,6 +10,20 @@ smoother, beamformer and VAD sources that used to vendor under
 `Audio_ALG/pipelines/third_party/`. This file records changes to `audiolib`
 as a whole from this point on.
 
+## [Unreleased] — 2026-10-27 — Spatial third-party test: steering golden with a tolerance; `make test-ubsan`
+
+No product code changed.
+
+### Fixed
+- `tests/test_spatial_third_party.c` failed under `-fsanitize=undefined` with "heap SRP a_array matches the plane-wave
+  steering golden". The compiler may serve a `cosf`/`sinf` pair through the fused `sincosf` entry point in one translation
+  unit and through two separate calls in another (an instrumented build does this for `srp.c`), and the two differ by one
+  ulp at one point. The steering-golden spot check now compares with a tolerance of `4 * FLT_EPSILON`; a flipped phase sign
+  or a `tau` scaled by 1.0001 in `srp.c` still fails it. The heap-versus-pool comparison stays bit exact.
+
+### Added
+- `make test-ubsan`: reruns `make test` with `-fsanitize=undefined -fno-sanitize-recover=all` in its own build directories.
+
 ## [Unreleased] — 2026-10-24 — Unused functions removed
 
 Everything below had no caller in `audiolib`, `AEC`, `NR`, `Audio_ALG` or the board samples other than tests of the

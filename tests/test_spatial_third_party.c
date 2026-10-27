@@ -5,6 +5,7 @@
  * paths bin for bin.
  */
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -40,6 +41,9 @@ static float random_signed(void) {
 static float complex_error(Complex a, Complex b) {
     return fmaxf(fabsf(a.r - b.r), fabsf(a.i - b.i));
 }
+
+/* A few ulp of a unit-magnitude steering component. */
+#define STEER_GOLDEN_TOL (4.0f * FLT_EPSILON)
 
 /* Uniform circular array on caller-owned storage, so no test needs a heap geometry. */
 typedef struct {
@@ -512,7 +516,10 @@ static int test_srp_init_pool_poison_and_bounds(void) {
  * steering vectors and evolve identically across frames with varying VAD, including doa_step()
  * output and the per-bin S_theta/bin_best_idx state. Spot-checks a_array[a][m][f] against a
  * plane-wave steering phase evaluated in this test from the geometry alone, so both constructors
- * are held to one formula that neither of them calls. */
+ * are held to one formula that neither of them calls. The spot-check is a few ulp wide: the
+ * compiler may serve a cosf/sinf pair through the fused sincosf entry point in one translation unit
+ * and through separate calls in another (a UBSan build does), and those differ by one ulp. The
+ * heap-vs-pool comparison stays exact. */
 static int test_srp_heap_vs_pool_byte_equal(void) {
     enum { M = 4, F = 65, NUM_ANGLES = 72, FRAMES = 40 };
     SRP_Config cfg;
@@ -565,11 +572,14 @@ static int test_srp_heap_vs_pool_byte_equal(void) {
                 float phase = -2.0f * M_PI * ((float)f * cfg.sr / cfg.NFFT) * tau;
                 float golden_r = cosf(phase);
                 float golden_i = sinf(phase);
-                CHECK(heap_s->a_array[a][m][f].r == golden_r &&
-                          heap_s->a_array[a][m][f].i == golden_i,
+                Complex golden;
+                golden.r = golden_r;
+                golden.i = golden_i;
+                CHECK(complex_error(heap_s->a_array[a][m][f], golden) <=
+                          STEER_GOLDEN_TOL,
                       "heap SRP a_array matches the plane-wave steering golden");
-                CHECK(pool_s->a_array[a][m][f].r == golden_r &&
-                          pool_s->a_array[a][m][f].i == golden_i,
+                CHECK(complex_error(pool_s->a_array[a][m][f], golden) <=
+                          STEER_GOLDEN_TOL,
                       "pool SRP a_array matches the plane-wave steering golden");
             }
         }
