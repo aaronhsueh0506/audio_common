@@ -11,7 +11,7 @@
 #### 生命週期
 
 純標頭，`static inline`，沒有 handle、沒有初始化、沒有釋放，不需要連結封存檔。
-只需要 `-I<common>` 加上 `-ffp-contract=off`（`utility/` 標頭以 `utility/xxx.h` 引用）。
+需要 `-I<common>/include`（`simd_kernels.h` 會 include `ac_complex.h`）與 `-I<common>`（`utility/` 標頭以 `utility/xxx.h` 引用），並帶 `-ffp-contract=off -fno-math-errno`（見第 3.5 節）。
 
 #### 逐函式簽章與呼叫時機
 
