@@ -10,6 +10,7 @@
  * fast_math.h's special-value table and the NEON sk_fast_sqrt_f32 lane equivalents.
  */
 #include "utility/simd_kernels.h"
+#include "utility/simd_test_mode.h"
 #include "utility/fast_math.h"
 
 #include <stdio.h>
@@ -1872,6 +1873,7 @@ static void bench_noise_update(void) {
 /* ═══════════════════════════════════ main ══════════════════════════════════ */
 
 int main(void) {
+    SK_MATCH_SCALAR_TO_VECTOR_MODE();
     init_special_pool();
 
     test_ema();

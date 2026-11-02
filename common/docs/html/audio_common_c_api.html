@@ -234,8 +234,8 @@ make -C common lib BACKEND=ne10 SIMD=0     # 純量建置</pre>
 &lt;libaudio_common.a&gt; -lm</pre>
 <div class="tblwrap"><table>
 <tr><th>要點</th><th>說明</th></tr>
-<tr><td>FFT 後端</td><td>NE10 是唯一後端;<code>BACKEND</code> 只接受 <code>ne10</code>,目標編譯器為 ARM32／ARM64;NEON FFT 依編譯器能力及 SIMD 自動選路,ARM32 共用微核心保留純量 fallback</td></tr>
-<tr><td>ARM32 旗標</td><td>支援 NEON 時用 <code>EXTRA_CFLAGS=-mfpu=neon-vfpv4</code>(AArch32 ARMv8 用 <code>-mfpu=neon-fp-armv8</code>);單純 <code>-mfpu=neon</code> 沒有硬體 FMA,每個 <code>fmaf()</code> 都變成 libm 呼叫(位元不變,速度慢很多)。ARMv7 Advanced SIMD 會把 subnormal 沖為零並以預設 NaN 取代 NaN payload,所以 ARM32 的 <code>SIMD=1</code> 與 <code>SIMD=0</code> 對這類值可能不同(NE10 NEON FFT，以及具硬體 FMA 核心上的 AEC delay matched filter)</td></tr>
+<tr><td>FFT 後端</td><td>NE10 是唯一後端;<code>BACKEND</code> 只接受 <code>ne10</code>,目標編譯器為 ARM32／ARM64;NEON FFT 依編譯器能力及 SIMD 自動選路,共用微核心由 <code>SK_HAVE_NEON</code> 單一決定(AArch64,以及具 NEON＋FMA 的 ARM32);無 FMA 的 ARM32 保留純量 fallback</td></tr>
+<tr><td>ARM32 旗標</td><td>支援 NEON 時用 <code>EXTRA_CFLAGS=-mfpu=neon-vfpv4</code>(AArch32 ARMv8 用 <code>-mfpu=neon-fp-armv8</code>);單純 <code>-mfpu=neon</code> 沒有硬體 FMA,每個 <code>fmaf()</code> 都變成 libm 呼叫(位元不變,速度慢很多)。ARMv7 Advanced SIMD 會把 subnormal 沖為零並以預設 NaN 取代 NaN payload,所以 ARM32 的 <code>SIMD=1</code> 與 <code>SIMD=0</code> 對這類值可能不同(NE10 NEON FFT，以及具硬體 FMA 的 ARM32 上所有走 NEON 的共用 kernel;NEON 與純量版只對有限且非次正規的輸入逐位元相同)</td></tr>
 <tr><td><code>SIMD_KERNELS_FORCE_SCALAR</code></td><td>archive 與<b>你的</b> TU 的定義狀態必須一致</td></tr>
 <tr><td>禁用</td><td><code>-Ofast</code>／<code>-ffast-math</code> 會改變遞迴 DSP 數值與 parity</td></tr>
 <tr><td>連結驅動器</td><td>archive 內有一個 C++ 目的檔(<code>NE10_fft_generic_int32.cpp</code>),本 repo 的 Makefile 以 <code>$(CXX)</code> 連結;本機用 C 驅動器連結本頁的範例通過,其他工具鏈是否需要額外的 C++ 執行期庫待量測</td></tr>

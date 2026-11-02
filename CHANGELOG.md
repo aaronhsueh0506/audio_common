@@ -10,6 +10,37 @@ smoother, beamformer and VAD sources that used to vendor under
 `Audio_ALG/pipelines/third_party/`. This file records changes to `audiolib`
 as a whole from this point on.
 
+## [Unreleased] — 2026-11-02 — NEON kernels also run on 32-bit ARM (AArch32)
+
+### Changed
+- `SK_HAVE_NEON` (`common/utility/simd_kernels.h`) is true on AArch64 and on 32-bit ARM with `__ARM_NEON` and `__ARM_FEATURE_FMA`
+  (`-mcpu=cortex-a32/a53/a55/a73`, `-mfpu=neon-vfpv4`, `-mfpu=neon-fp-armv8`). Plain `-mfpu=neon` (no FMA), `SIMD=0` and
+  `SIMD_KERNELS_FORCE_SCALAR` keep the scalar twins. AArch64 behaviour is unchanged.
+- `common/utility/simd_kernels.h` carries stand-ins for the AArch64-only intrinsics the kernels use (`vdivq_f32`, `vsqrtq_f32`, `vrndmq_f32`,
+  `vaddvq_f32`, `vmaxvq_f32`, `vpaddq_f32`, `vaddvq_u32`/`vmaxvq_u32`/`vminvq_u32`, `vminvq_u8`, `vaddlvq_u8`, `vceqzq_s32`,
+  `vzip1q_f32`/`vzip2q_f32`), aliased only when `!__aarch64__`. Division and square root are exact per-lane operations, never
+  reciprocal estimates; across-lane float adds keep AArch64's `(l0+l1)+(l2+l3)` order.
+- New `SK_NEON_BACKEND_NAME` (`"aarch64-neon"`, `"aarch32-neon"`, or `"scalar"` without NEON) is the label every `*_simd_backend()` and
+  test banner reports, so one build no longer mixes labels. `vrndmq_f32` is aliased to the per-lane stand-in unless the
+  ARMv8 floating-point unit is present (`__ARM_FEATURE_NUMERIC_MAXMIN`; `-mfpu=neon-fp-armv8`, the default of
+  `-mcpu=cortex-a32/a53/a55/a73`), which keeps the native instruction. An ARMv8 core built with `-mfpu=neon-vfpv4` uses the stand-in.
+
+### Known limit
+- The 32-bit ARM vector unit always flushes subnormals to zero and returns the default NaN, while scalar VFP follows FPSCR. A NEON
+  kernel equals its scalar twin there only for finite, non-subnormal inputs. `SK_MATCH_SCALAR_TO_VECTOR_MODE()` (new test-only header
+  `common/utility/simd_test_mode.h`; sets FPSCR.FZ/DN on 32-bit ARM, no-op elsewhere, also in a forced-scalar build) lets a test compare
+  the two; library code never includes it.
+
+### Fixed
+- `wav_finalize_write` (`include/wav_io.h`) also checks `ferror()` on the stream before `fclose`. On glibc a `fopencookie` stream in unbuffered
+  mode reports a full `fwrite` count and a successful `fclose` even though its write callback failed, so the failure went unnoticed;
+  `test_wav_io` (header-write-failure case) failed on glibc for that reason, on 32-bit and 64-bit ARM alike.
+
+### Tests
+- New `common/test/simd_a32_shim_selftest.c` (every stand-in against a lane-by-lane reference, and on AArch64 against the real
+  intrinsic). `simd_selftest`, `simd_nn_selftest` and `test_stft` call `SK_MATCH_SCALAR_TO_VECTOR_MODE()` first. Run natively under an
+  ARM32 gcc 12 container (qemu) for `-mcpu=cortex-a53`, `-mcpu=cortex-a32`, `-mfpu=neon-vfpv4`, `-mfpu=neon` and `SIMD=0`.
+
 ## [Unreleased] — 2026-10-27 — Spatial third-party test: steering golden with a tolerance; `make test-ubsan`
 
 No product code changed.

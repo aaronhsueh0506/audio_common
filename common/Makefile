@@ -433,6 +433,12 @@ selftest: $(LIB) test_stft test_stft_guard test_heap_alignment | _cfg_guard
 	$(CC) -o $(BIN_DIR)/simd_nn_selftest $(OBJ_DIR)/simd_nn_selftest.o $(LDFLAGS)
 	@echo "--- common NN SIMD kernel selftest [$(BACKEND)] ---"
 	@$(BIN_DIR)/simd_nn_selftest
+	# simd_kernels.h AArch32 stand-ins selftest: the AArch32 stand-ins for the AArch64-only intrinsics against a C
+	# reference (and, on AArch64, against the real intrinsics). Skips itself on targets without NEON.
+	$(CC) $(CFLAGS) -ffp-contract=off -fstrict-aliasing -MD -MP -c -o $(OBJ_DIR)/simd_a32_shim_selftest.o test/simd_a32_shim_selftest.c
+	$(CC) -o $(BIN_DIR)/simd_a32_shim_selftest $(OBJ_DIR)/simd_a32_shim_selftest.o $(LDFLAGS)
+	@echo "--- common AArch32 NEON shim selftest [$(BACKEND)] ---"
+	@$(BIN_DIR)/simd_a32_shim_selftest
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_audio_utilities.o test/test_audio_utilities.c
 	$(LINK) -o $(BIN_DIR)/test_audio_utilities $(OBJ_DIR)/test_audio_utilities.o $(LIB) $(LDFLAGS)
 	@echo "--- common resampler test [$(BACKEND)] ---"

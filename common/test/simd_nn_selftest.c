@@ -9,6 +9,7 @@
  * report-only timing section.
  */
 #include "utility/simd_kernel_nn.h"
+#include "utility/simd_test_mode.h"
 
 #include <float.h>
 #include <math.h>
@@ -676,6 +677,7 @@ static void bench(void) {
 }
 
 int main(void) {
+    SK_MATCH_SCALAR_TO_VECTOR_MODE();
     test_all_finite();
     test_rows_all_finite();
     test_fill_mul_power();

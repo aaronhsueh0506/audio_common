@@ -94,8 +94,13 @@ NE10 uses NEON when `__ARM_NEON` is available; otherwise it uses its scalar C
 FFT. `SIMD=0` always selects C. ARM32 uses the level-1 RFFT configuration,
 matching the existing ARM64 algorithm. Non-ARM targets remain unsupported.
 
-Shared DSP/spatial SIMD kernels require AArch64 instructions and retain their
-scalar fallbacks on ARM32, including an ARM32 NEON FFT build. ARM32 targets
+Shared DSP/spatial SIMD kernels use NEON on AArch64 and on 32-bit ARM that has
+NEON plus fused multiply-add (`-mcpu=cortex-a32/a53/a55/a73`,
+`-mfpu=neon-vfpv4`, `-mfpu=neon-fp-armv8`). The single gate is `SK_HAVE_NEON` in
+`utility/simd_kernels.h`; the few AArch64-only intrinsics the kernels use come
+from stand-ins in the same `utility/simd_kernels.h` on 32-bit ARM (exact per-lane `/` and `sqrtf`,
+never reciprocal estimates). 32-bit ARM with plain `-mfpu=neon` (no FMA), or any
+build with `SIMD=0` / `SIMD_KERNELS_FORCE_SCALAR`, keeps the scalar twins. ARM32 targets
 use correctly-rounded `sqrtf` (VSQRT on VFP, libm on soft-float), matching the ARM64 sqrt policy rather
 than the portable Newton approximation. Keep the same dispatch/ABI for byte
 regressions; cross-ABI or NEON/C FFT results need numerical tolerance.
@@ -113,9 +118,15 @@ again for each ABI; pointers change native layouts.
 
 ARMv7 Advanced SIMD flushes subnormal inputs and results to zero and returns the
 default NaN instead of propagating a payload. On ARM32 `SIMD=1` and `SIMD=0` can
-therefore differ for subnormal or NaN-payload values. Only the NE10 NEON FFT and, on cores with fused FMA (`-mfpu=neon-vfpv4`), the AEC delay
-matched-filter kernels are affected; every other kernel is plain C on ARM32 and follows the
-VFP rules in both modes.
+therefore differ for subnormal or NaN-payload values, and a NEON kernel equals
+its scalar twin on ARM32 only for finite, non-subnormal inputs (the AArch32
+stand-ins in `simd_kernels.h` are bit-exact under the same condition). A test
+that compares a NEON kernel with its scalar twin includes `utility/simd_test_mode.h` and calls
+`SK_MATCH_SCALAR_TO_VECTOR_MODE()` once at the start of `main`; it sets
+FPSCR.FZ/DN on 32-bit ARM, also in a `SIMD_KERNELS_FORCE_SCALAR` build, and is a
+no-op elsewhere. Library code never calls it. `test/simd_a32_shim_selftest.c`
+checks every stand-in against a lane-by-lane reference (and, on AArch64, against
+the real intrinsic).
 
 ## FP-contraction policy
 

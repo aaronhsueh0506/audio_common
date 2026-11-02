@@ -3,6 +3,7 @@
  * pure arithmetic matches NaN classification but not payload bits. Operation order is fixed and including units are compiled with
  * -ffp-contract=off: ordinary mul/add stay separate, explicit fmaf stays fused, no frecpe/frsqrte estimates, no reassociation;
  * the correctly rounded vsqrtq_f32 is used directly. SIMD_KERNELS_FORCE_SCALAR selects the scalar twins.
+ * On 32-bit ARM the same holds for finite, non-subnormal values: the vector unit flushes subnormals (see the stand-ins below).
  * In-place use (out == input) is supported only where a kernel says so; partial overlap never is. */
 
 #ifndef SIMD_KERNELS_H
@@ -15,11 +16,150 @@
 
 #include "ac_complex.h"    /* Complex { float r; float i; }, interleaved */
 
-#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(SIMD_KERNELS_FORCE_SCALAR)
+/* The one decision point for every NEON path in the libraries, the same on AArch64 and 32-bit ARM: NEON
+ * with fused multiply-add. The kernels use vfmaq_f32 to match the scalar twins' explicit fmaf bit for bit
+ * (vmlaq_f32 rounds twice), and the intrinsic does not exist without FMA. AArch64 always has it (the
+ * __aarch64__ term only covers a compiler that omits the macro); 32-bit ARM has it with VFPv4 or ARMv8
+ * (-mcpu=cortex-a32/a53/a55/a73, -mfpu=neon-vfpv4 / neon-fp-armv8). Plain -mfpu=neon keeps the scalar
+ * twins. The AArch64-only intrinsics the kernels use are supplied by the stand-ins below on 32-bit ARM. */
+#if defined(__ARM_NEON) && !defined(SIMD_KERNELS_FORCE_SCALAR) && \
+    (defined(__aarch64__) || defined(__ARM_FEATURE_FMA))
 #include <arm_neon.h>
 #define SK_HAVE_NEON 1
+#if defined(__aarch64__)
+#define SK_NEON_BACKEND_NAME "aarch64-neon"
+#else
+#define SK_NEON_BACKEND_NAME "aarch32-neon"
+#endif
 #else
 #define SK_HAVE_NEON 0
+#define SK_NEON_BACKEND_NAME "scalar"
+#endif
+
+/* AArch32 stand-ins for the AArch64-only NEON intrinsics the shared kernels use. Each is built only from the ARMv7
+ * NEON subset or from one scalar operation per lane, and reproduces the AArch64 instruction's result for finite inputs
+ * bit for bit, the same contract the kernels state for their scalar twins:
+ *   - division and square root are the correctly rounded per-lane scalar operations (vdiv.f32, vsqrt.f32), never the
+ *     reciprocal / reciprocal-square-root estimate steps;
+ *   - across-lane float adds use AArch64's order, (l0 + l1) + (l2 + l3);
+ *   - min/max/add reductions of integers are order-insensitive.
+ * A NaN result carries the NaN class but not necessarily the payload bits, as for the other kernels. On AArch32 the
+ * vector instructions flush subnormal operands and results to zero unconditionally and return the default NaN, while
+ * the scalar VFP path follows FPSCR; NEON and scalar twins therefore agree there only for finite, non-subnormal values.
+ * On 32-bit ARM the AArch64 intrinsic names are aliased to the sk_a32_* stand-ins below, so kernels are written once
+ * against the AArch64 names. SK_A32_SHIM_HOST_TEST additionally defines the stand-ins on AArch64 (without the aliases)
+ * so test/simd_a32_shim_selftest.c can compare each one with the real intrinsic. */
+#if defined(__ARM_NEON) && (!defined(__aarch64__) || defined(SK_A32_SHIM_HOST_TEST))
+#include <arm_neon.h>
+#include <math.h>
+#include <stdint.h>
+
+static inline float32x4_t sk_a32_vdivq_f32(float32x4_t a, float32x4_t b) {
+    float32x4_t r = vdupq_n_f32(0.0f);
+    r = vsetq_lane_f32(vgetq_lane_f32(a, 0) / vgetq_lane_f32(b, 0), r, 0);
+    r = vsetq_lane_f32(vgetq_lane_f32(a, 1) / vgetq_lane_f32(b, 1), r, 1);
+    r = vsetq_lane_f32(vgetq_lane_f32(a, 2) / vgetq_lane_f32(b, 2), r, 2);
+    r = vsetq_lane_f32(vgetq_lane_f32(a, 3) / vgetq_lane_f32(b, 3), r, 3);
+    return r;
+}
+
+/* Needs -fno-math-errno (the projects' FP policy) for sqrtf to compile to the instruction. */
+static inline float32x4_t sk_a32_vsqrtq_f32(float32x4_t a) {
+    float32x4_t r = vdupq_n_f32(0.0f);
+    r = vsetq_lane_f32(sqrtf(vgetq_lane_f32(a, 0)), r, 0);
+    r = vsetq_lane_f32(sqrtf(vgetq_lane_f32(a, 1)), r, 1);
+    r = vsetq_lane_f32(sqrtf(vgetq_lane_f32(a, 2)), r, 2);
+    r = vsetq_lane_f32(sqrtf(vgetq_lane_f32(a, 3)), r, 3);
+    return r;
+}
+
+/* Round toward minus infinity per lane (a libm call). A core with the ARMv8 floating-point unit (-mfpu=neon-fp-armv8, the
+ * default of -mcpu=cortex-a32/a53/a55/a73) has the native vrndmq_f32, which the build keeps; an ARMv8 core given a VFPv4 FPU
+ * (-mfpu=neon-vfpv4) does not, although its arm_neon.h declares it. */
+static inline float32x4_t sk_a32_vrndmq_f32(float32x4_t a) {
+    float32x4_t r = vdupq_n_f32(0.0f);
+    r = vsetq_lane_f32(floorf(vgetq_lane_f32(a, 0)), r, 0);
+    r = vsetq_lane_f32(floorf(vgetq_lane_f32(a, 1)), r, 1);
+    r = vsetq_lane_f32(floorf(vgetq_lane_f32(a, 2)), r, 2);
+    r = vsetq_lane_f32(floorf(vgetq_lane_f32(a, 3)), r, 3);
+    return r;
+}
+
+static inline float sk_a32_vaddvq_f32(float32x4_t v) {
+    float32x2_t p = vpadd_f32(vget_low_f32(v), vget_high_f32(v));
+    return vget_lane_f32(vpadd_f32(p, p), 0);
+}
+
+static inline float sk_a32_vmaxvq_f32(float32x4_t v) {
+    float32x2_t p = vpmax_f32(vget_low_f32(v), vget_high_f32(v));
+    return vget_lane_f32(vpmax_f32(p, p), 0);
+}
+
+/* [a0 + a1, a2 + a3, b0 + b1, b2 + b3] */
+static inline float32x4_t sk_a32_vpaddq_f32(float32x4_t a, float32x4_t b) {
+    return vcombine_f32(vpadd_f32(vget_low_f32(a), vget_high_f32(a)),
+                        vpadd_f32(vget_low_f32(b), vget_high_f32(b)));
+}
+
+static inline uint32_t sk_a32_vaddvq_u32(uint32x4_t v) {
+    uint32x2_t p = vpadd_u32(vget_low_u32(v), vget_high_u32(v));
+    return vget_lane_u32(vpadd_u32(p, p), 0);
+}
+
+static inline uint32_t sk_a32_vmaxvq_u32(uint32x4_t v) {
+    uint32x2_t p = vpmax_u32(vget_low_u32(v), vget_high_u32(v));
+    return vget_lane_u32(vpmax_u32(p, p), 0);
+}
+
+static inline uint32_t sk_a32_vminvq_u32(uint32x4_t v) {
+    uint32x2_t p = vpmin_u32(vget_low_u32(v), vget_high_u32(v));
+    return vget_lane_u32(vpmin_u32(p, p), 0);
+}
+
+static inline uint8_t sk_a32_vminvq_u8(uint8x16_t v) {
+    uint8x8_t m = vmin_u8(vget_low_u8(v), vget_high_u8(v));
+    m = vpmin_u8(m, m);
+    m = vpmin_u8(m, m);
+    m = vpmin_u8(m, m);
+    return vget_lane_u8(m, 0);
+}
+
+/* Sum of the sixteen bytes, widened (the largest sum, 4080, needs 16 bits). */
+static inline uint16_t sk_a32_vaddlvq_u8(uint8x16_t v) {
+    return (uint16_t)sk_a32_vaddvq_u32(vpaddlq_u16(vpaddlq_u8(v)));
+}
+
+static inline uint32x4_t sk_a32_vceqzq_s32(int32x4_t a) {
+    return vceqq_s32(a, vdupq_n_s32(0));
+}
+
+/* [a0, b0, a1, b1] and [a2, b2, a3, b3] */
+static inline float32x4_t sk_a32_vzip1q_f32(float32x4_t a, float32x4_t b) {
+    return vzipq_f32(a, b).val[0];
+}
+static inline float32x4_t sk_a32_vzip2q_f32(float32x4_t a, float32x4_t b) {
+    return vzipq_f32(a, b).val[1];
+}
+
+#endif /* stand-ins */
+
+#if SK_HAVE_NEON && !defined(__aarch64__)
+#define vdivq_f32   sk_a32_vdivq_f32
+#define vsqrtq_f32  sk_a32_vsqrtq_f32
+#define vaddvq_f32  sk_a32_vaddvq_f32
+#define vmaxvq_f32  sk_a32_vmaxvq_f32
+#define vpaddq_f32  sk_a32_vpaddq_f32
+#define vaddvq_u32  sk_a32_vaddvq_u32
+#define vmaxvq_u32  sk_a32_vmaxvq_u32
+#define vminvq_u32  sk_a32_vminvq_u32
+#define vminvq_u8   sk_a32_vminvq_u8
+#define vaddlvq_u8  sk_a32_vaddlvq_u8
+#define vceqzq_s32  sk_a32_vceqzq_s32
+#define vzip1q_f32  sk_a32_vzip1q_f32
+#define vzip2q_f32  sk_a32_vzip2q_f32
+#if !defined(__ARM_FEATURE_NUMERIC_MAXMIN) /* defined exactly when the ARMv8 FPU (with vrintm) is present */
+#define vrndmq_f32  sk_a32_vrndmq_f32
+#endif
 #endif
 
 /* Keyed on the architecture, not SK_HAVE_NEON, so the scalar sqrt helper stays sqrtf on AArch64 under SIMD_KERNELS_FORCE_SCALAR (as fast_math.h's FM_HAVE_HW_SQRT). */
@@ -100,6 +240,12 @@ static inline void sk_ema_f32_scalar(float *state, const float *x,
     for (i = 0; i < n; ++i) state[i] = alpha * state[i] + beta * x[i];
 }
 
+#if SK_HAVE_NEON && defined(__GNUC__) && !defined(__clang__)
+/* gcc on 32-bit ARM reasons that the scalar tail after the NEON loop cannot reach iteration 2^30 and warns about it
+ * (an error under -Werror); the tail is correct for every n. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Waggressive-loop-optimizations"
+#endif
 #if SK_HAVE_NEON
 static inline void sk_ema_f32(float *state, const float *x,
                                float alpha, float beta, int n) {
@@ -113,6 +259,9 @@ static inline void sk_ema_f32(float *state, const float *x,
     }
     for (; i < n; ++i) state[i] = alpha * state[i] + beta * x[i];
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 #else
 static inline void sk_ema_f32(float *state, const float *x,
                                float alpha, float beta, int n) {

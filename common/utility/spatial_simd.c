@@ -426,9 +426,5 @@ void spatial_pair_score_accumulate(
 
 const char* spatial_simd_backend(void)
 {
-#if THIRD_PARTY_SPATIAL_NEON
-    return "aarch64-neon";
-#else
-    return "scalar";
-#endif
+    return SK_NEON_BACKEND_NAME;
 }

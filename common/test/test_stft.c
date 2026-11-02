@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "utility/simd_test_mode.h"
 #include "audio_stft.h"
 #include "fft_wrapper.h"
 #include "utility/mem_align.h"
@@ -474,6 +475,7 @@ static void test_scaled_entry_points(void) {
 /* ----------------------------- main ----------------------------- */
 
 int main(void) {
+    SK_MATCH_SCALAR_TO_VECTOR_MODE();
     test_windows();
     test_latency();
     test_api_contract();
