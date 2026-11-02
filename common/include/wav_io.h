@@ -409,6 +409,9 @@ static inline int wav_finalize_write(WavWriter* w) {
     uint32_t data_sz = (uint32_t)data_sz64;
     if (fwrite(&data_sz, 4, 1, w->fp) != 1) ok = 0;
 
+    /* fwrite can report a full count on a stream whose write already failed (glibc cookie streams in unbuffered mode,
+     * where fclose then also returns 0); the sticky stream error flag is the reliable signal. */
+    if (ferror(w->fp)) ok = 0;
     if (fclose(w->fp) != 0) ok = 0;
     free(w);
     return ok ? 0 : -1;
