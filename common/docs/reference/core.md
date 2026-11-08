@@ -1,18 +1,15 @@
-> [索引](c_user_manual_zh_TW.md) | [上一部分](c_user_manual_zh_TW.md) | [下一部分](c_user_manual_zh_TW_02_modules_util_io.md) <!-- split-nav -->
-## 5. 逐模組說明
+# FFT、重取樣、高通與 pool
 
-每個模組都用同一套架構說明：**何時使用 → 生命週期 → 逐函式簽章與呼叫時機 → 緩衝區大小規則 → 就地／別名限制 → 錯誤回傳 → 常見錯誤**。
+[C 整合手冊](../c_user_manual_zh_TW.md)
 
----
+## fft_wrapper.h · FFT 包裝層
 
-### 5.1 `fft_wrapper.h` — FFT 包裝層
-
-#### 何時使用
+### 何時使用
 
 需要把時域實數訊號轉到頻域、或把頻域轉回時域時。典型用法是每個 hop 做一次 `fft_forward`，在頻域做處理，再做一次 `fft_inverse`。
 這一組 API 在 heap 路徑與 static pool 路徑上行為一致。
 
-#### 生命週期
+### 生命週期
 
 兩條路徑，選一條，不要混用。
 
@@ -40,7 +37,7 @@ fft_destroy(fft);            /* pool 路徑下是真正的 no-op，重複呼叫�
 
 `fft_get_mem_size()` 回報的位元組數**已包含** NE10 內部的 twiddle／設定資料，`fft_init()` 之後不會再向 heap 要任何記憶體。
 
-#### 逐函式簽章與呼叫時機
+### 逐函式簽章與呼叫時機
 
 ```c
 FftHandle* fft_create(int fft_size);
@@ -73,7 +70,7 @@ void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);
 | `fft_power` | 需要 \|X[k]\|² 時 | `n_freqs` 由 `fft_get_n_freqs()` 取得 |
 | `fft_apply_gain` | 對頻譜逐 bin 套用實數增益（就地） | `gain` 長度 `n_freqs` |
 
-#### 緩衝區大小規則
+### 緩衝區大小規則
 
 | 緩衝區 | 元素型別 | 長度 |
 |---|---|---|
@@ -85,14 +82,14 @@ void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);
 
 static pool 的緩衝區只要 16-byte 對齊即可，不需要更大的對齊。
 
-#### 就地／別名限制
+### 就地／別名限制
 
 - `fft_forward` / `fft_inverse` 的輸入與輸出**不可以重疊**（宣告上帶 `restrict`），重疊是未定義行為。
 - 需要「輸入緩衝區可被覆寫」的語意時用 `_scratch` 版本；它只是**允許**覆寫，不保證一定覆寫，所以呼叫後絕對不要再讀那個緩衝區。
 - `fft_apply_gain` 本來就是就地操作（直接改寫 `freq`）。
 - `fft_power` 的輸入與輸出應視為不可重疊。
 
-#### 錯誤回傳
+### 錯誤回傳
 
 - `fft_create` / `fft_init`：失敗回 `NULL`。
 - `fft_get_mem_size`：`fft_size` 不合法回 `0`。
@@ -100,7 +97,7 @@ static pool 的緩衝區只要 16-byte 對齊即可，不需要更大的對齊�
 - 其餘全為 `void`；傳入 NULL handle 或 NULL 緩衝區時直接 return，不會當機也不會回報。**這代表忘記檢查 `fft_create()` 的回傳值時，後續處理會安靜地什麼都不做，輸出保持原樣。**
 - `fft_destroy`：heap handle 只能釋放一次；pool handle 呼叫幾次都安全。
 
-#### 常見錯誤
+### 常見錯誤
 
 1. 用 `fft_size` 當頻域緩衝區長度（正確是 `n_freqs`），或反過來。
 2. 對 `fft_inverse` 的輸出再除一次 N。
@@ -111,13 +108,13 @@ static pool 的緩衝區只要 16-byte 對齊即可，不需要更大的對齊�
 
 ---
 
-### 5.2 `audio_resampler.h` — 串流重取樣器
+## audio_resampler.h · 串流重取樣器
 
-#### 何時使用
+### 何時使用
 
 輸入取樣率與處理取樣率不同時。它是有狀態的串流式重取樣器：狀態跨 `process()` 呼叫保留，因此把一段音訊切成任意大小的區塊逐塊送進去，得到的輸出與一次送完整段完全相同。
 
-#### 生命週期
+### 生命週期
 
 **Heap 路徑**
 
@@ -141,7 +138,7 @@ audio_resampler_destroy(rs);   /* pool 路徑下為 no-op */
 
 **物件必須在整段串流期間存活。** 每個區塊重建一次會清掉濾波器歷史，在每個區塊邊界產生 artifact。
 
-#### 逐函式簽章與呼叫時機
+### 逐函式簽章與呼叫時機
 
 ```c
 #define AUDIO_RESAMPLER_MAX_CHANNELS 8
@@ -180,7 +177,7 @@ int audio_resampler_latency_input_frames(const AudioResampler* self);
 - 它會盡量處理，直到輸出容量裝不下下一個輸入 frame 可能產生的輸出為止。**若 `*consumed_frames < input_frames`，剩餘輸入沒被消耗，必須在下次呼叫時重送。**
 - 輸入與輸出取樣率相同時是精確的 `memmove` 直通，`consumed == produced == min(input_frames, output_capacity_frames)`。
 
-#### 緩衝區大小規則
+### 緩衝區大小規則
 
 ```c
 /* 輸入：input_frames * channels 個 float */
@@ -192,13 +189,13 @@ if (capacity < 0) { /* handle 為 NULL 或 input_frames 為負，或結果過大
 
 `output_bound()` 給的是保守上界，實際 `produced` 通常會少一點（例如 48 kHz → 16 kHz、480 frames 輸入時，bound 為 161，實際產出 160）。**永遠用 `output_bound()` 的值配置，不要自己用比例推算**，否則在某些相位下會少一個 frame 而導致輸入被截斷。
 
-#### 就地／別名限制
+### 就地／別名限制
 
 - 取樣率**不相同**時，`input` 與 `output` **不可重疊**。
 - 取樣率**相同**時是 `memmove` 直通，重疊是安全的。
 - 依賴這個差異很脆弱：實務上請一律使用兩個不重疊的緩衝區。
 
-#### 錯誤回傳
+### 錯誤回傳
 
 - `create` / `init`：失敗回 `NULL`（取樣率不在白名單、`channels` 不在 `[1, 8]`、pool 未對齊或太小）。
 - `get_mem_size`：參數不合法回 `0`。
@@ -207,7 +204,7 @@ if (capacity < 0) { /* handle 為 NULL 或 input_frames 為負，或結果過大
 - `latency_input_frames`：handle 為 NULL 時回 `-1`。
 - `reset` / `destroy`：`void`，NULL 安全。
 
-#### 常見錯誤
+### 常見錯誤
 
 1. 把 `input_frames` 當成樣本數而不是 frame 數（多通道時緩衝區會少 N 倍）。
 2. 不看 `consumed_frames`，以為每次都會吃完，造成靜默丟資料。
@@ -219,13 +216,13 @@ if (capacity < 0) { /* handle 為 NULL 或 input_frames 為負，或結果過大
 
 ---
 
-### 5.3 `hpf.h` — 二階高通濾波器
+## hpf.h · 二階高通濾波器
 
-#### 何時使用
+### 何時使用
 
 要移除直流偏移、電源哼聲與低頻隆隆聲時，通常放在處理鏈的最前段（麥克風路徑）。逐樣本、就地處理。
 
-#### 生命週期
+### 生命週期
 
 **Heap 路徑**
 
@@ -248,7 +245,7 @@ hpf_destroy(hpf);        /* pool 路徑下為 no-op */
 
 濾波器狀態跨 `hpf_process()` 呼叫保留，物件必須在整段串流期間存活。
 
-#### 逐函式簽章與呼叫時機
+### 逐函式簽章與呼叫時機
 
 ```c
 Hpf*   hpf_create(float cutoff_hz, int sample_rate);
@@ -275,22 +272,22 @@ void   hpf_reset(Hpf* hpf);
 任一條件不滿足（含 `cutoff_hz` 為 NaN 或 Inf）都回 `NULL`，不會產生退化係數。
 例：`sample_rate = 16000` 時上限是 `7200`，`hpf_create(7199.0f, 16000)` 成功，`hpf_create(8000.0f, 16000)` 回 `NULL`。
 
-#### 緩衝區大小規則
+### 緩衝區大小規則
 
 - `data` 是 mono `float` 陣列，長度 `n`。多通道請每個通道各自建立一個 `Hpf` 並各自去交錯後處理。
 - static pool 需求由 `hpf_get_mem_size()` 查詢，不帶參數（尺寸與截止頻率無關）。
 
-#### 就地／別名限制
+### 就地／別名限制
 
 `hpf_process()` **只有**就地模式：它直接改寫 `data`。沒有分離輸出的版本。若需要保留原始訊號，請自己先複製一份。
 
-#### 錯誤回傳
+### 錯誤回傳
 
 - `hpf_create` / `hpf_init`：失敗回 `NULL`。`hpf_init` 在基底位址未對齊時**不會寫入該記憶體**就回 `NULL`。
 - `hpf_get_mem_size`：僅在尺寸算術溢位時回 `0`（實務上不會發生）。
 - `hpf_process` / `hpf_reset` / `hpf_destroy`：`void`。`hpf_process` 在 `hpf` 或 `data` 為 NULL 時安靜 return——**沒濾到任何東西也不會有任何徵兆**。
 
-#### 常見錯誤
+### 常見錯誤
 
 1. 截止頻率設得太靠近 Nyquist（≥ 0.45×fs），`create()` 回 `NULL` 卻沒檢查，之後 `hpf_process()` 全程 no-op，訊號原封不動通過。
 2. 每個區塊重建 `Hpf`，在區塊邊界產生咔聲。
@@ -299,18 +296,18 @@ void   hpf_reset(Hpf* hpf);
 
 ---
 
-### 5.4 `mem_align.h` — static pool 對齊與尺寸算術
+## mem_align.h · static pool 對齊與尺寸算術
 
-#### 何時使用
+### 何時使用
 
 只有在**你自己也要從同一塊 pool 切出物件**、或要自己計算 pool 總需求時才需要 include 它。
 單純呼叫 `X_get_mem_size()` + `X_init()` 的使用者不需要直接用到這個標頭（不過 `ALIGN16()` 在推進 pool 游標時很方便）。
 
-#### 生命週期
+### 生命週期
 
 純巨集與 `static inline` 函式，沒有物件、沒有生命週期、不需要連結封存檔。
 
-#### 逐函式／巨集簽章與呼叫時機
+### 逐函式／巨集簽章與呼叫時機
 
 ```c
 #define ALIGN16(x)            /* 把 x 向上取整到 16 的倍數 */
@@ -346,7 +343,7 @@ size_t my_get_mem_size(int n)
 
 這些檢查過的算術在任何一步溢位時都會飽和到 `SIZE_MAX` 並一路傳遞下去，所以走訪結尾只要檢查一次 `MEM_SIZE_INVALID()` 就能攔截整條鏈。
 
-#### 緩衝區大小規則
+### 緩衝區大小規則
 
 - **pool 基底位址必須至少 16-byte 對齊。** 這是整個函式庫共用的唯一對齊要求；所有 `X_init()` 進入點都會檢查，未對齊直接回 `NULL`。
 - 尺寸查詢與 init 走訪欄位的順序必須完全一致，回報的大小才會跟實際佈局吻合。這對本函式庫已成立；你自己寫的模組要自己維持。
@@ -357,22 +354,18 @@ size_t my_get_mem_size(int n)
 static unsigned char g_pool[POOL_BYTES] __attribute__((aligned(16)));
 ```
 
-#### 就地／別名限制
+### 就地／別名限制
 
 不適用（無資料處理）。
 
-#### 錯誤回傳
+### 錯誤回傳
 
 - `MEM_SIZE_INVALID(total)` 為真代表尺寸算術溢位；此時尺寸查詢**必須**回 `0`（失敗），絕不能回一個被截斷的小數字。
 - 巨集本身不回報錯誤。
 
-#### 常見錯誤
+### 常見錯誤
 
 1. pool 基底沒有對齊到 16 byte（例如 `char pool[N];` 直接用）——所有 `X_init()` 都會回 `NULL`。
 2. 推進游標時用 `cursor += bytes` 而不是 `cursor += ALIGN16(bytes)`，導致下一個物件的基底未對齊。
 3. 把尺寸查詢回傳的 `0` 當成「不需要記憶體」而繼續往下走。
 4. 用一般的 `a * b + c` 算 pool 尺寸而不用 `ck_*`，在極端參數下靜默回繞。
-
----
-
-> [索引](c_user_manual_zh_TW.md) | [上一部分](c_user_manual_zh_TW.md) | [下一部分](c_user_manual_zh_TW_02_modules_util_io.md) <!-- split-nav -->

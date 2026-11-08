@@ -1,19 +1,24 @@
-> [索引](c_user_manual_zh_TW.md) | [上一部分](c_user_manual_zh_TW_01_modules_core.md) | [下一部分](c_user_manual_zh_TW_03_checklist.md) <!-- split-nav -->
-### 5.5 `simd_kernels.h` — per-bin 微核心（純標頭）
+# SIMD 核心、數學函式、WAV 與 STFT
 
-#### 何時使用
+[C 整合手冊](../c_user_manual_zh_TW.md)
+
+<a id="simd-kernels"></a>
+
+## simd_kernels.h · per-bin 微核心（純標頭）
+
+### 何時使用
 
 當你自己的 per-bin／per-sample 迴圈是熱點、而下表剛好有形狀一致的核心時。
 每個核心都有兩個進入點：`sk_<name>()`（在支援的平台上走 NEON）與 `sk_<name>_scalar()`（永遠是純量）。**兩者對任何有限輸入產生逐位元相同的結果**，所以可以在效能與可攜性之間切換而不改變數值輸出。
 
 如果你的迴圈形狀跟下表都不一樣，就不要硬套——直接寫你自己的純量迴圈。神經網路前後處理另有 `simd_kernel_nn.h` 的 `skn_*` 核心（同樣的 scalar 雙胞胎與 `SIMD=0` 規則），不在本手冊逐一列出。
 
-#### 生命週期
+### 生命週期
 
 純標頭，`static inline`，沒有 handle、沒有初始化、沒有釋放，不需要連結封存檔。
 需要 `-I<common>/include`（`simd_kernels.h` 會 include `ac_complex.h`）與 `-I<common>`（`utility/` 標頭以 `utility/xxx.h` 引用），並帶 `-ffp-contract=off -fno-math-errno`（見第 3.5 節）。
 
-#### 逐函式簽章與呼叫時機
+### 逐函式簽章與呼叫時機
 
 ```c
 /* 建置狀態 */
@@ -74,16 +79,16 @@ void sk_cmac_fma_ring_f32(Complex *acc, const Complex *W, const Complex *X_buf,
 
 **選 `sk_*` 還是 `sk_*_scalar`？** 平常一律呼叫不帶後綴的版本，它會自動依建置設定選路。只有在要做「NEON vs 純量」對照驗證時才直接呼叫 `_scalar` 版本。
 
-**數值定義域**：`sk_fast_*` 與 `sk_exp1_approx_f32` 的每個元素行為與 `fast_math.h` 的同名函式完全一致（含定義域邊界值），見[第 5.6 節](c_user_manual_zh_TW_02_modules_util_io.md#56-fast_mathh--快速數學近似純標頭)。
+**數值定義域**：`sk_fast_*` 與 `sk_exp1_approx_f32` 的每個元素行為與 `fast_math.h` 的同名函式完全一致（含定義域邊界值），見[fast_math.h](#fast-math)。
 
-#### 緩衝區大小規則
+### 緩衝區大小規則
 
 - 所有陣列參數的長度都是 `n`，單位是元素數（`float` 或 `Complex`），不是位元組。
 - `Complex` 陣列 `n` 個元素佔 `n * 2 * sizeof(float)` 位元組。
 - **`n` 不需要是 4 的倍數**：每個核心的 NEON 路徑處理完 4 的倍數後，尾端剩餘元素會走與純量版本完全相同的逐元素程式碼。
 - 沒有對齊要求：核心使用不要求對齊的載入／儲存。
 
-#### 就地／別名限制
+### 就地／別名限制
 
 **這是本模組最容易出錯的地方。** 除了下列明確支援的情況，所有指標都假設**互不重疊**。
 
@@ -98,11 +103,11 @@ void sk_cmac_fma_ring_f32(Complex *acc, const Complex *W, const Complex *X_buf,
 
 **部分重疊（`out == x + k`，`k != 0`）在所有核心一律不支援**，即使某次執行看起來正常。
 
-#### 錯誤回傳
+### 錯誤回傳
 
 **沒有錯誤通道。** 所有核心都是 `void`，不檢查 NULL 指標、不檢查 `n` 的範圍。傳入 NULL 會直接當機；傳入負的 `n` 會讓迴圈不執行。呼叫端必須自己保證參數正確。
 
-#### 常見錯誤
+### 常見錯誤
 
 1. include 了這個標頭但 TU 沒加 `-ffp-contract=off`，導致數值與封存檔內的同名邏輯不一致。
 2. 封存檔用 `SIMD=0` 建、自己的 TU 沒定義 `SIMD_KERNELS_FORCE_SCALAR`（或反過來），兩邊走不同路徑。
@@ -112,18 +117,20 @@ void sk_cmac_fma_ring_f32(Complex *acc, const Complex *W, const Complex *X_buf,
 
 ---
 
-### 5.6 `fast_math.h` — 快速數學近似（純標頭）
+<a id="fast-math"></a>
 
-#### 何時使用
+## fast_math.h · 快速數學近似（純標頭）
+
+### 何時使用
 
 在逐樣本／逐 bin 的熱迴圈裡需要 `exp`、`log`、`log10`、`sqrt` 或指數積分 `E1` 時。它們是**有限定義域的近似**，不是 libm 的替代品：精度換速度。
 若你需要標準 libm 的精度與 IEEE 特殊值語意（例如 `sqrtf(-1)` 要得到 NaN），就直接用 libm。
 
-#### 生命週期
+### 生命週期
 
 純標頭，`static inline`，沒有 handle、沒有狀態，不需要連結封存檔。
 
-#### 逐函式簽章與呼叫時機
+### 逐函式簽章與呼叫時機
 
 ```c
 /* 常數 */
@@ -162,7 +169,7 @@ production `fast_log` 以 IEEE-754 range reduction 加 degree-4 minimax 多項�
 
 `exp1_approx` 的數學目標是 Ephraim–Malah MMSE-LSA 增益裡的精確指數積分；production 三段係數則固定採用 Martin、Malah、Cox、Accardi 2004 論文式 (17) 的低複雜度近似，不把它當成可自由 retune 的 NR 參數。
 
-#### 使用方式
+### 使用方式
 
 ```c
 #include "utility/fast_math.h"
@@ -174,19 +181,19 @@ for (int k = 0; k < n_freqs; ++k) {
 }
 ```
 
-#### 緩衝區大小規則
+### 緩衝區大小規則
 
-不適用——全部都是純量對純量的函式。要對整個陣列做同樣運算時，請改用 `simd_kernels.h` 的 `sk_fast_*` 陣列版本（[第 5.5 節](c_user_manual_zh_TW_02_modules_util_io.md#55-simd_kernelsh--per-bin-微核心純標頭)），它們的每元素行為與這裡完全一致。
+不適用——全部都是純量對純量的函式。要對整個陣列做同樣運算時，請改用 `simd_kernels.h` 的 `sk_fast_*` 陣列版本（[simd_kernels.h](#simd-kernels)），它們的每元素行為與這裡完全一致。
 
-#### 就地／別名限制
+### 就地／別名限制
 
 不適用（傳值、傳回值，沒有指標）。
 
-#### 錯誤回傳
+### 錯誤回傳
 
 **沒有錯誤通道。** 所有函式都回傳 `float`，永遠不會失敗、不會 trap、不會產生未定義行為；超出定義域時回傳上表列出的固定邊界值。呼叫端無法從回傳值區分「真的算出這個值」與「輸入超出定義域」，所以請自己保證輸入有效。
 
-#### 常見錯誤
+### 常見錯誤
 
 1. 期待 `fast_sqrt(negative)` 回 NaN（實際回 `0.0f`），因此漏掉本來能靠 NaN 察覺的上游發散問題。
 2. 對 `fast_log(0.0f)` 的結果做算術，得到 `-1e10f` 這個巨大有限值污染後續計算。忘了加 epsilon。
@@ -196,14 +203,14 @@ for (int k = 0; k < n_freqs; ++k) {
 
 ---
 
-### 5.7 `wav_io.h` — WAV 讀寫（純標頭）
+## wav_io.h · WAV 讀寫（純標頭）
 
-#### 何時使用
+### 何時使用
 
 離線工具、測試程式、批次轉檔——需要從磁碟讀入音訊或把處理結果寫成檔案時。
 **不適合即時／嵌入式路徑**：它使用 `stdio`、`malloc`，而且每個樣本一次 `fread`／`fwrite`。
 
-#### 生命週期
+### 生命週期
 
 純標頭（`static inline`），不需要連結封存檔，但物件本身是 `malloc` 出來的，有明確的擁有權規則。
 
@@ -228,7 +235,7 @@ if (wav_finalize_write(w) != 0) { /* 檔案內容不可信 */ }
 
 **擁有權**：`wav_finalize_write()` **無論成功或失敗都會消耗 `w`**（關檔並釋放結構）。呼叫之後不可以再解參考 `w`，也不可以再對同一個指標呼叫 `wav_finalize_write()` 或 `wav_close_write()`。
 
-#### 逐函式簽章與呼叫時機
+### 逐函式簽章與呼叫時機
 
 ```c
 typedef struct { int sample_rate; int channels; int bits_per_sample;
@@ -321,17 +328,17 @@ float32 輸出路徑（`WAV_IO_WRITER_AEC` + `AEC_OUT_FLOAT=1`）是**原始位�
 
 `write_error` 也會被折進 `wav_finalize_write()` 的回傳值，所以只檢查回傳值就足夠；直接讀欄位可以在串流中途就發現問題。
 
-#### 緩衝區大小規則
+### 緩衝區大小規則
 
 - `wav_read_float(r, buf, n)`：`buf` 至少 `n` 個 `float`。因為只回第一個通道，`buf` 的大小與檔案通道數無關。
 - `wav_write_float(w, buf, n)`：`buf` 至少 `n` 個 `float`。多通道時請自己把資料交錯好後整段送，並確保 `n` 是 `frames * channels`。
 - 檔案總樣本數（每通道）由 `r->info.num_samples` 取得。
 
-#### 就地／別名限制
+### 就地／別名限制
 
 不適用——沒有任何函式會就地改寫呼叫端的緩衝區。`wav_read_float()` 只寫 `buf`，`wav_write_float()` 只讀 `buf`。
 
-#### 錯誤回傳
+### 錯誤回傳
 
 - `wav_open_read`：失敗回 `NULL`（開檔失敗、非 RIFF/WAVE、格式不被接受、標頭與檔案大小不一致等）。失敗時不會留下任何已配置資源。
 - `wav_read_float`：回傳實際讀到的樣本數。`r` 或 `buf` 為 NULL 時回 `0`。回傳值 `< n` 代表已到檔尾或讀取失敗。
@@ -341,7 +348,7 @@ float32 輸出路徑（`WAV_IO_WRITER_AEC` + `AEC_OUT_FLOAT=1`）是**原始位�
 - `wav_finalize_write`：回 `0` 代表標頭寫入與關檔全部成功、且先前沒有任何短寫；回 `-1` 代表任一環節失敗、尺寸病態、或 `w` 為 NULL。**無論回傳什麼，`w` 都已被釋放。**
 - `wav_close_write`：`void`，把上面的結果丟掉。新程式碼請改用 `wav_finalize_write()`。
 
-#### 常見錯誤
+### 常見錯誤
 
 1. 用 `wav_read_float()` 讀立體聲檔案，卻以為會拿到兩個通道的資料（實際只有第 0 通道）。
 2. 呼叫 `wav_finalize_write()` 之後又呼叫 `wav_close_write()`，造成 double free。
@@ -352,15 +359,15 @@ float32 輸出路徑（`WAV_IO_WRITER_AEC` + `AEC_OUT_FLOAT=1`）是**原始位�
 
 ---
 
-### 5.8 `audio_stft.h` — sqrt-Hann STFT／ISTFT
+## audio_stft.h · sqrt-Hann STFT／ISTFT
 
-#### 何時使用
+### 何時使用
 
 需要 50% overlap 的 sqrt-Hann 組幀時：`AcStft` 每次吃 hop = `fft_size/2` 個樣本、吐加窗 rFFT 幀；`AcIstft` 吃一幀頻譜、吐 hop 個完成的樣本。
 
 只需要窗表時可直接 include `audio_window.h`，呼叫 `ac_window_build(w, n)`；`w` 由呼叫端配置 n 個 float，函式不配置記憶體，也不依賴 FFT。`n <= 0` 時不寫入。窗以 float32 的 periodic 公式計算，與 NumPy／PyTorch 的建窗捨入可能不同。`audio_stft.h` 也 include 這個 API，既有呼叫端仍可直接使用。
 
-#### 生命週期
+### 生命週期
 
 只有 static 路徑，沒有 heap、沒有 destroy。
 
@@ -375,7 +382,7 @@ AcIstft *syn = ac_istft_init(pool_s, ss, &cfg);
 
 `cfg.fft`／`cfg.window` 為 NULL 時由 pool 自帶；非 NULL 時借用（handle 的 `n_freqs` 必須等於 `fft_size/2+1`，窗表須維持不變且活得比物件久，一支 handle 可被多個物件循序共用）。
 
-#### 逐函式簽章與呼叫時機
+### 逐函式簽章與呼叫時機
 
 ```c
 void ac_stft_config_default(AcStftConfig* cfg, int fft_size);
@@ -397,24 +404,20 @@ int  ac_istft_flush(AcIstft*, float* out);                                  /* �
 void ac_window_build(float* w, int n);
 ```
 
-#### 緩衝區大小規則
+### 緩衝區大小規則
 
 `center = 1` 時 `ac_stft_push` 的輸出要容納 2 幀（第 f 幀在 `out + f * n_freqs`）；`center = 0` 恆 1 幀。`ac_istft_push` 的輸出要容納 hop 個 float。
 
-#### 就地／別名限制
+### 就地／別名限制
 
 輸出緩衝區不得與輸入重疊；`ac_istft_push` 不修改輸入頻譜。
 
-#### 錯誤回傳
+### 錯誤回傳
 
 `get_mem_size` 回 0、`init` 回 NULL 表示設定不合法（`fft_size` 非 2 的冪或不在 [16, 8192]、`center` 非 0／1、`ola` 不是兩個列舉值之一、借用 handle 大小不符）、pool 太小或未對齊。push／flush 遇 NULL 引數回 0。
 
-#### 常見錯誤
+### 常見錯誤
 
 - `spec_scale`／`ispec_scale` 恰為 `1.0f` 時略過乘法；要縮放就給 `1.0f` 以外的值。
 - 同一個 `AcStft` 不可混用兩種 `center`；`center` 在建立時固定。
 - `AC_OLA_ENV_NORM` 的第 1 幀不吐樣本，`center = 1` 的第 1 次 push 不產出幀；呼叫端自行補第 1 個 hop 的零。
-
----
-
-> [索引](c_user_manual_zh_TW.md) | [上一部分](c_user_manual_zh_TW_01_modules_core.md) | [下一部分](c_user_manual_zh_TW_03_checklist.md) <!-- split-nav -->

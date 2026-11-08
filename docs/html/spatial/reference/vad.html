@@ -1,43 +1,24 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VAD 與頻率遮罩</title>
-<style>
-body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;margin:0 auto;padding:0 1rem 3rem;line-height:1.55;color:#1a1a1a;max-width:70rem}
-nav{padding:.6rem 0;border-bottom:2px solid #2a6;margin-bottom:1rem;font-size:.95rem}
-nav a{margin-right:1rem;color:#164;text-decoration:none;font-weight:600}
-nav a:hover{text-decoration:underline}
-nav .sep{color:#999;margin-right:1rem}
-h1{font-size:1.5rem;border-bottom:1px solid #ccc;padding-bottom:.3rem}
-h2{font-size:1.15rem;margin-top:1.6rem;border-left:4px solid #2a6;padding-left:.5rem}
-h3{font-size:1rem;margin-top:1.1rem;color:#164}
-table{border-collapse:collapse;margin:.6rem 0;font-size:.86rem}
-th,td{border:1px solid #bbb;padding:.25rem .5rem;text-align:left;vertical-align:top}
-th{background:#eef5f0}
-pre{background:#f4f6f5;border:1px solid #dde;padding:.6rem;overflow-x:auto;font-size:.8rem;line-height:1.35}
-code{font-family:ui-monospace,Menlo,monospace;font-size:.86em;background:#f2f2f2;padding:0 .15em}
-pre code{background:none;padding:0}
-.note{background:#fff8e6;border:1px solid #e0c878;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
-.warn{background:#fdeeee;border:1px solid #e0a0a0;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
-.small{font-size:.82rem;color:#555}
-.tblwrap{overflow-x:auto}
-.ext{background:#eaf6ee}
-.int{background:#f6f0e4}
-</style>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VAD 與頻率遮罩 · audiolib</title>
+<link rel="stylesheet" href="../../style.css">
 </head>
 <body>
-<nav><a href="../../../Audio_ALG/docs/html/index.html">index</a><a href="../../../AEC/docs/html/aec.html">aec</a><a href="../../../NR/docs/html/nr.html">nr</a><a href="../../common/docs/html/audio_common.html">common</a><span class="sep">|</span><a href="spatial_chain.html">空間鏈</a><a href="doa_srp.html">DOA/SRP</a><a href="bf.html">BF</a><a href="vad.html">VAD</a><span class="sep">|</span><a href="../../common/docs/html/audio_common_params.html">common 參數</a><a href="../../common/docs/html/audio_common_c_api.html">common API</a><a href="../../common/docs/html/audio_common_detail.html">common 細節</a><span class="sep">|</span><a href="../../../AEC/docs/html/aec_params.html">AEC 參數</a><a href="../../../NR/docs/html/nr_c_api_params.html">NR 參數</a><a href="../../../Audio_ALG/docs/html/pipeline_4ch.html">4ch pipeline</a></nav>
+<nav aria-label="文件導覽"><a href="../../index.html">audiolib 文件</a>
+<a href="../index.html">空間音訊</a></nav>
+<main>
 <h1>VAD 與頻率遮罩(<code>VAD/</code>)</h1>
-<p class="small">對應 <code>audiolib/VAD/vad_api.h</code>(整合者入口)、<code>masker.h</code>(遮罩估計)、<code>vad.h</code>(遮罩轉有聲/無聲)。與 SRP、BF 的串接見 <a href="spatial_chain.html">空間鏈</a>。</p>
+<p class="small">對應 <code>audiolib/VAD/vad_api.h</code>(整合者入口)、<code>masker.h</code>(遮罩估計)、<code>vad.h</code>(遮罩轉有聲/無聲)。與 SRP、BF 的串接見 <a href="../index.html">空間鏈</a>。</p>
 
 <h2>概要</h2>
 <p>單聲道的頻域 VAD,分兩層。<b>masker</b> 對一路頻譜(<code>X_ref</code>,F = NFFT/2+1 個 bin)逐 bin 判斷「這個 bin 現在有沒有語音」,輸出一張 0/1 的頻率遮罩;<b>MaskVAD</b> 把遮罩算成一個有聲/無聲旗標。<code>VADApi</code> 把兩層包成一次呼叫,並同時給出三個東西:<code>raw</code>(遮罩判定,未平滑)、<code>out</code>(經中值與 hangover)、<code>mask</code>(給 SRP 選 bin、給 BF 凍結 bin)。目前 backend 只有 <code>VAD_BACKEND_MASKER</code>。</p>
-<div class="warn">專案內沒有任何 pipeline 實例化 <code>VADApi</code>(只有 <code>tests/</code> 與 <code>make bench-masker</code>),所以<b>沒有產品預設值</b>,也沒有 <code>config_default</code> 函式;本頁範例的數值是示意,未針對實際音訊調校,偵測品質待量測。測試檔(<code>tests/test_spatial_third_party.c:vad_test_config</code>)的 <code>spp_thr = 0.5</code> 只用來驗證 pool 與設定拒絕,不適合直接拿去偵測(原因見下方「<code>spp_thr</code> 的意義」)。</div>
+<p>呼叫端須填入完整的 <code>VADApiConfig</code>。選擇偵測門檻、平滑和 hangover 時，以產品預期的噪聲與語音環境調校。</p>
 
 <h2>如何呼叫使用</h2>
-<p><b>順序</b>:填 <code>VADApiConfig</code>(兩個子設定必須互相一致)→ <code>vad_api_get_mem_size</code>(0 = 被拒)→ 16-byte 對齊 pool → <code>vad_api_init(cfg, mem, n)</code>(注意參數順序:設定在前)→ 每 hop <code>vad_api_process</code> 後讀 <code>get_raw</code>/<code>get</code>/<code>get_mask</code> → <code>vad_api_destroy</code>。heap 路徑 <code>vad_api_create(cfg)</code>。<b>沒有 reset</b>:要重新開始就對同一塊 pool 再呼叫 <code>vad_api_init</code>(init 會先清零)。以下範例已用 <code>-Wall -Wextra -Werror</code> 編譯,並以合成輸入(低振幅噪聲後接一段強頻譜)執行:噪聲段不觸發;語音段開始後 <code>raw</code> 晚 1 hop 變 1、<code>out</code> 再晚 2 hop(中值 k = 5);語音段結束後 <code>out</code> 比 <code>raw</code> 多維持約 hangover + 2 = 10 hop。</p>
+<p><b>順序</b>:填 <code>VADApiConfig</code>(兩個子設定必須互相一致)→ <code>vad_api_get_mem_size</code>(0 = 被拒)→ 16-byte 對齊 pool → <code>vad_api_init(cfg, mem, n)</code>(注意參數順序:設定在前)→ 每 hop <code>vad_api_process</code> 後讀 <code>get_raw</code>/<code>get</code>/<code>get_mask</code> → <code>vad_api_destroy</code>。heap 路徑 <code>vad_api_create(cfg)</code>。<b>沒有 reset</b>:要重新開始就對同一塊 pool 再呼叫 <code>vad_api_init</code>(init 會先清零)。</p>
 <pre><code>#include "vad_api.h"
 
 enum { FFT_N = 256, BINS = FFT_N / 2 + 1 };
@@ -110,7 +91,7 @@ int vad_hop(VADApi *v, const Complex *X0, int *vad_raw, const int **mask)
      |-- vad_api_init(同一塊 pool)  (沒有 reset 函式)
      |-- vad_api_destroy            (pool 路徑不釋放;heap 路徑釋放整塊)
 </pre>
-<p><b>泳道(以 hop 為欄)</b>:<code>hangover = 3</code>、遮罩非空的 hop 為 2–7。數字由本機以 <code>vad_step</code> 餵遮罩量測(<code>mode = 0</code>)。</p>
+<p><b>泳道(以 hop 為欄)</b>:<code>hangover = 3</code>、遮罩非空的 hop 為 2–7。範例採用 <code>mode = 0</code>。</p>
 <pre>
 hop →                 0 1 2 3 4 5 6 7 8 9 10 11 12 13
 raw(遮罩判定)         0 0 1 1 1 1 1 1 0 0  0  0  0  0
@@ -120,7 +101,7 @@ out(中值 k=5 開)      0 0 0 0 1 1 1 1 1 1  1  1  1  0     ← 起點延後 2 
 <p class="small">起點延後 floor(k/2) hop 是因為中值取最近 k 個 raw 的多數(<code>sum &gt;= k/2+1</code>),緩衝初始為 0;<code>out</code> 的終點 = 中值終點 + hangover。</p>
 
 <h2>參數表</h2>
-<p class="small">分類準則同 <a href="doa_srp.html">DOA/SRP</a>。沒有產品先例可循,下列分類依「單位是否固定、是否與 hop 大小耦合」判斷。所有設定在建立時固定,沒有執行期 setter。</p>
+<p class="small">分類準則同 <a href="doa.html">DOA/SRP</a>。所有設定在建立時固定,沒有執行期 setter。</p>
 <h3>外部</h3>
 <div class="tblwrap"><table>
 <tr class="ext"><th>欄位</th><th>範圍(程式碼驗證)</th><th>作用</th></tr>
@@ -145,7 +126,7 @@ out(中值 k=5 開)      0 0 0 0 1 1 1 1 1 1  1  1  1  0     ← 起點延後 2 
 <tr><td><code>MaskEstimator</code>/<code>MaskVAD</code> 結構欄位、<code>med_buf[9]</code></td><td><code>masker.h</code>、<code>vad.h</code></td><td>工作區與狀態,不是 API</td></tr>
 </table></div>
 <h3><code>spp_thr</code> 的意義(由 <code>masker.c</code> 的公式推得,非量測)</h3>
-<p><code>Q = xi − ln(1+xi)</code> 對所有 <code>xi &gt; 0</code> 都大於 0,所以 <code>spp = 1/(1+e<sup>−Q</sup>) &gt; 0.5</code> 等價於 <code>xi &gt; 0</code>,也就是 <code>γ = power/noise_psd &gt; 1</code>。穩態雜訊下仍有相當比例的 bin 功率會高於噪聲 PSD,因此 <code>spp_thr = 0.5</code> 會讓遮罩對雜訊也有一大片 1(本機以低振幅白噪聲餵過,遮罩持續有數十個 bin 為 1,<code>raw</code> 在多數 hop 為 1)。下表是各門檻要求的 <code>γ</code>(數值解 <code>γ−1−ln γ = ln(thr/(1−thr))</code>):</p>
+<p><code>Q = xi − ln(1+xi)</code> 對所有 <code>xi &gt; 0</code> 都大於 0,所以 <code>spp = 1/(1+e<sup>−Q</sup>) &gt; 0.5</code> 等價於 <code>xi &gt; 0</code>,也就是 <code>γ = power/noise_psd &gt; 1</code>。穩態雜訊下仍有相當比例的 bin 功率會高於噪聲 PSD,因此 <code>spp_thr = 0.5</code> 會讓遮罩對雜訊也有一大片 1。下表是各門檻要求的 <code>γ</code>(數值解 <code>γ−1−ln γ = ln(thr/(1−thr))</code>):</p>
 <div class="tblwrap"><table>
 <tr><th><code>spp_thr</code></th><th>0.6</th><th>0.7</th><th>0.8</th><th>0.9</th><th>0.95</th><th>0.99</th></tr>
 <tr><td>需要 <code>γ ≥</code></td><td>2.19(3.4 dB)</td><td>2.92(4.7 dB)</td><td>3.69(5.7 dB)</td><td>4.76(6.8 dB)</td><td>5.68(7.5 dB)</td><td>7.63(8.8 dB)</td></tr>
@@ -166,14 +147,7 @@ out(中值 k=5 開)      0 0 0 0 1 1 1 1 1 1  1  1  1  0     ← 起點延後 2 
 <tr><td>MaskVAD:<code>med_buf[9]</code>、<code>state</code>、<code>hang_cnt</code>、<code>vad_raw/out</code></td><td><code>vad_get_mem_size() = 96 B</code></td><td>caller pool</td></tr>
 <tr><td><code>VADApi</code>(上兩者加外殼)</td><td><code>vad_api_get_mem_size</code>:NFFT=256 為 6,240 B;NFFT=512 為 11,872 B;NFFT=1024 為 23,136 B</td><td>caller pool(單一區塊)</td></tr>
 </table></div>
-<p class="small">ARM64/LP64 本機實測;結構含指標,ARM32 須重新查詢。</p>
-
-<h2>相關檔案與測試</h2>
-<ul class="small">
-<li><code>audiolib/VAD/vad_api.{h,c}</code>、<code>masker.{h,c}</code>、<code>vad.{h,c}</code></li>
-<li><code>audiolib/tests/test_spatial_third_party.c</code>:<code>test_vad_api_refuses_configs_its_modules_cannot_serve</code>、<code>test_vad_api_init_pool_poison_and_bounds</code>、<code>test_vad_api_heap_vs_pool_identical</code>;<code>audiolib/tests/bench_masker.c</code>(<code>make bench-masker</code>,各階段耗時,只報時間)</li>
-<li>頁面:<a href="spatial_chain.html">空間鏈</a>、<a href="doa_srp.html">DOA/SRP</a>、<a href="bf.html">BF</a>、<a href="../../common/docs/html/audio_common.html">common</a>、<a href="../../../Audio_ALG/docs/html/index.html">Audio_ALG 總覽</a></li>
-</ul>
-
+<p class="small">ARM64/LP64。結構含指標,ARM32 須重新查詢。</p>
+</main>
 </body>
 </html>

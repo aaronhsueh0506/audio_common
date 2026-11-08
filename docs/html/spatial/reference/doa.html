@@ -1,36 +1,17 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DOA / SRP-PHAT</title>
-<style>
-body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;margin:0 auto;padding:0 1rem 3rem;line-height:1.55;color:#1a1a1a;max-width:70rem}
-nav{padding:.6rem 0;border-bottom:2px solid #2a6;margin-bottom:1rem;font-size:.95rem}
-nav a{margin-right:1rem;color:#164;text-decoration:none;font-weight:600}
-nav a:hover{text-decoration:underline}
-nav .sep{color:#999;margin-right:1rem}
-h1{font-size:1.5rem;border-bottom:1px solid #ccc;padding-bottom:.3rem}
-h2{font-size:1.15rem;margin-top:1.6rem;border-left:4px solid #2a6;padding-left:.5rem}
-h3{font-size:1rem;margin-top:1.1rem;color:#164}
-table{border-collapse:collapse;margin:.6rem 0;font-size:.86rem}
-th,td{border:1px solid #bbb;padding:.25rem .5rem;text-align:left;vertical-align:top}
-th{background:#eef5f0}
-pre{background:#f4f6f5;border:1px solid #dde;padding:.6rem;overflow-x:auto;font-size:.8rem;line-height:1.35}
-code{font-family:ui-monospace,Menlo,monospace;font-size:.86em;background:#f2f2f2;padding:0 .15em}
-pre code{background:none;padding:0}
-.note{background:#fff8e6;border:1px solid #e0c878;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
-.warn{background:#fdeeee;border:1px solid #e0a0a0;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
-.small{font-size:.82rem;color:#555}
-.tblwrap{overflow-x:auto}
-.ext{background:#eaf6ee}
-.int{background:#f6f0e4}
-</style>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DOA / SRP-PHAT · audiolib</title>
+<link rel="stylesheet" href="../../style.css">
 </head>
 <body>
-<nav><a href="../../../Audio_ALG/docs/html/index.html">index</a><a href="../../../AEC/docs/html/aec.html">aec</a><a href="../../../NR/docs/html/nr.html">nr</a><a href="../../common/docs/html/audio_common.html">common</a><span class="sep">|</span><a href="spatial_chain.html">空間鏈</a><a href="doa_srp.html">DOA/SRP</a><a href="bf.html">BF</a><a href="vad.html">VAD</a><span class="sep">|</span><a href="../../common/docs/html/audio_common_params.html">common 參數</a><a href="../../common/docs/html/audio_common_c_api.html">common API</a><a href="../../common/docs/html/audio_common_detail.html">common 細節</a><span class="sep">|</span><a href="../../../AEC/docs/html/aec_params.html">AEC 參數</a><a href="../../../NR/docs/html/nr_c_api_params.html">NR 參數</a><a href="../../../Audio_ALG/docs/html/pipeline_4ch.html">4ch pipeline</a></nav>
+<nav aria-label="文件導覽"><a href="../../index.html">audiolib 文件</a>
+<a href="../index.html">空間音訊</a></nav>
+<main>
 <h1>DOA / SRP-PHAT(<code>doa/</code>)</h1>
-<p class="small">對應 <code>audiolib/doa/srp.h</code>、<code>srp.c</code>、<code>doa_smoother.{h,c}</code>。與 VAD、BF 的串接見 <a href="spatial_chain.html">空間鏈</a>。</p>
+<p class="small">對應 <code>audiolib/doa/srp.h</code>、<code>srp.c</code>、<code>doa_smoother.{h,c}</code>。與 VAD、BF 的串接見 <a href="../index.html">空間鏈</a>。</p>
 
 <h2>概要</h2>
 <p>SRP-PHAT 方位角估計:對 M 路麥克風的所有 M(M−1)/2 個麥克風對,先算 PHAT 正規化互功率譜(每個 hop 只算一次,與候選角無關),再對 <code>[0, 2π)</code> 上均勻的 <code>num_angles</code> 個候選角,在搜尋頻帶內累積「互功率譜 × 預先算好的 pair steering」的實部,分數最高的角就是 <code>doa_raw</code>。<code>DOA_Smoother</code> 再把 <code>doa_raw</code> 去抖成 <code>doa_s</code>:新方向要連續出現 <code>switch_consec</code> 次才採用。輸出是弧度;<b>NaN 代表沒有值</b>。</p>
@@ -41,7 +22,7 @@ pre code{background:none;padding:0}
 </ul>
 
 <h2>如何呼叫使用</h2>
-<p><b>順序</b>:填 <code>ArrayGeometry</code> 與 <code>SRP_Config</code> → <code>srp_get_mem_size</code>(0 = 被拒)→ 16-byte 對齊的 pool → <code>srp_init</code>(NULL = 失敗)→ 每 hop <code>doa_step</code> 再讀 <code>doa_get_smooth</code>/<code>doa_get_raw</code> → <code>srp_reset</code>(換串流)→ <code>srp_destroy</code>。heap 路徑 <code>srp_create_from_geometry(cfg, geom)</code> 內部用 <code>posix_memalign</code>,沒有 POSIX 的目標請用 <code>srp_init</code>。以下範例已用 <code>-Wall -Wextra -Werror</code> 編譯並以合成平面波執行(輸出 60.0°)。</p>
+<p><b>順序</b>:填 <code>ArrayGeometry</code> 與 <code>SRP_Config</code> → <code>srp_get_mem_size</code>(0 = 被拒)→ 16-byte 對齊的 pool → <code>srp_init</code>(NULL = 失敗)→ 每 hop <code>doa_step</code> 再讀 <code>doa_get_smooth</code>/<code>doa_get_raw</code> → <code>srp_reset</code>(換串流)→ <code>srp_destroy</code>。heap 路徑 <code>srp_create_from_geometry(cfg, geom)</code> 內部用 <code>posix_memalign</code>,沒有 POSIX 的目標請用 <code>srp_init</code>。</p>
 <pre><code>#include &lt;math.h&gt;
 #include "srp.h"
 
@@ -115,7 +96,7 @@ float doa_hop(SRP *s, const Complex *const *X, const int *mask, int vad_raw, int
 <tr><td>跑了 SRP,<code>enable_smoothing = 1</code>,<code>vad_out = 1</code></td><td>新值</td><td>smoother 輸出(首次直接採用;換向要連續 <code>switch_consec</code> 次)</td></tr>
 <tr><td>跑了 SRP,<code>enable_smoothing = 0</code></td><td>新值</td><td>等於 <code>doa_raw</code>(不看 <code>vad_out</code>)</td></tr>
 </table></div>
-<p class="small">swimlane(換向需要幾個 hop)見 <a href="spatial_chain.html">空間鏈</a>。SRP 本身不引入取樣延遲;<code>doa_s</code> 換向需要 <code>switch_consec</code> 次連續的 SRP 觀測,即第一次觀測到新方向後再經 <code>(switch_consec−1) × update_interval</code> hop(<code>vad_raw</code> 持續為 1 時)。</p>
+<p class="small">swimlane(換向需要幾個 hop)見 <a href="../index.html">空間鏈</a>。SRP 本身不引入取樣延遲;<code>doa_s</code> 換向需要 <code>switch_consec</code> 次連續的 SRP 觀測,即第一次觀測到新方向後再經 <code>(switch_consec−1) × update_interval</code> hop(<code>vad_raw</code> 持續為 1 時)。</p>
 
 <h2>參數表</h2>
 <p class="small">分類沿用 AEC/NR 參數面整理的準則:<b>外部</b> = 第三方可決定、有界、效果可預期;<b>衍生</b> = 由陣列與 FFT 格點決定,不是調參;<b>內部</b> = 存在於程式內、技術上可改,但不建議開放。「sample beam」欄是專案內唯一整合者(sample beam helper)的 <code>mcab_sample_beam_default_params()</code>(<code>Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab_sample_beam.c</code>)使用的值,僅供參考。所有 <code>SRP_Config</code> 欄位都是建立時固定。</p>
@@ -142,9 +123,9 @@ float doa_hop(SRP *s, const Complex *const *X, const int *mask, int vad_raw, int
 <div class="tblwrap"><table>
 <tr class="int"><th>項目</th><th>位置</th><th>為什麼不開放</th></tr>
 <tr><td>角度格點 <code>a·2π/A</code>(均勻、0 起算、不含 2π)</td><td><code>srp.c:139</code></td><td>BF 的 <code>doa2index</code> 假設同一個格點;運算順序決定每個 steering 相位的捨入</td></tr>
-<tr><td>使用全部 M(M−1)/2 個麥克風對</td><td><code>srp.c:srp_init</code></td><td>子集合會改變分數尺度與記憶體公式,沒有驗證過</td></tr>
+<tr><td>使用全部 M(M−1)/2 個麥克風對</td><td><code>srp.c:srp_init</code></td><td>子集合會改變分數尺度與記憶體公式,需同步調整</td></tr>
 <tr><td>PHAT 正規化的 <code>1e-8f</code></td><td><code>common/utility/spatial_simd.c:14</code></td><td>編譯期常數;scalar/NEON 共用,改動需同步重驗位元一致性</td></tr>
-<tr><td><code>f_start ≥ 1</code>(排除 DC)與夾限規則</td><td><code>srp.c:217</code></td><td>防止越界;行為已被退化頻帶測試鎖定</td></tr>
+<tr><td><code>f_start ≥ 1</code>(排除 DC)與夾限規則</td><td><code>srp.c:217</code></td><td>防止 bin 索引越界</td></tr>
 <tr><td><code>same_angle</code> 不做 2π 環繞(<code>|a−b| ≤ tol</code>)</td><td><code>doa_smoother.c:4</code></td><td>實作行為:靠近 0 與靠近 2π 的結果會被當成兩個不同方向。改它會改變換向行為,屬演算法變更</td></tr>
 <tr><td>smoother 的 <code>null_value = NaN</code>、<code>vad_out = 0</code> 時清 pending</td><td><code>srp.c:srp_init</code>、<code>doa_smoother.c</code></td><td>與 <code>doa_step</code> 的「維持上一個值」邏輯配套</td></tr>
 <tr><td><code>S_theta</code>、<code>best_score</code>、<code>bin_best_idx</code>、<code>score_scratch</code>、<code>pair_phat</code>、<code>frame_counter</code>(uint64)</td><td><code>SRP</code> 結構</td><td>工作區與狀態,不是 API;<code>bin_best_idx</code> 為 post-gain 保留</td></tr>
@@ -159,14 +140,7 @@ float doa_hop(SRP *s, const Complex *const *X, const int *mask, int vad_raw, int
 </table></div>
 
 <h2>狀態與記憶體</h2>
-<p>SRP 的狀態全部在 caller 的 pool 內(單一區塊,<code>srp_init</code> 先清零再切分,切分後必須剛好用完)。<code>srp_reset</code> 清追蹤狀態但不重算 steering 表。實測大小見 <a href="spatial_chain.html">空間鏈</a> 的記憶體表(A=72、M=4、F=129:758,608 B;ARM64/LP64 量測)。</p>
-
-<h2>相關檔案與測試</h2>
-<ul class="small">
-<li><code>audiolib/doa/srp.h</code>、<code>srp.c</code>、<code>doa_smoother.h</code>、<code>doa_smoother.c</code></li>
-<li><code>audiolib/tests/test_spatial_third_party.c</code>:<code>test_srp_precompute_equivalence</code>、<code>test_srp_score_scratch_band_contract</code>、<code>test_srp_init_pool_poison_and_bounds</code>、<code>test_srp_heap_vs_pool_byte_equal</code>、<code>test_degenerate_band_and_angle_inputs</code>、<code>test_srp_frame_counter_survives_32bit_boundary</code></li>
-<li>頁面:<a href="spatial_chain.html">空間鏈</a>、<a href="bf.html">BF</a>、<a href="vad.html">VAD</a>、<a href="../../common/docs/html/audio_common.html">common</a>、<a href="../../../Audio_ALG/docs/html/index.html">Audio_ALG 總覽</a></li>
-</ul>
-
+<p>SRP 的狀態全部在 caller 的 pool 內(單一區塊,<code>srp_init</code> 先清零再切分,切分後必須剛好用完)。<code>srp_reset</code> 清追蹤狀態但不重算 steering 表。實測大小見 <a href="../index.html">空間鏈</a> 的記憶體表(A=72、M=4、F=129:758,608 B;ARM64/LP64 量測)。</p>
+</main>
 </body>
 </html>

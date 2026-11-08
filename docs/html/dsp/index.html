@@ -1,38 +1,19 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>common (FFT / STFT / HPF / 重取樣)</title>
-<style>
-body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;margin:0 auto;padding:0 1rem 3rem;line-height:1.55;color:#1a1a1a;max-width:70rem}
-nav{padding:.6rem 0;border-bottom:2px solid #2a6;margin-bottom:1rem;font-size:.95rem}
-nav a{margin-right:1rem;color:#164;text-decoration:none;font-weight:600}
-nav a:hover{text-decoration:underline}
-nav .sep{color:#999;margin-right:1rem}
-h1{font-size:1.5rem;border-bottom:1px solid #ccc;padding-bottom:.3rem}
-h2{font-size:1.15rem;margin-top:1.6rem;border-left:4px solid #2a6;padding-left:.5rem}
-h3{font-size:1rem;margin-top:1.1rem;color:#164}
-table{border-collapse:collapse;margin:.6rem 0;font-size:.86rem}
-th,td{border:1px solid #bbb;padding:.25rem .5rem;text-align:left;vertical-align:top}
-th{background:#eef5f0}
-pre{background:#f4f6f5;border:1px solid #dde;padding:.6rem;overflow-x:auto;font-size:.8rem;line-height:1.35}
-code{font-family:ui-monospace,Menlo,monospace;font-size:.86em;background:#f2f2f2;padding:0 .15em}
-pre code{background:none;padding:0}
-.note{background:#fff8e6;border:1px solid #e0c878;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
-.warn{background:#fdeeee;border:1px solid #e0a0a0;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
-.small{font-size:.82rem;color:#555}
-.tblwrap{overflow-x:auto}
-.ext{background:#eaf6ee}
-.int{background:#f6f0e4}
-</style>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>common (FFT / STFT / HPF / 重取樣) · audiolib</title>
+<link rel="stylesheet" href="../style.css">
 </head>
 <body>
-<nav><a href="../../../../Audio_ALG/docs/html/index.html">index</a><a href="../../../../AEC/docs/html/aec.html">aec</a><a href="../../../../NR/docs/html/nr.html">nr</a><a href="audio_common.html">common</a><span class="sep">|</span><a href="audio_common_detail.html">common 細節</a><a href="audio_common_c_api.html">common API</a><a href="audio_common_params.html">common 參數</a><span class="sep">|</span><a href="../../../docs/html/spatial_chain.html">空間鏈</a><a href="../../../docs/html/doa_srp.html">DOA/SRP</a><a href="../../../docs/html/bf.html">BF</a><a href="../../../docs/html/vad.html">VAD</a><span class="sep">|</span><a href="../../../../AEC/docs/html/aec_c_api.html">AEC API</a><a href="../../../../AEC/docs/html/aec_params.html">AEC 參數</a><a href="../../../../NR/docs/html/nr_c_api.html">NR API</a><a href="../../../../NR/docs/html/nr_c_api_params.html">NR 參數</a><a href="../../../../Audio_ALG/docs/html/integration_example.html">串接範例</a></nav>
+<nav aria-label="文件導覽"><a href="../index.html">audiolib 文件</a></nav>
+<main>
 <h1>common — 共用 DSP 層(FFT、STFT/ISTFT、HPF、重取樣)</h1>
+<p><a href="reference/framing.html">STFT 時序、延遲與尾端排空</a> · <a href="reference/api.html">函式、緩衝區與參數</a></p>
 
 <h2>概要</h2>
-<p><code>common</code> 是 AEC / NR / Audio_ALG pipelines 共用的 DSP 底層,位於 sibling checkout <code>audiolib/common/</code>。消費端加入 <code>-I common/include -I common</code>,連結 <code>libaudio_common.a</code>,TU 帶 <code>-ffp-contract=off -fno-math-errno</code>。空間相關模組(SRP、BF、VAD)在同 repo 的 <code>doa/</code>、<code>bf/</code>、<code>VAD/</code>,見 <a href="../../../docs/html/spatial_chain.html">空間鏈</a>。</p>
+<p><code>common</code> 是 AEC / NR / Audio_ALG pipelines 共用的 DSP 底層,位於 sibling checkout <code>audiolib/common/</code>。消費端加入 <code>-I common/include -I common</code>,連結 <code>libaudio_common.a</code>,TU 帶 <code>-ffp-contract=off -fno-math-errno</code>。空間相關模組(SRP、BF、VAD)在同 repo 的 <code>doa/</code>、<code>bf/</code>、<code>VAD/</code>,見 <a href="../spatial/index.html">空間鏈</a>。</p>
 <div class="tblwrap"><table>
 <tr><th>模組</th><th>標頭</th><th>生命週期</th><th>呼叫端要保存</th><th>延遲</th></tr>
 <tr><td>FFT</td><td><code>fft_wrapper.h</code></td><td>heap(<code>create/destroy</code>)或 pool(<code>get_mem_size</code>+<code>init</code>)</td><td>handle(可被多個模組共借,呼叫須循序)</td><td>0,無 warm-up</td></tr>
@@ -43,14 +24,14 @@ pre code{background:none;padding:0}
 <tr><td>標頭型核心</td><td><code>simd_kernels.h</code> 等</td><td>header-only,無狀態</td><td>—</td><td>—</td></tr>
 </table></div>
 <ul>
-<li><b>一個公開 API、一個 FFT 後端</b>:NE10 是唯一後端,依 ARM32／ARM64 編譯目標自動選路;有 NEON 且 <code>SIMD=1</code> 時走 NEON FFT,其餘走 C FFT;<code>BACKEND=ne10</code> 是預設也是唯一接受的值。<code>SIMD=0</code> 保留後端、改走純量 C 核心,與 NEON 路徑只在浮點捨入內一致。同一 <code>SIMD</code> 設定下 heap 與 static 路徑 byte-equal(selftest 實測)。</li>
-<li><b>FP 政策</b>:<code>-ffp-contract=off</code> 是四 repo 統一政策,每個 Makefile 把它放在 CFLAGS 最後,並在 parse 期擋掉 <code>-ffast-math</code>/<code>-Ofast</code>/自帶 <code>-ffp-contract</code> 的覆寫;<code>scripts/audit_fp_contract.sh</code> 用反組譯檢查預期為純量的目的檔沒有自動 FMA。</li>
+<li><b>一個公開 API、一個 FFT 後端</b>:NE10 是唯一後端,依 ARM32／ARM64 編譯目標自動選路;有 NEON 且 <code>SIMD=1</code> 時走 NEON FFT,其餘走 C FFT;<code>BACKEND=ne10</code> 是預設也是唯一接受的值。<code>SIMD=0</code> 保留後端、改走純量 C 核心,與 NEON 路徑只在浮點捨入內一致。同一 <code>SIMD</code> 設定下 heap 與 static 路徑 逐樣本一致。</li>
+<li>呼叫端編譯時使用 <code>-ffp-contract=off -fno-math-errno</code>，讓純標頭核心與 archive 遵循相同的浮點規則。</li>
 <li><b>精度</b>:音訊與頻譜為 float32;HPF 參數邊界驗證以 double 比較。</li>
 <li><b>sqrt-Hann 慣例</b>:window = sqrt(periodic Hann),50% overlap 即 COLA、無需再正規化。<code>ac_window_build(w, n)</code> 提供這張表,公式 <code>sqrtf(0.5f * (1.0f - cosf(2.0f * pi * k / N)))</code>;AEC <code>c_impl/src/pbfdkf.c</code>、NR <code>c_impl/example/main_mem.c</code> 與 Audio_ALG 的 DFN rate bridge 都呼叫它。</li>
 </ul>
 
 <h2>如何呼叫使用</h2>
-<p><b>通則(每個有狀態模組相同)</b>:(1) 填設定;(2) <code>X_get_mem_size(...)</code>,<b>0 永遠代表失敗</b>,不是「不需要記憶體」;(3) 配置 16-byte 對齊的 pool;(4) <code>X_init(pool, bytes, ...)</code>,NULL 代表設定不合法、未對齊或 pool 太小;(5) 每個 block 呼叫處理函式;(6) 換串流時 <code>X_reset</code>;(7) <code>X_destroy</code>(pool 路徑是 no-op,可重複呼叫;heap 路徑只能一次)。物件要活過整段串流,<b>不要逐 block 重建</b>。heap 路徑把 (2)–(4) 換成 <code>X_create(...)</code>。以下範例都已用 <code>-Wall -Wextra -Werror</code> 編譯並執行過。</p>
+<p>採用 caller pool 時，先用模組的 <code>*_get_mem_size</code> 確認非零尺寸，配置 16-byte 對齊的記憶體，再呼叫 <code>*_init</code> 並檢查回傳值。物件與 pool 應存活到串流結束。FFT 沒有逐 hop 的歷史狀態，STFT／ISTFT 的 reset 可清除其分析或合成歷史。</p>
 <h3>FFT</h3>
 <pre><code>#include "fft_wrapper.h"
 
@@ -115,7 +96,7 @@ void chain_reset(Chain *c)                         /* 換串流時;不要在一�
 {
     ac_stft_reset(c-&gt;an); ac_istft_reset(c-&gt;syn); hpf_reset(c-&gt;hpf);
 }</code></pre>
-<p><code>center = 1</code> 與 <code>AC_OLA_ENV_NORM</code>(torch 語意)的差異:第 1 次 push 回 0 幀、第 2 次回 2 幀(<code>spec</code> 要容納 2 幀,第 f 幀在 <code>spec + f * N_FREQS</code>);ENV_NORM 的第 1 幀 <code>ac_istft_push</code> 回 0;收尾用 <code>ac_stft_flush_planar</code> 補尾端 reflect 幀、<code>ac_istft_flush</code> 吐尚在 overlap 內的 hop 個樣本,之後呼叫 reset。完整表格見 <a href="audio_common_detail.html">common 細節</a>。</p>
+<p><code>center = 1</code> 與 <code>AC_OLA_ENV_NORM</code>(torch 語意)的差異:第 1 次 push 回 0 幀、第 2 次回 2 幀(<code>spec</code> 要容納 2 幀,第 f 幀在 <code>spec + f * N_FREQS</code>);ENV_NORM 的第 1 幀 <code>ac_istft_push</code> 回 0;收尾用 <code>ac_stft_flush_planar</code> 補尾端 reflect 幀、<code>ac_istft_flush</code> 吐尚在 overlap 內的 hop 個樣本,之後呼叫 reset。完整表格見 <a href="reference/framing.html">common 細節</a>。</p>
 <h3>重取樣</h3>
 <pre><code>#include "audio_resampler.h"
 
@@ -200,15 +181,7 @@ int rs_block(AudioResampler *rs, const float *in, int in_frames, float *out, int
 <tr><td>HPF</td><td>無 bulk 延遲</td><td>無(初始 state 0)</td></tr>
 <tr><td>重取樣</td><td>降取樣比 r 時 16·r 輸入 frame,升取樣 16 輸入 frame(48k→16k:48;48k→8k:96;16k→48k:16);等取樣率為 0</td><td>輸出與輸入怎麼切塊無關</td></tr>
 </table></div>
-<p class="small">swimlane、I/O 表、跨呼叫狀態大小(實測)與整張延遲矩陣見 <a href="audio_common_detail.html">common 細節</a>。</p>
-
-<h2>相關檔案與測試路徑</h2>
-<ul class="small">
-<li>公開標頭:<code>common/include/{fft_wrapper,audio_window,audio_stft,audio_resampler,hpf,wav_io,ac_complex}.h</code>、<code>common/utility/mem_align.h</code>;實作 <code>common/src/</code>;vendored FFT 後端 <code>common/lib/ne10/</code></li>
-<li>測試(<code>make test</code> 為預設層,<code>make test-full</code> 另加 NEON-vs-C FFT 容差比對與完整建置隔離套件):<code>selftest</code>(round-trip、static-vs-heap、NEON-vs-scalar 逐位元、<code>test_stft</code>、<code>test_stft_guard</code>、<code>test_heap_alignment</code>、<code>test_audio_utils</code>)、<code>test_pool</code>、<code>test_wav</code>、<code>test_wav_nr_style</code>、<code>test_zero_heap</code>、<code>test-fast-sqrt-codegen</code></li>
-<li>頁面:<a href="audio_common_detail.html">common 細節</a>、<a href="audio_common_c_api.html">common API</a>、<a href="audio_common_params.html">common 參數(外部 / 內部)</a>、<a href="../../../docs/html/spatial_chain.html">空間鏈</a>、<a href="../../../../Audio_ALG/docs/html/index.html">Audio_ALG 總覽</a></li>
-<li>文件:<code>common/docs/c_user_manual_zh_TW.md</code>(逐函式手冊)、<code>common/README.md</code>(build / 後端 / FP 政策)</li>
-</ul>
-
+<p class="small">swimlane、I/O 表、跨呼叫狀態大小(實測)與整張延遲矩陣見 <a href="reference/framing.html">common 細節</a>。</p>
+</main>
 </body>
 </html>

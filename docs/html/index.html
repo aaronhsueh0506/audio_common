@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>音訊函式庫 · audiolib</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<main>
+<h1>audiolib 音訊函式庫</h1>
+<h2><a href="dsp/index.html">通用 DSP</a></h2>
+<p>FFT、STFT／ISTFT、重取樣和高通濾波使用 <code>libaudio_common.a</code>。從一個 hop 的 C 呼叫開始，查閱輸出緩衝區大小、第一幀和收尾的行為。</p>
+<h2><a href="spatial/index.html">空間音訊</a></h2>
+<p>呼叫端先對各支麥克風做 FFT。VAD 使用一路頻譜產生遮罩，DOA 和 BF 使用各通道頻譜估計方向並合成波束。此頁附初始化、每 hop 與釋放順序的完整範例。</p>
+<h2>建置</h2>
+<p>在 audiolib 根目錄，用 ARM32 或 ARM64 工具鏈執行所需目標。</p>
+<pre><code>make -C common lib
+make -s -C common print-lib-path
+
+make libspatial_common.a libdoa.a libbf.a libvad.a
+make -s print-bin-dir</code></pre>
+<p>建置及查詢要使用同一組工具鏈與 <code>SIMD</code> 設定。將空間模組的 archive 放在 <code>libspatial_common.a</code> 之前連結，最後加 <code>-lm</code>。</p>
+</main>
+</body>
+</html>
