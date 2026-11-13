@@ -91,7 +91,7 @@ void beam_hop(BF *bf, const Complex *const *X, float doa_s, int vad_out, const i
 <p class="small">BF 沒有取樣延遲(同 hop 輸入、同 hop 輸出)。RLS 的收斂速度由 <code>lambda</code> 與更新次數決定,更新次數 = 滿足 <code>allow_adapt</code>、<code>adapt_interval</code>、遮罩三道門的 hop 數;swimlane 見 <a href="../index.html">空間鏈</a>。</p>
 
 <h2>參數表</h2>
-<p class="small">分類準則同 <a href="doa.html">DOA/SRP</a>。BF <b>沒有任何執行期 setter</b>,所有設定在 <code>bf_init</code> 時固定。「sample beam」欄是專案內 sample helper 的 <code>mcab_sample_beam_default_params()</code>(<code>Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab_sample_beam.c</code>)使用的值,僅供參考。</p>
+<p class="small">分類準則同 <a href="doa.html">DOA/SRP</a>。BF <b>沒有任何執行期 setter</b>,所有設定在 <code>bf_init</code> 時固定。「sample beam」欄是專案內 sample helper 的 <code>array_sample_beam_default_params()</code>(<code>Audio_ALG/pipelines/4ch/array_sample_beam.c</code>)使用的值,僅供參考。</p>
 <h3>外部(<code>BF_Config</code>)</h3>
 <div class="tblwrap"><table>
 <tr class="ext"><th>欄位</th><th>範圍(程式碼驗證)</th><th>作用與取捨</th><th>sample beam</th></tr>

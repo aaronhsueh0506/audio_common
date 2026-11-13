@@ -99,7 +99,7 @@ float doa_hop(SRP *s, const Complex *const *X, const int *mask, int vad_raw, int
 <p class="small">swimlane(換向需要幾個 hop)見 <a href="../index.html">空間鏈</a>。SRP 本身不引入取樣延遲;<code>doa_s</code> 換向需要 <code>switch_consec</code> 次連續的 SRP 觀測,即第一次觀測到新方向後再經 <code>(switch_consec−1) × update_interval</code> hop(<code>vad_raw</code> 持續為 1 時)。</p>
 
 <h2>參數表</h2>
-<p class="small">分類沿用 AEC/NR 參數面整理的準則:<b>外部</b> = 第三方可決定、有界、效果可預期;<b>衍生</b> = 由陣列與 FFT 格點決定,不是調參;<b>內部</b> = 存在於程式內、技術上可改,但不建議開放。「sample beam」欄是專案內唯一整合者(sample beam helper)的 <code>mcab_sample_beam_default_params()</code>(<code>Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab_sample_beam.c</code>)使用的值,僅供參考。所有 <code>SRP_Config</code> 欄位都是建立時固定。</p>
+<p class="small">分類沿用 AEC/NR 參數面整理的準則:<b>外部</b> = 第三方可決定、有界、效果可預期;<b>衍生</b> = 由陣列與 FFT 格點決定,不是調參;<b>內部</b> = 存在於程式內、技術上可改,但不建議開放。「sample beam」欄是專案內唯一整合者(sample beam helper)的 <code>array_sample_beam_default_params()</code>(<code>Audio_ALG/pipelines/4ch/array_sample_beam.c</code>)使用的值,僅供參考。所有 <code>SRP_Config</code> 欄位都是建立時固定。</p>
 <h3>外部(<code>SRP_Config</code> 與 <code>ArrayGeometry</code>)</h3>
 <div class="tblwrap"><table>
 <tr class="ext"><th>欄位</th><th>單位/範圍(程式碼驗證)</th><th>作用與取捨</th><th>sample beam</th></tr>
