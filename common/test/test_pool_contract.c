@@ -312,6 +312,8 @@ static void test_mem_align_helpers(void) {
         cur = 48;
         p1 = NULL;
         CHECK(ck_carve(base, &cur, SIZE_MAX, 16, &p1) == -1 && cur == 48 && p1 == NULL, "ck_carve reports overflow and leaves its outputs");
+        p1 = NULL;
+        CHECK(ck_carve(base, NULL, 1, 4, &p1) == -1 && p1 == NULL, "ck_carve refuses a NULL cursor");
     }
 }
 

@@ -68,10 +68,12 @@ static inline void* ac_pool_carve(AcPoolCursor* cursor, size_t count, size_t ele
 }
 
 /* Size-walk form of the same carve: reserve `count` elements of `elem` bytes at *cursor (aligned first). base == NULL only sizes;
- * with a base, *out receives base + aligned offset. Returns -1 on overflow with *cursor and *out untouched. */
+ * with a base, *out receives base + aligned offset. Returns -1 on overflow or a NULL cursor with *cursor and *out untouched. */
 static inline int ck_carve(unsigned char* base, size_t* cursor, size_t count, size_t elem, void** out) {
-    size_t aligned = ck_align16_size(*cursor);
-    size_t next = ck_add_size(aligned, ck_mul_size(count, elem));
+    size_t aligned, next;
+    if (!cursor) return -1;
+    aligned = ck_align16_size(*cursor);
+    next = ck_add_size(aligned, ck_mul_size(count, elem));
     if (MEM_SIZE_INVALID(next)) return -1;
     if (base && out) *out = base + aligned;
     *cursor = next;

@@ -17,6 +17,7 @@ as a whole from this point on.
   the size-walk `ck_carve()`, and `AC_FNV1A_SEED`/`ac_fnv1a_u32()`/`ac_fnv1a_str()`; `ac_memreq_abi_hash()` folds its ILP32 token through
   `ac_fnv1a_str()`. All static inline; the objects of every other translation unit are byte-identical. `test_pool_contract` covers the helpers and the
   ILP32 token on any host.
+- `audio_resampler_init()` carves its pool with `ac_pool_carve()` (its private `audio_resampler_carve()` was the same allocator). All 25 rate pairs x channel counts give the same pool offsets and contents, and a pool one granule short is still refused. `ck_carve()` returns -1 for a NULL cursor. `simd_selftest.c` and `spatial_complex.h` drop includes nothing in them uses.
 - `bf_init()` ends in `bf_reset()` instead of repeating its field resets. `vad_api_process()` drops the always-true backend guard.
 - `spatial_complex.h` holds the four complex helpers as `static inline`; `spatial_complex.c` is gone, so `libspatial_common.a` carries one member
   (`spatial_simd.o`) and the spatial CFG_SIG changes. `bf.c` calls `sk_csub_f32()` directly. Same IEEE operations under `-ffp-contract=off`.
@@ -27,7 +28,7 @@ as a whole from this point on.
 ### Removed
 - `bf_process()` (use `bf_process_with_weights(..., NULL)`), `ac_stft_get_config()`, `clip_f()`.
 - Write-only state: `BF.first_doa_frame`, `BF.current_doa`, `SRP.last_doa_raw`, `AudioResampler.input_rate`/`output_rate`,
-  `WavReader.data_start`, `WavWriter.data_start`. `sizeof(BF)`/`sizeof(SRP)` and the pool of each `AudioResampler` shrink by 16 bytes; the board
+  `WavReader.data_start`, `WavWriter.data_start`. `sizeof(BF)` shrinks by 16 bytes and `sizeof(SRP)` by 8 (arm64); the BF, SRP and each `AudioResampler` pool shrink by 16 bytes. The board
   samples that link these must be rebuilt.
 
 ## [Unreleased] — 2026-11-02 — NEON kernels also run on 32-bit ARM (AArch32)

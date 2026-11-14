@@ -1,7 +1,6 @@
 #ifndef SPATIAL_COMPLEX_H
 #define SPATIAL_COMPLEX_H
 
-#include <math.h>
 #include "fft_wrapper.h"
 
 static inline Complex spatial_complex_add(Complex a, Complex b)

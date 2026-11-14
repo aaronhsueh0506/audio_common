@@ -18,8 +18,6 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
-#include <float.h>
-#include <time.h>
 
 #include "simd_test_harness.h"
 

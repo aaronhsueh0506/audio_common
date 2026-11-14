@@ -115,20 +115,6 @@ size_t audio_resampler_get_mem_size(int input_rate,
         ? layout.bytes : 0;
 }
 
-static void* audio_resampler_carve(uint8_t** cursor,
-                                   size_t* remaining,
-                                   size_t count,
-                                   size_t item_size)
-{
-    size_t bytes = ck_align16_size(ck_mul_size(count, item_size));
-    void* result;
-    if (MEM_SIZE_INVALID(bytes) || bytes > *remaining) return NULL;
-    result = *cursor;
-    *cursor += bytes;
-    *remaining -= bytes;
-    return result;
-}
-
 #define RS_COEF(self, phase, tap) \
     ((self)->coefficients[(size_t)(phase) * (self)->window + \
                           ((self)->window - 1 - (tap))])
@@ -186,26 +172,22 @@ AudioResampler* audio_resampler_init(void* mem,
 {
     ResamplerLayout layout;
     AudioResampler* self;
-    uint8_t* cursor;
-    size_t remaining;
+    AcPoolCursor cursor;
     if (!mem || !MEM_IS_ALIGNED16(mem) ||
         !audio_resampler_layout(
             input_rate, output_rate, channels, &layout) ||
         mem_size < layout.bytes) {
         return NULL;
     }
-    cursor = (uint8_t*)mem;
-    remaining = mem_size;
-    self = (AudioResampler*)audio_resampler_carve(
-        &cursor, &remaining, 1, sizeof(*self));
+    cursor.ptr = (uint8_t*)mem;
+    cursor.remaining = mem_size;
+    self = (AudioResampler*)ac_pool_carve(&cursor, 1, sizeof(*self));
     if (!self) return NULL;
     memset(self, 0, sizeof(*self));
-    self->coefficients = (float*)audio_resampler_carve(
-        &cursor, &remaining,
-        (size_t)layout.up * layout.window, sizeof(float));
-    self->work = (float*)audio_resampler_carve(
-        &cursor, &remaining,
-        (size_t)channels * layout.work_stride, sizeof(float));
+    self->coefficients = (float*)ac_pool_carve(
+        &cursor, (size_t)layout.up * layout.window, sizeof(float));
+    self->work = (float*)ac_pool_carve(
+        &cursor, (size_t)channels * layout.work_stride, sizeof(float));
     if (!self->coefficients || !self->work) return NULL;
     self->channels = channels;
     self->up = layout.up;
