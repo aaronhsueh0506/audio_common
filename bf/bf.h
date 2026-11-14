@@ -52,8 +52,6 @@ typedef struct {
 
     int initialized;
     int first_doa_found;
-    int64_t first_doa_frame;  /* -1 until the first DOA is found. */
-    float current_doa;
     uint64_t frame_idx;  /* Monotonic per-frame counter. */
 
     float doa_used;
@@ -84,15 +82,8 @@ BF*   bf_init(void* mem, size_t mem_size, int M, int F,
                 int num_angles, Complex*** a_array,
                 const BF_Config* cfg);
 
-/* mask (optional): nonzero = freeze RLS adaptation on that bin; NULL = none. Opposite polarity to srp(). */
-void bf_process(BF* g,
-                 const Complex* const* X,
-                 float doa_s,
-                 int allow_adapt_in,
-                 const int* mask,
-                 Complex* bf_out);
-
-/* bf_process() that also returns the pre-update effective weights: bf_out[f] = sum(effective_weights[m,f] * X[m,f])
+/* One BF hop. mask (optional): nonzero = freeze RLS adaptation on that bin; NULL = none; opposite polarity to srp().
+ * Also returns the pre-update effective weights: bf_out[f] = sum(effective_weights[m,f] * X[m,f])
  * (no conjugation at the call site). effective_weights may be NULL when not needed; bf_out is required. */
 void bf_process_with_weights(BF* g,
                               const Complex* const* X,

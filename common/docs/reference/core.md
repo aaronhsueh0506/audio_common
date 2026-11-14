@@ -318,6 +318,16 @@ static inline size_t ck_add_size(size_t a, size_t b);
 static inline size_t ck_mul_size(size_t a, size_t b);
 static inline size_t ck_align16_size(size_t x);
 static inline size_t ck_field_size(size_t total, size_t count, size_t elem_size);
+static inline size_t ck_field_size_reps(size_t total, size_t count, size_t elem_size, size_t reps);
+
+typedef struct AcPoolCursor { uint8_t* ptr; size_t remaining; } AcPoolCursor;
+static inline void*  ac_pool_carve(AcPoolCursor* cursor, size_t count, size_t element_size);
+static inline int    ck_carve(unsigned char* base, size_t* cursor, size_t count, size_t elem, void** out);
+
+#define AC_FNV1A_SEED UINT32_C(2166136261)
+static inline uint32_t ac_fnv1a_u32(uint32_t h, uint32_t v);
+static inline uint32_t ac_fnv1a_str(uint32_t h, const char* s);
+static inline uint32_t ac_memreq_abi_hash(uint32_t h);
 ```
 
 | 名稱 | 什麼時候用 |
@@ -327,17 +337,47 @@ static inline size_t ck_field_size(size_t total, size_t count, size_t elem_size)
 | `ck_field_size(total, count, elem)` | 累加一個欄位的需求：`total = ck_field_size(total, n, sizeof(float));`。這是尺寸走訪的標準寫法 |
 | `ck_field_size_reps(total, count, elem, reps)` | 連續 `reps` 個大小相同、各自對齊 16 的欄位，一次累加 |
 | `ck_add_size` / `ck_mul_size` / `ck_align16_size` | 需要更細緻的步驟時 |
+| `AcPoolCursor` + `ac_pool_carve(&cursor, count, elem)` | `init` 時依 `get_mem_size` 的走訪順序逐段切 pool。每次取 `ALIGN16(count * elem)` 位元組；`count` 或 `elem` 為 0、乘法溢位、剩餘空間不足時回 `NULL`，且游標不動 |
+| `ck_carve(base, &cursor, count, elem, &out)` | 以位移游標走訪：先把游標對齊 16，再保留 `count * elem` 位元組；`base == NULL` 時只算大小，有 `base` 時 `*out = base + 對齊後位移`。溢位回 `-1`，`*cursor` 與 `*out` 不變。成功回 0 |
+| `AC_FNV1A_SEED`、`ac_fnv1a_u32(h, v)`、`ac_fnv1a_str(h, s)` | 描述子雜湊（FNV-1a 32 位元）：從 `AC_FNV1A_SEED` 起連續折入；`u32` 依低位元組在前折入四個位元組 |
+| `ac_memreq_abi_hash(h)` | 在 32 位元指標目標（`UINTPTR_MAX == UINT32_MAX`）把 `"|abi:ilp32"` 折進呼叫端的雜湊，64 位元目標原值返回。pool 內含原生指標，ARM32 與 ARM64 的描述子因此不同 |
 | `MEM_SIZE_INVALID(total)` | 走訪結束後檢查是否有任何一步溢位 |
 
 自己寫尺寸查詢時的標準形狀：
 
 ```c
+typedef struct { float* gain; int* flag; int n; } MyState;
+
 size_t my_get_mem_size(int n)
 {
     size_t total = 0;
+    if (n <= 0) return 0;
     total = ck_field_size(total, 1, sizeof(MyState));
     total = ck_field_size(total, (size_t)n, sizeof(float));
+    total = ck_field_size(total, (size_t)n, sizeof(int));
     return MEM_SIZE_INVALID(total) ? 0 : total;   /* 溢位時回 0 = 失敗 */
+}
+```
+
+`init` 端依同一走訪順序切出各欄位：
+
+```c
+MyState* my_init(void* mem, size_t mem_size, int n)
+{
+    size_t need = my_get_mem_size(n);
+    size_t head = ALIGN16(sizeof(MyState));
+    AcPoolCursor c;
+    MyState* s;
+    if (!mem || need == 0 || !MEM_IS_ALIGNED16(mem) || mem_size < need) return NULL;
+    memset(mem, 0, need);
+    s = (MyState*)mem;
+    c.ptr = (uint8_t*)mem + head;
+    c.remaining = need - head;
+    s->gain = (float*)ac_pool_carve(&c, (size_t)n, sizeof(float));
+    s->flag = (int*)ac_pool_carve(&c, (size_t)n, sizeof(int));
+    if (!s->gain || !s->flag) return NULL;
+    s->n = n;
+    return s;
 }
 ```
 

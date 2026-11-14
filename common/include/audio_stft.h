@@ -56,8 +56,6 @@ AcStft* ac_stft_init(void* mem, size_t mem_size, const AcStftConfig* cfg);
 void    ac_stft_reset(AcStft* s);
 /** The window table in use (n floats), for sharing with an AcIstft. */
 const float* ac_stft_window(const AcStft* s);
-/** Snapshot of the live analysis config (fields of the other object keep defaults). Returns 0, or -1 for NULL. */
-int ac_stft_get_config(const AcStft* s, AcStftConfig* cfg);
 
 /** Push hop = fft_size / 2 samples. Returns the frames written (0..2); frame f lands at out + f * n_freqs
  * (n_freqs = fft_size / 2 + 1). `out` needs room for 2 frames when center = 1, else 1. */

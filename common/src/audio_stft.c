@@ -160,16 +160,6 @@ void ac_stft_reset(AcStft* s) {
 
 const float* ac_stft_window(const AcStft* s) { return s ? s->window : NULL; }
 
-int ac_stft_get_config(const AcStft* s, AcStftConfig* cfg) {
-    if (!s || !cfg) return -1;
-    ac_stft_config_default(cfg, s->n);
-    cfg->center = s->center;
-    cfg->spec_scale = s->scale;
-    cfg->fft = s->fft;
-    cfg->window = s->window;
-    return 0;
-}
-
 /* Window the segment into s->seg (the segment may be s->seg itself) and run
  * the forward FFT into `out`. */
 static void transform(AcStft* s, const float* segment, Complex* out) {

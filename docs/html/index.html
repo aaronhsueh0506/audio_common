@@ -22,6 +22,11 @@ make -s -C common print-lib-path
 make libspatial_common.a libdoa.a libbf.a libvad.a
 make -s print-bin-dir</code></pre>
 <p>建置及查詢要使用同一組工具鏈與 <code>SIMD</code> 設定。將空間模組的 archive 放在 <code>libspatial_common.a</code> 之前連結，最後加 <code>-lm</code>。</p>
+<h2>驗證</h2>
+<pre><code>make test                       # 空間模組測試，含 audit-no-stdio（四個 archive 不得引用 stdio 符號）
+make -C common selftest         # 通用 DSP
+make -C common test-full        # 另含 audit-fp-contract 與建置隔離，需要旁邊有 AEC 與 NR checkout</code></pre>
+<p>各目標的範圍見 <a href="../../common/docs/reference/build.md">common 建置與驗證</a>。</p>
 </main>
 </body>
 </html>

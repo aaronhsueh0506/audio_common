@@ -26,8 +26,6 @@
 #define AUDIO_RESAMPLER_CHUNK 128
 
 struct AudioResampler {
-    int input_rate;
-    int output_rate;
     int channels;
     int up;
     int down;
@@ -209,8 +207,6 @@ AudioResampler* audio_resampler_init(void* mem,
         &cursor, &remaining,
         (size_t)channels * layout.work_stride, sizeof(float));
     if (!self->coefficients || !self->work) return NULL;
-    self->input_rate = input_rate;
-    self->output_rate = output_rate;
     self->channels = channels;
     self->up = layout.up;
     self->down = layout.down;

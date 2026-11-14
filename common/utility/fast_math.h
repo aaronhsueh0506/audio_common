@@ -215,13 +215,6 @@ static inline float exp1_approx(float v) {
 
 #endif  // USE_STANDARD_MATH
 
-/** Clip value to [min, max]. */
-static inline float clip_f(float x, float min_val, float max_val) {
-    if (x < min_val) return min_val;
-    if (x > max_val) return max_val;
-    return x;
-}
-
 /** Max of two floats. */
 static inline float max_f(float a, float b) {
     return (a > b) ? a : b;

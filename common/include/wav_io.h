@@ -31,7 +31,6 @@ typedef struct {
 typedef struct {
     FILE* fp;
     WavInfo info;
-    long data_start;
     int samples_read;
     /* Float32 source samples that were NaN/Inf and replaced with 0.0f by wav_read_float (0 for PCM16 sources). */
     uint64_t nonfinite_sanitized;
@@ -40,7 +39,6 @@ typedef struct {
 typedef struct {
     FILE* fp;
     WavInfo info;
-    long data_start;
     uint64_t samples_written;
     /* PCM16-path samples that were NaN/Inf and replaced with 0.0f before quantization (float32 mode leaves this at 0). */
     uint64_t nonfinite_sanitized;
@@ -180,7 +178,6 @@ static inline WavReader* wav_open_read(const char* path) {
             if (num_samples64 > (uint64_t)INT_MAX) goto error;
 
             r->info.num_samples = (int)num_samples64;
-            r->data_start = data_pos;
             break;
         } else {
             if (!wav_io_skip_chunk(fp, file_size, chunk_sz)) goto error;
@@ -292,7 +289,6 @@ static inline WavWriter* wav_open_write(const char* path, int sample_rate, int c
         free(w);
         return NULL;
     }
-    w->data_start = 44;
 
     return w;
 }

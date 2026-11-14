@@ -54,8 +54,8 @@ float doa_hop(SRP *s, const Complex *const *X, const int *mask, int vad_raw, int
 /* 換串流:srp_reset(s);結束:srp_destroy(s)(pool 路徑不釋放記憶體) */</code></pre>
 <div class="tblwrap"><table>
 <tr><th>函式</th><th>什麼時候呼叫</th><th>失敗/邊界</th></tr>
-<tr><td><code>srp_get_mem_size(cfg)</code></td><td>init 前一次</td><td>0 = <code>M&lt;=1、F&lt;=1、num_angles&lt;=0</code>,或 <code>sr/NFFT/c</code> 非有限或 &lt;=0,或 <code>low_freq/high_freq</code> 非有限(<code>srp.c:38</code>);此函式拿不到 geom,所以不檢查幾何</td></tr>
-<tr><td><code>srp_init(mem, n, cfg, geom)</code></td><td>一次</td><td>NULL = 上述設定不合法、<code>geom-&gt;M != cfg-&gt;M</code>、<code>geom-&gt;x/y</code> 為 NULL、<code>mem</code> 未 16-byte 對齊、<code>n</code> 不足(<code>srp.c:49,110</code>)。<code>geom</code> 只在 init 內被讀取</td></tr>
+<tr><td><code>srp_get_mem_size(cfg)</code></td><td>init 前一次</td><td>0 = <code>M&lt;=1、F&lt;=1、num_angles&lt;=0</code>,或 <code>sr/NFFT/c</code> 非有限或 &lt;=0,或 <code>low_freq/high_freq</code> 非有限(<code>srp.c:srp_validate_config</code>);此函式拿不到 geom,所以不檢查幾何</td></tr>
+<tr><td><code>srp_init(mem, n, cfg, geom)</code></td><td>一次</td><td>NULL = 上述設定不合法、<code>geom-&gt;M != cfg-&gt;M</code>、<code>geom-&gt;x/y</code> 為 NULL、<code>mem</code> 未 16-byte 對齊、<code>n</code> 不足(<code>srp.c:srp_validate_geometry</code>、<code>srp_init</code>)。<code>geom</code> 只在 init 內被讀取</td></tr>
 <tr><td><code>doa_step(s, X, mask, vad_raw, vad_out)</code></td><td>每 hop 一次</td><td><code>s</code> 或 <code>X</code> 為 NULL 靜默返回。<code>mask</code> 可為 NULL(全部 bin);非 0 表示「該 bin 計入分數」</td></tr>
 <tr><td><code>doa_get_smooth(s)</code> / <code>doa_get_raw(s)</code></td><td><code>doa_step</code> 之後</td><td>NULL 或尚無值回 NaN</td></tr>
 <tr><td><code>srp_reset(s)</code></td><td>換串流、重新開始追蹤</td><td>清 <code>frame_counter</code>、DOA、smoother;steering 表不動</td></tr>
@@ -122,10 +122,10 @@ float doa_hop(SRP *s, const Complex *const *X, const int *mask, int vad_raw, int
 <h3>內部(不建議開放)</h3>
 <div class="tblwrap"><table>
 <tr class="int"><th>項目</th><th>位置</th><th>為什麼不開放</th></tr>
-<tr><td>角度格點 <code>a·2π/A</code>(均勻、0 起算、不含 2π)</td><td><code>srp.c:139</code></td><td>BF 的 <code>doa2index</code> 假設同一個格點;運算順序決定每個 steering 相位的捨入</td></tr>
+<tr><td>角度格點 <code>a·2π/A</code>(均勻、0 起算、不含 2π)</td><td><code>srp.c:srp_init</code>(<code>s-&gt;angles[a]</code>)</td><td>BF 的 <code>doa2index</code> 假設同一個格點;運算順序決定每個 steering 相位的捨入</td></tr>
 <tr><td>使用全部 M(M−1)/2 個麥克風對</td><td><code>srp.c:srp_init</code></td><td>子集合會改變分數尺度與記憶體公式,需同步調整</td></tr>
 <tr><td>PHAT 正規化的 <code>1e-8f</code></td><td><code>common/utility/spatial_simd.c:14</code></td><td>編譯期常數;scalar/NEON 共用,改動需同步重驗位元一致性</td></tr>
-<tr><td><code>f_start ≥ 1</code>(排除 DC)與夾限規則</td><td><code>srp.c:217</code></td><td>防止 bin 索引越界</td></tr>
+<tr><td><code>f_start ≥ 1</code>(排除 DC)與夾限規則</td><td><code>srp.c:srp_init</code>(<code>f_start</code>/<code>f_end</code>)</td><td>防止 bin 索引越界</td></tr>
 <tr><td><code>same_angle</code> 不做 2π 環繞(<code>|a−b| ≤ tol</code>)</td><td><code>doa_smoother.c:4</code></td><td>實作行為:靠近 0 與靠近 2π 的結果會被當成兩個不同方向。改它會改變換向行為,屬演算法變更</td></tr>
 <tr><td>smoother 的 <code>null_value = NaN</code>、<code>vad_out = 0</code> 時清 pending</td><td><code>srp.c:srp_init</code>、<code>doa_smoother.c</code></td><td>與 <code>doa_step</code> 的「維持上一個值」邏輯配套</td></tr>
 <tr><td><code>S_theta</code>、<code>best_score</code>、<code>bin_best_idx</code>、<code>score_scratch</code>、<code>pair_phat</code>、<code>frame_counter</code>(uint64)</td><td><code>SRP</code> 結構</td><td>工作區與狀態,不是 API;<code>bin_best_idx</code> 為 post-gain 保留</td></tr>
@@ -140,7 +140,7 @@ float doa_hop(SRP *s, const Complex *const *X, const int *mask, int vad_raw, int
 </table></div>
 
 <h2>狀態與記憶體</h2>
-<p>SRP 的狀態全部在 caller 的 pool 內(單一區塊,<code>srp_init</code> 先清零再切分,切分後必須剛好用完)。<code>srp_reset</code> 清追蹤狀態但不重算 steering 表。實測大小見 <a href="../index.html">空間鏈</a> 的記憶體表(A=72、M=4、F=129:758,608 B;ARM64/LP64 量測)。</p>
+<p>SRP 的狀態全部在 caller 的 pool 內(單一區塊,<code>srp_init</code> 先清零再切分,切分後必須剛好用完)。<code>srp_reset</code> 清追蹤狀態但不重算 steering 表。實測大小見 <a href="../index.html">空間鏈</a> 的記憶體表(A=72、M=4、F=129:758,592 B;ARM64/LP64 量測)。</p>
 </main>
 </body>
 </html>

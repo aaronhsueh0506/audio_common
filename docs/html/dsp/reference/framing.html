@@ -107,7 +107,7 @@ ac_istft_push 吐出(逐幀)           —(無幀)   0 , hop    hop     ← 第 
 <tr><td><code>AcStft</code></td><td><code>ac_stft_get_mem_size</code>(自帶 FFT 與窗 / 借用兩者):N=256:11,344 / 3,168 B;N=512:21,840 / 6,240 B;N=1024:42,832 / 12,384 B(<code>center</code> 不影響大小)</td><td>C struct(pool)</td><td>最近 N 個樣本的歷史、加窗暫存 <code>seg[N]</code>、FFT 輸出 staging <code>spec[N/2+1]</code>、幀計數(飽和於 3);窗與 FFT 自帶時另佔 pool</td></tr>
 <tr><td><code>AcIstft</code></td><td>ACCUMULATE:與 <code>AcStft</code> 同尺寸;ENV_NORM 多一個 <code>env[N]</code>(自帶 / 借用):N=256:12,368 / 4,192 B;N=512:23,888 / 8,288 B;N=1024:46,928 / 16,480 B</td><td>C struct(pool)</td><td>OLA 累加器 <code>acc[N]</code>(原點 = 下一段輸出)、(ENV_NORM)平方窗包絡 <code>env[N]</code>、反向 FFT 輸出 <code>time[N]</code>、輸入 staging <code>spec[N/2+1]</code>、幀計數(飽和於 2)</td></tr>
 <tr><td><code>Hpf</code>(二階 Butterworth,DF2-transposed)</td><td><code>hpf_get_mem_size()</code> = 32 B(與 cutoff 無關)</td><td>C struct(pool/heap)</td><td>係數 5 個與延遲線 <code>z1, z2</code>(跨樣本 state;<code>hpf_reset</code> 清除)</td></tr>
-<tr><td><code>AudioResampler</code></td><td><code>audio_resampler_get_mem_size(in, out, ch)</code>:48k→16k 單聲道 1,408 B;16k→48k 單聲道 1,184 B;48k→16k 4 聲道 4,128 B;同取樣率單聲道 640 B</td><td>C struct(pool/heap)</td><td>polyphase 係數表與每聲道輸入歷史(block 邊界不變式;<code>reset</code> 只在換流時呼叫)</td></tr>
+<tr><td><code>AudioResampler</code></td><td><code>audio_resampler_get_mem_size(in, out, ch)</code>:48k→16k 單聲道 1,392 B;16k→48k 單聲道 1,168 B;48k→16k 4 聲道 4,112 B;同取樣率單聲道 624 B</td><td>C struct(pool/heap)</td><td>polyphase 係數表與每聲道輸入歷史(block 邊界不變式;<code>reset</code> 只在換流時呼叫)</td></tr>
 <tr><td>fast_math / simd_kernels</td><td>—</td><td>header-only、無 state</td><td>純函式(LUT 為編譯期常數)</td></tr>
 </table></div>
 <p class="small">本 repo 的 common 無 NN/NPU 成分;所有 state 都在上述 C struct 內,host 不需另存。</p>
@@ -119,7 +119,7 @@ ac_istft_push 吐出(逐幀)           —(無幀)   0 , hop    hop     ← 第 
 <li><code>Hpf</code>:IIR biquad,無整體(bulk)延遲、無 warm-up(初始 state 為 0)。</li>
 <li><code>AudioResampler</code>:有濾波器延遲,查 <code>audio_resampler_latency_input_frames()</code>(單位是輸入 frame);等取樣率為精確 pass-through。每個輸出點只由自己的視窗與相位列決定,與輸入如何切塊、輸出容量多大無關;NEON(四 lane 逐塊累加)與 <code>SIMD=0</code>(sequential、最新 tap 先加)求和順序不同,兩者只在 float 誤差內一致。輸入若含非有限樣本,會污染所有濾波視窗涵蓋它的輸出(NEON 另多讀最多 3 個補零 tap,所以 <code>SIMD=0</code> 受污染的輸出略少),請在送進來前攔截。</li>
 </ul>
-<p>重取樣延遲(輸入 frame,呼叫 <code>audio_resampler_latency_input_frames</code> 取得)。公式:降取樣比 r 時為 16·r,升取樣為 16,四捨五入(出處 <code>src/audio_resampler.c:93,541</code>)。</p>
+<p>重取樣延遲(輸入 frame,呼叫 <code>audio_resampler_latency_input_frames</code> 取得)。公式:降取樣比 r 時為 16·r,升取樣為 16,四捨五入(出處 <code>src/audio_resampler.c:audio_resampler_layout</code>、<code>audio_resampler_latency_input_frames</code>)。</p>
 <div class="tblwrap"><table>
 <tr><th>輸入 \ 輸出</th><th>8 kHz</th><th>16 kHz</th><th>24 kHz</th><th>32 kHz</th><th>48 kHz</th></tr>
 <tr><td>8 kHz</td><td>0</td><td>16</td><td>16</td><td>16</td><td>16</td></tr>

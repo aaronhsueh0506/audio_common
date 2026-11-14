@@ -65,7 +65,6 @@ struct SRP {
     int update_interval;
     uint64_t frame_counter;  /* Monotonic per-frame counter. */
 
-    float last_doa_raw;
     float last_doa_s;
 
     /* Unique-pair SRP precompute: pair_steer[a][p][f] = conj(a_array[a][i][f]) * a_array[a][j][f]. */
@@ -96,7 +95,7 @@ SRP* srp_create_from_geometry(
     const ArrayGeometry* geom
 );
 
-/* mask (optional): nonzero = use that bin in the score; NULL = all bins. Opposite polarity to bf_process(). */
+/* mask (optional): nonzero = use that bin in the score; NULL = all bins. Opposite polarity to bf_process_with_weights(). */
 void srp(SRP* s, const Complex* const* X, const int* mask);
 
 float srp2doa(SRP* s);

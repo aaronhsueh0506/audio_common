@@ -40,8 +40,9 @@ Build-membership column legend:
   that file, plus any local patch listed in the Local patches table, e.g. the
   P0004 ISA guards and the P0005 comment edits; not necessarily byte-identical
   to upstream) but excluded from the `BACKEND=ne10` build by the F16
-  source-list trim below; kept for provenance/completeness with the upstream
-  import, not because anything in this repo still needs it.
+  source-list trim below, or a header that no compiled source includes; kept
+  for provenance/completeness with the upstream import, not because anything in
+  this repo still needs it.
 
 ### Compiled into `libaudio_common.a` (BACKEND=ne10)
 
@@ -69,10 +70,6 @@ comment above `NE10_C_SRCS` for the full empirical trail.
 
 | File | SHA-256 |
 |------|---------|
-| `common/NE10_mask_table.h` | `470074c1e66d3bc081418c7d7ea465ff94902ff0bb78b3d1f08d77f466db7de4` |
-| `common/factor.h` | `76ca4ab897e356c018c8a2bbbc22d63bd90219544010e60d547c65855731765c` |
-| `common/macros.h` | `7ebd5524636855c348fb30fe5385a4e5ab7315bb84213691b78a138b9c6ca536` |
-| `common/versionheader.h` | `26074a49e1fca81f93e3ef08e1c879b0d94f9092da3975ce77bf5f2bc80796c1` |
 | `inc/NE10.h` | `c7834fa2f1c588ff9715117ec6bb5ecb24ffa89783034ea6b3e6b222b3ed91d2` |
 | `inc/NE10_dsp.h` (carries P0001, P0003) | `076ec0136cb0b749ca080cf5182f188e6ac9ec617f239ac967fc5a3ebd1cef85` |
 | `inc/NE10_imgproc.h` | `2adb7e64ff127e5dc940231b02664ae12d40c3aa8cfa0bafd10e7abafc4a4f61` |
@@ -89,7 +86,6 @@ comment above `NE10_C_SRCS` for the full empirical trail.
 | `modules/dsp/NE10_fft_debug_macro.h` | `63f502a791b31c79401da731783322e1b9e16b3f8c35c4afb2ca583ac580e777` |
 | `modules/dsp/NE10_fft_generic_float32.h` | `2c8b2d4d568e0ac09af882f3a0a58269cc639e25ae7af46bbbc952345807ebb0` |
 | `modules/dsp/NE10_fft_generic_int32.h` | `5108f6d4d1a2eff2fb4b275271be9b7d868793c5d48ddce07860d99b5e429308` |
-| `modules/dsp/NE10_fft_generic_int32.neonintrinsic.h` | `cfdebbd98622230f947792c3a3ed8114e491b85a2afde70a567dcccdeb106c9f` |
 
 Note: `modules/dsp/NE10_fft.h` is where P0002 (see the Local patches table
 above, if present) guards `NE10_DSP_RFFT_SCALING` against redefinition — its
@@ -110,12 +106,24 @@ hash here reflects that patch once it lands.
 | `modules/dsp/NE10_fir_init.c` | `17a9590296d844649b4ca88e3b5724076649ef8c973a1451a531f72dc5a255af` |
 | `modules/dsp/NE10_iir.c` | `c052cc28578402df409021a19ecb5bab2107fa4b73094a3a51e3fef508d4f3ce` |
 | `modules/dsp/NE10_iir_init.c` | `7105bf577992073eb17aaa9cd9522a5b52601baabdc33f34e3ae40ed7133d02b` |
+| `common/NE10_mask_table.h` | `470074c1e66d3bc081418c7d7ea465ff94902ff0bb78b3d1f08d77f466db7de4` |
+| `common/factor.h` | `76ca4ab897e356c018c8a2bbbc22d63bd90219544010e60d547c65855731765c` |
+| `common/macros.h` | `7ebd5524636855c348fb30fe5385a4e5ab7315bb84213691b78a138b9c6ca536` |
+| `common/versionheader.h` | `26074a49e1fca81f93e3ef08e1c879b0d94f9092da3975ce77bf5f2bc80796c1` |
+| `modules/dsp/NE10_fft_generic_int32.neonintrinsic.h` | `cfdebbd98622230f947792c3a3ed8114e491b85a2afde70a567dcccdeb106c9f` |
 | `modules/dsp/NE10_init_dsp.c` | `58e70cbb71e51f9bf036f10ef589aec19e0de9f5b3028bcfd87f1b22cae827f9` |
 
 Verified excludable by rebuilding `BACKEND=ne10` with each dropped (in
 combination) and confirming a clean link plus a full PASS on all four test
 targets (`selftest`, `test_pool`, `test_wav`, `test_zero_heap`) — see the
 Makefile comment above `NE10_C_SRCS` for the per-file reasoning.
+
+Five of the rows above are headers rather than sources, and no compiled source includes them (checked against the
+compiler dependency files of the `SIMD=1` and `SIMD=0` builds): `common/NE10_mask_table.h`, `common/factor.h`,
+`common/macros.h`, `common/versionheader.h` and `modules/dsp/NE10_fft_generic_int32.neonintrinsic.h`.
+`common/factor.h` is reached only through `common/macros.h`, which nothing includes; `common/NE10_mask_table.h` and
+`common/versionheader.h` have no includer; the `neonintrinsic.h` is included only by the uncompiled
+`NE10_fft_generic_int32.neonintrinsic.cpp`.
 
 ## License
 

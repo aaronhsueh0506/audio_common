@@ -46,15 +46,62 @@ static inline size_t ck_field_size_reps(size_t total, size_t count, size_t elem_
     return ck_add_size(total, ck_mul_size(one, reps));
 }
 
+/* Bounds-checked bump allocator over one caller block, for init paths that carve in the order get_mem_size() walks:
+ * each carve takes ALIGN16(count * elem_size) bytes and returns NULL for a zero-sized request, an overflow or an exhausted block. */
+typedef struct AcPoolCursor {
+    uint8_t* ptr;
+    size_t remaining;
+} AcPoolCursor;
+
+static inline void* ac_pool_carve(AcPoolCursor* cursor, size_t count, size_t element_size) {
+    size_t raw, aligned;
+    void* out;
+    if (!cursor || count == 0 || element_size == 0) return NULL;
+    raw = ck_mul_size(count, element_size);
+    aligned = ck_align16_size(raw);
+    if (MEM_SIZE_INVALID(raw) || MEM_SIZE_INVALID(aligned) ||
+        aligned > cursor->remaining) return NULL;
+    out = cursor->ptr;
+    cursor->ptr += aligned;
+    cursor->remaining -= aligned;
+    return out;
+}
+
+/* Size-walk form of the same carve: reserve `count` elements of `elem` bytes at *cursor (aligned first). base == NULL only sizes;
+ * with a base, *out receives base + aligned offset. Returns -1 on overflow with *cursor and *out untouched. */
+static inline int ck_carve(unsigned char* base, size_t* cursor, size_t count, size_t elem, void** out) {
+    size_t aligned = ck_align16_size(*cursor);
+    size_t next = ck_add_size(aligned, ck_mul_size(count, elem));
+    if (MEM_SIZE_INVALID(next)) return -1;
+    if (base && out) *out = base + aligned;
+    *cursor = next;
+    return 0;
+}
+
+/* FNV-1a-32 descriptor folds: start from AC_FNV1A_SEED and chain; a u32 folds its four bytes least-significant first. */
+#define AC_FNV1A_SEED UINT32_C(2166136261)
+
+static inline uint32_t ac_fnv1a_u32(uint32_t h, uint32_t v) {
+    int i;
+    for (i = 0; i < 4; ++i) {
+        h ^= (v >> (i * 8)) & 0xffu;
+        h *= UINT32_C(16777619);
+    }
+    return h;
+}
+
+static inline uint32_t ac_fnv1a_str(uint32_t h, const char* s) {
+    while (*s) {
+        h ^= (uint32_t)(unsigned char)*s++;
+        h *= UINT32_C(16777619);
+    }
+    return h;
+}
+
 /* Pool layouts contain native pointers; the hash input distinguishes ARM32 descriptors. The caller supplies its final FNV-1a hash. */
 static inline uint32_t ac_memreq_abi_hash(uint32_t h) {
 #if UINTPTR_MAX == UINT32_MAX
-    static const char token[] = "|abi:ilp32";
-    size_t i;
-    for (i = 0; i < sizeof(token) - 1; ++i) {
-        h ^= (uint32_t)(unsigned char)token[i];
-        h *= UINT32_C(16777619);
-    }
+    h = ac_fnv1a_str(h, "|abi:ilp32");
 #endif
     return h;
 }

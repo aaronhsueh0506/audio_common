@@ -52,18 +52,6 @@ void spatial_bf_projection(
     int bins,
     Complex* u);
 
-void spatial_complex_sub_array_scalar(
-    const Complex* lhs,
-    const Complex* rhs,
-    Complex* out,
-    int count);
-
-void spatial_complex_sub_array(
-    const Complex* lhs,
-    const Complex* rhs,
-    Complex* out,
-    int count);
-
 /* Effective channel-major [channels][bins] response represented by the
  * current BF steering vectors and adaptive weights. */
 void spatial_bf_effective_weights_scalar(

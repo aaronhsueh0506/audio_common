@@ -12,27 +12,6 @@
 
 /* Pool-first construction: the SRP struct, then every array carved from one caller-provided block with a 16-byte-aligned bump allocator (mem_align.h). */
 
-typedef struct PoolCursor {
-    uint8_t* ptr;
-    size_t remaining;
-} PoolCursor;
-
-static void* pool_carve(PoolCursor* cursor, size_t count,
-                        size_t element_size) {
-    size_t raw;
-    size_t aligned;
-    void* out;
-    if (!cursor || count == 0 || element_size == 0) return NULL;
-    raw = ck_mul_size(count, element_size);
-    aligned = ck_align16_size(raw);
-    if (MEM_SIZE_INVALID(raw) || MEM_SIZE_INVALID(aligned) ||
-        aligned > cursor->remaining) return NULL;
-    out = cursor->ptr;
-    cursor->ptr += aligned;
-    cursor->remaining -= aligned;
-    return out;
-}
-
 /* Config-only validation shared by srp_get_mem_size() and srp_init(): M > 1, F > 1, num_angles > 0,
  * finite positive sr/NFFT/c, finite low_freq/high_freq. */
 static int srp_validate_config(const SRP_Config* cfg) {
@@ -104,7 +83,7 @@ SRP* srp_init(void* mem, size_t mem_size,
     int M, F, A;
     size_t num_pairs_sz;
     SRP* s;
-    PoolCursor cursor;
+    AcPoolCursor cursor;
 
     if (!mem || !cfg) return NULL;
     if (!srp_validate_config(cfg)) return NULL;
@@ -131,7 +110,7 @@ SRP* srp_init(void* mem, size_t mem_size,
     s->num_angles = A;
 
     /* Float angle grid a * 2*pi / A; the multiplication order fixes the rounding of every steering phase below. */
-    s->angles = (float*)pool_carve(&cursor, (size_t)A, sizeof(float));
+    s->angles = (float*)ac_pool_carve(&cursor, (size_t)A, sizeof(float));
     if (!s->angles) return NULL;
     {
         int a;
@@ -147,10 +126,10 @@ SRP* srp_init(void* mem, size_t mem_size,
         Complex* data;
         int a;
 
-        top = (Complex***)pool_carve(&cursor, (size_t)A, sizeof(Complex**));
-        mid = (Complex**)pool_carve(
+        top = (Complex***)ac_pool_carve(&cursor, (size_t)A, sizeof(Complex**));
+        mid = (Complex**)ac_pool_carve(
             &cursor, (size_t)A * (size_t)M, sizeof(Complex*));
-        data = (Complex*)pool_carve(
+        data = (Complex*)ac_pool_carve(
             &cursor, (size_t)A * (size_t)M * (size_t)F, sizeof(Complex));
         if (!top || !mid || !data) return NULL;
 
@@ -182,10 +161,10 @@ SRP* srp_init(void* mem, size_t mem_size,
         s->a_array = top;
     }
 
-    s->S_theta = (float*)pool_carve(&cursor, (size_t)A, sizeof(float));
-    s->bin_best_idx = (int*)pool_carve(&cursor, (size_t)F, sizeof(int));
-    s->score_scratch = (float*)pool_carve(&cursor, (size_t)F, sizeof(float));
-    s->best_score = (float*)pool_carve(&cursor, (size_t)F, sizeof(float));
+    s->S_theta = (float*)ac_pool_carve(&cursor, (size_t)A, sizeof(float));
+    s->bin_best_idx = (int*)ac_pool_carve(&cursor, (size_t)F, sizeof(int));
+    s->score_scratch = (float*)ac_pool_carve(&cursor, (size_t)F, sizeof(float));
+    s->best_score = (float*)ac_pool_carve(&cursor, (size_t)F, sizeof(float));
     if (!s->S_theta || !s->bin_best_idx || !s->score_scratch ||
         !s->best_score) return NULL;
     {
@@ -199,7 +178,6 @@ SRP* srp_init(void* mem, size_t mem_size,
     }
 
     s->frame_counter = 0;
-    s->last_doa_raw = NAN;
     s->last_doa_s = NAN;
     s->doa_raw = NAN;
     s->doa_s = NAN;
@@ -240,8 +218,8 @@ SRP* srp_init(void* mem, size_t mem_size,
         Complex* phat_data;
 
         s->num_pairs = num_pairs;
-        s->pair_i = (int*)pool_carve(&cursor, num_pairs_sz, sizeof(int));
-        s->pair_j = (int*)pool_carve(&cursor, num_pairs_sz, sizeof(int));
+        s->pair_i = (int*)ac_pool_carve(&cursor, num_pairs_sz, sizeof(int));
+        s->pair_j = (int*)ac_pool_carve(&cursor, num_pairs_sz, sizeof(int));
         if (!s->pair_i || !s->pair_j) return NULL;
 
         p = 0;
@@ -256,10 +234,10 @@ SRP* srp_init(void* mem, size_t mem_size,
             }
         }
 
-        pt_top = (Complex***)pool_carve(&cursor, (size_t)A, sizeof(Complex**));
-        pt_mid = (Complex**)pool_carve(
+        pt_top = (Complex***)ac_pool_carve(&cursor, (size_t)A, sizeof(Complex**));
+        pt_mid = (Complex**)ac_pool_carve(
             &cursor, (size_t)A * num_pairs_sz, sizeof(Complex*));
-        pt_data = (Complex*)pool_carve(
+        pt_data = (Complex*)ac_pool_carve(
             &cursor, (size_t)A * num_pairs_sz * (size_t)F, sizeof(Complex));
         if (!pt_top || !pt_mid || !pt_data) return NULL;
 
@@ -289,8 +267,8 @@ SRP* srp_init(void* mem, size_t mem_size,
         }
         s->pair_steer = pt_top;
 
-        phat_top = (Complex**)pool_carve(&cursor, num_pairs_sz, sizeof(Complex*));
-        phat_data = (Complex*)pool_carve(
+        phat_top = (Complex**)ac_pool_carve(&cursor, num_pairs_sz, sizeof(Complex*));
+        phat_data = (Complex*)ac_pool_carve(
             &cursor, num_pairs_sz * (size_t)F, sizeof(Complex));
         if (!phat_top || !phat_data) return NULL;
         for (p = 0; p < num_pairs; p++) {
@@ -417,7 +395,6 @@ void doa_step(SRP* s,
 
         /* doa_raw: fresh SRP-PHAT result, neither smoothed nor held. */
         s->doa_raw = srp2doa(s);
-        s->last_doa_raw = s->doa_raw;
 
         /* doa_s: pending-smoothed DOA with hold; the stable DOA for downstream modules (BF, post-gain). */
         float doa_s_new;
@@ -462,7 +439,6 @@ void srp_reset(SRP* s)
 {
     if (!s) return;
     s->frame_counter = 0;
-    s->last_doa_raw = NAN;
     s->last_doa_s = NAN;
     s->doa_raw = NAN;
     s->doa_s = NAN;

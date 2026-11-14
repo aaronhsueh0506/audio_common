@@ -244,28 +244,6 @@ void spatial_bf_projection(
 #endif
 }
 
-/* Wraps the shared output-first subtraction kernels with an input-first API and a NULL/count guard. */
-
-void spatial_complex_sub_array_scalar(
-    const Complex* lhs,
-    const Complex* rhs,
-    Complex* out,
-    int count)
-{
-    if (!lhs || !rhs || !out || count <= 0) return;
-    sk_csub_f32_scalar(out, lhs, rhs, count);
-}
-
-void spatial_complex_sub_array(
-    const Complex* lhs,
-    const Complex* rhs,
-    Complex* out,
-    int count)
-{
-    if (!lhs || !rhs || !out || count <= 0) return;
-    sk_csub_f32(out, lhs, rhs, count);
-}
-
 static void spatial_bf_effective_weights_scalar_range(
     const Complex* const* steering,
     const Complex* const* adaptive_weights,

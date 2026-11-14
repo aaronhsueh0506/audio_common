@@ -146,7 +146,6 @@ static inline float fast_log10(float x);
 static inline float fast_sqrt(float v);
 static inline float exp1_approx(float v);    /* Martin et al. 2004 式 (17) 的 E1 三段近似 */
 
-static inline float clip_f(float x, float min_val, float max_val);
 static inline float max_f(float a, float b);
 ```
 
@@ -158,7 +157,7 @@ static inline float max_f(float a, float b);
 | `fast_log10(x)` | 同 `fast_log` | 同 `fast_log`，再乘上 `FM_LOG10E` |
 | `fast_sqrt(v)` | `v > 0` 的有限值 | `v <= 0`（含 `-0.0f`）或 NaN → `0.0f`（正零）；`+Inf` 在 ARM32／ARM64 的 sqrtf 路徑回 `+Inf` |
 | `exp1_approx(v)` | `v > 0` | `v <= FM_EPSILON` 會先被夾成 `FM_EPSILON` 再計算 |
-| `clip_f` / `max_f` | 任意有限值 | 無特殊處理，就是單純的比較選擇 |
+| `max_f` | 任意有限值 | 無特殊處理，就是單純的比較選擇 |
 
 **重點：這些函式對非有限輸入回傳的是「定義域邊界常數」，不是 IEEE 語意的結果。**
 例如 `fast_sqrt(NaN)` 回 `0.0f`（不是 NaN）、`fast_log(-1.0f)` 回 `-1e10f`（不是 NaN）、`fast_exp(+Inf)` 回一個有限的飽和值（不是 `+Inf`）。這些值是確定且穩定的，但**不具數學意義**。正確做法是在資料進入 DSP 之前就把非有限樣本清掉（`wav_read_float()` 在讀檔端已經做了這件事），而不是依賴這些邊界值。
@@ -177,7 +176,7 @@ production `fast_log` 以 IEEE-754 range reduction 加 degree-4 minimax 多項�
 for (int k = 0; k < n_freqs; ++k) {
     float mag = fast_sqrt(power[k]);
     float db  = 20.0f * fast_log10(mag + FM_EPSILON);   /* 先加 epsilon 避開 0 */
-    gain[k]   = clip_f(gain[k], 0.05f, 1.0f);
+    gain[k]   = max_f(gain[k], 0.05f);
 }
 ```
 
@@ -241,10 +240,10 @@ if (wav_finalize_write(w) != 0) { /* 檔案內容不可信 */ }
 typedef struct { int sample_rate; int channels; int bits_per_sample;
                  int num_samples; int is_float; } WavInfo;
 
-typedef struct { FILE* fp; WavInfo info; long data_start; int samples_read;
+typedef struct { FILE* fp; WavInfo info; int samples_read;
                  uint64_t nonfinite_sanitized; } WavReader;
 
-typedef struct { FILE* fp; WavInfo info; long data_start;
+typedef struct { FILE* fp; WavInfo info;
                  uint64_t samples_written; uint64_t nonfinite_sanitized;
                  int write_error; } WavWriter;
 
@@ -392,8 +391,7 @@ size_t   ac_istft_get_mem_size(const AcStftConfig* cfg);
 AcIstft* ac_istft_init(void* mem, size_t mem_size, const AcStftConfig* cfg);
 void ac_stft_reset(AcStft*);   void ac_istft_reset(AcIstft*);               /* 清歷史與幀計數，設定與窗不變 */
 const float* ac_stft_window(const AcStft*);                                 /* 使用中的窗表，可借給 AcIstft */
-int  ac_stft_get_config(const AcStft*, AcStftConfig*);                      /* 0；NULL 引數回 -1 */
-int  ac_istft_get_config(const AcIstft*, AcStftConfig*);
+int  ac_istft_get_config(const AcIstft*, AcStftConfig*);                    /* 0；NULL 引數回 -1 */
 int  ac_stft_push(AcStft*, const float* hop_in, Complex* out);              /* 回傳幀數 0..2 */
 int  ac_stft_push_planar(AcStft*, const float* hop_in, float* re, float* im);
 void ac_stft_frame_planar(AcStft*, const float* frame, float* re, float* im); /* 呼叫端自備 N 樣本，不碰歷史 */

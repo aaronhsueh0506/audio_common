@@ -72,7 +72,7 @@ override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
                    $(CPPFLAGS) $(EXTRA_CFLAGS) $(SIMD_CFLAGS) \
                    $(WERROR_CFLAGS) -ffp-contract=off -fno-math-errno
 
-SRCS = common/utility/spatial_complex.c common/utility/spatial_simd.c \
+SRCS = common/utility/spatial_simd.c \
        doa/doa_smoother.c doa/srp.c bf/bf.c \
        VAD/masker.c VAD/vad.c VAD/vad_api.c
 # The same CC command can select a different SDK through PATH.
@@ -119,7 +119,7 @@ $(COMMON_LIB): FORCE
 	+$(MAKE) -C $(COMMON_DIR) $(COMMON_FWD) lib
 	@test -f '$@' || { echo "FATAL: common did not produce $@" >&2; exit 1; }
 
-SPATIAL_COMMON_OBJS = $(OBJ_DIR)/spatial_complex.o $(OBJ_DIR)/spatial_simd.o
+SPATIAL_COMMON_OBJS = $(OBJ_DIR)/spatial_simd.o
 DOA_OBJS = $(OBJ_DIR)/doa_smoother.o $(OBJ_DIR)/srp.o
 BF_OBJS = $(OBJ_DIR)/bf.o
 VAD_OBJS = $(OBJ_DIR)/masker.o $(OBJ_DIR)/vad.o $(OBJ_DIR)/vad_api.o
@@ -160,9 +160,6 @@ _cfg_guard:
 	  printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$tmp"; \
 	  mv -f "$$tmp" "$(OBJ_DIR)/config.manifest"; \
 	fi
-
-$(OBJ_DIR)/spatial_complex.o: common/utility/spatial_complex.c common/utility/spatial_complex.h | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/spatial_simd.o: common/utility/spatial_simd.c common/utility/spatial_simd.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
@@ -223,7 +220,7 @@ audit-no-bf-test-symbols: $(BF_LIB)
 	fi
 	@echo "audit-no-bf-test-symbols: clean"
 
-test: audit-no-bf-test-symbols $(BIN_DIR)/test_spatial_third_party
+test: audit-no-bf-test-symbols audit-no-stdio $(BIN_DIR)/test_spatial_third_party
 	"$(abspath $(BIN_DIR))/test_spatial_third_party"
 
 # The same gate rebuilt (this archive set and common's) under -fsanitize=undefined; EXTRA_CFLAGS is part of the

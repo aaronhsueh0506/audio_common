@@ -30,26 +30,7 @@ static void median_filter_1d(const int* in, int* out, int F, int k)
     }
 }
 
-/* Pool layout: bump allocator over the flat pool; masker_get_mem_size() and masker_carve() must stay in lockstep. */
-typedef struct PoolCursor {
-    uint8_t* ptr;
-    size_t remaining;
-} PoolCursor;
-
-static void* pool_carve(PoolCursor* cursor, size_t count, size_t element_size)
-{
-    size_t raw, aligned;
-    void* out;
-    if (!cursor || count == 0 || element_size == 0) return NULL;
-    raw = ck_mul_size(count, element_size);
-    aligned = ck_align16_size(raw);
-    if (MEM_SIZE_INVALID(raw) || MEM_SIZE_INVALID(aligned) ||
-        aligned > cursor->remaining) return NULL;
-    out = cursor->ptr;
-    cursor->ptr += aligned;
-    cursor->remaining -= aligned;
-    return out;
-}
+/* masker_get_mem_size() and masker_carve() must stay in lockstep (ac_pool_carve, mem_align.h). */
 
 size_t masker_get_mem_size(const MaskerConfig* cfg)
 {
@@ -71,7 +52,7 @@ static MaskEstimator* masker_carve(void* mem, size_t need,
                                    const MaskerConfig* cfg)
 {
     MaskEstimator* m;
-    PoolCursor cursor;
+    AcPoolCursor cursor;
     size_t F;
     int f;
 
@@ -87,18 +68,18 @@ static MaskEstimator* masker_carve(void* mem, size_t need,
     m->F    = cfg->NFFT / 2 + 1;
     F = (size_t)m->F;
 
-    m->noise_floor = (float*)pool_carve(&cursor, F, sizeof(float));
-    m->noise_psd   = (float*)pool_carve(&cursor, F, sizeof(float));
-    m->spp_time    = (float*)pool_carve(&cursor, F, sizeof(float));
-    m->power_frame = (float*)pool_carve(&cursor, F, sizeof(float));
-    m->energy_frame = (float*)pool_carve(&cursor, F, sizeof(float));
+    m->noise_floor = (float*)ac_pool_carve(&cursor, F, sizeof(float));
+    m->noise_psd   = (float*)ac_pool_carve(&cursor, F, sizeof(float));
+    m->spp_time    = (float*)ac_pool_carve(&cursor, F, sizeof(float));
+    m->power_frame = (float*)ac_pool_carve(&cursor, F, sizeof(float));
+    m->energy_frame = (float*)ac_pool_carve(&cursor, F, sizeof(float));
 
-    m->band_mask    = (int*)pool_carve(&cursor, F, sizeof(int));
-    m->energy_mask  = (int*)pool_carve(&cursor, F, sizeof(int));
-    m->spp_mask     = (int*)pool_carve(&cursor, F, sizeof(int));
-    m->spp_mask_bin = (int*)pool_carve(&cursor, F, sizeof(int));
-    m->spp_mask_f   = (int*)pool_carve(&cursor, F, sizeof(int));
-    m->mask         = (int*)pool_carve(&cursor, F, sizeof(int));
+    m->band_mask    = (int*)ac_pool_carve(&cursor, F, sizeof(int));
+    m->energy_mask  = (int*)ac_pool_carve(&cursor, F, sizeof(int));
+    m->spp_mask     = (int*)ac_pool_carve(&cursor, F, sizeof(int));
+    m->spp_mask_bin = (int*)ac_pool_carve(&cursor, F, sizeof(int));
+    m->spp_mask_f   = (int*)ac_pool_carve(&cursor, F, sizeof(int));
+    m->mask         = (int*)ac_pool_carve(&cursor, F, sizeof(int));
 
     if (!m->noise_floor || !m->noise_psd || !m->spp_time || !m->power_frame ||
         !m->energy_frame ||

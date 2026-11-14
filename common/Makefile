@@ -330,7 +330,7 @@ $(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test test-full test-isolation test_stft test_stft_guard test_heap_alignment test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
+.PHONY: all lib selftest test test-full test-isolation audit-fp-contract test_stft test_stft_guard test_heap_alignment test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
 all: lib
 
 lib: $(LIB)
@@ -402,7 +402,7 @@ $(OBJ_DIR)/%.o: %.c | _cfg_guard
 $(OBJ_DIR)/%.o: %.cpp | _cfg_guard
 	$(CXX) $(CXXFLAGS) -MD -MP -c -o $@ $<
 
-selftest: $(LIB) test_stft test_stft_guard test_heap_alignment | _cfg_guard
+selftest: $(LIB) test_stft test_stft_guard test_heap_alignment test_audio_utils | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/roundtrip.o test/roundtrip.c
 	$(LINK) -o $(BIN_DIR)/roundtrip $(OBJ_DIR)/roundtrip.o $(LIB) $(LDFLAGS)
 	@echo "--- common selftest [$(BACKEND)] ---"
@@ -439,10 +439,6 @@ selftest: $(LIB) test_stft test_stft_guard test_heap_alignment | _cfg_guard
 	$(CC) -o $(BIN_DIR)/simd_a32_shim_selftest $(OBJ_DIR)/simd_a32_shim_selftest.o $(LDFLAGS)
 	@echo "--- common AArch32 NEON shim selftest [$(BACKEND)] ---"
 	@$(BIN_DIR)/simd_a32_shim_selftest
-	$(CC) $(CFLAGS) -MD -MP -c -o $(OBJ_DIR)/test_audio_utilities.o test/test_audio_utilities.c
-	$(LINK) -o $(BIN_DIR)/test_audio_utilities $(OBJ_DIR)/test_audio_utilities.o $(LIB) $(LDFLAGS)
-	@echo "--- common resampler test [$(BACKEND)] ---"
-	@$(BIN_DIR)/test_audio_utilities
 
 # test_stft: audio_stft.h window, latency, API-contract and scaled-entry-point checks.
 test_stft: $(LIB) | _cfg_guard
@@ -588,8 +584,9 @@ _ne10_parity_bin: $(LIB) | _cfg_guard
 # --- Test tiers ---------------------------------------------------------------
 # `make test` is the default tier: the unit and contract tests plus the core scenarios of the
 # build-isolation suite. `make test-full` adds what the default tier leaves out because another check
-# already covers it or because it only guards `make publish`: the standalone `test_ne10_force_c`
-# and the publish scenarios of the isolation suite (S7p, S11, S13-S18). The standalone `test_stft`,
+# already covers it or because it only guards `make publish`: the standalone `test_ne10_force_c`,
+# the FP-contract disassembly audit (`audit-fp-contract`) and the publish scenarios of the isolation suite
+# (S7p, S11, S13-S18). The standalone `test_stft`,
 # `test_stft_guard`, `test_heap_alignment` and `test_audio_utils` are not listed: `selftest` runs
 # them. The isolation suite needs the AEC repo as a sibling checkout and runs the same for any SIMD
 # setting, because it builds both itself. Steps run one after another, so the isolation suite never
@@ -601,8 +598,13 @@ test:
 	@$(MAKE) --no-print-directory test-isolation ISOL_TIER=core
 
 test-full:
-	@$(MAKE) --no-print-directory $(LEAN_TESTS) test_ne10_force_c
+	@$(MAKE) --no-print-directory $(LEAN_TESTS) test_ne10_force_c audit-fp-contract
 	@$(MAKE) --no-print-directory test-isolation ISOL_TIER=full
+
+# audit-fp-contract: the disassembly gate for the pinned -ffp-contract=off policy (scripts/audit_fp_contract.sh; needs NR as
+# a sibling checkout). It is part of test-full only: it builds common and NR keyed objects of its own.
+audit-fp-contract:
+	@scripts/audit_fp_contract.sh $(BACKEND)
 
 # The suite starts its own makes with explicit SIMD settings, so the caller's MAKEFLAGS must not reach
 # them: a command-line SIMD=0 would otherwise override the SIMD=1 configuration it compares against.

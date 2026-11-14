@@ -15,6 +15,7 @@
 #include "bf.h"
 #include "bf_test_hooks.h"
 #include "spatial_simd.h"
+#include "utility/simd_kernels.h"
 #include "srp.h"
 #include "vad_api.h"
 
@@ -209,8 +210,8 @@ static int test_bf_vector_kernels_scalar_vs_dispatch(void) {
                  sizeof(weights_scalar)) == 0,
           "BF effective-weight dispatch must be bit-identical to scalar");
 
-    spatial_complex_sub_array_scalar(das, rhs, sub_scalar, F);
-    spatial_complex_sub_array(das, rhs, sub_dispatch, F);
+    sk_csub_f32_scalar(sub_scalar, das, rhs, F);
+    sk_csub_f32(sub_dispatch, das, rhs, F);
     CHECK(memcmp(sub_scalar, sub_dispatch, sizeof(sub_scalar)) == 0,
           "complex subtract dispatch must be bit-identical to scalar");
     return 1;
@@ -691,8 +692,8 @@ static int test_bf_weight_export(void) {
                 channels[m][f].i = random_signed();
             }
         }
-        bf_process(
-            original, (const Complex* const*)channels, 0.7f, frame < 5, NULL, output_original);
+        bf_process_with_weights(
+            original, (const Complex* const*)channels, 0.7f, frame < 5, NULL, output_original, NULL);
         bf_process_with_weights(
             exported, (const Complex* const*)channels, 0.7f, frame < 5, NULL,
             output_exported, weights);

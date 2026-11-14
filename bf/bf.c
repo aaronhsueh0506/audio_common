@@ -37,28 +37,6 @@ int bf_effective_adapt_interval(
     return effective;
 }
 
-/* Bump allocator over BF's flat pool; bf_get_mem_size() and bf_init() carve in lockstep. */
-typedef struct PoolCursor {
-    uint8_t* ptr;
-    size_t remaining;
-} PoolCursor;
-
-static void* pool_carve(PoolCursor* cursor, size_t count,
-                        size_t element_size) {
-    size_t raw;
-    size_t aligned;
-    void* out;
-    if (!cursor || count == 0 || element_size == 0) return NULL;
-    raw = ck_mul_size(count, element_size);
-    aligned = ck_align16_size(raw);
-    if (MEM_SIZE_INVALID(raw) || MEM_SIZE_INVALID(aligned) ||
-        aligned > cursor->remaining) return NULL;
-    out = cursor->ptr;
-    cursor->ptr += aligned;
-    cursor->remaining -= aligned;
-    return out;
-}
-
 /* Total bytes for shape (M, F); independent of num_angles and cfg. The carve order must match bf_init(). */
 size_t bf_get_mem_size(int M, int F) {
     size_t total;
@@ -94,7 +72,7 @@ BF* bf_init(void* mem, size_t mem_size, int M, int F,
               int num_angles, Complex*** a_array,
               const BF_Config* cfg) {
     BF* g;
-    PoolCursor cursor;
+    AcPoolCursor cursor;
     size_t need;
     size_t fM;
     size_t mM;
@@ -135,13 +113,13 @@ BF* bf_init(void* mem, size_t mem_size, int M, int F,
     mM = ck_mul_size((size_t)M, (size_t)M);
     if (MEM_SIZE_INVALID(fM) || MEM_SIZE_INVALID(mM)) return NULL;
 
-    /* P: pointer tables over flat frequency planes, per-bin identity initial state. */
+    /* P: pointer tables over flat frequency planes (identity fill and state reset: bf_reset below). */
     {
-        Complex*** p_top = (Complex***)pool_carve(
+        Complex*** p_top = (Complex***)ac_pool_carve(
             &cursor, (size_t)M, sizeof(Complex**));
-        Complex** p_mid = (Complex**)pool_carve(
+        Complex** p_mid = (Complex**)ac_pool_carve(
             &cursor, mM, sizeof(Complex*));
-        Complex* p_data = (Complex*)pool_carve(
+        Complex* p_data = (Complex*)ac_pool_carve(
             &cursor, ck_mul_size(fM, (size_t)M), sizeof(Complex));
         if (!p_top || !p_mid || !p_data) return NULL;
 
@@ -151,18 +129,14 @@ BF* bf_init(void* mem, size_t mem_size, int M, int F,
             for (int j = 0; j < M; j++) {
                 g->P[i][j] =
                     p_data + ((size_t)i * (size_t)M + (size_t)j) * (size_t)F;
-                for (int f = 0; f < F; f++) {
-                    g->P[i][j][f].r = (i == j);
-                    g->P[i][j][f].i = 0;
-                }
             }
         }
     }
 
     {
-        Complex** wa_top = (Complex**)pool_carve(
+        Complex** wa_top = (Complex**)ac_pool_carve(
             &cursor, (size_t)M, sizeof(Complex*));
-        Complex* wa_data = (Complex*)pool_carve(
+        Complex* wa_data = (Complex*)ac_pool_carve(
             &cursor, fM, sizeof(Complex));
         if (!wa_top || !wa_data) return NULL;
 
@@ -174,7 +148,7 @@ BF* bf_init(void* mem, size_t mem_size, int M, int F,
 
     {
         size_t count = ck_mul_size((size_t)M + 3, (size_t)F);
-        g->scratch = (Complex*)pool_carve(&cursor, count, sizeof(Complex));
+        g->scratch = (Complex*)ac_pool_carve(&cursor, count, sizeof(Complex));
         if (!g->scratch) return NULL;
         g->scratch_das = g->scratch;
         g->scratch_wu = g->scratch_das + F;
@@ -185,16 +159,7 @@ BF* bf_init(void* mem, size_t mem_size, int M, int F,
     /* The carves must consume exactly `need` bytes. */
     if (cursor.remaining != 0) return NULL;
 
-    g->initialized = 0;
-    g->first_doa_found = 0;
-    g->first_doa_frame = -1;
-    g->current_doa = 0;
-    g->frame_idx = 0;
-    g->doa_used = NAN;
-    g->adaptive = 0;
-    g->bin_resets = 0;
-    g->owned_heap = NULL;
-
+    bf_reset(g);
     return g;
 }
 
@@ -658,7 +623,6 @@ static void bf_process_with_weights_impl(
      * - allow_adapt_in is supplied by the caller (typically vad_out == 0). */
     if (g->enable_fix_mode) {
         doa_use = g->fixed_doa_rad;
-        g->current_doa = doa_use;
         g->first_doa_found = 1;
     } else {
         if (isnan(doa_s)) {
@@ -667,12 +631,7 @@ static void bf_process_with_weights_impl(
         }
 
         doa_use = doa_s;
-        g->current_doa = doa_use;
-
-        if (!g->first_doa_found) {
-            g->first_doa_found = 1;
-            g->first_doa_frame = g->frame_idx;
-        }
+        g->first_doa_found = 1;
     }
 
     g->doa_used = doa_use;
@@ -705,7 +664,7 @@ static void bf_process_with_weights_impl(
             u_channels, g->M, g->F, 1.0f, wu);
     }
 
-    spatial_complex_sub_array(das, wu, bf_spec, g->F);
+    sk_csub_f32(bf_spec, das, wu, g->F);
     memcpy(bf_out, bf_spec, (size_t)g->F * sizeof(Complex));
 
     /* Export the response of the current wa (before the RLS update): y = a^H x/M - wa^H (x - a(a^H x)/denom). */
@@ -769,17 +728,6 @@ void bf_test_process_with_weights_scalar_rls(
 }
 #endif
 
-void bf_process(BF* g,
-                 const Complex* const* X,
-                 float doa_s,
-                 int allow_adapt_in,
-                 const int* mask,
-                 Complex* bf_out)
-{
-    bf_process_with_weights(
-        g, X, doa_s, allow_adapt_in, mask, bf_out, NULL);
-}
-
 void bf_reset(BF* g)
 {
     if (!g) return;
@@ -796,8 +744,6 @@ void bf_reset(BF* g)
     }
     g->initialized = 0;
     g->first_doa_found = 0;
-    g->first_doa_frame = -1;
-    g->current_doa = 0.0f;
     g->frame_idx = 0;
     g->doa_used = NAN;
     g->adaptive = 0;

@@ -10,6 +10,26 @@ smoother, beamformer and VAD sources that used to vendor under
 `Audio_ALG/pipelines/third_party/`. This file records changes to `audiolib`
 as a whole from this point on.
 
+## [Unreleased] — 2026-11-14 — Tidy
+
+### Changed
+- `common/utility/mem_align.h` gains `AcPoolCursor`/`ac_pool_carve()` (the bump allocator `bf.c`, `srp.c`, `masker.c` and `vad_api.c` each carried a copy of),
+  the size-walk `ck_carve()`, and `AC_FNV1A_SEED`/`ac_fnv1a_u32()`/`ac_fnv1a_str()`; `ac_memreq_abi_hash()` folds its ILP32 token through
+  `ac_fnv1a_str()`. All static inline; the objects of every other translation unit are byte-identical. `test_pool_contract` covers the helpers and the
+  ILP32 token on any host.
+- `bf_init()` ends in `bf_reset()` instead of repeating its field resets. `vad_api_process()` drops the always-true backend guard.
+- `spatial_complex.h` holds the four complex helpers as `static inline`; `spatial_complex.c` is gone, so `libspatial_common.a` carries one member
+  (`spatial_simd.o`) and the spatial CFG_SIG changes. `bf.c` calls `sk_csub_f32()` directly. Same IEEE operations under `-ffp-contract=off`.
+- `make test` (audiolib) runs `audit-no-stdio`; `make -C common test-full` runs `audit-fp-contract`. `selftest` depends on `test_audio_utils` instead of
+  repeating its recipe. `common/test/simd_test_harness.h` holds the input-generation, comparison and canary helpers the SIMD selftests share.
+- `lib/ne10/VENDORED.md`: five headers no compiled source includes move from "header-only" to "vendored, not compiled". No file is removed.
+
+### Removed
+- `bf_process()` (use `bf_process_with_weights(..., NULL)`), `ac_stft_get_config()`, `clip_f()`.
+- Write-only state: `BF.first_doa_frame`, `BF.current_doa`, `SRP.last_doa_raw`, `AudioResampler.input_rate`/`output_rate`,
+  `WavReader.data_start`, `WavWriter.data_start`. `sizeof(BF)`/`sizeof(SRP)` and the pool of each `AudioResampler` shrink by 16 bytes; the board
+  samples that link these must be rebuilt.
+
 ## [Unreleased] — 2026-11-02 — NEON kernels also run on 32-bit ARM (AArch32)
 
 ### Changed

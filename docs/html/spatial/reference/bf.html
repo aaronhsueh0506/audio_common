@@ -17,12 +17,12 @@
 <p>頻域自適應波束器,結構是 GSC 形式:固定波束 <code>das</code>(以目前方向的 steering 做共軛加權平均,係數 1/M)減去自適應分支 <code>wa<sup>H</sup>·u</code>,其中 <code>u = x − a·(a<sup>H</sup>x)/(a<sup>H</sup>a)</code> 是把目標方向投影掉的 blocking 輸出。<code>wa</code> 以逐 bin 的 RLS 更新。方向來自呼叫端傳入的 <code>doa_s</code>(通常是 SRP 的 <code>doa_get_smooth</code>),BF 自己不做 DOA、也不做任何保持(hold);也可以設定固定波束。</p>
 <ul>
 <li>輸入 <code>X[m][f]</code> 是 M 路、F 個 bin 的頻譜;輸出 <code>bf_out[F]</code> 是波束後頻譜(<code>Complex</code>)。BF 不做 FFT/OLA,時域重建由整合者負責。</li>
-<li><b>steering 表是借用的</b>:<code>a_array[angle][mic][bin]</code> 由呼叫端擁有(通常是 <code>srp-&gt;a_array</code>),<code>bf_init</code> 不複製、<code>bf_destroy</code> 不釋放。BF 用 <code>doa2index</code> 把方向四捨五入到 <code>360/num_angles</code> 度的格點,所以 <code>num_angles</code> 必須與產生這張表的格點一致;非有限的方向取 0 號格點(<code>bf.c:579</code>)。</li>
+<li><b>steering 表是借用的</b>:<code>a_array[angle][mic][bin]</code> 由呼叫端擁有(通常是 <code>srp-&gt;a_array</code>),<code>bf_init</code> 不複製、<code>bf_destroy</code> 不釋放。BF 用 <code>doa2index</code> 把方向四捨五入到 <code>360/num_angles</code> 度的格點,所以 <code>num_angles</code> 必須與產生這張表的格點一致;非有限的方向取 0 號格點(<code>bf.c:doa2index</code>)。</li>
 <li>遮罩極性與 SRP <b>相反</b>:BF 的 <code>mask</code> 非 0 表示「凍結該 bin 的 RLS 更新」(<code>fixed_align_notebook</code> 模式例外,該模式忽略遮罩)。</li>
 </ul>
 
 <h2>如何呼叫使用</h2>
-<p><b>順序</b>:取得 steering 表 → <code>bf_get_mem_size(M, F)</code>(0 = M 或 F 不合法;大小與 <code>num_angles</code>、<code>cfg</code> 無關)→ 16-byte 對齊 pool → <code>bf_init</code>(NULL = 失敗)→ 每 hop <code>bf_process</code> 或 <code>bf_process_with_weights</code> → <code>bf_reset</code>(換串流)→ <code>bf_destroy</code>(要在擁有 steering 表的 SRP 之前)。heap 路徑 <code>bf_create(M, F, num_angles, a_array, cfg)</code> 內部用 <code>posix_memalign</code>。</p>
+<p><b>順序</b>:取得 steering 表 → <code>bf_get_mem_size(M, F)</code>(0 = M 或 F 不合法;大小與 <code>num_angles</code>、<code>cfg</code> 無關)→ 16-byte 對齊 pool → <code>bf_init</code>(NULL = 失敗)→ 每 hop <code>bf_process_with_weights</code>(不要權重時 <code>w</code> 傳 NULL)→ <code>bf_reset</code>(換串流)→ <code>bf_destroy</code>(要在擁有 steering 表的 SRP 之前)。heap 路徑 <code>bf_create(M, F, num_angles, a_array, cfg)</code> 內部用 <code>posix_memalign</code>。</p>
 <pre><code>#include "bf.h"
 
 enum { MICS = 4, BINS = 129, ANGLES = 72 };
@@ -48,15 +48,14 @@ BF *beam_open(Complex ***a_array, int fixed_mode, float fixed_doa_rad)
 void beam_hop(BF *bf, const Complex *const *X, float doa_s, int vad_out, const int *mask, Complex *beam)
 {
     /* allow_adapt:通常只在「沒有目標語音」(vad_out == 0)時讓 RLS 學;mask 非 0 的 bin 不更新 */
-    bf_process(bf, X, doa_s, vad_out ? 0 : 1, mask, beam);
+    bf_process_with_weights(bf, X, doa_s, vad_out ? 0 : 1, mask, beam, NULL);
     /* bf_get_adaptive(bf):本 hop 是否真的做了 RLS 更新;bf_get_doa_used(bf):實際使用的方向 */
 }
 /* 換串流:bf_reset(bf)(清 RLS 與計數,bin_resets 不清);結束:bf_destroy(bf) */</code></pre>
 <div class="tblwrap"><table>
 <tr><th>函式</th><th>失敗/邊界</th></tr>
 <tr><td><code>bf_init(mem, n, M, F, num_angles, a_array, cfg)</code></td><td>NULL = <code>mem</code>/<code>cfg</code>/<code>a_array</code> 為 NULL、<code>M/F/num_angles &lt;= 0</code>、<code>lambda</code> 非有限或不在 <code>(0, 1]</code>、<code>mu</code> 非有限、固定模式下 <code>fixed_doa_rad</code> 非有限、<code>mem</code> 未對齊或 <code>n</code> 不足(<code>bf.c:bf_init</code> 開頭的檢查)。init 只清 <code>bf_get_mem_size</code> 的範圍</td></tr>
-<tr><td><code>bf_process(g, X, doa_s, allow_adapt, mask, bf_out)</code></td><td><b>不檢查 NULL</b>;<code>X</code> 必須是 M 個各含 F 個 bin 的指標;<code>bf_out</code> 要 F 個 <code>Complex</code></td></tr>
-<tr><td><code>bf_process_with_weights(…, bf_out, w)</code></td><td>同上,另外把本 hop <b>更新前</b>的等效權重寫進 <code>w[M*F]</code>(通道主序,<code>w[m*F+f]</code>);<code>bf_out[f] = Σ_m w[m,f]·X[m,f]</code>(呼叫端不必再取共軛)。<code>w</code> 可為 NULL,<code>bf_out</code> 必須有</td></tr>
+<tr><td><code>bf_process_with_weights(g, X, doa_s, allow_adapt, mask, bf_out, w)</code></td><td><b>不檢查 NULL</b>;<code>X</code> 必須是 M 個各含 F 個 bin 的指標;<code>bf_out</code> 要 F 個 <code>Complex</code>;另外把本 hop <b>更新前</b>的等效權重寫進 <code>w[M*F]</code>(通道主序,<code>w[m*F+f]</code>);<code>bf_out[f] = Σ_m w[m,f]·X[m,f]</code>(呼叫端不必再取共軛)。<code>w</code> 可為 NULL,<code>bf_out</code> 必須有</td></tr>
 <tr><td><code>bf_get_doa_used(g)</code> / <code>bf_get_adaptive(g)</code></td><td>NULL 回 NaN / 0。bypass 的 hop 兩者為 NaN / 0</td></tr>
 <tr><td><code>bf_effective_adapt_interval(fix, notebook, interval)</code></td><td>BF 實際使用的更新間隔(<code>interval &lt;= 0</code> 為 1;固定+notebook 強制 1)。要依更新節奏推算時間常數的整合者必須用它,而不是自己的設定值</td></tr>
 </table></div>
@@ -77,7 +76,7 @@ void beam_hop(BF *bf, const Complex *const *X, float doa_s, int vad_out, const i
      |                     |  das  = conj-beamform(a, X, 1/M) ----------------------------&gt; spatial_conj_beamform
      |                     |  u    = projection(a, X, das) -------------------------------&gt; spatial_bf_projection
      |                     |  wu   = conj-beamform(wa, u, 1)  ----------------------------&gt; spatial_conj_beamform
-     |                     |  out  = das − wu                ----------------------------&gt; spatial_complex_sub_array
+     |                     |  out  = das − wu                ----------------------------&gt; sk_csub_f32
      |                     |  (w 非 NULL) 匯出更新前的等效權重 ---------------------------&gt; spatial_bf_effective_weights
      |                     |  allow_adapt 且 frame_idx % adapt_interval == 0 時:
      |                     |     對 mask 為 0 的每個 bin:RLS 更新 P、wa(wa 先乘 leak)
@@ -104,10 +103,10 @@ void beam_hop(BF *bf, const Complex *const *X, float doa_s, int vad_out, const i
 <h3>內部(不建議開放)</h3>
 <div class="tblwrap"><table>
 <tr class="int"><th>項目</th><th>位置</th><th>為什麼不開放</th></tr>
-<tr><td><code>fixed_align_notebook</code>(<code>BF_Config</code> 欄位,但屬內部)</td><td><code>bf.c:648-653</code></td><td>為了對齊參考實作而存在:強制每 frame 更新、停用遮罩凍結與 <code>mu</code>、<code>upu</code> 多加一個 <code>lambda</code>。只在固定模式下有意義,不是產品選項</td></tr>
+<tr><td><code>fixed_align_notebook</code>(<code>BF_Config</code> 欄位,但屬內部)</td><td><code>bf.c:bf_effective_adapt_interval</code>、<code>bf_process_with_weights_impl</code>、<code>bf_rls_update_bin_scalar</code></td><td>為了對齊參考實作而存在:強制每 frame 更新、停用遮罩凍結與 <code>mu</code>、<code>upu</code> 多加一個 <code>lambda</code>。只在固定模式下有意義,不是產品選項</td></tr>
 <tr><td><code>BF_WA_LEAK = 0.99999f</code></td><td><code>bf.c:18</code>;唯讀 <code>bf_wa_leak_factor()</code></td><td>只在實際更新時套用的權重漏洩,時間常數 1/(1−leak) 次更新,遠慢於遺忘時間,用來限制長時間連續執行的 <code>wa</code> 成長;與 <code>lambda</code> 耦合</td></tr>
 <tr><td><code>BF_P_DIAG_FLOOR = 1e-6f</code>、<code>BF_P_DIAG_CEIL = 1e6f</code></td><td><code>bf.c:25-26</code>;唯讀 <code>bf_p_diag_floor/ceil()</code></td><td>RLS 發散護欄,每次更新後夾 P 的對角。改動會悄悄改變 <code>bin_resets</code> 的觸發行為</td></tr>
-<tr><td><code>upu</code> 守衛:非有限或 <code>&lt;= 0</code> 重置該 bin;<code>|upu| &lt; 1e-12f</code> 墊到 <code>1e-12f</code></td><td><code>bf.c:277-283</code></td><td>單 bin 重置而非整個 BF 重置,避免丟掉其他 bin 的適應;屬數值護欄</td></tr>
+<tr><td><code>upu</code> 守衛:非有限或 <code>&lt;= 0</code> 重置該 bin;<code>|upu| &lt; 1e-12f</code> 墊到 <code>1e-12f</code></td><td><code>bf.c:bf_rls_update_bin_scalar</code>(NEON 路徑 <code>bf_rls_update_four_neon</code> 同規則)</td><td>單 bin 重置而非整個 BF 重置,避免丟掉其他 bin 的適應;屬數值護欄</td></tr>
 <tr><td>投影分母下限 <code>1e-12f</code>、<code>das</code> 係數 <code>1/M</code>、P 的 Hermitian 對稱化</td><td><code>common/utility/spatial_simd.c:162</code>、<code>bf.c</code></td><td>演算法定義的一部分;scalar/NEON 共用</td></tr>
 <tr><td>P 初值單位陣、<code>wa</code> 初值 0、<code>bin_resets</code> 不被 <code>bf_reset</code> 清除</td><td><code>bf.c:bf_init</code>、<code>bf_reset</code></td><td><code>bin_resets</code> 是診斷計數(正常運作應為 0 或接近 0),不是狀態</td></tr>
 <tr><td><code>BF</code> 結構欄位(<code>P</code>、<code>wa</code>、<code>scratch*</code>、<code>frame_idx</code>…)</td><td><code>bf.h</code></td><td>標頭註明 <code>P</code> 為「內部,不要保存或索引」;其餘同理</td></tr>
@@ -116,9 +115,9 @@ void beam_hop(BF *bf, const Complex *const *X, float doa_s, int vad_out, const i
 <h3>函式:整合者呼叫 vs 內部</h3>
 <div class="tblwrap"><table>
 <tr><th>類別</th><th>函式</th></tr>
-<tr><td>整合者呼叫</td><td><code>bf_get_mem_size</code>、<code>bf_init</code>、<code>bf_create</code>、<code>bf_process</code>、<code>bf_process_with_weights</code>、<code>bf_reset</code>、<code>bf_destroy</code>、<code>bf_get_doa_used</code>、<code>bf_get_adaptive</code>、<code>bf_effective_adapt_interval</code></td></tr>
+<tr><td>整合者呼叫</td><td><code>bf_get_mem_size</code>、<code>bf_init</code>、<code>bf_create</code>、<code>bf_process_with_weights</code>、<code>bf_reset</code>、<code>bf_destroy</code>、<code>bf_get_doa_used</code>、<code>bf_get_adaptive</code>、<code>bf_effective_adapt_interval</code></td></tr>
 <tr><td>診斷(唯讀)</td><td><code>bf_get_bin_resets</code>、<code>bf_wa_leak_factor</code>、<code>bf_p_diag_floor</code>、<code>bf_p_diag_ceil</code></td></tr>
-<tr><td>內部</td><td><code>spatial_conj_beamform</code>、<code>spatial_bf_projection</code>、<code>spatial_complex_sub_array</code>、<code>spatial_bf_effective_weights</code>、<code>spatial_complex_*</code>(<code>common/utility/spatial_*.h</code>)</td></tr>
+<tr><td>內部</td><td><code>spatial_conj_beamform</code>、<code>spatial_bf_projection</code>、<code>spatial_bf_effective_weights</code>、<code>spatial_complex_*</code>(<code>common/utility/spatial_*.h</code>)</td></tr>
 </table></div>
 
 <h2>狀態與記憶體</h2>
@@ -129,7 +128,7 @@ void beam_hop(BF *bf, const Complex *const *X, float doa_s, int vad_out, const i
 <tr><td>每 hop 工作區 <code>scratch</code></td><td>(M+3)·F·8 B</td><td>caller pool</td></tr>
 <tr><td>steering 表</td><td>不在 BF 內(借用)</td><td>呼叫端</td></tr>
 </table></div>
-<p>總量 <code>bf_get_mem_size(4, 129) = 28,224 B</code>、<code>(4, 257) = 55,872 B</code>、<code>(4, 513) = 111,168 B</code>(ARM64/LP64，含指標表與對齊)。</p>
+<p>總量 <code>bf_get_mem_size(4, 129) = 28,208 B</code>、<code>(4, 257) = 55,856 B</code>、<code>(4, 513) = 111,152 B</code>(ARM64/LP64，含指標表與對齊)。</p>
 </main>
 </body>
 </html>

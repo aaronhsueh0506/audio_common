@@ -26,7 +26,7 @@
 <tr><td><code>simd_kernels.h</code></td><td class="dead">內部/共用核心</td><td>一般整合者<b>不呼叫</b>。只有自己寫的熱迴圈剛好與某個核心形狀完全一致時才考慮</td></tr>
 <tr><td><code>simd_kernel_nn.h</code></td><td class="dead">內部/共用核心</td><td>神經網路模型前後處理與 <code>audio_stft.h</code> 專用的 <code>skn_*</code> 核心(與 <code>simd_kernels.h</code> 分開管理,傳統 AEC/NR 不引用)。一般整合者<b>不呼叫</b></td></tr>
 <tr><td><code>simd_aec.h</code>、<code>simd_nr.h</code></td><td class="dead">內部(AEC／NR 專用)</td><td>AEC、NR 各自引用的專用核心本體,由各自 repo 測試;整合者不呼叫</td></tr>
-<tr><td><code>spatial_complex.h</code>、<code>spatial_simd.h</code></td><td class="dead">內部(SRP／BF 用)</td><td>編進 <code>libspatial_common.a</code>,見 <a href="../../spatial/index.html">空間鏈</a></td></tr>
+<tr><td><code>spatial_complex.h</code>、<code>spatial_simd.h</code></td><td class="dead">內部(SRP／BF 用)</td><td><code>spatial_complex.h</code> 的四個複數輔助函式是 <code>static inline</code>(沒有 .c 也沒有 archive 成員);<code>spatial_simd.h</code> 的實作編進 <code>libspatial_common.a</code>(目前只有 <code>spatial_simd.o</code> 一個成員),見 <a href="../../spatial/index.html">空間鏈</a></td></tr>
 <tr><td><code>fast_math.h</code></td><td class="dead">內部/共用</td><td>同上。<b>超出定義域回固定邊界常數而非 IEEE 語意</b>(例:<code>fast_sqrt(NaN)</code> 回 <code>0.0f</code>)</td></tr>
 <tr><td><code>wav_io.h</code></td><td class="dead">離線工具專用</td><td><b>不適合即時/嵌入式路徑</b>(用 stdio + malloc,每樣本一次 fread/fwrite)</td></tr>
 </table></div>
@@ -98,7 +98,7 @@ for (int f = 0; f &lt; n; ++f)
 <tr><td><code>AcIstft</code> 輸出</td><td><code>AC_OLA_ACCUMULATE</code>:每幀吐 hop 個樣本。<code>AC_OLA_ENV_NORM</code>:acc／max(env, <code>1e-11f</code>);第 1 幀吐 0 個;<code>ac_istft_flush()</code> 吐 hop 個尚在 overlap 內的樣本(不推進狀態)。輸入頻譜不會被修改</td></tr>
 <tr><td>別名</td><td>輸出緩衝區不得與輸入重疊;<code>ac_stft_frame_planar()</code> 的 <code>frame</code> 是呼叫端自備的 N 樣本,不改變歷史</td></tr>
 <tr><td>延遲</td><td>恆等串接 = hop = <code>fft_size/2</code> 個樣本</td></tr>
-<tr><td>取回設定</td><td><code>ac_stft_get_config(s, &amp;cfg)</code>／<code>ac_istft_get_config(s, &amp;cfg)</code> 取得使用中設定的快照(另一個物件負責的欄位保持預設值);回 0,任一引數為 NULL 回 −1</td></tr>
+<tr><td>取回設定</td><td><code>ac_istft_get_config(s, &amp;cfg)</code> 取得使用中設定的快照(AcStft 的欄位保持預設值);回 0,任一引數為 NULL 回 −1</td></tr>
 <tr><td>記憶體</td><td>只有 static 路徑,無 heap、無 destroy;pool 16-byte 對齊。<code>init</code> 對髒 pool 與全零 pool 給出相同輸出(<code>test_stft</code> 檢查)</td></tr>
 </table></div>
 <div class="note"><code>test_stft</code> 驗證本物件的窗公式(與兩種寫法的獨立公式逐位元相同)、分析→合成的延遲與恆等重建、API 契約,以及非單位 <code>spec_scale</code>／<code>ispec_scale</code> 下 interleaved 與 split 入口逐位元相同、且等於未縮放結果乘以縮放值。</div>
@@ -231,7 +231,7 @@ make -C common lib BACKEND=ne10 SIMD=0     # 純量建置</pre>
 <h3>重取樣(<code>audio_resampler.h</code>)</h3>
 <div class="tblwrap"><table>
 <tr><th>參數</th><th>類別</th><th>範圍 / 預設</th><th>說明與出處</th></tr>
-<tr class="ext"><td><code>input_rate</code> / <code>output_rate</code></td><td>外部</td><td>8000、16000、24000、32000、48000(可相同)</td><td>其他值一律被拒;相同 = 精確 memmove 直通(<code>src/audio_resampler.c:rate_supported</code>)</td></tr>
+<tr class="ext"><td><code>input_rate</code> / <code>output_rate</code></td><td>外部</td><td>8000、16000、24000、32000、48000(可相同)</td><td>其他值一律被拒;相同 = 精確 memmove 直通(<code>src/audio_resampler.c:audio_resampler_rate_supported</code>)</td></tr>
 <tr class="ext"><td><code>channels</code></td><td>外部</td><td><code>[1, 8]</code>(<code>AUDIO_RESAMPLER_MAX_CHANNELS</code>)</td><td>介面是交錯 float32</td></tr>
 </table></div>
 
@@ -240,6 +240,8 @@ make -C common lib BACKEND=ne10 SIMD=0     # 純量建置</pre>
 <tr><th>項目</th><th>類別</th><th>說明</th></tr>
 <tr class="ext"><td>pool 基底 16-byte 對齊</td><td>外部(契約)</td><td>所有 <code>X_init</code> 都檢查,未對齊回 NULL</td></tr>
 <tr class="ext"><td><code>ALIGN16</code>、<code>MEM_IS_ALIGNED16</code>、<code>MEM_SIZE_INVALID</code>、<code>ck_add_size</code>、<code>ck_mul_size</code>、<code>ck_align16_size</code>、<code>ck_field_size</code>、<code>ck_field_size_reps</code></td><td>外部(自己切 pool 時才用)</td><td>飽和算術;溢位飽和到 <code>SIZE_MAX</code>,走訪結束檢查一次,溢位時 <code>get_mem_size</code> 必須回 0</td></tr>
+<tr class="ext"><td><code>AcPoolCursor</code>／<code>ac_pool_carve</code>、<code>ck_carve</code></td><td>外部(自己切 pool 時才用)</td><td><code>ac_pool_carve</code> 在 <code>init</code> 依走訪順序切出 <code>ALIGN16(count × elem)</code> 位元組,零大小、溢位或空間不足回 NULL 且游標不動;<code>ck_carve</code> 是位移游標版,<code>base</code> 為 NULL 時只量大小,溢位回 −1</td></tr>
+<tr class="ext"><td><code>AC_FNV1A_SEED</code>、<code>ac_fnv1a_u32</code>、<code>ac_fnv1a_str</code>、<code>ac_memreq_abi_hash</code></td><td>外部(自己算描述子雜湊時才用)</td><td>FNV-1a 32 位元折入;<code>ac_memreq_abi_hash</code> 在 32 位元指標目標加入 <code>|abi:ilp32</code>,所以同一份 pool 描述子在 ARM32 與 ARM64 不同</td></tr>
 </table></div>
 
 <h3>標頭型核心與編譯期開關</h3>

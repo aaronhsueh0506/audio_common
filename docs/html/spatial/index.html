@@ -24,7 +24,7 @@
 </pre>
 <ul>
 <li>專案內用到 SRP 與 BF 的是 Audio_ALG 的 sample beam helper(<code>Audio_ALG/pipelines/4ch/array_sample_beam.h</code> 與 <code>array_sample_beam.c</code>):它建立 <code>SRP</code> 與 <code>BF</code>、讓 BF 借用 <code>srp-&gt;a_array</code>,並在 <code>aec_process_linear()</code> 與 <code>aec_process_residual()</code> 之間每 hop 跑 <code>doa_step()</code> 與 <code>bf_process_with_weights()</code>。VAD 旗標與頻率遮罩由呼叫端帶入 <code>array_sample_beam_process_beam()</code> / <code>array_sample_beam_process_with_activity()</code>;<code>array_sample_beam_process()</code> 則改用 helper 內建的 energy VAD(<code>vad_raw = vad_out</code>、不帶遮罩),由 <code>ArraySampleBeamParams</code> 的 <code>auto_vad_threshold_dbfs</code>、<code>auto_vad_snr_ratio</code>、<code>auto_vad_hangover_frames</code> 決定。波束後頻譜與等效權重再經 <code>array_sample_beam_fuse()</code>(內部呼叫 <code>aec_process_residual()</code>)交給後級。專案內沒有任何 pipeline 實例化 <code>VADApi</code>(只有 <code>tests/</code> 與 <code>bench-masker</code> 在用)。本頁的 VAD 步驟是這三個模組的設計用法,不是已量產的接線。呼叫順序見 4ch pipeline。</li>
-<li>遮罩極性在兩個標頭都有寫:<code>mask[f]</code> 非 0 表示「SRP 用這個 bin」,同一個遮罩傳給 <code>bf_process</code> 時表示「凍結這個 bin 的 RLS 更新」,兩邊極性相反;<code>array_sample_beam.h</code> 的 <code>frequency_mask</code> 也是這樣定義:NULL 或 <code>n_freqs</code> 個 int,1 表示該 bin 供 SRP 使用,同時凍結該 bin 上的 BF 更新。</li>
+<li>遮罩極性在兩個標頭都有寫:<code>mask[f]</code> 非 0 表示「SRP 用這個 bin」,同一個遮罩傳給 <code>bf_process_with_weights</code> 時表示「凍結這個 bin 的 RLS 更新」,兩邊極性相反;<code>array_sample_beam.h</code> 的 <code>frequency_mask</code> 也是這樣定義:NULL 或 <code>n_freqs</code> 個 int,1 表示該 bin 供 SRP 使用,同時凍結該 bin 上的 BF 更新。</li>
 </ul>
 
 <h2>如何呼叫使用</h2>
@@ -120,7 +120,7 @@ void spatial_hop(Spatial *s, const Complex *const *X, Complex *beam, Complex *ef
 <tr><td>任一 <code>*_get_mem_size</code> 回 0</td><td>設定被拒;不要 init。SRP 看 <code>M&gt;1、F&gt;1、num_angles&gt;0</code> 與 <code>sr、NFFT、c</code> 有限且 &gt;0、<code>low_freq/high_freq</code> 有限</td></tr>
 <tr><td><code>srp_init</code>/<code>bf_init</code>/<code>vad_api_init</code> 回 NULL</td><td>設定不合法、pool 未對齊或太小(<code>srp_init</code> 另檢查 <code>geom-&gt;M == cfg-&gt;M</code> 且 <code>x</code>、<code>y</code> 非 NULL)</td></tr>
 <tr><td><code>doa_step</code>、<code>vad_api_process</code> 收到 NULL</td><td>靜默返回</td></tr>
-<tr><td><code>bf_process*</code>、<code>srp()</code>、<code>srp2doa()</code></td><td><b>不檢查 NULL</b>;<code>bf_init</code> 也不檢查 <code>a_array</code> 的實際形狀(必須是 <code>[num_angles][M][F]</code>,<code>num_angles</code> 與 SRP 相同),呼叫端負責</td></tr>
+<tr><td><code>bf_process_with_weights</code>、<code>srp()</code>、<code>srp2doa()</code></td><td><b>不檢查 NULL</b>;<code>bf_init</code> 也不檢查 <code>a_array</code> 的實際形狀(必須是 <code>[num_angles][M][F]</code>,<code>num_angles</code> 與 SRP 相同),呼叫端負責</td></tr>
 <tr><td>非有限的頻譜值</td><td>BF 會重置受影響 bin 的 RLS 狀態(<code>bf_get_bin_resets</code> 計數);SRP 與 VAD 沒有此防護,請在進 FFT 前攔截</td></tr>
 <tr><td>重置</td><td><code>srp_reset</code>、<code>bf_reset</code>;VAD 三層(<code>masker</code>、<code>vad</code>、<code>vad_api</code>)都沒有 reset 函式,要重置就對同一塊 pool 再呼叫 <code>vad_api_init</code>(init 會先把該塊清零)</td></tr>
 <tr><td>執行緒</td><td>每個物件有可變狀態,同一物件不可同時被兩條執行緒使用</td></tr>
@@ -175,8 +175,8 @@ RLS 更新(allow_adapt)  可     -      -      -      -      -      -      -    
 <p class="small">以下為ARM64／LP64 上呼叫 <code>*_get_mem_size</code> 的實測值。結構內含指標,ARM32 須重新查詢。SRP 以 <code>num_angles = 72</code>、<code>M = 4</code>、<code>sr/NFFT = 16000/256</code> 等計算。</p>
 <div class="tblwrap"><table>
 <tr><th>物件</th><th>誰存放</th><th>F = 129 (16 kHz / 256)</th><th>F = 257 (16 kHz / 512)</th><th>F = 513 (48 kHz / 1024)</th></tr>
-<tr><td><code>SRP</code>(A=72, M=4)</td><td>caller pool</td><td>758,608 B</td><td>1,503,568 B</td><td>2,993,488 B</td></tr>
-<tr><td><code>BF</code>(M=4)</td><td>caller pool</td><td>28,224 B</td><td>55,872 B</td><td>111,168 B</td></tr>
+<tr><td><code>SRP</code>(A=72, M=4)</td><td>caller pool</td><td>758,592 B</td><td>1,503,552 B</td><td>2,993,472 B</td></tr>
+<tr><td><code>BF</code>(M=4)</td><td>caller pool</td><td>28,208 B</td><td>55,856 B</td><td>111,152 B</td></tr>
 <tr><td><code>VADApi</code></td><td>caller pool</td><td>6,240 B(其中 masker 6,000 B、VAD 96 B)</td><td>11,872 B</td><td>23,136 B</td></tr>
 </table></div>
 <p>SRP 的大宗是兩張預先計算的表:<code>a_array</code> ≈ A·M·F·8 B 與 <code>pair_steer</code> ≈ A·M(M−1)/2·F·8 B(出處 <code>doa/srp.c:srp_get_mem_size</code>)。因此記憶體隨 <code>num_angles</code> 線性成長,這是 <code>num_angles</code> 不宜隨意調大的主因。BF 的大宗是 <code>P[M][M][F]</code> 的 RLS 協方差,與 <code>num_angles</code> 無關。</p>

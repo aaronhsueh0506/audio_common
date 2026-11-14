@@ -3,7 +3,9 @@
  *   - fft_init and hpf_init reject a misaligned base pointer before writing anything, and a mem_size
  *     below get_mem_size() (including the exact-size boundary);
  *   - hpf_create / hpf_init reject a cutoff_hz / sample_rate pair that is non-finite, non-positive,
- *     or has cutoff_hz at or above 0.45 * sample_rate.
+ *     or has cutoff_hz at or above 0.45 * sample_rate;
+ *   - the mem_align.h carve and FNV-1a helpers keep their documented semantics, and the ARM32 ABI token
+ *     folds to the pinned descriptor values on every host.
  * Each failure is printed and sets a global flag; main() reports ALL PASS or FAIL at the end.
  */
 #include "fft_wrapper.h"
@@ -251,6 +253,68 @@ static void test_hpf_cutoff_validation(void) {
 
 /* ═══════════════════════════════════ main ════════════════════════════════ */
 
+/* ═══════════════════════════════ mem_align.h helpers ═════════════════════ */
+
+static uint32_t fnv1a_ref(uint32_t h, const unsigned char* p, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+static void test_mem_align_helpers(void) {
+    /* Published FNV-1a-32 vectors, and the ILP32 ABI token on any host (the same values the ARM32 branch pins above). */
+    CHECK(ac_fnv1a_str(AC_FNV1A_SEED, "") == AC_FNV1A_SEED, "fnv1a_str of the empty string is the seed");
+    CHECK(ac_fnv1a_str(AC_FNV1A_SEED, "a") == UINT32_C(0xe40c292c), "fnv1a_str('a')");
+    CHECK(ac_fnv1a_str(AC_FNV1A_SEED, "foobar") == UINT32_C(0xbf9cf968), "fnv1a_str('foobar')");
+    CHECK(ac_fnv1a_str(UINT32_C(0), "|abi:ilp32") == UINT32_C(0xa6439712), "ilp32 token, zero seed");
+    CHECK(ac_fnv1a_str(AC_FNV1A_SEED, "|abi:ilp32") == UINT32_C(0xa37437b7), "ilp32 token, FNV seed");
+    CHECK(ac_fnv1a_str(UINT32_MAX, "|abi:ilp32") == UINT32_C(0x1a2aa061), "ilp32 token, max seed");
+
+    /* A u32 folds its four bytes least-significant first. */
+    {
+        const unsigned char le[4] = { 0x78, 0x56, 0x34, 0x12 };
+        CHECK(ac_fnv1a_u32(AC_FNV1A_SEED, UINT32_C(0x12345678)) == fnv1a_ref(AC_FNV1A_SEED, le, 4),
+              "fnv1a_u32 folds the bytes least-significant first");
+        CHECK(ac_fnv1a_u32(UINT32_C(7), 0) == fnv1a_ref(7u, (const unsigned char*)"\0\0\0\0", 4),
+              "fnv1a_u32 folds zero bytes");
+    }
+
+    /* ac_pool_carve: ALIGN16 steps, NULL for zero-sized, overflowing and exhausting requests; a refusal leaves the cursor alone. */
+    {
+        uint8_t block[64] __attribute__((aligned(16)));
+        AcPoolCursor c;
+        void* a;
+        void* b;
+        c.ptr = block;
+        c.remaining = sizeof(block);
+        a = ac_pool_carve(&c, 3, sizeof(float));
+        b = ac_pool_carve(&c, 5, sizeof(float));
+        CHECK(a == block && b == block + 16, "pool carves step by ALIGN16(count * size)");
+        CHECK(c.remaining == 64 - 48 && c.ptr == block + 48, "pool cursor tracks the carved bytes");
+        CHECK(ac_pool_carve(&c, 0, 4) == NULL && ac_pool_carve(&c, 4, 0) == NULL, "pool carve refuses zero-sized requests");
+        CHECK(ac_pool_carve(&c, SIZE_MAX / 2, 4) == NULL, "pool carve refuses an overflowing request");
+        CHECK(ac_pool_carve(&c, 9, sizeof(float)) == NULL && c.remaining == 16, "pool carve refuses past the end and keeps the cursor");
+        CHECK(ac_pool_carve(&c, 4, sizeof(float)) == block + 48 && c.remaining == 0, "pool carve takes exactly the remaining bytes");
+        CHECK(ac_pool_carve(NULL, 1, 4) == NULL, "pool carve refuses a NULL cursor");
+    }
+
+    /* ck_carve: size-only walk, then the same walk against a base; overflow leaves the cursor and out untouched. */
+    {
+        unsigned char base[96] __attribute__((aligned(16)));
+        size_t cur = 5;
+        void* out = base;
+        void* p1 = NULL;
+        void* p2 = NULL;
+        CHECK(ck_carve(NULL, &cur, 3, 4, &out) == 0 && out == base && cur == 16 + 12, "ck_carve without a base only sizes");
+        cur = 5;
+        CHECK(ck_carve(base, &cur, 3, 4, &p1) == 0 && p1 == base + 16 && cur == 28, "ck_carve aligns the cursor first");
+        CHECK(ck_carve(base, &cur, 1, 16, &p2) == 0 && p2 == base + 32 && cur == 48, "ck_carve chains");
+        cur = 48;
+        p1 = NULL;
+        CHECK(ck_carve(base, &cur, SIZE_MAX, 16, &p1) == -1 && cur == 48 && p1 == NULL, "ck_carve reports overflow and leaves its outputs");
+    }
+}
+
 int main(void) {
     test_fft_misaligned_base();
     test_fft_size_boundary();
@@ -258,6 +322,7 @@ int main(void) {
     test_hpf_misaligned_base();
     test_hpf_size_boundary();
     test_hpf_cutoff_validation();
+    test_mem_align_helpers();
 
     if (g_fail) {
         printf(">>> FAIL\n");

@@ -47,31 +47,10 @@ size_t vad_api_get_mem_size(const VADApiConfig* cfg)
     return MEM_SIZE_INVALID(total) ? 0 : total;
 }
 
-/* Bounds-checked bump allocator over this instance's pool; returns NULL when the pool is exhausted. */
-typedef struct PoolCursor {
-    uint8_t* ptr;
-    size_t remaining;
-} PoolCursor;
-
-static void* pool_carve(PoolCursor* cursor, size_t count, size_t element_size)
-{
-    size_t raw, aligned;
-    void* out;
-    if (!cursor || count == 0 || element_size == 0) return NULL;
-    raw = ck_mul_size(count, element_size);
-    aligned = ck_align16_size(raw);
-    if (MEM_SIZE_INVALID(raw) || MEM_SIZE_INVALID(aligned) ||
-        aligned > cursor->remaining) return NULL;
-    out = cursor->ptr;
-    cursor->ptr += aligned;
-    cursor->remaining -= aligned;
-    return out;
-}
-
 VADApi* vad_api_init(const VADApiConfig* cfg, void* mem, size_t mem_size)
 {
     VADApi* v;
-    PoolCursor cursor;
+    AcPoolCursor cursor;
     void* masker_mem;
     void* vad_mem;
     size_t need;
@@ -92,8 +71,8 @@ VADApi* vad_api_init(const VADApiConfig* cfg, void* mem, size_t mem_size)
     cursor.ptr = (uint8_t*)mem + ck_align16_size(sizeof(VADApi));
     cursor.remaining = need - ck_align16_size(sizeof(VADApi));
 
-    masker_mem = pool_carve(&cursor, 1, masker_need);
-    vad_mem    = pool_carve(&cursor, 1, vad_need);
+    masker_mem = ac_pool_carve(&cursor, 1, masker_need);
+    vad_mem    = ac_pool_carve(&cursor, 1, vad_need);
     if (!masker_mem || !vad_mem) return NULL;
 
     v->masker   = masker_init(masker_mem, masker_need, &cfg->masker_cfg);
@@ -129,16 +108,11 @@ void vad_api_process(VADApi* v,
 {
     if (!v || !frame_in) return;
 
-    if (v->cfg.backend == VAD_BACKEND_MASKER) {
-        masker_step(v->masker, frame_in);
-
-        v->mask = masker_get_mask(v->masker);
-
-        vad_step(v->mask_vad, v->mask);
-
-        v->vad_raw = vad_get_raw(v->mask_vad);
-        v->vad_out = vad_get_out(v->mask_vad);
-    }
+    masker_step(v->masker, frame_in);
+    v->mask = masker_get_mask(v->masker);
+    vad_step(v->mask_vad, v->mask);
+    v->vad_raw = vad_get_raw(v->mask_vad);
+    v->vad_out = vad_get_out(v->mask_vad);
 }
 
 int vad_api_get(const VADApi* v)

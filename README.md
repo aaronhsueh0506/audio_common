@@ -11,4 +11,6 @@ make libspatial_common.a libdoa.a libbf.a libvad.a
 make -s print-bin-dir
 ```
 
+Run `make test` for the spatial libraries and `make -C common selftest` for the common DSP layer.
+
 The offline guide covers per-hop C calls, FFT and overlap-add latency, caller-owned memory, and spatial configuration. [audiolib documentation](docs/html/index.html)
