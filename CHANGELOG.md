@@ -28,6 +28,11 @@ as a whole from this point on.
   separate header is gone, so this supersedes the `spatial_complex.h` line above. `bf.o`, `bf_test.o`, `srp.o` and `spatial_simd.o` are byte-identical, SIMD=1 and SIMD=0.
 - Test-only headers fold into their single user: `bf/bf_test_hooks.h` into `tests/test_spatial_third_party.c`, `common/test/test_tmp_path.h` into
   `common/test/test_wav_writer_common.h`. No library object changes.
+- No `_Static_assert` remains. The `Complex` layout (8 bytes, `r`/`i` at offsets 0/4) is pinned at run time by `common/test/simd_selftest.c`, and
+  `Complex` against `ne10_fft_cpx_float32_t` (size, alignment, `r`/`i` offsets) by `common/test/roundtrip.c`; both use readable failure messages.
+  `fft_wrapper_ne10.c` loses its four asserts and `<stddef.h>`, `simd_kernels.h` loses its two asserts and the `SK_STATIC_ASSERT` macro (no other
+  repo used it). The `-std=c11` in the `common/docs/c_user_manual_zh_TW.md` build line becomes `-std=c99`; the library is built `-std=gnu99`. Every
+  library object is byte-identical, SIMD=1 and SIMD=0.
 
 ### Removed
 - `bf_process()` (use `bf_process_with_weights(..., NULL)`), `ac_stft_get_config()`, `clip_f()`.

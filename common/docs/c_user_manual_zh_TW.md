@@ -8,7 +8,7 @@ FFT、STFT、重取樣和 HPF 的輸入輸出是 float32。每條串流建立自
 
 ```sh
 make -C common lib
-cc -std=c11 -Icommon/include -Icommon -ffp-contract=off -fno-math-errno \
+cc -std=c99 -Icommon/include -Icommon -ffp-contract=off -fno-math-errno \
    example.c "$(make -s -C common print-lib-path)" -lm -o example
 ./example
 ```

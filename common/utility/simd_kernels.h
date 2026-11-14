@@ -174,30 +174,6 @@ static inline float32x4_t sk_a32_vzip2q_f32(float32x4_t a, float32x4_t b) {
 #define SK_USE_CORRECT_SQRT 0
 #endif
 
-/* SK_STATIC_ASSERT: compile-time assert for C99, C11 and C++11; the C99 typedef name is made unique per use. */
-#if defined(__cplusplus)
-#  define SK_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
-#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-#  define SK_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
-#else
-#  define SK__STATIC_ASSERT_CONCAT_(a, b) a##b
-#  define SK__STATIC_ASSERT_CONCAT(a, b) SK__STATIC_ASSERT_CONCAT_(a, b)
-#  define SK_STATIC_ASSERT(cond, msg) \
-       typedef char SK__STATIC_ASSERT_CONCAT(sk_static_assert_line_, \
-                                              __LINE__)[(cond) ? 1 : -1]
-#endif
-
-/* The NEON Complex kernels and sk__cquad_load/store need Complex to be exactly two contiguous, unpadded floats {r, i}. */
-SK_STATIC_ASSERT(sizeof(Complex) == 2 * sizeof(float),
-               "Complex must be exactly two floats {r,i} (8 bytes, no "
-               "padding) -- the sk_c*_f32 NEON kernels' "
-               "quad-load/store layout depends on this");
-SK_STATIC_ASSERT(offsetof(Complex, r) == 0 &&
-               offsetof(Complex, i) == sizeof(float),
-               "Complex.r/.i must sit at byte offsets 0/4 in that order "
-               "(interleaved AoS) -- the sk_c*_f32 NEON kernels' "
-               "quad-load/store assumes this exact layout");
-
 #ifdef __cplusplus
 extern "C" {
 #endif

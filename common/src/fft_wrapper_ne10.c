@@ -5,22 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <stddef.h>
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
 
-/* Complex and ne10_fft_cpx_float32_t are cast to each other, which needs identical size, alignment and offsets (asserted below).
+/* Complex and ne10_fft_cpx_float32_t are cast to each other, which needs identical size, alignment and offsets (pinned by test/roundtrip.c).
  * The casts are not strict-aliasing compatible: this object is built with -fno-strict-aliasing and must not be built with LTO. */
-_Static_assert(sizeof(Complex) == sizeof(ne10_fft_cpx_float32_t),
-               "Complex/ne10_fft_cpx_float32_t size mismatch -- fft_forward/"
-               "fft_inverse cast between them without copying");
-_Static_assert(_Alignof(Complex) == _Alignof(ne10_fft_cpx_float32_t),
-               "Complex/ne10_fft_cpx_float32_t alignment mismatch -- cast "
-               "between them is unsafe");
-_Static_assert(offsetof(Complex, r) == offsetof(ne10_fft_cpx_float32_t, r),
-               "Complex/ne10_fft_cpx_float32_t .r offset mismatch");
-_Static_assert(offsetof(Complex, i) == offsetof(ne10_fft_cpx_float32_t, i),
-               "Complex/ne10_fft_cpx_float32_t .i offset mismatch");
 
 /* NE10 uses its ARM32/ARM64 NEON kernels, or its C kernels on a target without NEON or in a scalar build. */
 #if defined(SIMD_KERNELS_FORCE_SCALAR) || !defined(__ARM_NEON)

@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stddef.h>
+#include "NE10.h"
 
 /* Reference result of one call on a handle that has never run anything else. */
 static void fresh_forward(int n, const float* in, Complex* out) {
@@ -83,6 +85,35 @@ static int staging_independence(int n, int use_pool) {
     return ok;
 }
 
+/* C99 alignment of a type: the offset of a member of that type behind a char. */
+#define ALIGN_OF(T) offsetof(struct { char c; T t; }, t)
+
+/* fft_forward/fft_inverse cast Complex* and ne10_fft_cpx_float32_t* to each other, which needs identical size, alignment and offsets. */
+static int complex_matches_ne10_cpx(void) {
+    int ok = 1;
+    if (sizeof(Complex) != sizeof(ne10_fft_cpx_float32_t)) {
+        printf("FAIL: sizeof(Complex)=%zu != sizeof(ne10_fft_cpx_float32_t)=%zu -- fft_forward/fft_inverse cast between them without copying\n",
+               sizeof(Complex), sizeof(ne10_fft_cpx_float32_t));
+        ok = 0;
+    }
+    if (ALIGN_OF(Complex) != ALIGN_OF(ne10_fft_cpx_float32_t)) {
+        printf("FAIL: alignof(Complex)=%zu != alignof(ne10_fft_cpx_float32_t)=%zu -- cast between them is unsafe\n",
+               (size_t)ALIGN_OF(Complex), (size_t)ALIGN_OF(ne10_fft_cpx_float32_t));
+        ok = 0;
+    }
+    if (offsetof(Complex, r) != offsetof(ne10_fft_cpx_float32_t, r)) {
+        printf("FAIL: Complex/ne10_fft_cpx_float32_t .r offset mismatch (%zu vs %zu)\n",
+               offsetof(Complex, r), offsetof(ne10_fft_cpx_float32_t, r));
+        ok = 0;
+    }
+    if (offsetof(Complex, i) != offsetof(ne10_fft_cpx_float32_t, i)) {
+        printf("FAIL: Complex/ne10_fft_cpx_float32_t .i offset mismatch (%zu vs %zu)\n",
+               offsetof(Complex, i), offsetof(ne10_fft_cpx_float32_t, i));
+        ok = 0;
+    }
+    return ok;
+}
+
 int main(void) {
     const int nfft = 512, nf = nfft / 2 + 1;
     float in[512], out_heap[512], out_static[512];
@@ -137,7 +168,10 @@ int main(void) {
     printf("interleaved forward/inverse on one handle (n=16..8192, heap+pool): %s\n",
            stage_ok ? "independent of earlier calls" : "DIFFER");
 
-    int ok = (maxerr < 1e-3) && spec_eq && time_eq && stage_ok;
+    int layout_ok = complex_matches_ne10_cpx();
+    printf("Complex vs ne10_fft_cpx_float32_t (size, alignment, r/i offsets): %s\n", layout_ok ? "identical" : "DIFFER");
+
+    int ok = (maxerr < 1e-3) && spec_eq && time_eq && stage_ok && layout_ok;
     printf(ok ? ">>> PASS\n" : ">>> FAIL\n");
     return ok ? 0 : 1;
 }

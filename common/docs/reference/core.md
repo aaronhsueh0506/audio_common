@@ -76,7 +76,7 @@ void fft_power(const Complex* freq, float* power, int n_freqs);
 | 頻域頻譜 | `Complex` | `n_freqs = fft_size/2 + 1` |
 | power / gain | `float` | `n_freqs` |
 
-`Complex` 的定義就是 `{ float r; float i; }`，保證是兩個連續、無填補的 `float`（`simd_kernels.h` 有編譯期斷言保護這個佈局）。因此 `n_freqs` 個 `Complex` 佔 `n_freqs * 2 * sizeof(float)` 位元組。
+`Complex` 的定義就是 `{ float r; float i; }`，保證是兩個連續、無填補的 `float`（`test/simd_selftest.c` 在執行期檢查這個佈局）。因此 `n_freqs` 個 `Complex` 佔 `n_freqs * 2 * sizeof(float)` 位元組。
 
 static pool 的緩衝區只要 16-byte 對齊即可，不需要更大的對齊。
 
