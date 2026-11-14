@@ -3,7 +3,6 @@
 #include <math.h>
 #include "srp.h"
 #include "utility/mem_align.h"
-#include "spatial_complex.h"
 #include "spatial_simd.h"
 
 #ifndef M_PI

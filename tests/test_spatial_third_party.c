@@ -13,11 +13,20 @@
 #include <string.h>
 
 #include "bf.h"
-#include "bf_test_hooks.h"
 #include "spatial_simd.h"
 #include "utility/simd_kernels.h"
 #include "srp.h"
 #include "vad_api.h"
+
+/* Scalar-recurrence entry; compiled only with BF_TESTING and absent from the production library. */
+void bf_test_process_with_weights_scalar_rls(
+    BF* g,
+    const Complex* const* X,
+    float doa_s,
+    int allow_adapt_in,
+    const int* mask,
+    Complex* bf_out,
+    Complex* effective_weights);
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

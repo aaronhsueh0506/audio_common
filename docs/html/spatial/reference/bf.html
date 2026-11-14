@@ -117,7 +117,7 @@ void beam_hop(BF *bf, const Complex *const *X, float doa_s, int vad_out, const i
 <tr><th>類別</th><th>函式</th></tr>
 <tr><td>整合者呼叫</td><td><code>bf_get_mem_size</code>、<code>bf_init</code>、<code>bf_create</code>、<code>bf_process_with_weights</code>、<code>bf_reset</code>、<code>bf_destroy</code>、<code>bf_get_doa_used</code>、<code>bf_get_adaptive</code>、<code>bf_effective_adapt_interval</code></td></tr>
 <tr><td>診斷(唯讀)</td><td><code>bf_get_bin_resets</code>、<code>bf_wa_leak_factor</code>、<code>bf_p_diag_floor</code>、<code>bf_p_diag_ceil</code></td></tr>
-<tr><td>內部</td><td><code>spatial_conj_beamform</code>、<code>spatial_bf_projection</code>、<code>spatial_bf_effective_weights</code>、<code>spatial_complex_*</code>(<code>common/utility/spatial_*.h</code>)</td></tr>
+<tr><td>內部</td><td><code>spatial_conj_beamform</code>、<code>spatial_bf_projection</code>、<code>spatial_bf_effective_weights</code>、<code>spatial_complex_*</code>(<code>common/utility/spatial_simd.h</code>)</td></tr>
 </table></div>
 
 <h2>狀態與記憶體</h2>

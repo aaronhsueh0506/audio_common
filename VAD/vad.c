@@ -20,21 +20,6 @@ static int vad_median(MaskVAD* v, int raw)
     return (sum >= (k / 2 + 1));
 }
 
-/* Fills a fresh instance; shared by the heap and pool constructors. */
-static void vad_reset_state(MaskVAD* v, const VadConfig* cfg)
-{
-    v->cfg = *cfg;
-
-    v->state = 0;
-    v->hang_cnt = 0;
-    v->med_pos = 0;
-    v->vad_raw = 0;
-    v->vad_out = 0;
-
-    for (int i = 0; i < 9; i++)
-        v->med_buf[i] = 0;
-}
-
 size_t vad_get_mem_size(void)
 {
     return ck_align16_size(sizeof(MaskVAD));
@@ -63,7 +48,7 @@ MaskVAD* vad_init(void* mem, size_t mem_size, const VadConfig* cfg)
     /* Only the budgeted region is touched; trailing bytes of a larger pool are left alone. */
     memset(mem, 0, need);
     v = (MaskVAD*)mem;
-    vad_reset_state(v, cfg);
+    v->cfg = *cfg;
     v->owned_heap = NULL;
     return v;
 }

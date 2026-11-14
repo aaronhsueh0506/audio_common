@@ -136,7 +136,7 @@ float doa_hop(SRP *s, const Complex *const *X, const int *mask, int vad_raw, int
 <tr><th>類別</th><th>函式</th></tr>
 <tr><td>整合者呼叫</td><td><code>srp_get_mem_size</code>、<code>srp_init</code>、<code>srp_create_from_geometry</code>、<code>doa_step</code>、<code>doa_get_smooth</code>、<code>doa_get_raw</code>、<code>srp_reset</code>、<code>srp_destroy</code></td></tr>
 <tr><td>低階(進階)</td><td><code>srp</code>、<code>srp2doa</code>(<code>doa_step</code> 的組成;無 NULL 檢查)</td></tr>
-<tr><td>內部</td><td><code>doa_smoother_update</code>(宣告在公開標頭,但只該由 <code>doa_step</code> 呼叫)、<code>spatial_phat_cross</code>、<code>spatial_pair_score_accumulate</code>、<code>spatial_complex_*</code>(<code>common/utility/spatial_*.h</code>)</td></tr>
+<tr><td>內部</td><td><code>doa_smoother_update</code>(宣告在公開標頭,但只該由 <code>doa_step</code> 呼叫)、<code>spatial_phat_cross</code>、<code>spatial_pair_score_accumulate</code>、<code>spatial_complex_*</code>(<code>common/utility/spatial_simd.h</code>)</td></tr>
 </table></div>
 
 <h2>狀態與記憶體</h2>

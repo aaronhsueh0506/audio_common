@@ -26,7 +26,7 @@
 <tr><td><code>simd_kernels.h</code></td><td class="dead">內部/共用核心</td><td>一般整合者<b>不呼叫</b>。只有自己寫的熱迴圈剛好與某個核心形狀完全一致時才考慮</td></tr>
 <tr><td><code>simd_kernel_nn.h</code></td><td class="dead">內部/共用核心</td><td>神經網路模型前後處理與 <code>audio_stft.h</code> 專用的 <code>skn_*</code> 核心(與 <code>simd_kernels.h</code> 分開管理,傳統 AEC/NR 不引用)。一般整合者<b>不呼叫</b></td></tr>
 <tr><td><code>simd_aec.h</code>、<code>simd_nr.h</code></td><td class="dead">內部(AEC／NR 專用)</td><td>AEC、NR 各自引用的專用核心本體,由各自 repo 測試;整合者不呼叫</td></tr>
-<tr><td><code>spatial_complex.h</code>、<code>spatial_simd.h</code></td><td class="dead">內部(SRP／BF 用)</td><td><code>spatial_complex.h</code> 的四個複數輔助函式是 <code>static inline</code>(沒有 .c 也沒有 archive 成員);<code>spatial_simd.h</code> 的實作編進 <code>libspatial_common.a</code>(目前只有 <code>spatial_simd.o</code> 一個成員),見 <a href="../../spatial/index.html">空間鏈</a></td></tr>
+<tr><td><code>spatial_simd.h</code></td><td class="dead">內部(SRP／BF 用)</td><td>四個複數輔助函式 <code>spatial_complex_{add,mul,conj,scale}</code> 是 <code>spatial_simd.h</code> 內的 <code>static inline</code>(沒有 archive 成員);其餘函式的實作編進 <code>libspatial_common.a</code>(目前只有 <code>spatial_simd.o</code> 一個成員),見 <a href="../../spatial/index.html">空間鏈</a></td></tr>
 <tr><td><code>fast_math.h</code></td><td class="dead">內部/共用</td><td>同上。<b>超出定義域回固定邊界常數而非 IEEE 語意</b>(例:<code>fast_sqrt(NaN)</code> 回 <code>0.0f</code>)</td></tr>
 <tr><td><code>wav_io.h</code></td><td class="dead">離線工具專用</td><td><b>不適合即時/嵌入式路徑</b>(用 stdio + malloc,每樣本一次 fread/fwrite)</td></tr>
 </table></div>

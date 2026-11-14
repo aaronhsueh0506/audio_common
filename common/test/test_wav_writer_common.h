@@ -16,7 +16,15 @@
 #include <math.h>
 #include <unistd.h>
 
-#include "test_tmp_path.h"
+#define TEST_TMP_PATH_MAX 512
+
+/* mkstemp template under $TMPDIR (the Makefile points it at the build dir), else /tmp. An overflowing template is
+ * truncated, so the caller's mkstemp() fails and its setup check reports it. */
+static inline void test_tmp_template(char* out, size_t cap, const char* stem) {
+    const char* dir = getenv("TMPDIR");
+    if (!dir || !*dir) dir = "/tmp";
+    snprintf(out, cap, "%s/%s_XXXXXX", dir, stem);
+}
 
 /* Returns 1 if any check failed (each failure is printed to stderr as it
  * happens), 0 if every check passed. */

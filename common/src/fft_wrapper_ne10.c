@@ -124,7 +124,6 @@ FftHandle* fft_init(void* mem, size_t mem_size, int fft_size) {
     size_t cfg_reserved  = ck_align16_size((size_t)ne10_fft_r2c_mem_size_float32(fft_size));
     size_t cfg_budget    = (cfg_remaining < cfg_reserved) ? cfg_remaining : cfg_reserved;
     h->r2c_cfg = ne10_fft_init_r2c_float32_ext(cursor, (ne10_uint32_t)cfg_budget, fft_size);
-    cursor += ALIGN16((size_t)ne10_fft_r2c_mem_size_float32(fft_size));
     if (!h->r2c_cfg) return NULL;
 
     return h;

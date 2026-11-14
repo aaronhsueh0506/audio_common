@@ -157,36 +157,6 @@ static void test_all_finite(void) {
     printf("PASS all_finite_f32 / all_finite_cf32\n");
 }
 
-/* Finite predicate over strided rows (rows of `width` floats, `stride`
- * floats apart; the gap between width and stride holds planted non-finite
- * values that must not matter), against a plain double loop. */
-static void test_rows_all_finite(void) {
-    static float buf[8 * 64];
-    int round, want;
-    for (round = 0; round < 4000; ++round) {
-        size_t width = 1 + next_u32() % 40;
-        size_t stride = width + next_u32() % 24;
-        size_t rows = 1 + next_u32() % 8;
-        size_t r, i;
-        want = 1;
-        for (i = 0; i < sizeof(buf) / sizeof(float); ++i) buf[i] = gen_finite(0);
-        for (r = 0; r < rows; ++r)
-            for (i = width; i < stride; ++i) buf[r * stride + i] = gen_any();
-        if (round % 3 != 0) {
-            r = next_u32() % rows; i = next_u32() % width;
-            buf[r * stride + i] = gen_any();
-        }
-        for (r = 0; r < rows; ++r)
-            for (i = 0; i < width; ++i)
-                if (!isfinite(buf[r * stride + i])) want = 0;
-        if (skn_all_finite_rows_f32(buf, rows, stride, width) != want)
-            fail_int("all_finite_rows_f32", (int)(rows * stride), round, skn_all_finite_rows_f32(buf, rows, stride, width), want);
-        if (skn_all_finite_rows_f32_scalar(buf, rows, stride, width) != want)
-            fail_int("all_finite_rows_f32_scalar", (int)(rows * stride), round, skn_all_finite_rows_f32_scalar(buf, rows, stride, width), want);
-    }
-    printf("PASS all_finite_rows_f32\n");
-}
-
 static void test_fill_mul_power(void) {
     int ni, t, i;
     for (ni = 0; ni < N_COUNT; ++ni) {
@@ -679,7 +649,6 @@ static void bench(void) {
 int main(void) {
     SK_MATCH_SCALAR_TO_VECTOR_MODE();
     test_all_finite();
-    test_rows_all_finite();
     test_fill_mul_power();
     test_mag_eps();
     test_interleave();

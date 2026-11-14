@@ -24,9 +24,16 @@ as a whole from this point on.
 - `make test` (audiolib) runs `audit-no-stdio`; `make -C common test-full` runs `audit-fp-contract`. `selftest` depends on `test_audio_utils` instead of
   repeating its recipe. `common/test/simd_test_harness.h` holds the input-generation, comparison and canary helpers the SIMD selftests share.
 - `lib/ne10/VENDORED.md`: five headers no compiled source includes move from "header-only" to "vendored, not compiled". No file is removed.
+- The four `spatial_complex_*` helpers move from `common/utility/spatial_complex.h` into `common/utility/spatial_simd.h` (still `static inline`, bodies unchanged); the
+  separate header is gone, so this supersedes the `spatial_complex.h` line above. `bf.o`, `bf_test.o`, `srp.o` and `spatial_simd.o` are byte-identical, SIMD=1 and SIMD=0.
+- Test-only headers fold into their single user: `bf/bf_test_hooks.h` into `tests/test_spatial_third_party.c`, `common/test/test_tmp_path.h` into
+  `common/test/test_wav_writer_common.h`. No library object changes.
 
 ### Removed
 - `bf_process()` (use `bf_process_with_weights(..., NULL)`), `ac_stft_get_config()`, `clip_f()`.
+- Dead internals: `skn_all_finite_rows_f32()` and `skn_all_finite_rows_f32_scalar()` (`common/utility/simd_kernel_nn.h`; no caller since the AINR/AIAEC pre/post chains
+  stopped using them) with their selftests, the static `vad_reset_state()` (`vad_init()` already zero-fills the block, so `vad.o` loses only redundant stores), and a
+  dead cursor increment in `fft_init()`.
 - Write-only state: `BF.first_doa_frame`, `BF.current_doa`, `SRP.last_doa_raw`, `AudioResampler.input_rate`/`output_rate`,
   `WavReader.data_start`, `WavWriter.data_start`. `sizeof(BF)` shrinks by 16 bytes and `sizeof(SRP)` by 8 (arm64); the BF, SRP and each `AudioResampler` pool shrink by 16 bytes. The board
   samples that link these must be rebuilt.

@@ -18,7 +18,6 @@
 
 #include "wav_io.h"
 #include "test_wav_writer_common.h"
-#include "test_tmp_path.h"
 
 #include <stdio.h>
 #include <stdlib.h>

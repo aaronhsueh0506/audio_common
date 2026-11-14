@@ -4,7 +4,6 @@
 #include "bf.h"
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
-#include "spatial_complex.h"
 #include "spatial_simd.h"
 
 #ifndef M_PI

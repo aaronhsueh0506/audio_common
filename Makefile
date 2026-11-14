@@ -167,7 +167,7 @@ $(OBJ_DIR)/spatial_simd.o: common/utility/spatial_simd.c common/utility/spatial_
 $(OBJ_DIR)/doa_smoother.o: doa/doa_smoother.c doa/doa_smoother.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/srp.o: doa/srp.c doa/srp.h common/utility/spatial_complex.h common/utility/spatial_simd.h | _cfg_guard
+$(OBJ_DIR)/srp.o: doa/srp.c doa/srp.h common/utility/spatial_simd.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/masker.o: VAD/masker.c VAD/masker.h | _cfg_guard
@@ -179,16 +179,16 @@ $(OBJ_DIR)/vad.o: VAD/vad.c VAD/vad.h | _cfg_guard
 $(OBJ_DIR)/vad_api.o: VAD/vad_api.c VAD/vad_api.h VAD/masker.h VAD/vad.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/bf.o: bf/bf.c bf/bf.h common/utility/spatial_complex.h common/utility/spatial_simd.h | _cfg_guard
+$(OBJ_DIR)/bf.o: bf/bf.c bf/bf.h common/utility/spatial_simd.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_spatial_third_party.o: tests/test_spatial_third_party.c \
-        bf/bf.h bf/bf_test_hooks.h VAD/vad_api.h | _cfg_guard
+        bf/bf.h VAD/vad_api.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # The BF_TESTING build of bf.c, compiled ONLY here. audit-no-bf-test-symbols
 # below proves the deployable archive never picks it up.
-$(OBJ_DIR)/bf_test.o: bf/bf.c bf/bf.h common/utility/spatial_complex.h \
+$(OBJ_DIR)/bf_test.o: bf/bf.c bf/bf.h \
         common/utility/spatial_simd.h | _cfg_guard
 	$(CC) $(CFLAGS) -DBF_TESTING=1 -MD -MP -c -o $@ $<
 
