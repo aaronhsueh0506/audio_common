@@ -56,7 +56,6 @@ void fft_inverse_scratch(FftHandle* handle, Complex* freq_in_clobbered,
                          float* real_out);
 
 void fft_power(const Complex* freq, float* power, int n_freqs);
-void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);
 ```
 
 | 函式 | 什麼時候呼叫 | 參數怎麼填 |
@@ -68,7 +67,6 @@ void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);
 | `fft_forward_scratch` | 輸入緩衝區之後用不到、且想省一次複製時 | 呼叫後 `time_in_clobbered` 內容**未定義** |
 | `fft_inverse_scratch` | 同上，頻域側 | 呼叫後 `freq_in_clobbered` 內容**未定義** |
 | `fft_power` | 需要 \|X[k]\|² 時 | `n_freqs` 由 `fft_get_n_freqs()` 取得 |
-| `fft_apply_gain` | 對頻譜逐 bin 套用實數增益（就地） | `gain` 長度 `n_freqs` |
 
 ### 緩衝區大小規則
 
@@ -86,7 +84,6 @@ static pool 的緩衝區只要 16-byte 對齊即可，不需要更大的對齊�
 
 - `fft_forward` / `fft_inverse` 的輸入與輸出**不可以重疊**（宣告上帶 `restrict`），重疊是未定義行為。
 - 需要「輸入緩衝區可被覆寫」的語意時用 `_scratch` 版本；它只是**允許**覆寫，不保證一定覆寫，所以呼叫後絕對不要再讀那個緩衝區。
-- `fft_apply_gain` 本來就是就地操作（直接改寫 `freq`）。
 - `fft_power` 的輸入與輸出應視為不可重疊。
 
 ### 錯誤回傳

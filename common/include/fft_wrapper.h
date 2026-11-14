@@ -60,9 +60,6 @@ void fft_inverse_scratch(FftHandle* handle, Complex* freq_in_clobbered, float* r
 /** Power spectrum (magnitude^2): power[k] from freq[k], k < n_freqs. */
 void fft_power(const Complex* freq, float* power, int n_freqs);
 
-/** Apply gain[k] to freq[k] in place, k < n_freqs. */
-void fft_apply_gain(Complex* freq, const float* gain, int n_freqs);
-
 #ifdef __cplusplus
 }
 #endif

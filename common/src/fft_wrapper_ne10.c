@@ -197,10 +197,3 @@ void fft_power(const Complex* spectrum, float* power, int n_freqs) {
         power[k] = fmaf(re, re, im * im);
     }
 }
-
-void fft_apply_gain(Complex* spectrum, const float* gain, int n_freqs) {
-    if (!spectrum || !gain) return;
-
-    /* In-place real-gain multiply, equivalent to sk_capply_gain_f32 (simd_kernels.h) with out == z. */
-    sk_capply_gain_f32(spectrum, spectrum, gain, n_freqs);
-}

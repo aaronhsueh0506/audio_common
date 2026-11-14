@@ -65,7 +65,7 @@ fft_destroy(fft);</pre>
 <tr><td>省一次複製</td><td>輸入是可破壞的 scratch 時用 <code>fft_forward_scratch()</code>／<code>fft_inverse_scratch()</code>,呼叫後輸入內容<b>未定義</b></td></tr>
 </table></div>
 <div class="warn"><b>Aliasing 規則與 NR 相反。</b>NR 的 <code>anr_process()</code> 明確支援 <code>out == in</code>(完全同一指標);FFT 這裡則是任何重疊都 UB。兩層不要套用同一條直覺。</div>
-<p>其他:<code>fft_power</code>(|X|²,不開根號)／<code>fft_apply_gain</code>(就地)。</p>
+<p>其他:<code>fft_power</code>(|X|²,不開根號)。</p>
 <h3>FFT 後端</h3>
 <div class="tblwrap"><table>
 <tr><th>BACKEND</th><th>說明</th></tr>

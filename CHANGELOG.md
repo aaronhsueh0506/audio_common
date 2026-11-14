@@ -34,6 +34,7 @@ as a whole from this point on.
 - Dead internals: `skn_all_finite_rows_f32()` and `skn_all_finite_rows_f32_scalar()` (`common/utility/simd_kernel_nn.h`; no caller since the AINR/AIAEC pre/post chains
   stopped using them) with their selftests, the static `vad_reset_state()` (`vad_init()` already zero-fills the block, so `vad.o` loses only redundant stores), and a
   dead cursor increment in `fft_init()`.
+- `fft_apply_gain()` (`fft_wrapper.h`, `fft_wrapper_ne10.c`; no caller anywhere, `sk_capply_gain_f32()` stays). Callers needing it use `sk_capply_gain_f32(z, z, gain, n)`.
 - Write-only state: `BF.first_doa_frame`, `BF.current_doa`, `SRP.last_doa_raw`, `AudioResampler.input_rate`/`output_rate`,
   `WavReader.data_start`, `WavWriter.data_start`. `sizeof(BF)` shrinks by 16 bytes and `sizeof(SRP)` by 8 (arm64); the BF, SRP and each `AudioResampler` pool shrink by 16 bytes. The board
   samples that link these must be rebuilt.
