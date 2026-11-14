@@ -50,8 +50,6 @@ typedef struct {
     Complex* scratch_spec;
     Complex* scratch_u;
 
-    int initialized;
-    int first_doa_found;
     uint64_t frame_idx;  /* Monotonic per-frame counter. */
 
     float doa_used;

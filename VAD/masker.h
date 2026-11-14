@@ -40,9 +40,7 @@ typedef struct {
 
 typedef struct {
     /* system */
-    int NFFT;
     int F;
-    int sr;
 
     MaskerConfig cfg;
 
@@ -63,15 +61,9 @@ typedef struct {
     int* mask;
 
     int initialized;
-
-    /* Non-NULL only on the masker_create() path: the block backing this struct and its arrays, freed by masker_destroy(). */
-    void* owned_heap;
 } MaskEstimator;
 
 
-
-/* Heap constructor: one block sized by masker_get_mem_size() and carved like masker_init(). */
-MaskEstimator* masker_create(const MaskerConfig* cfg);
 
 /* Caller-pool constructor: `mem` must be 16-byte aligned and `mem_size` >= masker_get_mem_size(cfg), else NULL.
  * The caller owns the memory; masker_destroy() does not free it. */

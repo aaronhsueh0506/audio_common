@@ -38,6 +38,15 @@ as a whole from this point on.
 - Write-only state: `BF.first_doa_frame`, `BF.current_doa`, `SRP.last_doa_raw`, `AudioResampler.input_rate`/`output_rate`,
   `WavReader.data_start`, `WavWriter.data_start`. `sizeof(BF)` shrinks by 16 bytes and `sizeof(SRP)` by 8 (arm64); the BF, SRP and each `AudioResampler` pool shrink by 16 bytes. The board
   samples that link these must be rebuilt.
+- `masker_create()` (`masker.h`, `masker.c`; only `tests/bench_masker.c` called it, which now allocates with `posix_memalign()` + `masker_init()`; use `masker_init()` with a caller pool). `masker_destroy()` stays and does nothing.
+- Write-only or duplicate state: `VADApi.cfg` (private to `vad_api.c`), `BF.initialized`, `BF.first_doa_found`, `SRP.M`, `MaskEstimator.NFFT`/`.sr` (read as `cfg.NFFT`/`cfg.sr`; same `int` source, `band_mask` is unchanged),
+  `MaskEstimator.owned_heap`. No layout-version or descriptor constant covers these pools, so no constant moves.
+  Measured arm64 pool sizes (16k@256 / 16k@512 / 48k@1024): `vad_api_get_mem_size()` 6,240 / 11,872 / 23,136 B -> 6,128 / 11,760 / 23,024 B (-112: VADApi shell -96, masker -16);
+  `masker_get_mem_size()` 6,000 / 11,632 / 22,896 B -> 5,984 / 11,616 / 22,880 B; `bf_get_mem_size(4, F)` 28,208 / 55,856 / 111,152 B and `srp_get_mem_size()` (A=72, M=4) 758,592 / 1,503,552 / 2,993,472 B are unchanged
+  (`sizeof(BF)` 144 -> 136 and `sizeof(SRP)` 176 -> 168 stay inside the 16-byte rounding); `vad_get_mem_size()` stays 96 B. `sizeof(MaskEstimator)` 184 -> 168.
+  ARM32 (clang layout dump, not an SDK build): `sizeof(MaskEstimator)` 132 -> 120, `sizeof(BF)` 104 -> 96, `sizeof(SRP)` 128 unchanged, `sizeof(VADApi)` 128 -> 24 (derived); `vad_api_get_mem_size()` -112 B, `masker_get_mem_size()` -16 B,
+  `bf_get_mem_size()` -16 B, SRP unchanged. All figures are against the tree before this step; the earlier bullet's BF/SRP 16-byte figures are already in the baseline.
+  The board samples that size these pools at run time must be rebuilt.
 
 ## [Unreleased] — 2026-11-02 — NEON kernels also run on 32-bit ARM (AArch32)
 

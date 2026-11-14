@@ -37,6 +37,7 @@ int main(int argc, char** argv) {
     int F = nfft / 2 + 1;
     MaskerConfig cfg;
     MaskEstimator* m;
+    void* blk = NULL;
     Complex* frame;
     float* a; float* b;
     double t0, clock_cost, total, s_cmag, s_db, s_ema;
@@ -52,7 +53,8 @@ int main(int argc, char** argv) {
     cfg.enable_time_smooth = 1; cfg.T_alpha = 0.7f;
     cfg.enable_energy = 1; cfg.enable_spp = 1; cfg.enable_band = 1;
 
-    m = masker_create(&cfg);
+    m = (posix_memalign(&blk, 16, masker_get_mem_size(&cfg)) == 0)
+            ? masker_init(blk, masker_get_mem_size(&cfg), &cfg) : NULL;
     frame = (Complex*)malloc((size_t)F * sizeof(Complex));
     a = (float*)malloc((size_t)F * sizeof(float));
     b = (float*)malloc((size_t)F * sizeof(float));
@@ -113,6 +115,6 @@ int main(int argc, char** argv) {
            (total - s_cmag - s_db - s_ema) * 1e6,
            100.0 * (total - s_cmag - s_db - s_ema) / total);
 
-    masker_destroy(m); free(frame); free(a); free(b);
+    masker_destroy(m); free(blk); free(frame); free(a); free(b);
     return 0;
 }

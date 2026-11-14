@@ -7,8 +7,6 @@
 #include "utility/mem_align.h"
 
 struct VADApi {
-    VADApiConfig cfg;
-
     MaskEstimator* masker;
     MaskVAD* mask_vad;
 
@@ -63,7 +61,6 @@ VADApi* vad_api_init(const VADApiConfig* cfg, void* mem, size_t mem_size)
 
     memset(mem, 0, need);
     v = (VADApi*)mem;
-    v->cfg = *cfg;
 
     masker_need = masker_get_mem_size(&cfg->masker_cfg);
     vad_need    = vad_get_mem_size();

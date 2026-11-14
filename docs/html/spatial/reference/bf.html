@@ -85,7 +85,7 @@ void beam_hop(BF *bf, const Complex *const *X, float doa_s, int vad_out, const i
      |                     |  frame_idx++
      |&lt;- out[F]、w[M*F]、bf_get_adaptive / bf_get_doa_used / bf_get_bin_resets -|
  ─── 重置 ───────────────────────────────────────────────────────────────────────
-     |-- bf_reset -------->|  P=I、wa=0、frame_idx=0、first_doa 狀態與 doa_used 歸初值(bin_resets 不清)
+     |-- bf_reset -------->|  P=I、wa=0、frame_idx=0、doa_used 歸初值(bin_resets 不清)
 </pre>
 <p class="small">BF 沒有取樣延遲(同 hop 輸入、同 hop 輸出)。RLS 的收斂速度由 <code>lambda</code> 與更新次數決定,更新次數 = 滿足 <code>allow_adapt</code>、<code>adapt_interval</code>、遮罩三道門的 hop 數;swimlane 見 <a href="../index.html">空間鏈</a>。</p>
 

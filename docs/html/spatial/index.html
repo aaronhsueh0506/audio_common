@@ -177,7 +177,7 @@ RLS 更新(allow_adapt)  可     -      -      -      -      -      -      -    
 <tr><th>物件</th><th>誰存放</th><th>F = 129 (16 kHz / 256)</th><th>F = 257 (16 kHz / 512)</th><th>F = 513 (48 kHz / 1024)</th></tr>
 <tr><td><code>SRP</code>(A=72, M=4)</td><td>caller pool</td><td>758,592 B</td><td>1,503,552 B</td><td>2,993,472 B</td></tr>
 <tr><td><code>BF</code>(M=4)</td><td>caller pool</td><td>28,208 B</td><td>55,856 B</td><td>111,152 B</td></tr>
-<tr><td><code>VADApi</code></td><td>caller pool</td><td>6,240 B(其中 masker 6,000 B、VAD 96 B)</td><td>11,872 B</td><td>23,136 B</td></tr>
+<tr><td><code>VADApi</code></td><td>caller pool</td><td>6,128 B(其中 masker 5,984 B、VAD 96 B)</td><td>11,760 B</td><td>23,024 B</td></tr>
 </table></div>
 <p>SRP 的大宗是兩張預先計算的表:<code>a_array</code> ≈ A·M·F·8 B 與 <code>pair_steer</code> ≈ A·M(M−1)/2·F·8 B(出處 <code>doa/srp.c:srp_get_mem_size</code>)。因此記憶體隨 <code>num_angles</code> 線性成長,這是 <code>num_angles</code> 不宜隨意調大的主因。BF 的大宗是 <code>P[M][M][F]</code> 的 RLS 協方差,與 <code>num_angles</code> 無關。</p>
 </main>

@@ -622,7 +622,6 @@ static void bf_process_with_weights_impl(
      * - allow_adapt_in is supplied by the caller (typically vad_out == 0). */
     if (g->enable_fix_mode) {
         doa_use = g->fixed_doa_rad;
-        g->first_doa_found = 1;
     } else {
         if (isnan(doa_s)) {
             bf_bypass_frame(g, X, bf_out, effective_weights);
@@ -630,7 +629,6 @@ static void bf_process_with_weights_impl(
         }
 
         doa_use = doa_s;
-        g->first_doa_found = 1;
     }
 
     g->doa_used = doa_use;
@@ -741,8 +739,6 @@ void bf_reset(BF* g)
     for (int m = 0; m < g->M; ++m) {
         memset(g->wa[m], 0, (size_t)g->F * sizeof(Complex));
     }
-    g->initialized = 0;
-    g->first_doa_found = 0;
     g->frame_idx = 0;
     g->doa_used = NAN;
     g->adaptive = 0;

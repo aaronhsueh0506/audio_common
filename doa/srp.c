@@ -104,7 +104,6 @@ SRP* srp_init(void* mem, size_t mem_size,
     cursor.ptr = (uint8_t*)mem + ALIGN16(sizeof(SRP));
     cursor.remaining = need - ALIGN16(sizeof(SRP));
 
-    s->M = M;
     s->F = F;
     s->num_angles = A;
 

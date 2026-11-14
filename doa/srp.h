@@ -42,7 +42,6 @@ typedef struct {
 } SRP_Config;
 
 struct SRP {
-    int M;
     int F;
     int num_angles;
 

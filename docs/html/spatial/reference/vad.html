@@ -58,7 +58,7 @@ int vad_hop(VADApi *v, const Complex *X0, int *vad_raw, const int **mask)
 /* 沒有 reset 函式:重新開始就對同一塊 pool 再呼叫 vad_api_init;結束 vad_api_destroy(pool 路徑不釋放) */</code></pre>
 <div class="tblwrap"><table>
 <tr><th>函式</th><th>失敗/邊界</th></tr>
-<tr><td><code>vad_api_get_mem_size(cfg)</code></td><td>0 = <code>backend</code> 不是 MASKER、<code>vad_cfg.F != masker_cfg.NFFT/2+1</code>、<code>vad_config_is_valid</code> 失敗(<code>F &lt;= 0</code>,或開了中值而 <code>median_k</code> 不是 5/7/9)、開了 <code>enable_freq_smooth</code> 而 <code>smooth_size</code> 非正奇數、<code>masker_cfg.NFFT &lt;= 0</code>(<code>VAD/vad_api.c:23-46</code>)</td></tr>
+<tr><td><code>vad_api_get_mem_size(cfg)</code></td><td>0 = <code>backend</code> 不是 MASKER、<code>vad_cfg.F != masker_cfg.NFFT/2+1</code>、<code>vad_config_is_valid</code> 失敗(<code>F &lt;= 0</code>,或開了中值而 <code>median_k</code> 不是 5/7/9)、開了 <code>enable_freq_smooth</code> 而 <code>smooth_size</code> 非正奇數、<code>masker_cfg.NFFT &lt;= 0</code>(<code>VAD/vad_api.c:21-44</code>)</td></tr>
 <tr><td><code>vad_api_init(cfg, mem, n)</code></td><td>NULL = 上述任一、<code>mem</code> 為 NULL 或未對齊、<code>n</code> 不足</td></tr>
 <tr><td><code>vad_api_process(v, X_ref)</code></td><td>NULL 靜默返回。<code>X_ref</code> 必須有 F 個 bin;不檢查非有限值</td></tr>
 <tr><td><code>vad_api_get_raw / get / get_mask</code></td><td>NULL 回 0 / 0 / NULL。<code>get_mask</code> 在第一次 <code>process</code> 之前為 NULL;回傳的指標指向內部陣列,下一次 <code>process</code> 會被覆寫</td></tr>
@@ -136,16 +136,16 @@ out(中值 k=5 開)      0 0 0 0 1 1 1 1 1 1  1  1  1  0     ← 起點延後 2 
 <div class="tblwrap"><table>
 <tr><th>類別</th><th>函式</th></tr>
 <tr><td>整合者呼叫</td><td><code>vad_api_get_mem_size</code>、<code>vad_api_init</code>、<code>vad_api_create</code>、<code>vad_api_process</code>、<code>vad_api_get</code>、<code>vad_api_get_raw</code>、<code>vad_api_get_mask</code>、<code>vad_api_destroy</code></td></tr>
-<tr><td>下層(可單獨用,檢查較少)</td><td><code>masker_get_mem_size</code>、<code>masker_init</code>、<code>masker_create</code>、<code>masker_step</code>、<code>masker_get_mask</code>、<code>masker_destroy</code>;<code>vad_get_mem_size</code>、<code>vad_config_is_valid</code>、<code>vad_init</code>、<code>vad_create</code>、<code>vad_step</code>、<code>vad_get_raw</code>、<code>vad_get_out</code>、<code>vad_destroy</code></td></tr>
+<tr><td>下層(可單獨用,檢查較少)</td><td><code>masker_get_mem_size</code>、<code>masker_init</code>、<code>masker_step</code>、<code>masker_get_mask</code>、<code>masker_destroy</code>;<code>vad_get_mem_size</code>、<code>vad_config_is_valid</code>、<code>vad_init</code>、<code>vad_create</code>、<code>vad_step</code>、<code>vad_get_raw</code>、<code>vad_get_out</code>、<code>vad_destroy</code></td></tr>
 <tr><td>內部</td><td><code>median_filter_1d</code>、<code>vad_median</code>、<code>vad_smooth</code>、<code>vad_mask2raw</code>(皆 static);<code>sk_cmag_f32</code>、<code>sk_linear_to_db_f32</code>、<code>sk_asym_ema_f32</code>(<code>common/utility/simd_kernels.h</code>)</td></tr>
 </table></div>
 
 <h2>狀態與記憶體</h2>
 <div class="tblwrap"><table>
 <tr><th>狀態</th><th>大小</th><th>誰存放</th></tr>
-<tr><td>masker:<code>noise_floor</code>、<code>noise_psd</code>、<code>spp_time</code>、<code>power_frame</code>、<code>energy_frame</code>(各 F 個 float)與 6 張 F 個 int 的遮罩</td><td><code>masker_get_mem_size</code>:NFFT=256 為 6,000 B;NFFT=512 為 11,632 B</td><td>caller pool</td></tr>
+<tr><td>masker:<code>noise_floor</code>、<code>noise_psd</code>、<code>spp_time</code>、<code>power_frame</code>、<code>energy_frame</code>(各 F 個 float)與 6 張 F 個 int 的遮罩</td><td><code>masker_get_mem_size</code>:NFFT=256 為 5,984 B;NFFT=512 為 11,616 B</td><td>caller pool</td></tr>
 <tr><td>MaskVAD:<code>med_buf[9]</code>、<code>state</code>、<code>hang_cnt</code>、<code>vad_raw/out</code></td><td><code>vad_get_mem_size() = 96 B</code></td><td>caller pool</td></tr>
-<tr><td><code>VADApi</code>(上兩者加外殼)</td><td><code>vad_api_get_mem_size</code>:NFFT=256 為 6,240 B;NFFT=512 為 11,872 B;NFFT=1024 為 23,136 B</td><td>caller pool(單一區塊)</td></tr>
+<tr><td><code>VADApi</code>(上兩者加外殼)</td><td><code>vad_api_get_mem_size</code>:NFFT=256 為 6,128 B;NFFT=512 為 11,760 B;NFFT=1024 為 23,024 B</td><td>caller pool(單一區塊)</td></tr>
 </table></div>
 <p class="small">ARM64/LP64。結構含指標,ARM32 須重新查詢。</p>
 </main>

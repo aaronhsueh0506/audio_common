@@ -1,6 +1,5 @@
 #include <math.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 #include "masker.h"
 #include "utility/fast_math.h"
@@ -63,8 +62,6 @@ static MaskEstimator* masker_carve(void* mem, size_t need,
     cursor.remaining = need - ck_align16_size(sizeof(MaskEstimator));
 
     m->cfg  = *cfg;
-    m->NFFT = cfg->NFFT;
-    m->sr   = cfg->sr;
     m->F    = cfg->NFFT / 2 + 1;
     F = (size_t)m->F;
 
@@ -89,7 +86,7 @@ static MaskEstimator* masker_carve(void* mem, size_t need,
     }
 
     for (f = 0; f < m->F; f++) {
-        float freq = (float)f * m->sr / m->NFFT;
+        float freq = (float)f * m->cfg.sr / m->cfg.NFFT;
         m->band_mask[f] =
             (freq > m->cfg.low_freq && freq < m->cfg.high_freq) ? 1 : 0;
     }
@@ -98,41 +95,20 @@ static MaskEstimator* masker_carve(void* mem, size_t need,
     return m;
 }
 
-MaskEstimator* masker_create(const MaskerConfig* cfg)
-{
-    MaskEstimator* m;
-    void* block;
-    size_t need = masker_get_mem_size(cfg);
-
-    if (need == 0) return NULL;
-    /* One 16-byte-aligned block backs the struct and every array. */
-    if (posix_memalign(&block, 16, need) != 0 || !block) return NULL;
-
-    m = masker_carve(block, need, cfg);
-    if (!m) { free(block); return NULL; }
-    m->owned_heap = block;
-    return m;
-}
-
 MaskEstimator* masker_init(void* mem, size_t mem_size, const MaskerConfig* cfg)
 {
-    MaskEstimator* m;
     size_t need = masker_get_mem_size(cfg);
 
     if (!mem || need == 0 || !MEM_IS_ALIGNED16(mem) || mem_size < need)
         return NULL;
 
-    m = masker_carve(mem, need, cfg);
-    if (!m) return NULL;
-    m->owned_heap = NULL;
-    return m;
+    return masker_carve(mem, need, cfg);
 }
 
 void masker_destroy(MaskEstimator* m)
 {
-    if (!m) return;
-    /* Pool path (owned_heap == NULL): the caller owns the memory; nothing to free. */
-    if (m->owned_heap) free(m->owned_heap);
+    /* The caller owns the pool; nothing to free. */
+    (void)m;
 }
 
 /* X_ref: single-channel spectrum, e.g. X[0]. */
