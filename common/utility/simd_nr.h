@@ -290,8 +290,7 @@ SKR_TWIN void skr_final_blend_scalar(const SkrFinalGainParams* g,
 /* exp_gain: exp() of the clamped log gain in, final gain out. A log gain outside [log_g_min, 0] takes g_min / 1 and the matching saved log gain. */
 static inline void skr_final_store_elem(const SkrFinalGainParams* g, float log_gain,
                                         float conditional, float power, float* exp_gain,
-                                        float* saved_log, float* previous_gain,
-                                        float* previous_psd) {
+                                        float* saved_log, float* previous_psd) {
     float gain = *exp_gain;
     float log_save = log_gain;
     if (log_gain < g->log_g_min) {
@@ -303,20 +302,18 @@ static inline void skr_final_store_elem(const SkrFinalGainParams* g, float log_g
     }
     *exp_gain = gain;
     *saved_log = log_save;
-    *previous_gain = gain;
     float dd_gain = g->dd_from_gmmse ? conditional : gain;
     *previous_psd = dd_gain * dd_gain * power;
 }
 
 SKR_TWIN void skr_final_store_scalar(const SkrFinalGainParams* g,
                                      const float* log_gain, float* exp_gain,
-                                     float* saved_logs, float* previous_gain,
-                                     float* previous_psd,
+                                     float* saved_logs, float* previous_psd,
                                      const float* conditional_gain,
                                      const float* power, int n) {
     for (int k = 0; k < n; k++)
         skr_final_store_elem(g, log_gain[k], conditional_gain[k], power[k], exp_gain + k,
-                             saved_logs + k, previous_gain + k, previous_psd + k);
+                             saved_logs + k, previous_psd + k);
 }
 
 #if SK_HAVE_NEON
@@ -352,8 +349,8 @@ SKR_TWIN void skr_final_blend_neon(const SkrFinalGainParams* g, const float* pos
 }
 
 SKR_TWIN void skr_final_store_neon(const SkrFinalGainParams* g, const float* log_gain,
-                                   float* exp_gain, float* saved_logs, float* previous_gain,
-                                   float* previous_psd, const float* conditional_gain,
+                                   float* exp_gain, float* saved_logs, float* previous_psd,
+                                   const float* conditional_gain,
                                    const float* power, int n) {
     const float32x4_t one = vdupq_n_f32(1.0f);
     const float32x4_t zero = vdupq_n_f32(0.0f);
@@ -369,13 +366,12 @@ SKR_TWIN void skr_final_store_neon(const SkrFinalGainParams* g, const float* log
         float32x4_t log_save = vbslq_f32(below, log_min, vbslq_f32(above, zero, lg));
         vst1q_f32(exp_gain + k, gain);
         vst1q_f32(saved_logs + k, log_save);
-        vst1q_f32(previous_gain + k, gain);
         float32x4_t dd = g->dd_from_gmmse ? vld1q_f32(conditional_gain + k) : gain;
         vst1q_f32(previous_psd + k, vmulq_f32(vmulq_f32(dd, dd), vld1q_f32(power + k)));
     }
     for (; k < n; k++)
         skr_final_store_elem(g, log_gain[k], conditional_gain[k], power[k], exp_gain + k,
-                             saved_logs + k, previous_gain + k, previous_psd + k);
+                             saved_logs + k, previous_psd + k);
 }
 #endif /* SK_HAVE_NEON */
 

@@ -52,6 +52,9 @@ as a whole from this point on.
   ARM32 (clang layout dump, not an SDK build): `sizeof(MaskEstimator)` 132 -> 120, `sizeof(BF)` 104 -> 96, `sizeof(SRP)` 128 unchanged, `sizeof(VADApi)` 128 -> 24 (derived); `vad_api_get_mem_size()` -112 B, `masker_get_mem_size()` -16 B,
   `bf_get_mem_size()` -16 B, SRP unchanged. All figures are against the tree before this step; the earlier bullet's BF/SRP 16-byte figures are already in the baseline.
   The board samples that size these pools at run time must be rebuilt.
+- The `previous_gain` output of `skr_final_store_elem()`, `skr_final_store_scalar()` and `skr_final_store_neon()`
+  (`common/utility/simd_nr.h`). NR, their only caller, dropped the write-only array it filled. No audiolib object changes
+  (the header is NR-internal); NR must move to the matching commit.
 
 ## [Unreleased] — 2026-11-02 — NEON kernels also run on 32-bit ARM (AArch32)
 
