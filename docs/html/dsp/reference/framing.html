@@ -81,7 +81,7 @@ ac_istft_push 吐出(逐幀)           —(無幀)   0 , hop    hop     ← 第 
 <tr><th>用途</th><th>設定</th><th>行為</th></tr>
 <tr><td>pipeline 合成端(accumulate→emit→shift→尾端清零)</td><td>預設值</td><td>每幀吐 hop 個樣本(含第 1 幀);不縮放頻譜</td></tr>
 <tr><td>NN 正規化頻譜(DFN2:<code>spec_scale = 1/sqrtf(N)</code>、<code>ispec_scale = sqrtf(N)</code>;GTCRN:兩者 1.0f)</td><td><code>center = 0</code>、<code>AC_OLA_ACCUMULATE</code>、<code>spec_scale</code>/<code>ispec_scale</code></td><td>縮放發生在前向 FFT 之後、反向 FFT 之前的每個 bin;<b>scale 恰為 1.0f 時略過乘法</b>(bin 為精確搬移,NaN payload 與 −0.0 不變)</td></tr>
-<tr><td>Align-ULCNet、DeepVQE-S 的板端 PCM stream</td><td><code>center = 0</code>、<code>AC_OLA_ENV_NORM</code></td><td>每 hop 提供一幀頻譜給模型。合成的第一幀輸出長度為 0，SDK 將該 PCM hop 填零，接著每幀輸出一個 hop。</td></tr>
+<tr><td>Align-ULCNet、DeepVQE-S 的板端 PCM stream</td><td><code>center = 0</code>、<code>AC_OLA_ACCUMULATE</code>(預設值)</td><td>每 hop 提供一幀頻譜給模型，合成每次 push 都輸出一個 hop(含第 1 幀),輸出與輸入等長、延遲一個 hop。第 1 個 hop 是零歷史的半窗合成結果，不強制靜音。DeepVQE-S 在 <code>frames_per_call</code> N &gt; 1 時，最前面 N − 1 個 hop 輸出 0。</td></tr>
 <tr><td>離線 torch.stft(center=True, reflect) / torch.istft</td><td><code>center = 1</code>、<code>AC_OLA_ENV_NORM</code></td><td>分析:第 1 次 push 0 幀、第 2 次 2 幀(reflect 前綴幀 + 第 1 幀)、之後每次 1 幀;<code>ac_stft_flush_planar</code> 補尾端 reflect 幀。合成:同時累加窗平方包絡,輸出 acc / max(env, 1e-11f);第 1 幀落在被裁掉的半窗,不吐樣本;<code>ac_istft_flush</code> 吐出 hop 個尚在 overlap 內的樣本</td></tr>
 </table></div>
 
