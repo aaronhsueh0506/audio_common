@@ -56,6 +56,8 @@ as a whole from this point on.
   (`common/utility/simd_nr.h`). NR, their only caller, dropped the write-only array it filled. No audiolib object changes
   (the header is NR-internal); NR must move to the matching commit.
 - `common/scripts/audit_fp_contract.sh`: the `anr.o` row no longer names NR's removed `USE_FAST_GAIN_SMOOTHING` flag (text only; the row checks the same object).
+- `skr_gain_prepare_elem()`, `skr_gain_prepare_scalar()` and `skr_gain_prepare_neon()` (`common/utility/simd_nr.h`): NR's gain stage now takes the clamped
+  `v` and `xi/(1+xi)` straight from its SPP stage, so nothing calls them. No audiolib object changes; NR must move to the matching commit.
 
 ## [Unreleased] — 2026-11-02 — NEON kernels also run on 32-bit ARM (AArch32)
 

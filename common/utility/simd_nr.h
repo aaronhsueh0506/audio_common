@@ -199,56 +199,6 @@ SKR_TWIN void skr_restart_inert_neon(float* noise, const float* power,
 }
 #endif /* SK_HAVE_NEON */
 
-/* Clamp v to [1e-10, 700]. Recover xi/(1+xi) directly when v underflows; otherwise reuse v/(gamma+eps). Outputs must not overlap inputs. */
-static inline void skr_gain_prepare_elem(float v_in, float gamma, float xi, float* v_out,
-                                         float* ratio_out) {
-    float v = v_in;
-    if (v < 1e-10f) v = 1e-10f;
-    if (v > 700.0f) v = 700.0f;
-    *v_out = v;
-    if (v_in < 1e-10f) {
-        *ratio_out = xi / (1.0f + xi);
-    } else {
-        *ratio_out = v_in / (gamma + 1e-10f);
-    }
-}
-
-SKR_TWIN void skr_gain_prepare_scalar(const float* v_in, const float* gamma, const float* xi,
-                                      float* v_out, float* ratio_out, int n) {
-    for (int k = 0; k < n; k++)
-        skr_gain_prepare_elem(v_in[k], gamma[k], xi[k], v_out + k, ratio_out + k);
-}
-
-#if SK_HAVE_NEON
-SKR_TWIN void skr_gain_prepare_neon(const float* v_in, const float* gamma, const float* xi,
-                                    float* v_out, float* ratio_out, int n) {
-    const float32x4_t eps = vdupq_n_f32(1e-10f);
-    const float32x4_t one = vdupq_n_f32(1.0f);
-    const float32x4_t v_max = vdupq_n_f32(700.0f);
-    int k = 0;
-    for (; k + 4 <= n; k += 4) {
-        float32x4_t v_raw = vld1q_f32(v_in + k);
-        uint32x4_t below_eps = vcltq_f32(v_raw, eps);
-        float32x4_t ratio_div = vdivq_f32(v_raw, vaddq_f32(vld1q_f32(gamma + k), eps));
-        float32x4_t ratio;
-        if (vmaxvq_u32(below_eps) == 0) {
-            /* No lane needs the direct-xi fallback: skip its division and select. */
-            ratio = ratio_div;
-        } else {
-            float32x4_t xi_k = vld1q_f32(xi + k);
-            float32x4_t ratio_guard = vdivq_f32(xi_k, vaddq_f32(one, xi_k));
-            ratio = vbslq_f32(below_eps, ratio_guard, ratio_div);
-        }
-        float32x4_t v = vbslq_f32(below_eps, eps, v_raw);
-        v = vbslq_f32(vcgtq_f32(v, v_max), v_max, v);
-        vst1q_f32(v_out + k, v);
-        vst1q_f32(ratio_out + k, ratio);
-    }
-    for (; k < n; k++)
-        skr_gain_prepare_elem(v_in[k], gamma[k], xi[k], v_out + k, ratio_out + k);
-}
-#endif /* SK_HAVE_NEON */
-
 /* Final log-gain blend/store (NEON twins under ANR_VECTOR; scalar twins otherwise). */
 typedef struct {
     float log_g_min;
