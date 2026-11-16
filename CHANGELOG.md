@@ -20,6 +20,10 @@ as a whole from this point on.
 - `test_wav_io` sweeps every int16 value, every tie k +- 0.5 LSB and one float step either side (458,752 samples) against a double reference; the
   round-trip test derives its expectation from the same reference.
 
+## [Unreleased] — 2026-11-16 — `sk_cng_inject_f32` in `simd_aec.h`
+
+- `sk_cng_inject_f32()` (comfort-noise draw for n consecutive bins) and its `_scalar` twin. The scalar twin is the one-step-per-bin loop; the NEON twin reproduces its draws and its final generator state for any starting value, and equals it bit for bit on finite inputs. Covered by `simd_selftest_aec`.
+
 ## [Unreleased] — 2026-11-14 — Tidy
 
 ### Changed

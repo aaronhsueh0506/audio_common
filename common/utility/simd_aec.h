@@ -1705,6 +1705,95 @@ static inline void sk_saturation_counts_f32(
 #endif
 }
 
+/* sk_cng_inject_f32: per bin one step of s = (s * 69069 + 1) & 0x7FFFFFFF, ix = s >> 26, then spec += ng * (amp * lut[ix]) (re) and ng * (amp * lut[(ix + 8) & 31]) (im),
+ * ng = fast_sqrt(max(1 - g_res^2, 0)) times max(g_nr, nr_floor) when g_nr is non-NULL (nr_floor not NaN). The NEON twin steps four bins side by side by jump-ahead
+ * mod 2^32 (only bits 0..30 feed back): the same draws and final seed for any start value. */
+
+#define SK_CNG_LCG_A 69069u
+#define SK_CNG_LCG_MASK 0x7FFFFFFFu
+
+static inline void sk_cng_inject_f32_scalar(uint32_t *seed, Complex *spec, const float *amp,
+                                             const float *g_res, const float *g_nr, float nr_floor,
+                                             const float *lut, int n) {
+    uint32_t s = *seed;
+    int k;
+    for (k = 0; k < n; ++k) {
+        uint32_t ix;
+        float ng, cn_re, cn_im, t;
+        s = (s * SK_CNG_LCG_A + 1u) & SK_CNG_LCG_MASK;
+        ix = s >> 26;
+        cn_re = amp[k] * lut[ix];
+        cn_im = amp[k] * lut[(ix + 8u) & 31u];
+        t = 1.0f - g_res[k] * g_res[k];
+        if (t < 0.0f) t = 0.0f;
+        ng = sk__fast_sqrt_elem(t);
+        if (g_nr) ng = ng * fmaxf(g_nr[k], nr_floor);
+        spec[k].r += ng * cn_re;
+        spec[k].i += ng * cn_im;
+    }
+    *seed = s;
+}
+
+#if SK_HAVE_NEON
+static inline void sk_cng_inject_f32(uint32_t *seed, Complex *spec, const float *amp,
+                                      const float *g_res, const float *g_nr, float nr_floor,
+                                      const float *lut, int n) {
+    /* A^1..A^4 and A^(j-1) + ... + 1 for j = 1..4, mod 2^32. */
+    static const uint32_t jump_a[4] = { 69069u, 475559465u, 2801775573u, 1790562961u };
+    static const uint32_t jump_c[4] = { 1u, 69070u, 475628535u, 3277404108u };
+    int k = 0;
+    uint32_t s = *seed;
+    if (n >= 4) {
+        uint32x4_t sv = vaddq_u32(vmulq_u32(vdupq_n_u32(s), vld1q_u32(jump_a)), vld1q_u32(jump_c));
+        const uint32x4_t a4 = vdupq_n_u32(jump_a[3]), c4 = vdupq_n_u32(jump_c[3]);
+        const uint32x4_t m31 = vdupq_n_u32(31u);
+        const float32x4_t one = vdupq_n_f32(1.0f), zero = vdupq_n_f32(0.0f), vfloor = vdupq_n_f32(nr_floor);
+        for (; k + 4 <= n; k += 4) {
+            uint32_t ix[4];
+            float32x4_t sin_v, cos_v, amp_v, g, t, ng;
+            float32x4x2_t sp;
+            vst1q_u32(ix, vandq_u32(vshrq_n_u32(sv, 26), m31));
+            sin_v = vld1q_dup_f32(lut + ix[0]);
+            sin_v = vld1q_lane_f32(lut + ix[1], sin_v, 1);
+            sin_v = vld1q_lane_f32(lut + ix[2], sin_v, 2);
+            sin_v = vld1q_lane_f32(lut + ix[3], sin_v, 3);
+            cos_v = vld1q_dup_f32(lut + ((ix[0] + 8u) & 31u));
+            cos_v = vld1q_lane_f32(lut + ((ix[1] + 8u) & 31u), cos_v, 1);
+            cos_v = vld1q_lane_f32(lut + ((ix[2] + 8u) & 31u), cos_v, 2);
+            cos_v = vld1q_lane_f32(lut + ((ix[3] + 8u) & 31u), cos_v, 3);
+            s = vgetq_lane_u32(sv, 3);
+            sv = vaddq_u32(vmulq_u32(sv, a4), c4);
+            amp_v = vld1q_f32(amp + k);
+            g = vld1q_f32(g_res + k);
+            t = vsubq_f32(one, vmulq_f32(g, g));
+            t = vbslq_f32(vcltq_f32(t, zero), zero, t);
+#ifdef USE_STANDARD_MATH
+            ng = vsqrtq_f32(t);
+#else
+            ng = vbslq_f32(vcgtq_f32(t, zero), vsqrtq_f32(t), zero);
+#endif
+            if (g_nr) {
+                float32x4_t nr = vld1q_f32(g_nr + k);
+                ng = vmulq_f32(ng, vbslq_f32(vcgtq_f32(nr, vfloor), nr, vfloor));
+            }
+            sp = sk__cquad_load(spec + k);
+            sp.val[0] = vaddq_f32(sp.val[0], vmulq_f32(ng, vmulq_f32(amp_v, sin_v)));
+            sp.val[1] = vaddq_f32(sp.val[1], vmulq_f32(ng, vmulq_f32(amp_v, cos_v)));
+            sk__cquad_store(spec + k, sp);
+        }
+        s &= SK_CNG_LCG_MASK;
+    }
+    if (k < n) sk_cng_inject_f32_scalar(&s, spec + k, amp + k, g_res + k, g_nr ? g_nr + k : NULL, nr_floor, lut, n - k);
+    *seed = s;
+}
+#else
+static inline void sk_cng_inject_f32(uint32_t *seed, Complex *spec, const float *amp,
+                                      const float *g_res, const float *g_nr, float nr_floor,
+                                      const float *lut, int n) {
+    sk_cng_inject_f32_scalar(seed, spec, amp, g_res, g_nr, nr_floor, lut, n);
+}
+#endif
+
 #ifdef __cplusplus
 }
 #endif
