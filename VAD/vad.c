@@ -70,9 +70,7 @@ MaskVAD* vad_create(const VadConfig* cfg)
 
 void vad_destroy(MaskVAD* v)
 {
-    if (!v) return;
-    /* Pool path (owned_heap == NULL): the caller owns the memory; nothing to free. */
-    if (v->owned_heap) free(v->owned_heap);
+    if (v) free(v->owned_heap);
 }
 
 static int vad_mask2raw(MaskVAD* v, const int* mask)

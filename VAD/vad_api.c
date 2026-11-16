@@ -129,7 +129,5 @@ const int* vad_api_get_mask(const VADApi* v)
 
 void vad_api_destroy(VADApi* v)
 {
-    if (!v) return;
-
-    if (v->owned_heap) free(v->owned_heap);
+    if (v) free(v->owned_heap);
 }
