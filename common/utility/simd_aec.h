@@ -1656,6 +1656,61 @@ static inline void sk_stationarity_flags_u8(
     sk_stationarity_flags_u8_scalar(flags + k, acc + k, noise + k, window_hops, ratio, n - k);
 }
 
+/* sk_stationarity_window_flags_u8: flags[k] = (sum < ratio * (window_hops * max(noise[k], 1e-30f))) ? 1 : 0, where
+ * sum = ((hist[k] + hist[stride + k]) + ... + hist[(rows - 1) * stride + k]) in row order, plus rev[k] last when rev is non-NULL
+ * (rows >= 1). The NEON twin keeps each bin group's sum in registers over all rows; the scalar twin accumulates 128-bin blocks row by row. */
+static inline void sk_stationarity_window_flags_u8_scalar(
+    unsigned char *flags, const float *hist, size_t stride, int rows, const float *rev,
+    const float *noise, int window_hops, float ratio, int n) {
+    enum { BLOCK = 128 };   /* bins per accumulator block: rows are read contiguously; the block size does not change the sums */
+    float acc[BLOCK];
+    for (int base = 0; base < n; base += BLOCK) {
+        int m = n - base < BLOCK ? n - base : BLOCK;
+        for (int k = 0; k < m; ++k) acc[k] = hist[base + k];
+        for (int r = 1; r < rows; ++r) {
+            const float *row = hist + (size_t)r * stride + base;
+            for (int k = 0; k < m; ++k) acc[k] = acc[k] + row[k];
+        }
+        if (rev)
+            for (int k = 0; k < m; ++k) acc[k] = acc[k] + rev[base + k];
+        sk_stationarity_flags_u8_scalar(flags + base, acc, noise + base, window_hops, ratio, m);
+    }
+}
+
+static inline void sk_stationarity_window_flags_u8(
+    unsigned char *flags, const float *hist, size_t stride, int rows, const float *rev,
+    const float *noise, int window_hops, float ratio, int n) {
+    int k = 0;
+#if SK_HAVE_NEON
+    const float32x4_t tiny = vdupq_n_f32(1e-30f);
+    const float32x4_t wh = vdupq_n_f32((float)window_hops), vr = vdupq_n_f32(ratio);
+    const uint8x8_t one = vdup_n_u8(1);
+    for (; k + 8 <= n; k += 8) {
+        float32x4_t a0 = vld1q_f32(hist + k), a1 = vld1q_f32(hist + k + 4);
+        uint32x4_t lt[2];
+        for (int r = 1; r < rows; ++r) {
+            const float *row = hist + (size_t)r * stride + k;
+            a0 = vaddq_f32(a0, vld1q_f32(row));
+            a1 = vaddq_f32(a1, vld1q_f32(row + 4));
+        }
+        if (rev) {
+            a0 = vaddq_f32(a0, vld1q_f32(rev + k));
+            a1 = vaddq_f32(a1, vld1q_f32(rev + k + 4));
+        }
+        {
+            float32x4_t nz0 = vld1q_f32(noise + k), nz1 = vld1q_f32(noise + k + 4);
+            float32x4_t nd0 = vbslq_f32(vcgtq_f32(nz0, tiny), nz0, tiny);
+            float32x4_t nd1 = vbslq_f32(vcgtq_f32(nz1, tiny), nz1, tiny);
+            lt[0] = vcltq_f32(a0, vmulq_f32(vr, vmulq_f32(wh, nd0)));
+            lt[1] = vcltq_f32(a1, vmulq_f32(vr, vmulq_f32(wh, nd1)));
+        }
+        vst1_u8(flags + k, vand_u8(vmovn_u16(vcombine_u16(vmovn_u32(lt[0]), vmovn_u32(lt[1]))), one));
+    }
+#endif
+    sk_stationarity_window_flags_u8_scalar(flags + k, hist + k, stride, rows, rev ? rev + k : NULL,
+                                            noise + k, window_hops, ratio, n - k);
+}
+
 /* Integer counts of clipped samples and consecutive equal near-peak pairs. */
 static inline void sk_saturation_counts_f32_scalar(
     const float *signal, size_t n, float threshold, float high,
