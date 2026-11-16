@@ -10,6 +10,12 @@ smoother, beamformer and VAD sources that used to vendor under
 `Audio_ALG/pipelines/third_party/`. This file records changes to `audiolib`
 as a whole from this point on.
 
+## [Unreleased] — 2026-11-16 — `skn_all_within_f32`, one rounding rule for float -> int16, shared NEON bodies
+
+- `common/utility/simd_kernel_nn.h`: `skn_all_within_f32(x, n, limit)` and its `_scalar` twin; 1 when every `|x[i]| <= limit`, NaN and infinity count as above any finite limit, `n == 0` gives 1. The NEON body ANDs the compare masks over sixteen lanes and tests once per 64 elements. `simd_nn_selftest` compares both with the scalar loop for lengths 0 to 49 and the usual list, four pointer offsets, values at the limit, one float step either side, NaN, infinities and signed zero.
+- `common/include/wav_io.h`: `wav_io_round_s16_half_away(float scaled)` is the exact round-half-away rule (clip to the int16 range, truncate, compare the exact remainder with 0.5); `wav_write_float()` calls it. Over all 2^32 float bit patterns the writer's int16 is the same as before.
+- `sk__stationarity_flags8` (`simd_aec.h`) is the one compare / narrow epilogue of `sk_stationarity_flags_u8` and `sk_stationarity_window_flags_u8`; `sk__fast_sqrt_q` (`simd_kernels.h`) is the one vector fast square root of `sk_fast_sqrt_f32` and `sk_cng_inject_f32`. Output unchanged.
+
 ## [Unreleased] — 2026-11-16 — NR frozen-bin run kernel
 
 ### Added

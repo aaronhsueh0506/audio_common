@@ -293,6 +293,16 @@ static inline WavWriter* wav_open_write(const char* path, int sample_rate, int c
     return w;
 }
 
+/* Scaled sample (full scale 32768.0f, not NaN) -> int16: clip to [-32768, 32767], then round half away from zero exactly
+ * (truncate, compare the exact remainder with 0.5; a float add of 0.5 would carry the float just below 0.5 up to 1). */
+static inline int16_t wav_io_round_s16_half_away(float scaled) {
+    if (scaled > 32767.0f) scaled = 32767.0f;
+    if (scaled < -32768.0f) scaled = -32768.0f;
+    int32_t t = (int32_t)scaled;
+    float d = scaled - (float)t;
+    return (int16_t)(t + (d >= 0.5f) - (d <= -0.5f));
+}
+
 /** Write n float samples. */
 static inline void wav_write_float(WavWriter* w, const float* buf, int n) {
     if (!w || !buf) return;
@@ -322,15 +332,7 @@ static inline void wav_write_float(WavWriter* w, const float* buf, int n) {
         if (sample < -1.0f) sample = -1.0f;
 
 #if WAV_IO_WRITER_STYLE == WAV_IO_WRITER_AEC
-        // Round half away from zero exactly (truncate, then compare the exact remainder with 0.5; no float add of 0.5),
-        // then saturate to int16_t (a direct +-32768.5f conversion is undefined).
-        float scaled = sample * 32768.0f;
-        int32_t v = (int32_t)scaled;
-        float frac = scaled - (float)v;
-        v += (frac >= 0.5f) - (frac <= -0.5f);
-        if (v > 32767) v = 32767;
-        if (v < -32768) v = -32768;
-        int16_t s16 = (int16_t)v;
+        int16_t s16 = wav_io_round_s16_half_away(sample * 32768.0f);
 #else
         // NR style: truncation, no rounding.
         int32_t v = (int32_t)(sample * 32767.0f);

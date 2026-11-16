@@ -264,6 +264,7 @@ void       wav_close_write(WavWriter* w);      /* 相容包裝，吞掉結果 */
 | `wav_close_read` | 讀完 | NULL 安全 |
 | `wav_open_write` | 開始寫檔時 | `sample_rate` 與 `channels` 都必須 `> 0` |
 | `wav_write_float` | 每個區塊 | `buf` 為 `n` 個 `float`；`n <= 0` 直接 return |
+| `wav_io_round_s16_half_away` | 需要與 `wav_write_float` 相同的 float → int16 進位時 | 輸入是已乘 `32768.0f` 的非 NaN 值；先夾到 `[-32768, 32767]`，再精確地四捨五入（0.5 遠離零） |
 | `wav_finalize_write` | 寫完，且**只呼叫一次** | 回 `0` 成功、`-1` 失敗；一定會消耗 `w` |
 | `wav_close_write` | 相容包裝 | 等同 `wav_finalize_write()` 但丟棄回傳值 |
 

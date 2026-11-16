@@ -641,6 +641,21 @@ static void test_write_rounding_exact_at_ties(void) {
     free(out);
 }
 
+/* The shared rounding helper: ties away from zero, the float just below a tie rounds down, out-of-range values (infinities
+ * included) clip to the int16 range. */
+static void test_round_s16_helper(void) {
+    CHECK(wav_io_round_s16_half_away(0.5f) == 1 && wav_io_round_s16_half_away(-0.5f) == -1 &&
+          wav_io_round_s16_half_away(nextafterf(0.5f, 0.0f)) == 0 && wav_io_round_s16_half_away(-0.0f) == 0,
+          "helper: ties go away from zero, the float below the tie rounds toward zero");
+    CHECK(wav_io_round_s16_half_away(32766.5f) == 32767 && wav_io_round_s16_half_away(32767.0f) == 32767 &&
+          wav_io_round_s16_half_away(32768.0f) == 32767 && wav_io_round_s16_half_away(-32768.0f) == -32768 &&
+          wav_io_round_s16_half_away(-32768.5f) == -32768 && wav_io_round_s16_half_away(-32767.5f) == -32768,
+          "helper: the int16 range edges");
+    CHECK(wav_io_round_s16_half_away(1e30f) == 32767 && wav_io_round_s16_half_away(-1e30f) == -32768 &&
+          wav_io_round_s16_half_away(INFINITY) == 32767 && wav_io_round_s16_half_away(-INFINITY) == -32768,
+          "helper: values beyond the range clip");
+}
+
 /* Float mode (WAV_IO_WRITER_AEC with AEC_OUT_FLOAT=1) writes samples
  * unchanged and, unlike the PCM16 path, does not sanitize NaN / Inf. The
  * test therefore reads the file bytes directly: wav_read_float would replace
@@ -1062,6 +1077,7 @@ static void test_finalize_write_rejects_oversize_samples_written(void) {
 /* ═══════════════════════════════════ main ════════════════════════════════ */
 
 int main(void) {
+    test_round_s16_helper();
     test_reject_truncated_header();
     test_reject_fmt_size_12();
     test_reject_channels_0();
