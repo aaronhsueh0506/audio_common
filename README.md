@@ -2,7 +2,7 @@
 
 DSP libraries for ARM32 and ARM64. The common library provides FFT, STFT/ISTFT, resampling and high-pass filtering. The spatial libraries run on spectra supplied by the application. VAD reads one channel, while SRP-PHAT and the beamformer read the microphone array.
 
-From the repository root, build the libraries your application uses.
+From the repository root, build the libraries your application uses. The workspace path and the `CFLAGS` and include paths must not contain spaces or quotes.
 
 ```sh
 make -C common lib
