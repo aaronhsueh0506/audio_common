@@ -3,8 +3,7 @@
  *
  * Include after the header under test (it needs Complex). Helpers are static inline and the generator state is
  * file-static, so each including file has its own seed stream and its own g_total_checks. A mismatch or canary
- * violation prints a diagnostic and exits 1; there is no tolerance. The including file defines EDGE_MAX_N and
- * EDGE_ARENA_LEN for its own arena size.
+ * violation prints a diagnostic and exits 1; there is no tolerance.
  */
 #ifndef SIMD_TEST_HARNESS_H
 #define SIMD_TEST_HARNESS_H
