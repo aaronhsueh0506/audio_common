@@ -322,9 +322,12 @@ static inline void wav_write_float(WavWriter* w, const float* buf, int n) {
         if (sample < -1.0f) sample = -1.0f;
 
 #if WAV_IO_WRITER_STYLE == WAV_IO_WRITER_AEC
-        // Round half away from zero into int32_t, then saturate to int16_t (a direct +-32768.5f conversion is undefined).
+        // Round half away from zero exactly (truncate, then compare the exact remainder with 0.5; no float add of 0.5),
+        // then saturate to int16_t (a direct +-32768.5f conversion is undefined).
         float scaled = sample * 32768.0f;
-        int32_t v = (int32_t)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
+        int32_t v = (int32_t)scaled;
+        float frac = scaled - (float)v;
+        v += (frac >= 0.5f) - (frac <= -0.5f);
         if (v > 32767) v = 32767;
         if (v < -32768) v = -32768;
         int16_t s16 = (int16_t)v;

@@ -514,6 +514,19 @@ static void test_valid_pcm16_parses_as_before(void) {
 
 /* ═══════════════════════════ writer round-trip test ═══════════════════════ */
 
+/* Exact int16 encoding of a sample in the default (AEC) style, computed in double: clamp to +-1, scale by 32768,
+ * round half away from zero, saturate to the int16 range. */
+static int wav_expect_s16_exact(float x) {
+    double s = (double)x;
+    if (s > 1.0) s = 1.0;
+    if (s < -1.0) s = -1.0;
+    s *= 32768.0;
+    double r = floor(fabs(s) + 0.5);
+    if (s < 0.0) r = -r;
+    if (r > 32767.0) r = 32767.0;
+    return (int)r;
+}
+
 static void test_write_read_roundtrip_byte_exact(void) {
     /* Values that round exactly through the *32768.0f round-half-away
      * quantization of the default WAV_IO_WRITER_AEC style, with no ambiguity
@@ -553,8 +566,7 @@ static void test_write_read_roundtrip_byte_exact(void) {
                 float s = in_samples[i];
                 if (s > 1.0f) s = 1.0f;
                 if (s < -1.0f) s = -1.0f;
-                float scaled = s * 32768.0f;
-                int16_t expect_s16 = (int16_t)(scaled >= 0 ? scaled + 0.5f : scaled - 0.5f);
+                int16_t expect_s16 = (int16_t)wav_expect_s16_exact(s);
                 float expect = (float)expect_s16 / 32768.0f;
                 CHECK(out_samples[i] == expect, "round-tripped sample must be byte-exact vs the re-derived int16 encoding");
             }
@@ -571,6 +583,62 @@ static void test_write_read_roundtrip_byte_exact(void) {
  */
 static void test_writer_special_values_corpus_aec_style(void) {
     if (test_wav_writer_special_values_corpus()) g_fail = 1;
+}
+
+/* Every int16 value k, the ties k +- 0.5 LSB and one float step either side of each: the writer must give the exact
+ * round-half-away-from-zero result. The float just below 0.5 LSB is 0 (a float add of 0.5 would carry it to 1). */
+static void test_write_rounding_exact_at_ties(void) {
+    const int per_k = 7;
+    const int n = 65536 * per_k;
+    float* in = (float*)malloc((size_t)n * sizeof(float));
+    int16_t* out = (int16_t*)malloc((size_t)n * sizeof(int16_t));
+    CHECK(in != NULL && out != NULL, "setup: buffers for the rounding sweep");
+    if (!in || !out) { free(in); free(out); return; }
+
+    int m = 0;
+    for (int k = -32768; k <= 32767; k++) {
+        in[m++] = (float)k / 32768.0f;
+        for (int side = -1; side <= 1; side += 2) {
+            float f = ((float)k + 0.5f * (float)side) / 32768.0f;
+            in[m++] = f;
+            in[m++] = nextafterf(f, -INFINITY);
+            in[m++] = nextafterf(f, INFINITY);
+        }
+    }
+    CHECK(m == n, "setup: sweep length");
+
+    CHECK(wav_expect_s16_exact(nextafterf(0.5f / 32768.0f, 0.0f)) == 0 && wav_expect_s16_exact(0.5f / 32768.0f) == 1 &&
+          wav_expect_s16_exact(-0.5f / 32768.0f) == -1 && wav_expect_s16_exact(nextafterf(-0.5f / 32768.0f, 0.0f)) == 0,
+          "reference: below the tie is 0, the tie is +-1");
+
+    char path[TEST_TMP_PATH_MAX];
+    test_tmp_template(path, sizeof(path), "audio_common_test_wav_io_ties");
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "setup: mkstemp for the rounding sweep");
+    if (fd >= 0) close(fd);
+
+    WavWriter* w = wav_open_write(path, 16000, 1);
+    CHECK(w != NULL, "wav_open_write must succeed for the rounding sweep");
+    if (w) {
+        wav_write_float(w, in, n);
+        CHECK(w->write_error == 0 && w->samples_written == (uint64_t)n, "the rounding sweep must be written whole");
+        wav_close_write(w);
+
+        FILE* fp = fopen(path, "rb");
+        CHECK(fp != NULL, "must reopen the rounding sweep file");
+        if (fp) {
+            CHECK(fseek(fp, 44, SEEK_SET) == 0, "seek past the 44-byte header");
+            size_t got = fread(out, sizeof(int16_t), (size_t)n, fp);
+            CHECK(got == (size_t)n, "must read back the whole rounding sweep");
+            long bad = 0;
+            for (int i = 0; i < n && (size_t)i < got; i++) bad += out[i] != wav_expect_s16_exact(in[i]);
+            CHECK(bad == 0, "writer must round half away from zero exactly at every tie and one float step either side");
+            fclose(fp);
+        }
+    }
+    unlink(path);
+    free(in);
+    free(out);
 }
 
 /* Float mode (WAV_IO_WRITER_AEC with AEC_OUT_FLOAT=1) writes samples
@@ -1013,6 +1081,7 @@ int main(void) {
     test_valid_pcm16_parses_as_before();
 
     test_write_read_roundtrip_byte_exact();
+    test_write_rounding_exact_at_ties();
 
     test_writer_special_values_corpus_aec_style();
     test_write_float_mode_bitexact_and_riff_size();

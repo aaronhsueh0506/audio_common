@@ -10,6 +10,16 @@ smoother, beamformer and VAD sources that used to vendor under
 `Audio_ALG/pipelines/third_party/`. This file records changes to `audiolib`
 as a whole from this point on.
 
+## [Unreleased] — 2026-11-16 — WAV writer: exact float -> int16 rounding
+
+- **Behaviour change** `wav_write_float()` (`WAV_IO_WRITER_AEC`, the default) rounds half away from zero exactly: it truncates `sample * 32768.0f`
+  into an `int32_t` and compares the exact remainder with 0.5. Before, it added `+-0.5f` in float, which carried the float just below 0.5 LSB
+  (`nextafterf(0.5f / 32768.0f, 0)`, bit pattern 0x377fffff) and its negative up to +-1. Over all 2^32 float bit patterns exactly these two inputs
+  change (by 1 LSB); every tie, the int16 limits, the out-of-range clamp and NaN/Inf (written as 0) give the same result as before.
+  `WAV_IO_WRITER_NR` (truncation) and the reader are unchanged. Audio_ALG `stream_saturate_s16()` uses the same rule.
+- `test_wav_io` sweeps every int16 value, every tie k +- 0.5 LSB and one float step either side (458,752 samples) against a double reference; the
+  round-trip test derives its expectation from the same reference.
+
 ## [Unreleased] — 2026-11-14 — Tidy
 
 ### Changed

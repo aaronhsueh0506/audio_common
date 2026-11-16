@@ -50,8 +50,8 @@ static inline int test_wav_writer_special_values_corpus(void) {
     in_samples[8] = -0.5f;
 
 #if WAV_IO_WRITER_STYLE == WAV_IO_WRITER_AEC
-    /* Round half away from zero (`sample*32768.0f`, then +-0.5f, truncated
-     * into an int32_t), then saturate to the int16_t range:
+    /* Round half away from zero (`sample*32768.0f` truncated into an int32_t,
+     * the exact remainder compared with 0.5), then saturate to the int16_t range:
      * nextafterf(1.0f, 0) gives 32768 before saturation and so 32767;
      * nextafterf(-1.0f, 0) gives -32768 exactly. */
     const int16_t expect[9] = {
