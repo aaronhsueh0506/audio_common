@@ -157,6 +157,56 @@ static void test_all_finite(void) {
     printf("PASS all_finite_f32 / all_finite_cf32\n");
 }
 
+static int within_reference(const float *x, int n, float limit) {
+    int i;
+    for (i = 0; i < n; ++i) if (!(fabsf(x[i]) <= limit)) return 0;
+    return 1;
+}
+
+static void check_within(const float *x, int n, float limit, int tag) {
+    int want = within_reference(x, n, limit);
+    int got = skn_all_within_f32(x, (size_t)n, limit);
+    if (got != want || skn_all_within_f32_scalar(x, (size_t)n, limit) != want) fail_int("all_within_f32", n, tag, got, want);
+}
+
+static void test_all_within(void) {
+    static const float LIMITS[] = { 1.0f, 0.5f, 1000.0f, FLT_MAX, 0.0f, 1e-40f, INFINITY, NAN };
+    int nl = (int)(sizeof(LIMITS) / sizeof(LIMITS[0]));
+    int ni, li, off, n, p, t, k;
+    for (ni = 0; ni < 50 + N_COUNT; ++ni) {
+        n = ni < 50 ? ni : N_LIST[ni - 50];
+        for (li = 0; li < nl; ++li) {
+            float lim = LIMITS[li];
+            float edge = (lim == lim && !isinf(lim)) ? lim : 1.0f;
+            float specials[9];
+            specials[0] = edge; specials[1] = -edge;
+            specials[2] = nextafterf(edge, INFINITY); specials[3] = -nextafterf(edge, INFINITY);
+            specials[4] = nextafterf(edge, 0.0f); specials[5] = NAN;
+            specials[6] = INFINITY; specials[7] = -INFINITY; specials[8] = -0.0f;
+            for (off = 0; off < 4; ++off) {
+                for (p = 0; p < n; ++p) {
+                    for (k = 0; k < 9; ++k) {
+                        int i;
+                        for (i = 0; i < n + 4; ++i) X[i] = (i & 1) ? -0.25f * edge : 0.125f * edge;
+                        X[off + p] = specials[k];
+                        check_within(X + off, n, lim, li * 9 + k);
+                    }
+                }
+                for (t = 0; t < TRIALS; ++t) {
+                    int i;
+                    for (i = 0; i < n + 4; ++i) X[i] = gen_any();
+                    check_within(X + off, n, lim, t);
+                    for (i = 0; i < n + 4; ++i) X[i] = gen_finite(0);
+                    check_within(X + off, n, lim, t);
+                }
+                for (p = 0; p < n + 4; ++p) X[p] = (p & 1) ? -edge : edge;
+                check_within(X + off, n, lim, 99);
+            }
+        }
+    }
+    printf("PASS all_within_f32\n");
+}
+
 static void test_fill_mul_power(void) {
     int ni, t, i;
     for (ni = 0; ni < N_COUNT; ++ni) {
@@ -649,6 +699,7 @@ static void bench(void) {
 int main(void) {
     SK_MATCH_SCALAR_TO_VECTOR_MODE();
     test_all_finite();
+    test_all_within();
     test_fill_mul_power();
     test_mag_eps();
     test_interleave();

@@ -1,7 +1,7 @@
 /** NEON/scalar float32 kernels for the neural-network pre/post-processing stages.
  * Kept apart from simd_kernels.h; it shares that header's NEON switch (SK_HAVE_NEON), Complex layout checks and Complex-quad load/store helpers.
  * Contract: every NEON entry point matches its _scalar twin for finite inputs (ERB arithmetic pins NaN classification, not payload bits);
- * skn_all_finite_* agree for every input. Operation order is fixed: mul/add stay unfused (no vfmaq_f32), no reciprocal/sqrt estimates,
+ * skn_all_finite_* and skn_all_within_f32 agree for every input. Operation order is fixed: mul/add stay unfused (no vfmaq_f32), no reciprocal/sqrt estimates,
  * no reassociation; every including unit is compiled with -ffp-contract=off. SIMD_KERNELS_FORCE_SCALAR selects the scalar twins.
  * Arguments do not alias unless a kernel says so. */
 
@@ -90,6 +90,50 @@ static inline int skn_all_finite_f32(const float *x, size_t n) {
 }
 static inline int skn_all_finite_cf32(const Complex *x, size_t n) {
     return skn_all_finite_cf32_scalar(x, n);
+}
+#endif
+
+/* skn_all_within: 1 when every |x[i]| <= limit, else 0; NaN and infinity count as above any finite limit, n == 0 gives 1.
+ * Same block shape as skn_all_finite: compare masks are ANDed over sixteen lanes and tested once per 64 elements. */
+
+static inline int skn_all_within_f32_scalar(const float *x, size_t n, float limit) {
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        if (!(fabsf(x[i]) <= limit)) return 0;
+    }
+    return 1;
+}
+
+#if SK_HAVE_NEON
+static inline uint32x4_t skn__le_limit(const skn__alias_float *x, float32x4_t lim) {
+    return vcleq_f32(vabsq_f32(vld1q_f32(x)), lim);
+}
+
+static inline int skn_all_within_f32(const float *x, size_t n, float limit) {
+    const skn__alias_float *v = (const skn__alias_float *)(const void *)x;
+    const float32x4_t lim = vdupq_n_f32(limit);
+    size_t i = 0;
+    while (i + 64 <= n) {
+        uint32x4_t ok = vdupq_n_u32(0xffffffffu);
+        size_t end = i + 64;
+        for (; i < end; i += 16) {
+            ok = vandq_u32(ok, vandq_u32(
+                vandq_u32(skn__le_limit(v + i, lim), skn__le_limit(v + i + 4, lim)),
+                vandq_u32(skn__le_limit(v + i + 8, lim), skn__le_limit(v + i + 12, lim))));
+        }
+        if (vminvq_u32(ok) != 0xffffffffu) return 0;
+    }
+    for (; i + 4 <= n; i += 4) {
+        if (vminvq_u32(skn__le_limit(v + i, lim)) != 0xffffffffu) return 0;
+    }
+    for (; i < n; ++i) {
+        if (!(fabsf((float)v[i]) <= limit)) return 0;
+    }
+    return 1;
+}
+#else
+static inline int skn_all_within_f32(const float *x, size_t n, float limit) {
+    return skn_all_within_f32_scalar(x, n, limit);
 }
 #endif
 
