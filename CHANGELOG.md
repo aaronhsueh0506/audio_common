@@ -17,15 +17,15 @@ as a whole from this point on.
   the size-walk `ck_carve()`, and `AC_FNV1A_SEED`/`ac_fnv1a_u32()`/`ac_fnv1a_str()`; `ac_memreq_abi_hash()` folds its ILP32 token through
   `ac_fnv1a_str()`. All static inline; the objects of every other translation unit are byte-identical. `test_pool_contract` covers the helpers and the
   ILP32 token on any host.
-- `audio_resampler_init()` carves its pool with `ac_pool_carve()` (its private `audio_resampler_carve()` was the same allocator). All 25 rate pairs x channel counts give the same pool offsets and contents, and a pool one granule short is still refused. `ck_carve()` returns -1 for a NULL cursor. `simd_selftest.c` and `spatial_complex.h` drop includes nothing in them uses.
+- `audio_resampler_init()` carves its pool with `ac_pool_carve()` (its private `audio_resampler_carve()` was the same allocator). All 25 rate pairs x channel counts give the same pool offsets and contents, and a pool one granule short is still refused. `ck_carve()` returns -1 for a NULL cursor. `simd_selftest.c` drops includes nothing in it uses.
 - `bf_init()` ends in `bf_reset()` instead of repeating its field resets. `vad_api_process()` drops the always-true backend guard.
-- `spatial_complex.h` holds the four complex helpers as `static inline`; `spatial_complex.c` is gone, so `libspatial_common.a` carries one member
-  (`spatial_simd.o`) and the spatial CFG_SIG changes. `bf.c` calls `sk_csub_f32()` directly. Same IEEE operations under `-ffp-contract=off`.
+- The four `spatial_complex_*` helpers are `static inline` in `common/utility/spatial_simd.h` (bodies unchanged); `spatial_complex.h` and `spatial_complex.c` are gone, so
+  `libspatial_common.a` carries one member (`spatial_simd.o`) and the spatial CFG_SIG changes. `bf.c` calls `sk_csub_f32()` directly. Same IEEE operations under
+  `-ffp-contract=off`; `bf.o`, `bf_test.o`, `srp.o` and `spatial_simd.o` are byte-identical, SIMD=1 and SIMD=0.
 - `make test` (audiolib) runs `audit-no-stdio`; `make -C common test-full` runs `audit-fp-contract`. `selftest` depends on `test_audio_utils` instead of
-  repeating its recipe. `common/test/simd_test_harness.h` holds the input-generation, comparison and canary helpers the SIMD selftests share.
+  repeating its recipe. `common/test/simd_test_harness.h` holds the input-generation, comparison and canary helpers that `simd_selftest.c` and AEC's `simd_selftest_aec.c` include (`simd_nn_selftest.c` keeps its own).
+- `vad_api_destroy()` frees only the heap block of a `vad_api_create()` instance; the masker and VAD live inside the block and their destroy calls did nothing.
 - `lib/ne10/VENDORED.md`: five headers no compiled source includes move from "header-only" to "vendored, not compiled". No file is removed.
-- The four `spatial_complex_*` helpers move from `common/utility/spatial_complex.h` into `common/utility/spatial_simd.h` (still `static inline`, bodies unchanged); the
-  separate header is gone, so this supersedes the `spatial_complex.h` line above. `bf.o`, `bf_test.o`, `srp.o` and `spatial_simd.o` are byte-identical, SIMD=1 and SIMD=0.
 - Test-only headers fold into their single user: `bf/bf_test_hooks.h` into `tests/test_spatial_third_party.c`, `common/test/test_tmp_path.h` into
   `common/test/test_wav_writer_common.h`. No library object changes.
 - `_Static_assert` and the `SK_STATIC_ASSERT` macro are gone (`simd_kernels.h` no longer defines it; no other repo used it). The `Complex` layout (8 bytes, `r`/`i` at offsets 0/4) is
@@ -40,18 +40,21 @@ as a whole from this point on.
   stopped using them) with their selftests, the static `vad_reset_state()` (`vad_init()` already zero-fills the block, so `vad.o` loses only redundant stores), and a
   dead cursor increment in `fft_init()`.
 - `fft_apply_gain()` (`fft_wrapper.h`, `fft_wrapper_ne10.c`; no caller anywhere, `sk_capply_gain_f32()` stays). Callers needing it use `sk_capply_gain_f32(z, z, gain, n)`.
-- Write-only state: `BF.first_doa_frame`, `BF.current_doa`, `SRP.last_doa_raw`, `AudioResampler.input_rate`/`output_rate`,
-  `WavReader.data_start`, `WavWriter.data_start`. `sizeof(BF)` shrinks by 16 bytes and `sizeof(SRP)` by 8 (arm64); the BF, SRP and each `AudioResampler` pool shrink by 16 bytes. The board
-  samples that link these must be rebuilt.
+- Write-only or duplicate state: `BF.first_doa_frame`, `BF.current_doa`, `BF.initialized`, `BF.first_doa_found`, `SRP.last_doa_raw`, `SRP.M`, `AudioResampler.input_rate`/`output_rate`,
+  `WavReader.data_start`, `WavWriter.data_start`, `VADApi.cfg` (private to `vad_api.c`), `MaskEstimator.NFFT`/`.sr` (read as `cfg.NFFT`/`cfg.sr`; same `int` source, `band_mask` is unchanged) and
+  `MaskEstimator.owned_heap`. No layout-version or descriptor constant covers these pools, so no constant moves. The board samples that link these or size these pools at run time must be rebuilt.
+  arm64 sizes before -> after: `sizeof(BF)` 160 -> 136, `sizeof(SRP)` 184 -> 168, `sizeof(MaskEstimator)` 184 -> 168. Pool sizes (16k@256 / 16k@512 / 48k@1024; `bf_get_mem_size(4, F)` and
+  `srp_get_mem_size()` with A=72, M=4):
+
+  | pool | 16k@256 | 16k@512 | 48k@1024 |
+  |---|---|---|---|
+  | `bf_get_mem_size()` | 28,224 -> 28,208 B | 55,872 -> 55,856 B | 111,168 -> 111,152 B |
+  | `srp_get_mem_size()` | 758,608 -> 758,592 B | 1,503,568 -> 1,503,552 B | 2,993,488 -> 2,993,472 B |
+  | `vad_api_get_mem_size()` | 6,240 -> 6,128 B | 11,872 -> 11,760 B | 23,136 -> 23,024 B |
+  | `masker_get_mem_size()` | 6,000 -> 5,984 B | 11,632 -> 11,616 B | 22,896 -> 22,880 B |
+
+  `vad_get_mem_size()` stays 96 B. `audio_resampler_get_mem_size()` drops 16 B (16 kHz -> 48 kHz mono 1,184 -> 1,168 B, 4 channels 3,136 -> 3,120 B; 48 kHz -> 16 kHz mono 1,408 -> 1,392 B).
 - `masker_create()` (`masker.h`, `masker.c`; only `tests/bench_masker.c` called it, which now allocates with `posix_memalign()` + `masker_init()`; use `masker_init()` with a caller pool). `masker_destroy()` stays and does nothing.
-- Write-only or duplicate state: `VADApi.cfg` (private to `vad_api.c`), `BF.initialized`, `BF.first_doa_found`, `SRP.M`, `MaskEstimator.NFFT`/`.sr` (read as `cfg.NFFT`/`cfg.sr`; same `int` source, `band_mask` is unchanged),
-  `MaskEstimator.owned_heap`. No layout-version or descriptor constant covers these pools, so no constant moves.
-  Measured arm64 pool sizes (16k@256 / 16k@512 / 48k@1024): `vad_api_get_mem_size()` 6,240 / 11,872 / 23,136 B -> 6,128 / 11,760 / 23,024 B (-112: VADApi shell -96, masker -16);
-  `masker_get_mem_size()` 6,000 / 11,632 / 22,896 B -> 5,984 / 11,616 / 22,880 B; `bf_get_mem_size(4, F)` 28,208 / 55,856 / 111,152 B and `srp_get_mem_size()` (A=72, M=4) 758,592 / 1,503,552 / 2,993,472 B are unchanged
-  (`sizeof(BF)` 144 -> 136 and `sizeof(SRP)` 176 -> 168 stay inside the 16-byte rounding); `vad_get_mem_size()` stays 96 B. `sizeof(MaskEstimator)` 184 -> 168.
-  ARM32 (clang layout dump, not an SDK build): `sizeof(MaskEstimator)` 132 -> 120, `sizeof(BF)` 104 -> 96, `sizeof(SRP)` 128 unchanged, `sizeof(VADApi)` 128 -> 24 (derived); `vad_api_get_mem_size()` -112 B, `masker_get_mem_size()` -16 B,
-  `bf_get_mem_size()` -16 B, SRP unchanged. All figures are against the tree before this step; the earlier bullet's BF/SRP 16-byte figures are already in the baseline.
-  The board samples that size these pools at run time must be rebuilt.
 - The `previous_gain` output of `skr_final_store_elem()`, `skr_final_store_scalar()` and `skr_final_store_neon()`
   (`common/utility/simd_nr.h`). NR, their only caller, dropped the write-only array it filled. No audiolib object changes
   (the header is NR-internal); NR must move to the matching commit.
