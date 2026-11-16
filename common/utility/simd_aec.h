@@ -1711,6 +1711,41 @@ static inline void sk_stationarity_window_flags_u8(
                                             noise + k, window_hops, ratio, n - k);
 }
 
+/* sk_row_sum_f32: out[k] = ((rows[k] + rows[stride + k]) + ...) + rows[(n_rows - 1) * stride + k], rows added in order (n_rows >= 1).
+ * out must not overlap rows. The NEON twin keeps 16 bins of the sum in registers over all rows. */
+static inline void sk_row_sum_f32_scalar(float *out, const float *rows, size_t stride, int n_rows, int n) {
+    for (int k = 0; k < n; ++k) out[k] = rows[k];
+    for (int r = 1; r < n_rows; ++r) {
+        const float *row = rows + (size_t)r * stride;
+        for (int k = 0; k < n; ++k) out[k] = out[k] + row[k];
+    }
+}
+
+static inline void sk_row_sum_f32(float *out, const float *rows, size_t stride, int n_rows, int n) {
+    int k = 0;
+#if SK_HAVE_NEON
+    for (; k + 16 <= n; k += 16) {
+        float32x4_t a0 = vld1q_f32(rows + k), a1 = vld1q_f32(rows + k + 4);
+        float32x4_t a2 = vld1q_f32(rows + k + 8), a3 = vld1q_f32(rows + k + 12);
+        for (int r = 1; r < n_rows; ++r) {
+            const float *row = rows + (size_t)r * stride + k;
+            a0 = vaddq_f32(a0, vld1q_f32(row));
+            a1 = vaddq_f32(a1, vld1q_f32(row + 4));
+            a2 = vaddq_f32(a2, vld1q_f32(row + 8));
+            a3 = vaddq_f32(a3, vld1q_f32(row + 12));
+        }
+        vst1q_f32(out + k, a0); vst1q_f32(out + k + 4, a1);
+        vst1q_f32(out + k + 8, a2); vst1q_f32(out + k + 12, a3);
+    }
+    for (; k + 4 <= n; k += 4) {
+        float32x4_t a = vld1q_f32(rows + k);
+        for (int r = 1; r < n_rows; ++r) a = vaddq_f32(a, vld1q_f32(rows + (size_t)r * stride + k));
+        vst1q_f32(out + k, a);
+    }
+#endif
+    sk_row_sum_f32_scalar(out + k, rows + k, stride, n_rows, n - k);
+}
+
 /* Integer counts of clipped samples and consecutive equal near-peak pairs. */
 static inline void sk_saturation_counts_f32_scalar(
     const float *signal, size_t n, float threshold, float high,
