@@ -199,6 +199,54 @@ SKR_TWIN void skr_restart_inert_neon(float* noise, const float* power,
 }
 #endif /* SK_HAVE_NEON */
 
+/* A bin whose power stays above SKR_FROZEN_POWER_RATIO times its noise estimate is not being tracked: a saturated posterior has rounded the update coefficient to 1. */
+#ifndef SKR_FROZEN_POWER_RATIO
+#define SKR_FROZEN_POWER_RATIO 64.0f
+#endif
+
+/* Counts consecutive hops with power > ratio * noise; at run_hops the estimate is reseeded to seed (the smoothed power) and the count restarts. Any other hop clears it. */
+static inline void skr_frozen_run_elem(float* noise, float power, float seed, uint16_t* run,
+                                       float ratio, uint16_t run_hops) {
+    if (power > ratio * *noise) {
+        uint16_t next = (uint16_t)(*run + 1u);
+        if (next >= run_hops) {
+            *noise = seed;
+            next = 0;
+        }
+        *run = next;
+    } else {
+        *run = 0;
+    }
+}
+
+SKR_TWIN void skr_frozen_run_scalar(float* noise, const float* power, const float* seed,
+                                    uint16_t* run, float ratio, uint16_t run_hops, int n) {
+    for (int k = 0; k < n; k++)
+        skr_frozen_run_elem(noise + k, power[k], seed[k], run + k, ratio, run_hops);
+}
+
+#if SK_HAVE_NEON
+SKR_TWIN void skr_frozen_run_neon(float* noise, const float* power, const float* seed,
+                                  uint16_t* run, float ratio, uint16_t run_hops, int n) {
+    const float32x4_t ratio_v = vdupq_n_f32(ratio);
+    const uint16x4_t one = vdup_n_u16(1);
+    const uint16x4_t limit = vdup_n_u16(run_hops);
+    int k = 0;
+    for (; k + 4 <= n; k += 4) {
+        float32x4_t current = vld1q_f32(noise + k);
+        uint16x4_t above = vmovn_u32(vcgtq_f32(vld1q_f32(power + k), vmulq_f32(ratio_v, current)));
+        uint16x4_t next = vand_u16(vadd_u16(vld1_u16(run + k), one), above);
+        uint16x4_t fire = vcge_u16(next, limit);
+        uint32x4_t fire_wide = vmovl_u16(fire);
+        fire_wide = vorrq_u32(fire_wide, vshlq_n_u32(fire_wide, 16));
+        vst1q_f32(noise + k, vbslq_f32(fire_wide, vld1q_f32(seed + k), current));
+        vst1_u16(run + k, vbic_u16(next, fire));
+    }
+    for (; k < n; k++)
+        skr_frozen_run_elem(noise + k, power[k], seed[k], run + k, ratio, run_hops);
+}
+#endif /* SK_HAVE_NEON */
+
 /* Final log-gain blend/store (NEON twins under ANR_VECTOR; scalar twins otherwise). */
 typedef struct {
     float log_g_min;
