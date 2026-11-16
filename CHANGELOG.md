@@ -33,6 +33,7 @@ as a whole from this point on.
   offsets) by typedefs in `fft_wrapper_ne10.c`; `common/test/simd_selftest.c` and `common/test/roundtrip.c` check the same facts at run time. The
   `-std=c11` in the `common/docs/c_user_manual_zh_TW.md` build line becomes `-std=c99`; the library is built `-std=gnu99`. Every library object is byte-identical,
   SIMD=1 and SIMD=0.
+- `fft_wrapper_ne10.c` checks the `Complex` alignment with two named probe structs instead of a struct defined inside `offsetof()` (a C23 extension under `-Wpedantic`). New `audit-fft-wrapper-pedantic` (part of `make -C common test-full`) compiles that file with `-Wpedantic -Werror`. No object changes.
 
 ### Removed
 - `bf_process()` (use `bf_process_with_weights(..., NULL)`), `ac_stft_get_config()`, `clip_f()`.

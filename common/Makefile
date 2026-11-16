@@ -330,7 +330,7 @@ $(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test test-full test-isolation audit-fp-contract test_stft test_stft_guard test_heap_alignment test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
+.PHONY: all lib selftest test test-full test-isolation audit-fp-contract audit-fft-wrapper-pedantic test_stft test_stft_guard test_heap_alignment test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
 all: lib
 
 lib: $(LIB)
@@ -598,13 +598,18 @@ test:
 	@$(MAKE) --no-print-directory test-isolation ISOL_TIER=core
 
 test-full:
-	@$(MAKE) --no-print-directory $(LEAN_TESTS) test_ne10_force_c audit-fp-contract
+	@$(MAKE) --no-print-directory $(LEAN_TESTS) test_ne10_force_c audit-fp-contract audit-fft-wrapper-pedantic
 	@$(MAKE) --no-print-directory test-isolation ISOL_TIER=full
 
 # audit-fp-contract: the disassembly gate for the pinned -ffp-contract=off policy (scripts/audit_fp_contract.sh; needs NR as
 # a sibling checkout). It is part of test-full only: it builds common and NR keyed objects of its own.
 audit-fp-contract:
 	@scripts/audit_fp_contract.sh $(BACKEND)
+
+# audit-fft-wrapper-pedantic: fft_wrapper_ne10.c compiled with its normal flags plus -Wpedantic -Werror. Its layout typedefs must not use syntax
+# newer than the library standard (a struct defined inside offsetof() is a C23 extension); the library build itself does not pass -Wpedantic.
+audit-fft-wrapper-pedantic:
+	@$(CC) $(CFLAGS) -Wpedantic -Werror -fsyntax-only src/fft_wrapper_ne10.c && echo "PASS audit-fft-wrapper-pedantic"
 
 # The suite starts its own makes with explicit SIMD settings, so the caller's MAKEFLAGS must not reach
 # them: a command-line SIMD=0 would otherwise override the SIMD=1 configuration it compares against.

@@ -25,7 +25,7 @@ make -s print-bin-dir</code></pre>
 <h2>驗證</h2>
 <pre><code>make test                       # 空間模組測試，含 audit-no-stdio（四個 archive 不得引用 stdio 符號）
 make -C common selftest         # 通用 DSP
-make -C common test-full        # 另含 audit-fp-contract 與建置隔離，需要旁邊有 AEC 與 NR checkout</code></pre>
+make -C common test-full        # 另含 audit-fp-contract、audit-fft-wrapper-pedantic 與建置隔離，需要旁邊有 AEC 與 NR checkout</code></pre>
 <p>各目標的範圍見 <a href="../../common/docs/reference/build.md">common 建置與驗證</a>。</p>
 </main>
 </body>

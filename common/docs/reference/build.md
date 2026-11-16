@@ -29,4 +29,4 @@ archive 的路徑由編譯設定決定。交叉編譯或切換 ABI 後，重新�
 
 同一個 ABI、FP 及 SIMD 設定下，heap 與 static pool 產生相同結果。FFT、STFT 和重取樣在 NEON 與純量設定間可有 float 捨入差異。ARMv7 NEON 的 subnormal flush 與 NaN payload 規則也會影響比較，應固定 ABI 及浮點模式後再做位元比對。
 
-`make -C common selftest` 驗證通用 DSP。從 audiolib 根目錄執行 `make test` 可驗證空間模組（含 `audit-no-stdio`：四個封存檔不得引用 stdio 符號）。驗證共用函式庫的建置隔離與發布時，使用 `make -C common test-full`，其隔離測項需要旁邊有 AEC checkout；`test-full` 另含 `audit-fp-contract`（反組譯檢查 `-ffp-contract=off`，需要旁邊有 NR checkout）。
+`make -C common selftest` 驗證通用 DSP。從 audiolib 根目錄執行 `make test` 可驗證空間模組（含 `audit-no-stdio`：四個封存檔不得引用 stdio 符號）。驗證共用函式庫的建置隔離與發布時，使用 `make -C common test-full`，其隔離測項需要旁邊有 AEC checkout；`test-full` 另含 `audit-fp-contract`（反組譯檢查 `-ffp-contract=off`，需要旁邊有 NR checkout）與 `audit-fft-wrapper-pedantic`（`fft_wrapper_ne10.c` 加 `-Wpedantic -Werror` 只做語法檢查）。
