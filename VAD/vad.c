@@ -45,11 +45,10 @@ MaskVAD* vad_init(void* mem, size_t mem_size, const VadConfig* cfg)
     need = vad_get_mem_size();
     if (need == 0 || !MEM_IS_ALIGNED16(mem) || mem_size < need) return NULL;
 
-    /* Only the budgeted region is touched; trailing bytes of a larger pool are left alone. */
+    /* Only the budgeted region is touched; trailing bytes of a larger pool are left alone. owned_heap starts NULL. */
     memset(mem, 0, need);
     v = (MaskVAD*)mem;
     v->cfg = *cfg;
-    v->owned_heap = NULL;
     return v;
 }
 

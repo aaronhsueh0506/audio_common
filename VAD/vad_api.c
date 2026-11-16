@@ -59,7 +59,7 @@ VADApi* vad_api_init(const VADApiConfig* cfg, void* mem, size_t mem_size)
     if (!mem || need == 0 || !MEM_IS_ALIGNED16(mem) || mem_size < need)
         return NULL;
 
-    memset(mem, 0, need);
+    memset(mem, 0, need);  /* mask, vad_raw, vad_out and owned_heap start at zero/NULL */
     v = (VADApi*)mem;
 
     masker_need = masker_get_mem_size(&cfg->masker_cfg);
@@ -77,10 +77,6 @@ VADApi* vad_api_init(const VADApiConfig* cfg, void* mem, size_t mem_size)
 
     if (!v->masker || !v->mask_vad) return NULL;
 
-    v->mask = NULL;
-    v->vad_raw = 0;
-    v->vad_out = 0;
-    v->owned_heap = NULL;
     return v;
 }
 

@@ -55,7 +55,7 @@ static MaskEstimator* masker_carve(void* mem, size_t need,
     size_t F;
     int f;
 
-    memset(mem, 0, need);
+    memset(mem, 0, need);  /* initialized starts at 0 */
     m = (MaskEstimator*)mem;
 
     cursor.ptr = (uint8_t*)mem + ck_align16_size(sizeof(MaskEstimator));
@@ -91,7 +91,6 @@ static MaskEstimator* masker_carve(void* mem, size_t need,
             (freq > m->cfg.low_freq && freq < m->cfg.high_freq) ? 1 : 0;
     }
 
-    m->initialized = 0;
     return m;
 }
 
