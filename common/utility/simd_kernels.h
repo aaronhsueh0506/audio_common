@@ -475,28 +475,21 @@ static inline void sk_fast_sqrt_f32_scalar(const float *x, float *out, int n) {
 }
 
 #if SK_HAVE_NEON
+/* The four-lane form of sk__fast_sqrt_elem. */
+static inline float32x4_t sk__fast_sqrt_q(float32x4_t v) {
 #ifdef USE_STANDARD_MATH
-static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
-    int i = 0;
-    for (; i + 4 <= n; i += 4)
-        vst1q_f32(out + i, vsqrtq_f32(vld1q_f32(x + i)));
-    for (; i < n; ++i) out[i] = sk__fast_sqrt_elem(x[i]);
-}
+    return vsqrtq_f32(v);
 #else
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    return vbslq_f32(vcgtq_f32(v, zero), vsqrtq_f32(v), zero);
+#endif
+}
+
 static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
     int i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4_t v = vld1q_f32(x + i);
-        float32x4_t xk = vsqrtq_f32(v);
-        {
-            uint32x4_t ispos = vcgtq_f32(v, vdupq_n_f32(0.0f));
-            float32x4_t r = vbslq_f32(ispos, xk, vdupq_n_f32(0.0f));
-            vst1q_f32(out + i, r);
-        }
-    }
+    for (; i + 4 <= n; i += 4) vst1q_f32(out + i, sk__fast_sqrt_q(vld1q_f32(x + i)));
     for (; i < n; ++i) out[i] = sk__fast_sqrt_elem(x[i]);
 }
-#endif
 #else
 static inline void sk_fast_sqrt_f32(const float *x, float *out, int n) {
     sk_fast_sqrt_f32_scalar(x, out, n);

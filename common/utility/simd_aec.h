@@ -1620,6 +1620,19 @@ static inline void sk_stationarity_smooth_u8(unsigned char *f, int n) {
 #endif
 }
 
+#if SK_HAVE_NEON
+/* Eight flags: sum < ratio * (window_hops * max(noise, 1e-30f)), for the sums a0 (bins 0..3) and a1 (bins 4..7). */
+static inline void sk__stationarity_flags8(unsigned char *flags, float32x4_t a0, float32x4_t a1,
+                                           float32x4_t nz0, float32x4_t nz1, float32x4_t wh, float32x4_t vr) {
+    const float32x4_t tiny = vdupq_n_f32(1e-30f);
+    float32x4_t nd0 = vbslq_f32(vcgtq_f32(nz0, tiny), nz0, tiny);
+    float32x4_t nd1 = vbslq_f32(vcgtq_f32(nz1, tiny), nz1, tiny);
+    uint32x4_t lt0 = vcltq_f32(a0, vmulq_f32(vr, vmulq_f32(wh, nd0)));
+    uint32x4_t lt1 = vcltq_f32(a1, vmulq_f32(vr, vmulq_f32(wh, nd1)));
+    vst1_u8(flags, vand_u8(vmovn_u16(vcombine_u16(vmovn_u32(lt0), vmovn_u32(lt1))), vdup_n_u8(1)));
+}
+#endif
+
 /* Per-bin threshold: ratio * (window_hops * max(noise, 1e-30f)). */
 static inline void sk_stationarity_flags_u8_scalar(
     unsigned char *flags, const float *acc, const float *noise,
@@ -1638,19 +1651,10 @@ static inline void sk_stationarity_flags_u8(
     int window_hops, float ratio, int n) {
     int k = 0;
 #if SK_HAVE_NEON
-    const float32x4_t tiny = vdupq_n_f32(1e-30f);
     const float32x4_t wh = vdupq_n_f32((float)window_hops), vr = vdupq_n_f32(ratio);
-    const uint8x8_t one = vdup_n_u8(1);
     for (; k + 8 <= n; k += 8) {
-        uint32x4_t lt[2];
-        for (int g = 0; g < 2; ++g) {
-            float32x4_t nz = vld1q_f32(noise + k + 4 * g);
-            float32x4_t nd = vbslq_f32(vcgtq_f32(nz, tiny), nz, tiny);
-            float32x4_t threshold = vmulq_f32(vr, vmulq_f32(wh, nd));
-            lt[g] = vcltq_f32(vld1q_f32(acc + k + 4 * g), threshold);
-        }
-        vst1_u8(flags + k, vand_u8(vmovn_u16(vcombine_u16(
-            vmovn_u32(lt[0]), vmovn_u32(lt[1]))), one));
+        sk__stationarity_flags8(flags + k, vld1q_f32(acc + k), vld1q_f32(acc + k + 4),
+                                vld1q_f32(noise + k), vld1q_f32(noise + k + 4), wh, vr);
     }
 #endif
     sk_stationarity_flags_u8_scalar(flags + k, acc + k, noise + k, window_hops, ratio, n - k);
@@ -1682,12 +1686,9 @@ static inline void sk_stationarity_window_flags_u8(
     const float *noise, int window_hops, float ratio, int n) {
     int k = 0;
 #if SK_HAVE_NEON
-    const float32x4_t tiny = vdupq_n_f32(1e-30f);
     const float32x4_t wh = vdupq_n_f32((float)window_hops), vr = vdupq_n_f32(ratio);
-    const uint8x8_t one = vdup_n_u8(1);
     for (; k + 8 <= n; k += 8) {
         float32x4_t a0 = vld1q_f32(hist + k), a1 = vld1q_f32(hist + k + 4);
-        uint32x4_t lt[2];
         for (int r = 1; r < rows; ++r) {
             const float *row = hist + (size_t)r * stride + k;
             a0 = vaddq_f32(a0, vld1q_f32(row));
@@ -1697,14 +1698,7 @@ static inline void sk_stationarity_window_flags_u8(
             a0 = vaddq_f32(a0, vld1q_f32(rev + k));
             a1 = vaddq_f32(a1, vld1q_f32(rev + k + 4));
         }
-        {
-            float32x4_t nz0 = vld1q_f32(noise + k), nz1 = vld1q_f32(noise + k + 4);
-            float32x4_t nd0 = vbslq_f32(vcgtq_f32(nz0, tiny), nz0, tiny);
-            float32x4_t nd1 = vbslq_f32(vcgtq_f32(nz1, tiny), nz1, tiny);
-            lt[0] = vcltq_f32(a0, vmulq_f32(vr, vmulq_f32(wh, nd0)));
-            lt[1] = vcltq_f32(a1, vmulq_f32(vr, vmulq_f32(wh, nd1)));
-        }
-        vst1_u8(flags + k, vand_u8(vmovn_u16(vcombine_u16(vmovn_u32(lt[0]), vmovn_u32(lt[1]))), one));
+        sk__stationarity_flags8(flags + k, a0, a1, vld1q_f32(noise + k), vld1q_f32(noise + k + 4), wh, vr);
     }
 #endif
     sk_stationarity_window_flags_u8_scalar(flags + k, hist + k, stride, rows, rev ? rev + k : NULL,
@@ -1857,11 +1851,7 @@ static inline void sk_cng_inject_f32(uint32_t *seed, Complex *spec, const float 
             g = vld1q_f32(g_res + k);
             t = vsubq_f32(one, vmulq_f32(g, g));
             t = vbslq_f32(vcltq_f32(t, zero), zero, t);
-#ifdef USE_STANDARD_MATH
-            ng = vsqrtq_f32(t);
-#else
-            ng = vbslq_f32(vcgtq_f32(t, zero), vsqrtq_f32(t), zero);
-#endif
+            ng = sk__fast_sqrt_q(t);
             if (g_nr) {
                 float32x4_t nr = vld1q_f32(g_nr + k);
                 ng = vmulq_f32(ng, vbslq_f32(vcgtq_f32(nr, vfloor), nr, vfloor));
