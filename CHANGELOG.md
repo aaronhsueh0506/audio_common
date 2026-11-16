@@ -19,7 +19,7 @@ as a whole from this point on.
 ## [Unreleased] — 2026-11-16 — NR frozen-bin run kernel
 
 ### Added
-- `common/utility/simd_nr.h`: `skr_frozen_run_elem`, `skr_frozen_run_scalar`, `skr_frozen_run_neon` and `SKR_FROZEN_POWER_RATIO` (64.0f, overridable at build time). Per bin, `power > ratio * noise` counts consecutive hops in a `uint16_t` array and any other hop clears it; at `run_hops` the noise estimate is set from a seed array and the count restarts. The NEON twin returns the same bits as the scalar twin for NaN, signed zero, infinity, subnormal and boundary inputs (`NR/c_impl/test/test_anr_kernels.c`, `frozen_run`). Nothing else in `audiolib` includes the new symbols; the objects of every other translation unit are unchanged.
+- `common/utility/simd_nr.h`: `skr_frozen_run_elem`, `skr_frozen_run_scalar`, `skr_frozen_run_neon` and `SKR_FROZEN_POWER_RATIO` (64.0f, overridable at build time). Per bin, `power > ratio * noise` counts consecutive hops in a `uint16_t` array and any other hop clears it; at `run_hops` the noise estimate is set from a seed array and the count restarts. The NEON twin returns the same bits as the scalar twin for NaN, signed zero, infinity, subnormal and boundary inputs and for `run_hops` = 0 (`NR/c_impl/test/test_anr_kernels.c`, `frozen_run`). Nothing else in `audiolib` includes the new symbols; the objects of every other translation unit are unchanged.
 
 ## [Unreleased] — 2026-11-16 — WAV writer: exact float -> int16 rounding
 

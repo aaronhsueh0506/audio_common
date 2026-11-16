@@ -236,7 +236,7 @@ SKR_TWIN void skr_frozen_run_neon(float* noise, const float* power, const float*
         float32x4_t current = vld1q_f32(noise + k);
         uint16x4_t above = vmovn_u32(vcgtq_f32(vld1q_f32(power + k), vmulq_f32(ratio_v, current)));
         uint16x4_t next = vand_u16(vadd_u16(vld1_u16(run + k), one), above);
-        uint16x4_t fire = vcge_u16(next, limit);
+        uint16x4_t fire = vand_u16(vcge_u16(next, limit), above);
         uint32x4_t fire_wide = vmovl_u16(fire);
         fire_wide = vorrq_u32(fire_wide, vshlq_n_u32(fire_wide, 16));
         vst1q_f32(noise + k, vbslq_f32(fire_wide, vld1q_f32(seed + k), current));
