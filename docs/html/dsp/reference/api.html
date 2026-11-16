@@ -207,7 +207,7 @@ make -C common lib BACKEND=ne10 SIMD=0     # 純量建置</pre>
 <h3>FFT(<code>fft_wrapper.h</code>)</h3>
 <div class="tblwrap"><table>
 <tr><th>參數</th><th>類別</th><th>範圍 / 預設</th><th>說明與出處</th></tr>
-<tr class="ext"><td><code>fft_size</code></td><td>外部</td><td>2 的冪、<code>[16, 8192]</code>;無預設</td><td>唯一的 FFT 參數。範圍外 <code>fft_get_mem_size</code> 回 0、<code>fft_create</code>/<code>fft_init</code> 回 NULL(<code>src/fft_wrapper_ne10.c:39</code>)。建立時固定</td></tr>
+<tr class="ext"><td><code>fft_size</code></td><td>外部</td><td>2 的冪、<code>[16, 8192]</code>;無預設</td><td>唯一的 FFT 參數。範圍外 <code>fft_get_mem_size</code> 回 0、<code>fft_create</code>/<code>fft_init</code> 回 NULL(<code>src/fft_wrapper_ne10.c:fft_size_in_range</code>)。建立時固定</td></tr>
 <tr class="ext"><td>heap 或 pool 路徑</td><td>外部</td><td><code>fft_create</code> / <code>fft_get_mem_size</code>+<code>fft_init</code></td><td>pool 必須 16-byte 對齊;<code>fft_get_mem_size</code> 已含 NE10 內部 cfg 與 twiddle</td></tr>
 </table></div>
 
