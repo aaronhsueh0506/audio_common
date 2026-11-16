@@ -104,8 +104,8 @@ void beam_hop(BF *bf, const Complex *const *X, float doa_s, int vad_out, const i
 <div class="tblwrap"><table>
 <tr class="int"><th>項目</th><th>位置</th><th>為什麼不開放</th></tr>
 <tr><td><code>fixed_align_notebook</code>(<code>BF_Config</code> 欄位,但屬內部)</td><td><code>bf.c:bf_effective_adapt_interval</code>、<code>bf_process_with_weights_impl</code>、<code>bf_rls_update_bin_scalar</code></td><td>為了對齊參考實作而存在:強制每 frame 更新、停用遮罩凍結與 <code>mu</code>、<code>upu</code> 多加一個 <code>lambda</code>。只在固定模式下有意義,不是產品選項</td></tr>
-<tr><td><code>BF_WA_LEAK = 0.99999f</code></td><td><code>bf.c:18</code>;唯讀 <code>bf_wa_leak_factor()</code></td><td>只在實際更新時套用的權重漏洩,時間常數 1/(1−leak) 次更新,遠慢於遺忘時間,用來限制長時間連續執行的 <code>wa</code> 成長;與 <code>lambda</code> 耦合</td></tr>
-<tr><td><code>BF_P_DIAG_FLOOR = 1e-6f</code>、<code>BF_P_DIAG_CEIL = 1e6f</code></td><td><code>bf.c:25-26</code>;唯讀 <code>bf_p_diag_floor/ceil()</code></td><td>RLS 發散護欄,每次更新後夾 P 的對角。改動會悄悄改變 <code>bin_resets</code> 的觸發行為</td></tr>
+<tr><td><code>BF_WA_LEAK = 0.99999f</code></td><td><code>bf.c:BF_WA_LEAK</code>;唯讀 <code>bf_wa_leak_factor()</code></td><td>只在實際更新時套用的權重漏洩,時間常數 1/(1−leak) 次更新,遠慢於遺忘時間,用來限制長時間連續執行的 <code>wa</code> 成長;與 <code>lambda</code> 耦合</td></tr>
+<tr><td><code>BF_P_DIAG_FLOOR = 1e-6f</code>、<code>BF_P_DIAG_CEIL = 1e6f</code></td><td><code>bf.c:BF_P_DIAG_FLOOR/CEIL</code>;唯讀 <code>bf_p_diag_floor/ceil()</code></td><td>RLS 發散護欄,每次更新後夾 P 的對角。改動會悄悄改變 <code>bin_resets</code> 的觸發行為</td></tr>
 <tr><td><code>upu</code> 守衛:非有限或 <code>&lt;= 0</code> 重置該 bin;<code>|upu| &lt; 1e-12f</code> 墊到 <code>1e-12f</code></td><td><code>bf.c:bf_rls_update_bin_scalar</code>(NEON 路徑 <code>bf_rls_update_four_neon</code> 同規則)</td><td>單 bin 重置而非整個 BF 重置,避免丟掉其他 bin 的適應;屬數值護欄</td></tr>
 <tr><td>投影分母下限 <code>1e-12f</code>、<code>das</code> 係數 <code>1/M</code>、P 的 Hermitian 對稱化</td><td><code>common/utility/spatial_simd.c:162</code>、<code>bf.c</code></td><td>演算法定義的一部分;scalar/NEON 共用</td></tr>
 <tr><td>P 初值單位陣、<code>wa</code> 初值 0、<code>bin_resets</code> 不被 <code>bf_reset</code> 清除</td><td><code>bf.c:bf_init</code>、<code>bf_reset</code></td><td><code>bin_resets</code> 是診斷計數(正常運作應為 0 或接近 0),不是狀態</td></tr>
