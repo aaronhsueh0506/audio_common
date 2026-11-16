@@ -2,7 +2,7 @@
 
 DSP libraries for ARM32 and ARM64. The common library provides FFT, STFT/ISTFT, resampling and high-pass filtering. The spatial libraries run on spectra supplied by the application. VAD reads one channel, while SRP-PHAT and the beamformer read the microphone array.
 
-From the repository root, build the libraries your application uses. The workspace path and the `CFLAGS` and include paths must not contain spaces or quotes.
+From the repository root, build the libraries your application uses. A workspace path with spaces builds; a quote in it makes `make -s print-lib-path` fail. The flag variables (`EXTRA_CFLAGS`, `EXTRA_LDFLAGS`) take only letters, digits and `_ . / = , + -`, separated by spaces, so a quoted token or an `-I` path with a space stops the Makefile with an FP policy conflict.
 
 ```sh
 make -C common lib
