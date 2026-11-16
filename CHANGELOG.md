@@ -24,7 +24,7 @@ as a whole from this point on.
   `-ffp-contract=off`; `bf.o`, `bf_test.o`, `srp.o` and `spatial_simd.o` are byte-identical, SIMD=1 and SIMD=0.
 - `make test` (audiolib) runs `audit-no-stdio`; `make -C common test-full` runs `audit-fp-contract`. `selftest` depends on `test_audio_utils` instead of
   repeating its recipe. `common/test/simd_test_harness.h` holds the input-generation, comparison and canary helpers that `simd_selftest.c` and AEC's `simd_selftest_aec.c` include (`simd_nn_selftest.c` keeps its own).
-- `vad_api_destroy()` frees only the heap block of a `vad_api_create()` instance; the masker and VAD live inside the block and their destroy calls did nothing.
+- `vad_api_destroy()` frees only the heap block of a `vad_api_create()` instance; the masker and VAD live inside the block and their destroy calls did nothing. `vad_api_init()`, `vad_init()` and `masker_carve()` no longer store zero/NULL into fields their `memset` already cleared.
 - `lib/ne10/VENDORED.md`: five headers no compiled source includes move from "header-only" to "vendored, not compiled". No file is removed.
 - Test-only headers fold into their single user: `bf/bf_test_hooks.h` into `tests/test_spatial_third_party.c`, `common/test/test_tmp_path.h` into
   `common/test/test_wav_writer_common.h`. No library object changes.
