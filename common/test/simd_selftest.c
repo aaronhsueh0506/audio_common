@@ -925,35 +925,6 @@ static void test_noise_update(void) {
 
 #define EDGE_MAX_N SK_TEST_MAX_N
 #define EDGE_ARENA_LEN (EDGE_GUARD + EDGE_OFFSET_MAX + EDGE_MAX_N + EDGE_GUARD)
-/* Complex-array counterparts. They visit each element's `.r` and `.i`
- * members rather than casting the arena to float*, to avoid a strict-aliasing
- * cast. len, win_lo and win_len are Complex element counts. */
-static void edge_fill_canary_c(Complex *arena, int len) {
-    int i;
-    float c = edge_canary_float();
-    for (i = 0; i < len; ++i) { arena[i].r = c; arena[i].i = c; }
-}
-static void edge_check_canary_c(const char *label, const Complex *arena, int len,
-                                int win_lo, int win_len) {
-    int i;
-    uint32_t want = EDGE_CANARY_BITS;
-    int win_hi = win_lo + win_len;
-    for (i = 0; i < len; ++i) {
-        uint32_t got_r, got_i;
-        if (i >= win_lo && i < win_hi) continue; /* payload window, not guarded */
-        g_total_checks += 2;
-        memcpy(&got_r, &arena[i].r, sizeof got_r);
-        memcpy(&got_i, &arena[i].i, sizeof got_i);
-        if (got_r != want || got_i != want) {
-            fprintf(stderr,
-                "CANARY VIOLATION %s: arena[%d]={r=0x%08x,i=0x%08x} (want canary 0x%08x) "
-                "-- out-of-bounds access, payload window=[%d,%d)\n",
-                label, i, (unsigned)got_r, (unsigned)got_i, (unsigned)want, win_lo, win_hi);
-            exit(1);
-        }
-    }
-}
-
 static void test_ema_edge(void) {
     float *x_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
     float *state_ref_arena = (float *)edge_aligned_alloc((size_t)EDGE_ARENA_LEN * sizeof(float));
