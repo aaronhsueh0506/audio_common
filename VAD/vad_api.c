@@ -131,9 +131,5 @@ void vad_api_destroy(VADApi* v)
 {
     if (!v) return;
 
-    /* Sub-object destroys are no-ops on the pool path. */
-    masker_destroy(v->masker);
-    vad_destroy(v->mask_vad);
-
     if (v->owned_heap) free(v->owned_heap);
 }
