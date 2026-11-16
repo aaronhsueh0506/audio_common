@@ -9,7 +9,7 @@
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
 
-/* Complex and ne10_fft_cpx_float32_t are cast to each other, which needs identical size, alignment and offsets (checked at compile time below and at run time by test/roundtrip.c).
+/* Complex and ne10_fft_cpx_float32_t are cast to each other, which needs identical size, alignment and offsets (checked at compile time below).
  * The casts are not strict-aliasing compatible: this object is built with -fno-strict-aliasing and must not be built with LTO. */
 typedef char ne10_cpx_size_check[(sizeof(Complex) == sizeof(ne10_fft_cpx_float32_t)) ? 1 : -1];
 struct cpx_probe { char c; Complex t; };

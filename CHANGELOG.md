@@ -30,7 +30,7 @@ as a whole from this point on.
   `common/test/test_wav_writer_common.h`. No library object changes.
 - `_Static_assert` and the `SK_STATIC_ASSERT` macro are gone (`simd_kernels.h` no longer defines it; no other repo used it). The `Complex` layout (8 bytes, `r`/`i` at offsets 0/4) is
   still checked at compile time, by C99 negative-array typedefs in `common/include/ac_complex.h`, and `Complex` against `ne10_fft_cpx_float32_t` (size, alignment, `r`/`i`
-  offsets) by typedefs in `fft_wrapper_ne10.c`; `common/test/simd_selftest.c` and `common/test/roundtrip.c` check the same facts at run time. The
+  offsets) by typedefs in `fft_wrapper_ne10.c`; the run-time copies of these checks in `common/test/simd_selftest.c` and `common/test/roundtrip.c` are removed, since a layout change stops the build first. The
   `-std=c11` in the `common/docs/c_user_manual_zh_TW.md` build line becomes `-std=c99`; the library is built `-std=gnu99`. Every library object is byte-identical,
   SIMD=1 and SIMD=0.
 - `fft_wrapper_ne10.c` checks the `Complex` alignment with two named probe structs instead of a struct defined inside `offsetof()` (a C23 extension under `-Wpedantic`). New `audit-fft-wrapper-pedantic` (part of `make -C common test-full`) compiles that file with `-Wpedantic -Werror`. No object changes.

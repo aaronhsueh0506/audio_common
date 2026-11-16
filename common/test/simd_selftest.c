@@ -1699,31 +1699,12 @@ static void bench_noise_update(void) {
     }
 }
 
-
-/* The NEON Complex kernels and sk__cquad_load/store need Complex to be exactly two contiguous, unpadded floats {r, i}. */
-static void test_complex_layout(void) {
-    if (sizeof(Complex) != 2 * sizeof(float)) {
-        fprintf(stderr, "FAIL Complex layout: sizeof(Complex)=%zu, must be 2*sizeof(float)=%zu "
-                        "(8 bytes, no padding; the sk_c*_f32 NEON quad-load/store depends on it)\n",
-                sizeof(Complex), 2 * sizeof(float));
-        exit(1);
-    }
-    if (offsetof(Complex, r) != 0 || offsetof(Complex, i) != sizeof(float)) {
-        fprintf(stderr, "FAIL Complex layout: offsetof r=%zu i=%zu, must be 0/%zu "
-                        "(interleaved AoS {r,i}; the sk_c*_f32 NEON quad-load/store assumes it)\n",
-                offsetof(Complex, r), offsetof(Complex, i), sizeof(float));
-        exit(1);
-    }
-    g_total_checks += 2;
-}
-
 /* ═══════════════════════════════════ main ══════════════════════════════════ */
 
 int main(void) {
     SK_MATCH_SCALAR_TO_VECTOR_MODE();
     init_special_pool();
 
-    test_complex_layout();
     test_ema();
     test_capply_gain();
     test_cadd();
