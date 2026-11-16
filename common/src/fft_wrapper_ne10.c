@@ -5,11 +5,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stddef.h>
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
 
-/* Complex and ne10_fft_cpx_float32_t are cast to each other, which needs identical size, alignment and offsets (pinned by test/roundtrip.c).
+/* Complex and ne10_fft_cpx_float32_t are cast to each other, which needs identical size, alignment and offsets (checked at compile time below and at run time by test/roundtrip.c).
  * The casts are not strict-aliasing compatible: this object is built with -fno-strict-aliasing and must not be built with LTO. */
+typedef char ne10_cpx_size_check[(sizeof(Complex) == sizeof(ne10_fft_cpx_float32_t)) ? 1 : -1];
+typedef char ne10_cpx_align_check[(offsetof(struct { char c; Complex t; }, t) == offsetof(struct { char c; ne10_fft_cpx_float32_t t; }, t)) ? 1 : -1];
+typedef char ne10_cpx_offset_check[(offsetof(Complex, r) == offsetof(ne10_fft_cpx_float32_t, r) && offsetof(Complex, i) == offsetof(ne10_fft_cpx_float32_t, i)) ? 1 : -1];
 
 /* NE10 uses its ARM32/ARM64 NEON kernels, or its C kernels on a target without NEON or in a scalar build. */
 #if defined(SIMD_KERNELS_FORCE_SCALAR) || !defined(__ARM_NEON)

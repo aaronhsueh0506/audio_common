@@ -323,7 +323,7 @@ endif
 # $(FFT_WRAPPER_ALIAS_CFLAGS) and is part of CFG_SIG_PAYLOAD (see above).
 #
 # fft_forward/fft_inverse cast `Complex*` to `ne10_fft_cpx_float32_t*` in place. The
-# layouts match (pinned by test/roundtrip.c), but the types are distinct, so reading through one
+# layouts match (checked at compile time in fft_wrapper_ne10.c and at run time by test/roundtrip.c), but the types are distinct, so reading through one
 # after writing through the other is a type-based-alias violation. The flag removes that
 # assumption for this TU only; every other object keeps strict aliasing.
 $(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
