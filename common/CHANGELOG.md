@@ -4,6 +4,13 @@ All notable changes to audio_common. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The README states the
 current behaviour only; how it got there is recorded here.
 
+## [Unreleased] — 2026-11-16 — UBSan selftest in `test-full`
+
+- `make test-selftest-ubsan` runs `test/run_selftest_ubsan.sh` (`simd_selftest` built with `-fsanitize=undefined
+  -fno-sanitize-recover=all`) and fails when the script does; it is part of `make test-full`. Before, nothing ran the script.
+  The script takes the Makefile's `CC`, its keyed `BIN_DIR` and the `SIMD` / `EXTRA_CFLAGS` selection (`SELFTEST_CFLAGS`), so the probe
+  follows the build that invoked it. Run by hand it still defaults to `cc`, `bin/` and no extra flags.
+
 ## [Unreleased] — 2026-10-24 — Test tiers
 
 - `make test` (default tier) and `make test-full` aggregate the suite; `make test-isolation` runs the

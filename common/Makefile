@@ -330,7 +330,7 @@ $(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test test-full test-isolation audit-fp-contract audit-fft-wrapper-pedantic test_stft test_stft_guard test_heap_alignment test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
+.PHONY: all lib selftest test test-full test-isolation audit-fp-contract audit-fft-wrapper-pedantic test_stft test_stft_guard test_heap_alignment test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test-selftest-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
 all: lib
 
 lib: $(LIB)
@@ -586,8 +586,8 @@ _ne10_parity_bin: $(LIB) | _cfg_guard
 # build-isolation suite. `make test-full` adds what the default tier leaves out because another check
 # already covers it or because it only guards `make publish`: the standalone `test_ne10_force_c`,
 # the FP-contract disassembly audit (`audit-fp-contract`) and the publish scenarios of the isolation suite
-# (S7p, S11, S13-S18). The standalone `test_stft`,
-# `test_stft_guard`, `test_heap_alignment` and `test_audio_utils` are not listed: `selftest` runs
+# (S7p, S11, S13-S18), and `test-selftest-ubsan`, the UBSan build of the SIMD kernel selftest.
+# The standalone `test_stft`, `test_stft_guard`, `test_heap_alignment` and `test_audio_utils` are not listed: `selftest` runs
 # them. The isolation suite needs the AEC repo as a sibling checkout and runs the same for any SIMD
 # setting, because it builds both itself. Steps run one after another, so the isolation suite never
 # races another target for the real obj/ and bin/ directories it snapshots.
@@ -598,8 +598,13 @@ test:
 	@$(MAKE) --no-print-directory test-isolation ISOL_TIER=core
 
 test-full:
-	@$(MAKE) --no-print-directory $(LEAN_TESTS) test_ne10_force_c audit-fp-contract audit-fft-wrapper-pedantic
+	@$(MAKE) --no-print-directory $(LEAN_TESTS) test_ne10_force_c test-selftest-ubsan audit-fp-contract audit-fft-wrapper-pedantic
 	@$(MAKE) --no-print-directory test-isolation ISOL_TIER=full
+
+# test-selftest-ubsan: simd_selftest built with -fsanitize=undefined (test/run_selftest_ubsan.sh); test-full only.
+# The script gets this build's CC, keyed BIN_DIR and SIMD / EXTRA_CFLAGS selection.
+test-selftest-ubsan: | _cfg_guard
+	@CC="$(CC)" BIN_DIR="$(BIN_DIR)" SELFTEST_CFLAGS="$(EXTRA_CFLAGS) $(SIMD_CFLAGS)" sh test/run_selftest_ubsan.sh
 
 # audit-fp-contract: the disassembly gate for the pinned -ffp-contract=off policy (scripts/audit_fp_contract.sh; needs NR as
 # a sibling checkout). It is part of test-full only: it builds common and NR keyed objects of its own.
