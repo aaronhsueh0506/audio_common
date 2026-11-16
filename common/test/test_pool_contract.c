@@ -251,8 +251,6 @@ static void test_hpf_cutoff_validation(void) {
     free(pool);
 }
 
-/* ═══════════════════════════════════ main ════════════════════════════════ */
-
 /* ═══════════════════════════════ mem_align.h helpers ═════════════════════ */
 
 static uint32_t fnv1a_ref(uint32_t h, const unsigned char* p, size_t n) {
@@ -316,6 +314,8 @@ static void test_mem_align_helpers(void) {
         CHECK(ck_carve(base, NULL, 1, 4, &p1) == -1 && p1 == NULL, "ck_carve refuses a NULL cursor");
     }
 }
+
+/* ═══════════════════════════════════ main ════════════════════════════════ */
 
 int main(void) {
     test_fft_misaligned_base();
