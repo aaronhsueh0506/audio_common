@@ -10,6 +10,24 @@ smoother, beamformer and VAD sources that used to vendor under
 `Audio_ALG/pipelines/third_party/`. This file records changes to `audiolib`
 as a whole from this point on.
 
+## [Unreleased] — 2026-11-17 — One float -> int16 output rule, one WAV writer
+
+- **Behaviour change** `sk_clip_scale_to_s16`, `sk_clip_scale_to_s16_arr` and `sk__clip_scale_to_s16_elem` (`common/utility/simd_kernels.h`): `x * 32768`,
+  NaN -> 0, clip to [-32768, 32767] (+-Inf clip), round half away from zero exactly (truncate, compare the exact remainder with +-0.5; no float add
+  of 0.5). Before, they clipped to +-1, scaled by 32767 and truncated, and NaN reached an undefined conversion. Every int16 `k` comes back from
+  `k / 32768` unchanged. `SK_S16_FULL_SCALE` is 32768.0f. The NEON quad uses ARMv7 intrinsics only (truncating convert, exact remainder, compare
+  masks) and equals the scalar for all 2^32 float bit patterns on AArch64. Names and signatures are unchanged; every caller's output changes.
+- **Behaviour change** `common/include/wav_io.h` has one writer. The NR writer style (`WAV_IO_WRITER_NR`: `x * 32767` truncated, no float32 path) and the
+  `WAV_IO_WRITER_STYLE` / `WAV_IO_WRITER_AEC` macros are removed; a leftover `#define WAV_IO_WRITER_STYLE` has no effect. PCM16 samples go through
+  `sk__clip_scale_to_s16_elem` after non-finite samples become 0 and are counted, so the output is byte-identical to the former default style for all
+  2^32 float bit patterns. `AEC_OUT_FLOAT=1` (raw float32) now applies to every user, NR's example programs included. `wav_io_round_s16_half_away()`
+  is removed. `wav_io.h` includes `../utility/simd_kernels.h`, which needs `-I<common>/include` (AEC, NR and Audio_ALG already pass it).
+- `test_wav_nr_style` and `common/test/test_wav_writer_nr_style.c` are removed; `common/test/test_wav_writer_common.h` folds into `test_wav_io.c`, its
+  only user. `simd_selftest`'s `clip_scale_to_s16_rule` checks the single-sample, buffer and (with NEON) quad entry points, the quad at every lane,
+  against a double reference using C99 `round()`: special values with written expectations (NaN of both signs, +-Inf, +-FLT_MAX, subnormals, +-0),
+  all 65536 int16 round trips, every tie k + 0.5 LSB and one float step either side, a dense [-1, 1] sweep in steps of 2^-22, and raw bit patterns
+  including NaN.
+
 ## [Unreleased] — 2026-11-16 — `skn_all_within_f32`, one rounding rule for float -> int16, shared NEON bodies
 
 - `common/utility/simd_kernel_nn.h`: `skn_all_within_f32(x, n, limit)` and its `_scalar` twin; 1 when every `|x[i]| <= limit`, NaN and infinity count as above any finite limit, `n == 0` gives 1. The NEON body ANDs the compare masks over sixteen lanes and tests once per 64 elements. `simd_nn_selftest` compares both with the scalar loop for lengths 0 to 49 and the usual list, four pointer offsets, values at the limit, one float step either side, NaN, infinities and signed zero.

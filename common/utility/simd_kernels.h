@@ -874,18 +874,22 @@ static inline void sk_wola_accumulate_f32(float *acc, const float *x,
 }
 #endif
 
-/* sk_clip_scale_to_s16: float in [-1, 1] -> int16 PCM (clip to +-1, scale by 32767, truncate toward zero).
- *   sk__clip_scale_to_s16_elem: one sample (scalar twin); sk_clip_scale_to_s16_arr: a planar buffer;
- *   sk_clip_scale_to_s16: one NEON quad -> int16x4_t (NEON only, no _scalar twin; callers guard with SK_HAVE_NEON).
- * Clipping uses compare plus select as sk_clip_f32 (signed zeros convert identically); vcvtq_s32_f32 truncates like a C cast;
- * vqmovn_s32 never saturates after the clip. NaN is not handled and reaches an undefined float -> int conversion: callers must exclude it. */
+/* sk_clip_scale_to_s16: float PCM (full scale 1.0f) -> int16: v = x * 32768, NaN -> 0, clip to [-32768, 32767], round half away from
+ * zero exactly (truncate, compare the exact remainder with +-0.5). _elem: one sample; _arr: a buffer; the int16x4_t quad: NEON only.
+ * The quad equals _elem for every input, 32-bit ARM included: NaN converts to 0, a subnormal gives 0 with or without flush-to-zero. */
 
-#define SK_S16_FULL_SCALE 32767.0f
+#define SK_S16_FULL_SCALE 32768.0f
 
 static inline int16_t sk__clip_scale_to_s16_elem(float x) {
-    if (x > 1.0f) x = 1.0f;
-    else if (x < -1.0f) x = -1.0f;
-    return (int16_t)(x * SK_S16_FULL_SCALE);
+    float v = x * SK_S16_FULL_SCALE;
+    int32_t t;
+    float d;
+    if (isnan(v)) return 0;
+    if (v > 32767.0f) v = 32767.0f;
+    else if (v < -32768.0f) v = -32768.0f;
+    t = (int32_t)v;
+    d = v - (float)t;
+    return (int16_t)(t + (d >= 0.5f) - (d <= -0.5f));
 }
 
 static inline void sk_clip_scale_to_s16_arr_scalar(int16_t *out,
@@ -895,13 +899,20 @@ static inline void sk_clip_scale_to_s16_arr_scalar(int16_t *out,
 }
 
 #if SK_HAVE_NEON
-static inline int16x4_t sk_clip_scale_to_s16(float32x4_t v) {
-    const float32x4_t lo = vdupq_n_f32(-1.0f);
-    const float32x4_t hi = vdupq_n_f32(1.0f);
+static inline int16x4_t sk_clip_scale_to_s16(float32x4_t x) {
+    const float32x4_t hi = vdupq_n_f32(32767.0f);
+    const float32x4_t lo = vdupq_n_f32(-32768.0f);
+    float32x4_t v = vmulq_n_f32(x, SK_S16_FULL_SCALE);
+    int32x4_t t, r;
+    float32x4_t d;
     v = vbslq_f32(vcgtq_f32(v, hi), hi, v);
     v = vbslq_f32(vcltq_f32(v, lo), lo, v);
-    /* truncate, never vcvtnq_s32_f32 */
-    return vqmovn_s32(vcvtq_s32_f32(vmulq_n_f32(v, SK_S16_FULL_SCALE)));
+    t = vcvtq_s32_f32(v);
+    d = vsubq_f32(v, vcvtq_f32_s32(t));
+    /* true masks are -1: t - (d >= 0.5) + (d <= -0.5) */
+    r = vsubq_s32(t, vreinterpretq_s32_u32(vcgeq_f32(d, vdupq_n_f32(0.5f))));
+    r = vaddq_s32(r, vreinterpretq_s32_u32(vcleq_f32(d, vdupq_n_f32(-0.5f))));
+    return vmovn_s32(r);
 }
 
 static inline void sk_clip_scale_to_s16_arr(int16_t *out, const float *in,

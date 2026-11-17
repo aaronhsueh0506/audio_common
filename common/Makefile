@@ -330,7 +330,7 @@ $(OBJ_DIR)/fft_wrapper_ne10.o: CFLAGS += $(FFT_WRAPPER_ALIAS_CFLAGS)
 
 LIB = $(BIN_DIR)/libaudio_common.a
 
-.PHONY: all lib selftest test test-full test-isolation audit-fp-contract audit-fft-wrapper-pedantic test_stft test_stft_guard test_heap_alignment test-fast-sqrt-codegen test_audio_utils test_pool test_wav test_wav_nr_style test-wav-ubsan test-selftest-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
+.PHONY: all lib selftest test test-full test-isolation audit-fp-contract audit-fft-wrapper-pedantic test_stft test_stft_guard test_heap_alignment test-fast-sqrt-codegen test_audio_utils test_pool test_wav test-wav-ubsan test-selftest-ubsan test_zero_heap test_ne10_force_c _ne10_parity_bin clean publish print-bin-dir print-obj-dir print-lib-path print-fp-policy _cfg_guard
 all: lib
 
 lib: $(LIB)
@@ -490,16 +490,6 @@ test_wav: | _cfg_guard
 	@echo "--- common WAV I/O corpus under UBSan [$(BACKEND)] ---"
 	@TMPDIR=$(abspath $(BIN_DIR)) $(BIN_DIR)/test_wav_io_ubsan
 
-# test_wav_nr_style: runs the same writer special-values corpus
-# (test/test_wav_writer_common.h) as test_wav, compiled with WAV_IO_WRITER_STYLE forced
-# to WAV_IO_WRITER_NR; test_wav itself only exercises the default WAV_IO_WRITER_AEC
-# style (see wav_io.h). Header-only, same shape as test_wav.
-test_wav_nr_style: | _cfg_guard
-	$(CC) $(CFLAGS) -DWAV_IO_WRITER_STYLE=WAV_IO_WRITER_NR -MD -MP -c -o $(OBJ_DIR)/test_wav_writer_nr_style.o test/test_wav_writer_nr_style.c
-	$(CC) -o $(BIN_DIR)/test_wav_writer_nr_style $(OBJ_DIR)/test_wav_writer_nr_style.o -lm
-	@echo "--- common WAV writer NR-style special-values test [$(BACKEND)] ---"
-	@TMPDIR=$(abspath $(BIN_DIR)) $(BIN_DIR)/test_wav_writer_nr_style
-
 # test-wav-ubsan: the UBSan run of the WAV corpus, which test_wav already performs.
 test-wav-ubsan: test_wav
 
@@ -591,7 +581,7 @@ _ne10_parity_bin: $(LIB) | _cfg_guard
 # them. The isolation suite needs the AEC repo as a sibling checkout and runs the same for any SIMD
 # setting, because it builds both itself. Steps run one after another, so the isolation suite never
 # races another target for the real obj/ and bin/ directories it snapshots.
-LEAN_TESTS = selftest test_pool test_wav test_wav_nr_style test_zero_heap test-fast-sqrt-codegen
+LEAN_TESTS = selftest test_pool test_wav test_zero_heap test-fast-sqrt-codegen
 
 test:
 	@$(MAKE) --no-print-directory $(LEAN_TESTS)

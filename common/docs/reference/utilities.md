@@ -73,7 +73,7 @@ void sk_cmac_fma_ring_f32(Complex *acc, const Complex *W, const Complex *X_buf,
 | `sk_asym_ema_f32` | `s[i]` 就地更新：`x[i] < s[i]` 用 `a_down`，否則用 `a_up`（嚴格小於） | 上升與下降係數不同的 EMA |
 | `sk_scale_f32` | `out[i] = x[i]*g`（單一 broadcast 增益） | 整段乘常數 |
 | `sk_linear_to_db_f32` | `out[i] = 10*log10f(x[i])`，**只有純量**（libm `log10f`） | 功率轉 dB |
-| `sk_clip_scale_to_s16_arr` | float 夾到 ±1、乘 32767、向零截斷成 int16；**不處理 NaN**（呼叫端須先排除）；單 quad 版 `sk_clip_scale_to_s16` 只在 NEON、回傳 `int16x4_t` | 輸出到 PCM16 |
+| `sk_clip_scale_to_s16_arr` | float（滿刻度 1.0）轉 int16：先乘 `32768.0f`；NaN 得 0；夾到 `[-32768, 32767]`（±Inf 夾到兩端）；再四捨五入、半值遠離零（截斷後以精確餘數與 ±0.5 比較，不做浮點 +0.5）。int16 除以 32768 再轉回來，65536 個值都還原成原值。單樣本版 `sk__clip_scale_to_s16_elem`；單 quad 版 `sk_clip_scale_to_s16` 只在 NEON、回傳 `int16x4_t`，與純量版對所有輸入逐位元相同（32 位元 ARM 亦同） | 輸出到 PCM16；`wav_io.h` 的寫檔器也用它 |
 | `sk_argmax_f32`／`sk_argmax_sq_f32`／`sk_argmax_i32` | 回傳最大值（平方值／int32）的**第一個**索引 | 找峰值 |
 | `sk_cmac_f32`／`sk_cmac_fma_ring_f32` | 複數乘加 `acc[i] += w[i]*x[i]`；後者用 FMA 形式沿 `n_part` 個分割累加，`x` 取環形緩衝；**兩者不可互換**（捨入不同） | 濾波器乘加 |
 
@@ -264,7 +264,6 @@ void       wav_close_write(WavWriter* w);      /* 相容包裝，吞掉結果 */
 | `wav_close_read` | 讀完 | NULL 安全 |
 | `wav_open_write` | 開始寫檔時 | `sample_rate` 與 `channels` 都必須 `> 0` |
 | `wav_write_float` | 每個區塊 | `buf` 為 `n` 個 `float`；`n <= 0` 直接 return |
-| `wav_io_round_s16_half_away` | 需要與 `wav_write_float` 相同的 float → int16 進位時 | 輸入是已乘 `32768.0f` 的非 NaN 值；先夾到 `[-32768, 32767]`，再精確地四捨五入（0.5 遠離零） |
 | `wav_finalize_write` | 寫完，且**只呼叫一次** | 回 `0` 成功、`-1` 失敗；一定會消耗 `w` |
 | `wav_close_write` | 相容包裝 | 等同 `wav_finalize_write()` 但丟棄回傳值 |
 
@@ -297,24 +296,15 @@ void       wav_close_write(WavWriter* w);      /* 相容包裝，吞掉結果 */
 
 PCM16 來源會被轉成 float（除以 `32768.0f`）。float32 來源若含 NaN 或 ±Inf，會被替換成 `0.0f`，同時 `r->nonfinite_sanitized` 累加。
 
-**兩種寫入風格**
+**寫出格式**
 
-由編譯期巨集 `WAV_IO_WRITER_STYLE` 選擇，必須在 include 這個標頭**之前**定義：
+- 預設輸出 PCM16。量化用 `simd_kernels.h` 的 `sk__clip_scale_to_s16_elem`：先乘 `32768.0f`，夾到 `[-32768, 32767]`，截斷成整數後以精確餘數與 ±0.5 比較（四捨五入、半值遠離零；不做浮點 +0.5，故略小於半個 LSB 的值得 0）。
+- 環境變數 `AEC_OUT_FLOAT` 的值為 `1` 時（於 `wav_open_write()` 讀取），改輸出未量化的 IEEE float32。對所有使用這個標頭的程式都一樣。
 
-| 值 | 巨集名 | 行為 |
-|---|---|---|
-| `1`（未設定時的預設） | `WAV_IO_WRITER_AEC` | 預設輸出 PCM16；量化為「先乘 `32768.0f`，截斷成整數後以精確餘數與 0.5 比較」（四捨五入、半值遠離零；不做浮點 +0.5，故略小於半個 LSB 的值得 0），並飽和到 `[-32768, 32767]`。若環境變數 `AEC_OUT_FLOAT` 的值為 `1`，改輸出未量化的 IEEE float32 |
-| `2` | `WAV_IO_WRITER_NR` | 永遠輸出 PCM16；量化為「乘 `32767.0f` 後直接截斷」（不做四捨五入），同樣飽和到 `[-32768, 32767]`。沒有 float32 路徑 |
+PCM16 路徑會先把非有限樣本換成 `0.0f`（並累加 `w->nonfinite_sanitized`），再量化；所以 ±Inf 寫成 0，而不是夾到兩端。
+float32 輸出路徑（`AEC_OUT_FLOAT=1`）是**原始位元直通，不做任何清理**。
 
-```c
-#define WAV_IO_WRITER_STYLE WAV_IO_WRITER_NR
-#include "wav_io.h"
-```
-
-兩種風格輸出的位元組**不相同**。做位元級回歸比對時，兩邊必須用同一種風格。
-
-PCM16 路徑會先把非有限樣本換成 `0.0f`（並累加 `w->nonfinite_sanitized`），再夾到 `[-1, 1]`，再量化。
-float32 輸出路徑（`WAV_IO_WRITER_AEC` + `AEC_OUT_FLOAT=1`）是**原始位元直通，不做任何清理**。
+`wav_io.h` 以相對路徑 include `../utility/simd_kernels.h`，後者需要 `ac_complex.h`，所以編譯時 `-I<common>/include` 必須在搜尋路徑上（AEC、NR、Audio_ALG 的 Makefile 都已帶）。
 
 **可觀測欄位**
 
@@ -353,7 +343,7 @@ float32 輸出路徑（`WAV_IO_WRITER_AEC` + `AEC_OUT_FLOAT=1`）是**原始位�
 1. 用 `wav_read_float()` 讀立體聲檔案，卻以為會拿到兩個通道的資料（實際只有第 0 通道）。
 2. 呼叫 `wav_finalize_write()` 之後又呼叫 `wav_close_write()`，造成 double free。
 3. 用 `wav_close_write()` 而不檢查任何錯誤，磁碟滿時得到一個標頭正確但資料被截斷的檔案。
-4. 在 include 之後才定義 `WAV_IO_WRITER_STYLE`，結果拿到預設風格。
+4. 環境中留著 `AEC_OUT_FLOAT=1`，卻以為輸出是 PCM16。
 5. 餵 24-bit 等不被接受的格式，`wav_open_read()` 回 `NULL` 卻沒檢查。
 6. 在即時路徑上使用這個模組。
 

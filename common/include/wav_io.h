@@ -1,8 +1,6 @@
-/** Shared WAV reader/writer.
- * Reader: PCM16 and IEEE-float32, 1..8 channels; RIFF chunk bounds and format fields are validated; non-finite float
- * input becomes 0 and is counted in WavReader.nonfinite_sanitized.
- * Writer style is selected by WAV_IO_WRITER_STYLE: AEC style writes rounded PCM16 (raw float32 with AEC_OUT_FLOAT=1),
- * NR style writes PCM16 truncated toward zero. PCM16 output is finite-sanitized and saturated; float32 output is unsanitized. */
+/** Shared WAV reader/writer. Reader: PCM16 and IEEE-float32, 1..8 channels, RIFF chunk bounds and format fields validated,
+ * non-finite float input becomes 0 (counted in nonfinite_sanitized). Writer: PCM16 by sk__clip_scale_to_s16_elem with non-finite
+ * samples written as 0 (counted); raw, unsanitized IEEE float32 instead when the environment has AEC_OUT_FLOAT=1. */
 #ifndef WAV_IO_H
 #define WAV_IO_H
 
@@ -13,12 +11,7 @@
 #include <math.h>
 #include <limits.h>
 
-/* Writer-style selector: define WAV_IO_WRITER_STYLE to one of these before including; unset means WAV_IO_WRITER_AEC. */
-#define WAV_IO_WRITER_AEC 1
-#define WAV_IO_WRITER_NR  2
-#ifndef WAV_IO_WRITER_STYLE
-#define WAV_IO_WRITER_STYLE WAV_IO_WRITER_AEC
-#endif
+#include "../utility/simd_kernels.h"
 
 typedef struct {
     int sample_rate;
@@ -245,23 +238,15 @@ static inline void wav_close_read(WavReader* r) {
     }
 }
 
-/** Open a WAV file for writing (16-bit PCM, or float32 in the AEC style). Returns NULL on invalid arguments
+/** Open a WAV file for writing (16-bit PCM, or float32 when AEC_OUT_FLOAT=1). Returns NULL on invalid arguments
  * (NULL path, sample_rate <= 0, channels <= 0) or when block_align > 0xFFFF or byte_rate > 0xFFFFFFFF. */
 static inline WavWriter* wav_open_write(const char* path, int sample_rate, int channels) {
     if (!path || sample_rate <= 0 || channels <= 0) return NULL;
 
     // The sample format is decided before fopen so header range checks run before the file is created or truncated.
-    int is_float;
-    int bits_per_sample;
-#if WAV_IO_WRITER_STYLE == WAV_IO_WRITER_AEC
-    /* Default PCM16; AEC_OUT_FLOAT=1 writes IEEE float32. */
     const char* float_env = getenv("AEC_OUT_FLOAT");
-    is_float = (float_env && float_env[0] == '1') ? 1 : 0;
-    bits_per_sample = is_float ? 32 : 16;
-#else
-    is_float = 0;
-    bits_per_sample = 16;
-#endif
+    int is_float = (float_env && float_env[0] == '1') ? 1 : 0;
+    int bits_per_sample = is_float ? 32 : 16;
     int sample_bytes = is_float ? 4 : 2;
 
     uint64_t block_align64 = (uint64_t)channels * (uint64_t)sample_bytes;
@@ -293,23 +278,12 @@ static inline WavWriter* wav_open_write(const char* path, int sample_rate, int c
     return w;
 }
 
-/* Scaled sample (full scale 32768.0f, not NaN) -> int16: clip to [-32768, 32767], then round half away from zero exactly
- * (truncate, compare the exact remainder with 0.5; a float add of 0.5 would carry the float just below 0.5 up to 1). */
-static inline int16_t wav_io_round_s16_half_away(float scaled) {
-    if (scaled > 32767.0f) scaled = 32767.0f;
-    if (scaled < -32768.0f) scaled = -32768.0f;
-    int32_t t = (int32_t)scaled;
-    float d = scaled - (float)t;
-    return (int16_t)(t + (d >= 0.5f) - (d <= -0.5f));
-}
-
 /** Write n float samples. */
 static inline void wav_write_float(WavWriter* w, const float* buf, int n) {
     if (!w || !buf) return;
     // A negative n would become a huge size_t count in fwrite.
     if (n <= 0) return;
 
-#if WAV_IO_WRITER_STYLE == WAV_IO_WRITER_AEC
     if (w->info.is_float) {
         /* IEEE float32 is written unchanged, NaN/Inf payloads included. */
         size_t written = fwrite(buf, sizeof(float), (size_t)n, w->fp);
@@ -317,29 +291,17 @@ static inline void wav_write_float(WavWriter* w, const float* buf, int n) {
         if (written != (size_t)n) w->write_error = 1;
         return;
     }
-#endif
 
     for (int i = 0; i < n; i++) {
         float sample = buf[i];
 
-        // A non-finite sample becomes 0.0f (as in wav_read_float); otherwise NaN would reach an undefined float-to-int conversion.
+        // A non-finite sample is written as 0 and counted (as in wav_read_float).
         if (!isfinite(sample)) {
             sample = 0.0f;
             w->nonfinite_sanitized++;
         }
 
-        if (sample > 1.0f) sample = 1.0f;
-        if (sample < -1.0f) sample = -1.0f;
-
-#if WAV_IO_WRITER_STYLE == WAV_IO_WRITER_AEC
-        int16_t s16 = wav_io_round_s16_half_away(sample * 32768.0f);
-#else
-        // NR style: truncation, no rounding.
-        int32_t v = (int32_t)(sample * 32767.0f);
-        if (v > 32767) v = 32767;
-        if (v < -32768) v = -32768;
-        int16_t s16 = (int16_t)v;
-#endif
+        int16_t s16 = sk__clip_scale_to_s16_elem(sample);
         size_t written = fwrite(&s16, 2, 1, w->fp);
         if (written != 1) {
             // Short write: flag it and stop for this call.

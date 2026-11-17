@@ -4,6 +4,12 @@ All notable changes to audio_common. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The README states the
 current behaviour only; how it got there is recorded here.
 
+## [Unreleased] — 2026-11-17 — One WAV writer
+
+- `test_wav_nr_style` is removed (from `make test` too) with `test/test_wav_writer_nr_style.c`: `wav_io.h` has no NR writer style any more.
+  `test/test_wav_writer_common.h` folds into `test/test_wav_io.c`. The float -> int16 rule and the writer change are described in the
+  repository [`CHANGELOG.md`](../CHANGELOG.md) (2026-11-17).
+
 ## [Unreleased] — 2026-11-16 — UBSan selftest in `test-full`
 
 - `make test-selftest-ubsan` runs `test/run_selftest_ubsan.sh` (`simd_selftest` built with `-fsanitize=undefined

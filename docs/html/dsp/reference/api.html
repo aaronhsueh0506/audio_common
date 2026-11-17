@@ -156,7 +156,7 @@ if (audio_resampler_process(r, in, in_frames, out, cap,
 <tr><th>項目</th><th>契約</th></tr>
 <tr><td>接受格式</td><td>只有 PCM16(<code>audio_format=1,bits=16</code>)與 IEEE float32(<code>=3,bits=32</code>);<code>channels ∈ [1,8]</code></td></tr>
 <tr><td><code>wav_read_float()</code></td><td><b>永遠只回第一個聲道</b>,其餘被跳過</td></tr>
-<tr><td>寫入風格</td><td>編譯期 <code>WAV_IO_WRITER_STYLE</code>(<b>必須在 include 之前定義</b>):<code>_AEC</code>(預設,PCM16 四捨五入遠離零;<code>AEC_OUT_FLOAT=1</code> 環境變數可切成 float32 直通)vs <code>_NR</code>(永遠 PCM16,直接截斷)。<b>兩風格輸出位元組不同</b></td></tr>
+<tr><td>寫出格式</td><td>預設 PCM16,量化用 <code>sk__clip_scale_to_s16_elem</code>(乘 32768、夾到 <code>[-32768,32767]</code>、四捨五入半值遠離零);環境變數 <code>AEC_OUT_FLOAT=1</code> 改成 float32 直通。對所有使用者都一樣,沒有編譯期風格開關</td></tr>
 <tr><td>非有限樣本</td><td>讀入 float32 的 NaN/±Inf 換成 <code>0.0f</code> 並計入 <code>nonfinite_sanitized</code>;寫 PCM16 同樣清洗;<b>float32 輸出路徑不清洗</b></td></tr>
 <tr><td>擁有權</td><td><code>wav_finalize_write()</code> 無論成敗都<b>消耗</b> handle(關檔+釋放),之後不可再用</td></tr>
 </table></div>
@@ -177,7 +177,7 @@ if (audio_resampler_process(r, in, in_frames, out, cap,
 <tr><td><code>sk_fast_exp_f32</code> / <code>_exp_neg</code> / <code>_log</code> / <code>sk_exp1_approx_f32</code></td><td><code>fast_math</code> 對應陣列版</td><td>皆 <code>out==x</code> 可</td></tr>
 <tr><td><code>sk_noise_update_f32</code></td><td>噪聲 PSD 追蹤更新:<code>a=alpha_d+(1-alpha_d)·spp[i]·bb_scale</code>,<code>noise[i]=a·noise[i]+(1-a)·power[i]</code>(平滑係數隨每 bin 語音存在機率變動)</td><td><code>noise_psd</code> 就地</td></tr>
 <tr><td><code>sk_wola_accumulate_f32</code></td><td><code>acc[i]+=x[i]*w[i]</code>(OLA 累加)</td><td>不可</td></tr>
-<tr><td><code>sk_clip_scale_to_s16</code> / <code>_arr</code></td><td>float<code>[-1,1]</code>→int16 PCM(夾到 ±1、乘 32767、向零截斷;<b>不處理 NaN</b>,呼叫端須先排除)。單 quad 版回傳 <code>int16x4_t</code>、只在 NEON,呼叫端用 <code>SK_HAVE_NEON</code> 保護</td><td>—</td></tr>
+<tr><td><code>sk_clip_scale_to_s16</code> / <code>_arr</code></td><td>float(滿刻度 1.0)→int16 PCM:乘 32768;NaN 得 0;夾到 <code>[-32768,32767]</code>(±Inf 夾到兩端);四捨五入、半值遠離零(截斷後以精確餘數比 ±0.5,不做浮點 +0.5)。int16/32768 轉回來 65536 個值都還原。單 quad 版回傳 <code>int16x4_t</code>、只在 NEON,呼叫端用 <code>SK_HAVE_NEON</code> 保護;與純量版對所有輸入逐位元相同(含 32 位元 ARM)</td><td>—</td></tr>
 <tr><td><code>sk_argmax_f32</code> / <code>sk_argmax_sq_f32</code> / <code>sk_argmax_i32</code></td><td>回傳最大值(平方值 / int32)的第一個索引;<code>sk_argmax_i32</code> 只有純量且要求 <code>n&gt;=1</code></td><td>唯讀</td></tr>
 <tr><td><code>sk_cmag_f32</code></td><td>⚠ 名為 mag 但實際是 <code>x.r²+x.i²+eps</code>(<b>功率+floor,沒開根號</b>)</td><td>不可</td></tr>
 <tr><td><code>sk_linear_to_db_f32</code></td><td><code>10·log10f(x)</code>,<b>刻意沒有 NEON 路徑</b>(避免混用近似 log10)</td><td>不可</td></tr>
@@ -249,7 +249,6 @@ make -C common lib BACKEND=ne10 SIMD=0     # 純量建置</pre>
 <tr><th>項目</th><th>類別</th><th>說明</th></tr>
 <tr class="ext"><td><code>SIMD_KERNELS_FORCE_SCALAR</code>(消費端 TU 的定義)</td><td>外部</td><td>必須與 archive 的 <code>SIMD=0|1</code> 一致:<code>SIMD=0</code> 對應有定義。<code>SK_HAVE_NEON</code> 可在執行期印出確認</td></tr>
 <tr class="ext"><td><code>-ffp-contract=off -fno-math-errno</code>(消費端 TU)</td><td>外部</td><td>include 了 <code>simd_kernels.h</code>/<code>fast_math.h</code> 的 TU 必須帶,放在 CFLAGS 最後</td></tr>
-<tr class="ext"><td><code>WAV_IO_WRITER_STYLE</code>(<code>wav_io.h</code>)</td><td>外部(離線工具)</td><td><code>WAV_IO_WRITER_AEC</code>(預設)/ <code>WAV_IO_WRITER_NR</code>,須在 include 前定義;AEC 風格另受環境變數 <code>AEC_OUT_FLOAT=1</code> 影響</td></tr>
 </table></div>
 
 <h3>make 變數(建置面)</h3>

@@ -1165,9 +1165,8 @@ static void edge_check_canary_s16(const char *label, const int16_t *arena,
 /* Input distribution for sk_clip_scale_to_s16. gen_float() alone draws
  * arbitrary bit patterns, almost all far outside [-1, 1], so it would only
  * exercise the clip branches. The extra cases put samples inside the range at
- * fine granularity, where the rounding mode of the float -> int conversion is
- * observable: vcvtnq_s32_f32 (round to nearest) instead of vcvtq_s32_f32
- * (truncate) moves about half of them by one LSB. */
+ * fine granularity, where the rounding of the float -> int conversion is
+ * observable. */
 static float gen_pcm_float(void) {
     switch (lcg_next() % 6u) {
         case 0: return gen_float();               /* clip branches, inf, denormals */
@@ -1320,6 +1319,147 @@ static void test_clip_scale_to_s16_edge(void) {
     free(in_arena); free(out_scalar); free(out_simd);
     printf("PASS clip_scale_to_s16_edge (clip_hi=%d clip_lo=%d in_range=%d, "
            "canary-guarded)\n", clipped_hi, clipped_lo, in_range);
+}
+
+/* The float -> int16 output rule against an independent reference in double: scale by 32768, NaN -> 0, clamp to
+ * [-32768, 32767], then C99 round() (half away from zero). */
+static int ref_clip_scale_to_s16(float x) {
+    double v = (double)x * 32768.0;
+    if (isnan(v)) return 0;
+    if (v > 32767.0) v = 32767.0;
+    if (v < -32768.0) v = -32768.0;
+    return (int)round(v);
+}
+
+static void s16_rule_fail(const char *label, const char *path, int idx, float x, int got, int want) {
+    uint32_t b;
+    memcpy(&b, &x, sizeof b);
+    fprintf(stderr, "MISMATCH clip_scale_to_s16_rule %s path=%s idx=%d in=0x%08x (%.9g): got=%d want=%d\n",
+            label, path, idx, (unsigned)b, (double)x, got, want);
+    exit(1);
+}
+
+#define S16_RULE_CHUNK 4096
+
+/* in[0, n) through sk__clip_scale_to_s16_elem, sk_clip_scale_to_s16_arr and, with NEON, the quad at all four lane
+ * positions. want[] (or the reference when NULL) is the expected value; a given want[] must also equal the reference. */
+static void check_s16_rule(const char *label, const float *in, const int *want, int n) {
+    int16_t out[S16_RULE_CHUNK];
+    int i;
+    sk_clip_scale_to_s16_arr(out, in, n);
+    for (i = 0; i < n; ++i) {
+        int ref = ref_clip_scale_to_s16(in[i]);
+        int w = want ? want[i] : ref;
+        int elem = sk__clip_scale_to_s16_elem(in[i]);
+        g_total_checks += 3;
+        if (ref != w) s16_rule_fail(label, "reference", i, in[i], ref, w);
+        if (elem != w) s16_rule_fail(label, "elem", i, in[i], elem, w);
+        if (out[i] != w) s16_rule_fail(label, "arr", i, in[i], out[i], w);
+    }
+#if SK_HAVE_NEON
+    {
+        int off, l;
+        for (off = 0; off < 4; ++off) {
+            for (i = off; i + 4 <= n; i += 4) {
+                int16_t q[4];
+                vst1_s16(q, sk_clip_scale_to_s16(vld1q_f32(in + i)));
+                for (l = 0; l < 4; ++l) {
+                    int w = want ? want[i + l] : ref_clip_scale_to_s16(in[i + l]);
+                    g_total_checks++;
+                    if (q[l] != w) s16_rule_fail(label, "quad", i + l, in[i + l], q[l], w);
+                }
+            }
+        }
+    }
+#endif
+}
+
+static int clamp_s16_int(long v) {
+    return v > 32767 ? 32767 : v < -32768 ? -32768 : (int)v;
+}
+
+static void test_clip_scale_to_s16_rule(void) {
+    static float in[S16_RULE_CHUNK];
+    static int want[S16_RULE_CHUNK];
+    long checks0 = g_total_checks;
+    int n, k, i;
+
+    /* Special values, each with a hand-written expectation; three copies put every value in every quad lane. */
+    {
+        static const uint32_t bits[] = {
+            0x7fc00000u, 0xffc00000u, 0x7f800001u, 0x7fffffffu, 0xffffffffu, 0x7fc00123u,   /* NaN, both signs */
+            0x7f800000u, 0xff800000u, 0x7f7fffffu, 0xff7fffffu,                             /* +-Inf, +-FLT_MAX */
+            0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x007fffffu, 0x807fffffu,   /* +-0, subnormals */
+            0x00800000u, 0x80800000u,                                                       /* +-FLT_MIN */
+            0x3f800000u, 0xbf800000u, 0x3f7fffffu, 0xbf7fffffu, 0x40000000u, 0xc0000000u,   /* +-1, below +-1, +-2 */
+            0x501502f9u, 0xd01502f9u                                                        /* +-1e10 */
+        };
+        static const int bits_want[] = {
+            0, 0, 0, 0, 0, 0,
+            32767, -32768, 32767, -32768,
+            0, 0, 0, 0, 0, 0,
+            0, 0,
+            32767, -32768, 32767, -32768, 32767, -32768,
+            32767, -32768
+        };
+        const int m = (int)(sizeof(bits) / sizeof(bits[0]));
+        int c;
+        if ((int)(sizeof(bits_want) / sizeof(bits_want[0])) != m) {
+            fprintf(stderr, "FATAL clip_scale_to_s16_rule: special table size mismatch\n");
+            exit(1);
+        }
+        for (c = 0, n = 0; c < 3; ++c) {
+            for (i = 0; i < m; ++i, ++n) {
+                in[n] = bits_to_float(bits[i]);
+                want[n] = bits_want[i];
+            }
+        }
+        check_s16_rule("special", in, want, n);
+    }
+
+    /* Every int16 k: k / 32768 comes back as k. */
+    for (k = -32768; k <= 32767; k += n) {
+        for (n = 0; n < S16_RULE_CHUNK && k + n <= 32767; ++n) {
+            in[n] = (float)(k + n) / 32768.0f;
+            want[n] = k + n;
+        }
+        check_s16_rule("int16_roundtrip", in, want, n);
+    }
+
+    /* Each tie (k + 0.5) / 32768 and one float step either side, k over the int16 range plus one beyond each end:
+     * below -> k, the tie -> away from zero, above -> k + 1, all clamped. */
+    for (k = -32769; k <= 32768; k += n / 3) {
+        for (n = 0; n + 3 <= S16_RULE_CHUNK && k + n / 3 <= 32768; n += 3) {
+            int kk = k + n / 3;
+            float tie = ((float)kk + 0.5f) / 32768.0f;
+            in[n] = nextafterf(tie, -INFINITY);
+            in[n + 1] = tie;
+            in[n + 2] = nextafterf(tie, INFINITY);
+            want[n] = clamp_s16_int(kk);
+            want[n + 1] = clamp_s16_int(kk >= 0 ? (long)kk + 1 : kk);
+            want[n + 2] = clamp_s16_int((long)kk + 1);
+        }
+        check_s16_rule("ties", in, want, n);
+    }
+
+    /* Dense sweep of [-1 - 2^-8, 1 + 2^-8] in steps of 2^-22 (128 points per LSB). */
+    {
+        const long lim = (1L << 22) + (1L << 14);
+        long j = -lim;
+        while (j <= lim) {
+            for (n = 0; n < S16_RULE_CHUNK && j <= lim; ++n, ++j) in[n] = ldexpf((float)j, -22);
+            check_s16_rule("dense", in, NULL, n);
+        }
+    }
+
+    /* Raw bit patterns, NaN not excluded. */
+    for (k = 0; k < 64; ++k) {
+        for (n = 0; n < S16_RULE_CHUNK; ++n) in[n] = bits_to_float(lcg_next());
+        check_s16_rule("raw_bits", in, NULL, n);
+    }
+
+    printf("PASS clip_scale_to_s16_rule (specials, 65536 int16 round trips, ties +-1 step, dense [-1,1] sweep, raw bits; "
+           "%ld checks)\n", g_total_checks - checks0);
 }
 
 /* sk_wola_accumulate_f32 (acc[i] += x[i]*w[i]) follows the edge convention of this file (canary-guarded
@@ -1708,6 +1848,7 @@ int main(void) {
     test_fast_sqrt_edge();
     test_wola_accumulate_edge();
     test_clip_scale_to_s16_edge();
+    test_clip_scale_to_s16_rule();
     test_scale();
     test_cmag_edge();
     test_asym_ema_edge();

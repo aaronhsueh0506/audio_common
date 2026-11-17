@@ -1,8 +1,7 @@
 /*
  * test_wav_io.c - negative-corpus tests for the shared WAV parser and writer (include/wav_io.h).
  *
- * The default WAV_IO_WRITER_AEC writer is used (the style does not affect the reader). Every malformed
- * input must make wav_open_read() return NULL without crashing; every well-formed input must parse.
+ * Every malformed input must make wav_open_read() return NULL without crashing; every well-formed input must parse.
  * Writer coverage: wav_finalize_write() failure paths (fseek, fwrite, fclose) through a FILE* with
  * injectable failures (funopen on BSD/macOS, fopencookie on glibc; that group prints SKIP elsewhere),
  * wav_open_write() argument and header-field validation, and the oversize abandon path.
@@ -17,7 +16,6 @@
 #endif
 
 #include "wav_io.h"
-#include "test_wav_writer_common.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +35,16 @@ static int g_fail = 0;
         g_fail = 1; \
     } \
 } while (0)
+
+#define TEST_TMP_PATH_MAX 512
+
+/* mkstemp template under $TMPDIR (the Makefile points it at the build dir), else /tmp. An overflowing template is
+ * truncated, so the caller's mkstemp() fails and its setup check reports it. */
+static void test_tmp_template(char* out, size_t cap, const char* stem) {
+    const char* dir = getenv("TMPDIR");
+    if (!dir || !*dir) dir = "/tmp";
+    snprintf(out, cap, "%s/%s_XXXXXX", dir, stem);
+}
 
 /* ═══════════════════════════ raw-byte WAV builder ═════════════════════════
  * Growable byte buffer plus little-endian field pushers, so each test can hand-construct (and
@@ -514,7 +522,7 @@ static void test_valid_pcm16_parses_as_before(void) {
 
 /* ═══════════════════════════ writer round-trip test ═══════════════════════ */
 
-/* Exact int16 encoding of a sample in the default (AEC) style, computed in double: clamp to +-1, scale by 32768,
+/* Exact int16 encoding of a finite PCM16 sample, computed in double: clamp to +-1, scale by 32768,
  * round half away from zero, saturate to the int16 range. */
 static int wav_expect_s16_exact(float x) {
     double s = (double)x;
@@ -528,10 +536,9 @@ static int wav_expect_s16_exact(float x) {
 }
 
 static void test_write_read_roundtrip_byte_exact(void) {
-    /* Values that round exactly through the *32768.0f round-half-away
-     * quantization of the default WAV_IO_WRITER_AEC style, with no ambiguity
-     * at the .5 boundary. +1.0f is left to the special-values test below,
-     * where it saturates. */
+    /* Values that round exactly through the PCM16 writer's *32768.0f
+     * round-half-away quantization, with no ambiguity at the .5 boundary.
+     * +1.0f is left to the special-values test below, where it saturates. */
     const float in_samples[6] = { 0.0f, 0.5f, -0.5f, 0.999969482421875f /* 32767/32768 */, -1.0f, 0.99993896484375f /* 32766/32768 */ };
     char path[TEST_TMP_PATH_MAX];
     test_tmp_template(path, sizeof(path), "audio_common_test_wav_io_wr");
@@ -550,7 +557,7 @@ static void test_write_read_roundtrip_byte_exact(void) {
         if (r) {
             CHECK(r->info.sample_rate == 16000, "round-trip sample_rate must match");
             CHECK(r->info.channels == 1, "round-trip channels must match");
-            CHECK(r->info.bits_per_sample == 16, "round-trip bits_per_sample must be 16 (default writer style)");
+            CHECK(r->info.bits_per_sample == 16, "round-trip bits_per_sample must be 16 (PCM16 without AEC_OUT_FLOAT)");
             CHECK(r->info.num_samples == 6, "round-trip num_samples must match");
 
             float out_samples[6];
@@ -558,7 +565,7 @@ static void test_write_read_roundtrip_byte_exact(void) {
             CHECK(n == 6, "round-trip must read back all 6 samples");
 
             /* Recompute the exact expected int16 encoding (round-half-away
-             * from zero, matching wav_write_float's WAV_IO_WRITER_AEC path)
+             * from zero, matching wav_write_float's PCM16 path)
              * and compare the read-back float to that exact re-derived value
              * -- i.e. byte-exact through the quantization step, not just
              * "close". */
@@ -577,12 +584,64 @@ static void test_write_read_roundtrip_byte_exact(void) {
 }
 
 /* ═════════════════════ writer special-values corpus ═══════════════════════
- * The corpus and expected values are in test_wav_writer_common.h and run
- * against both writer styles; this file runs the default AEC style and
- * test_wav_writer_nr_style.c runs the NR style.
+ * The PCM16 quantizer at the +-1.0f boundary (32768 before saturation would be an out-of-range int16) and for
+ * NaN / +-Inf input, which the writer writes as 0 and counts in nonfinite_sanitized.
  */
-static void test_writer_special_values_corpus_aec_style(void) {
-    if (test_wav_writer_special_values_corpus()) g_fail = 1;
+static void test_writer_special_values_corpus(void) {
+    const int n = 9;
+    float in_samples[9];
+    in_samples[0] = 1.0f;                          // exactly +full-scale
+    in_samples[1] = -1.0f;                          // exactly -full-scale
+    in_samples[2] = nextafterf(1.0f, 0.0f);         // largest value < 1.0f
+    in_samples[3] = nextafterf(-1.0f, 0.0f);        // smallest value > -1.0f
+    in_samples[4] = NAN;
+    in_samples[5] = INFINITY;
+    in_samples[6] = -INFINITY;
+    in_samples[7] = 0.5f;
+    in_samples[8] = -0.5f;
+
+    /* nextafterf(1.0f, 0) scales to 32767.998, above 32767, so it clips to 32767; nextafterf(-1.0f, 0) rounds to -32768. */
+    const int16_t expect[9] = {
+        32767, -32768, 32767, -32768, 0, 0, 0, 16384, -16384
+    };
+
+    char path[TEST_TMP_PATH_MAX];
+    test_tmp_template(path, sizeof(path), "audio_common_test_wav_writer_special");
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "setup: mkstemp for writer special-values corpus");
+    if (fd < 0) return;
+    close(fd);  // wav_open_write will fopen() the same path
+
+    WavWriter* w = wav_open_write(path, 16000, 1);
+    CHECK(w != NULL, "wav_open_write must succeed for special-values corpus");
+    if (w) {
+        CHECK(w->info.is_float == 0, "this corpus is written in PCM16 mode");
+        wav_write_float(w, in_samples, n);
+        CHECK(w->nonfinite_sanitized == 3,
+              "exactly 3 non-finite samples (NAN/+Inf/-Inf) must be sanitized to 0.0f");
+        CHECK(w->write_error == 0,
+              "a normal-sized write to a fresh temp file must not report write_error");
+        CHECK(w->samples_written == (uint64_t)n,
+              "samples_written must count all 9 samples of the corpus");
+        wav_close_write(w);
+
+        WavReader* r = wav_open_read(path);
+        CHECK(r != NULL, "wav_open_read must read back the special-values corpus file");
+        if (r) {
+            float out[9];
+            int got = wav_read_float(r, out, n);
+            CHECK(got == n, "must read back all 9 samples");
+            for (int i = 0; i < n; i++) {
+                float expect_f = (float)expect[i] / 32768.0f;
+                char msg[112];
+                snprintf(msg, sizeof(msg),
+                         "corpus sample %d must dequantize to the documented expected int16 value", i);
+                CHECK(out[i] == expect_f, msg);
+            }
+            wav_close_read(r);
+        }
+    }
+    unlink(path);
 }
 
 /* Every int16 value k, the ties k +- 0.5 LSB and one float step either side of each: the writer must give the exact
@@ -641,22 +700,7 @@ static void test_write_rounding_exact_at_ties(void) {
     free(out);
 }
 
-/* The shared rounding helper: ties away from zero, the float just below a tie rounds down, out-of-range values (infinities
- * included) clip to the int16 range. */
-static void test_round_s16_helper(void) {
-    CHECK(wav_io_round_s16_half_away(0.5f) == 1 && wav_io_round_s16_half_away(-0.5f) == -1 &&
-          wav_io_round_s16_half_away(nextafterf(0.5f, 0.0f)) == 0 && wav_io_round_s16_half_away(-0.0f) == 0,
-          "helper: ties go away from zero, the float below the tie rounds toward zero");
-    CHECK(wav_io_round_s16_half_away(32766.5f) == 32767 && wav_io_round_s16_half_away(32767.0f) == 32767 &&
-          wav_io_round_s16_half_away(32768.0f) == 32767 && wav_io_round_s16_half_away(-32768.0f) == -32768 &&
-          wav_io_round_s16_half_away(-32768.5f) == -32768 && wav_io_round_s16_half_away(-32767.5f) == -32768,
-          "helper: the int16 range edges");
-    CHECK(wav_io_round_s16_half_away(1e30f) == 32767 && wav_io_round_s16_half_away(-1e30f) == -32768 &&
-          wav_io_round_s16_half_away(INFINITY) == 32767 && wav_io_round_s16_half_away(-INFINITY) == -32768,
-          "helper: values beyond the range clip");
-}
-
-/* Float mode (WAV_IO_WRITER_AEC with AEC_OUT_FLOAT=1) writes samples
+/* Float mode (AEC_OUT_FLOAT=1) writes samples
  * unchanged and, unlike the PCM16 path, does not sanitize NaN / Inf. The
  * test therefore reads the file bytes directly: wav_read_float would replace
  * NaN / Inf by 0.0f. It also checks that the RIFF chunk size (bytes 4-7)
@@ -1077,7 +1121,6 @@ static void test_finalize_write_rejects_oversize_samples_written(void) {
 /* ═══════════════════════════════════ main ════════════════════════════════ */
 
 int main(void) {
-    test_round_s16_helper();
     test_reject_truncated_header();
     test_reject_fmt_size_12();
     test_reject_channels_0();
@@ -1099,7 +1142,7 @@ int main(void) {
     test_write_read_roundtrip_byte_exact();
     test_write_rounding_exact_at_ties();
 
-    test_writer_special_values_corpus_aec_style();
+    test_writer_special_values_corpus();
     test_write_float_mode_bitexact_and_riff_size();
     test_write_zero_and_negative_n_is_noop();
     test_write_error_on_short_write();
